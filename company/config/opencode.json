@@ -1,0 +1,49 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "pm",
+  "agent": {
+    "pm": {
+      "model": "anthropic/claude-sonnet-4-6",
+      "prompt": "{file:company/personas/pm.yml}"
+    },
+    "architect": {
+      "model": "anthropic/claude-sonnet-4-6",
+      "prompt": "{file:company/personas/architect.yml}"
+    },
+    "implementer": {
+      "model": "anthropic/claude-sonnet-4-6",
+      "prompt": "{file:company/personas/implementer.yml}"
+    },
+    "ceo": {
+      "model": "anthropic/claude-sonnet-4-6",
+      "prompt": "{file:company/personas/ceo.yml}",
+      "tools": {
+        "write": false,
+        "edit": false,
+        "bash": false
+      }
+    }
+  },
+  "mcp": {
+    "orchestrator": {
+      "type": "local",
+      "command": ["node", "./company/plugins/mcp-proxy.mjs", "./target/debug/companyos-orchestrator-server"],
+      "environment": {
+        "COMPANYOS_ROOT": "."
+      }
+    },
+    "yaml-validator": {
+      "type": "local",
+      "command": ["node", "./company/plugins/mcp-proxy.mjs", "./target/debug/companyos-yaml-validator"],
+      "environment": {
+        "COMPANYOS_ROOT": "."
+      }
+    }
+  },
+  "instructions": ["company/config/personas.yml", "company/config/shared-rules.yml"],
+  "plugin": ["./company/plugins/defense-in-depth.mjs"],
+  "permission": {
+    "edit": "allow",
+    "bash": "allow"
+  }
+}

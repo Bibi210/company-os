@@ -1,0 +1,22 @@
+api_version: companyos/v1
+kind: human-review-triggers
+metadata:
+  id: c7ce9b0f-6d47-4ad6-bda1-493e1432321c
+  title: Human Review Triggers
+  author: ceo
+  created_at: "2026-03-14"
+
+spec:
+  triggers:
+    - condition: rfc modifies access matrix
+      action: escalate_user
+      description: Toute modification de l'access matrix doit être approuvée par l'utilisateur.
+    - condition: rfc modifies ceo persona
+      action: escalate_user
+      description: Les règles du CEO ne peuvent être modifiées sans approbation utilisateur.
+    - condition: rfc introduces breaking schema change
+      action: escalate_user
+      description: Les changements de schema incompatibles requièrent une approbation utilisateur.
+    - condition: rfc deletes persona
+      action: escalate_user
+      description: La suppression d'un persona requiert une approbation utilisateur.

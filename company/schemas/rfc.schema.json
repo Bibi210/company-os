@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://companyos.dev/schemas/rfc.schema.json",
+  "allOf": [
+    { "$ref": "_base.schema.json" },
+    {
+      "properties": {
+        "kind": { "const": "rfc" },
+        "metadata": {
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": ["draft", "review", "approved", "rejected", "implemented"]
+            }
+          }
+        },
+        "spec": {
+          "type": "object",
+          "properties": {
+            "motivation": { "type": "string" },
+            "proposal": { "type": "string" },
+            "impact": { "type": "string" },
+            "rollback_plan": { "type": "string" },
+            "affected_files": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          },
+          "required": ["motivation", "proposal", "impact"]
+        }
+      },
+      "required": ["spec"]
+    }
+  ]
+}

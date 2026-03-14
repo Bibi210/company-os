@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://companyos.dev/schemas/agent-message.schema.json",
+  "allOf": [
+    { "$ref": "_base.schema.json" },
+    {
+      "properties": {
+        "kind": { "const": "agent-message" },
+        "metadata": {
+          "properties": {
+            "from": { "type": "string" },
+            "to": { "type": "string" }
+          },
+          "required": ["from", "to"]
+        },
+        "spec": {
+          "type": "object",
+          "properties": {
+            "content": { "type": "string" }
+          },
+          "required": ["content"]
+        }
+      },
+      "required": ["spec"]
+    }
+  ]
+}

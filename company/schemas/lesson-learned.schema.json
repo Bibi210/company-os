@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://companyos.dev/schemas/lesson-learned.schema.json",
+  "allOf": [
+    { "$ref": "_base.schema.json" },
+    {
+      "properties": {
+        "kind": { "const": "lesson-learned" },
+        "metadata": {
+          "required": ["tags", "description"]
+        },
+        "spec": {
+          "type": "object",
+          "properties": {
+            "context": { "type": "string" },
+            "insight": { "type": "string" },
+            "recommendation": { "type": "string" }
+          },
+          "required": ["context", "insight", "recommendation"]
+        }
+      },
+      "required": ["spec"]
+    }
+  ]
+}

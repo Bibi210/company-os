@@ -1,0 +1,18 @@
+[package]
+name = "companyos-integration-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[test]]
+name = "user_stories"
+path = "user_stories.rs"
+
+[[test]]
+name = "edge_cases"
+path = "edge_cases.rs"
+
+[dependencies]
+companyos-config = { path = "../../crates/config" }
+companyos-validation = { path = "../../crates/validation" }
+companyos-orchestrator = { path = "../../crates/orchestrator" }

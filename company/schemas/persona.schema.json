@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://companyos.dev/schemas/persona.schema.json",
+  "allOf": [
+    { "$ref": "_base.schema.json" },
+    {
+      "properties": {
+        "kind": { "const": "persona" },
+        "metadata": {
+          "properties": {
+            "id": { "type": "string" },
+            "display_name": { "type": "string" }
+          },
+          "required": ["id", "display_name"]
+        },
+        "identity": { "type": "string" },
+        "rules": {
+          "type": "object",
+          "properties": {
+            "must": { "type": "array", "items": { "type": "string" } },
+            "never": { "type": "array", "items": { "type": "string" } }
+          },
+          "required": ["must", "never"]
+        },
+        "artifacts": {
+          "type": "object",
+          "properties": {
+            "produces": { "type": "array", "items": { "type": "string" } },
+            "consumes": { "type": "array", "items": { "type": "string" } }
+          },
+          "required": ["produces", "consumes"]
+        },
+        "review_behavior": { "type": "string" }
+      },
+      "required": ["identity", "rules", "artifacts", "review_behavior"]
+    }
+  ]
+}

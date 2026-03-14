@@ -1,0 +1,16 @@
+[package]
+name = "companyos-orchestrator"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+companyos-config = { path = "../config" }
+companyos-validation = { path = "../validation" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+rusqlite = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+glob = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "companyos-validation"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+companyos-config = { path = "../config" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+jsonschema = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://companyos.dev/schemas/design-doc.schema.json",
+  "allOf": [
+    { "$ref": "_base.schema.json" },
+    {
+      "properties": {
+        "kind": { "const": "design-doc" },
+        "spec": {
+          "type": "object",
+          "properties": {
+            "overview": { "type": "string" },
+            "components": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": { "type": "string" },
+                  "description": { "type": "string" }
+                },
+                "required": ["name", "description"]
+              }
+            },
+            "decisions": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "decision": { "type": "string" },
+                  "rationale": { "type": "string" }
+                },
+                "required": ["decision", "rationale"]
+              }
+            },
+            "open_questions": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          },
+          "required": ["overview"]
+        }
+      },
+      "required": ["spec"]
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://companyos.dev/schemas/review-protocol.schema.json",
+  "allOf": [
+    { "$ref": "_base.schema.json" },
+    {
+      "properties": {
+        "kind": { "const": "review-protocol" },
+        "spec": {
+          "type": "object",
+          "properties": {
+            "reviewers_by_artifact_type": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            },
+            "escalation_rules": {
+              "type": "object",
+              "properties": {
+                "max_iterations_before_ceo": { "type": "integer" },
+                "ceo_cannot_approve_alone": {
+                  "type": "array",
+                  "items": { "type": "string" }
+                }
+              }
+            }
+          },
+          "required": ["reviewers_by_artifact_type"]
+        }
+      },
+      "required": ["spec"]
+    }
+  ]
+}

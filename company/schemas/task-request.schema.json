@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://companyos.dev/schemas/task-request.schema.json",
+  "allOf": [
+    { "$ref": "_base.schema.json" },
+    {
+      "properties": {
+        "kind": { "const": "task-request" },
+        "metadata": {
+          "properties": {
+            "project": { "type": "string" }
+          }
+        },
+        "spec": {
+          "type": "object",
+          "properties": {
+            "acceptance_criteria": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "priority": {
+              "type": "string",
+              "enum": ["low", "medium", "high", "critical"]
+            },
+            "status": {
+              "type": "string",
+              "enum": ["backlog", "in_progress", "done", "cancelled"]
+            }
+          },
+          "required": ["acceptance_criteria"]
+        }
+      },
+      "required": ["spec"]
+    }
+  ]
+}

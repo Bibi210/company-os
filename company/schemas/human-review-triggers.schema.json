@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://companyos.dev/schemas/human-review-triggers.schema.json",
+  "allOf": [
+    { "$ref": "_base.schema.json" },
+    {
+      "properties": {
+        "kind": { "const": "human-review-triggers" },
+        "spec": {
+          "type": "object",
+          "properties": {
+            "triggers": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "condition": { "type": "string" },
+                  "action": { "type": "string" },
+                  "description": { "type": "string" }
+                },
+                "required": ["condition", "action", "description"]
+              }
+            }
+          },
+          "required": ["triggers"]
+        }
+      },
+      "required": ["spec"]
+    }
+  ]
+}

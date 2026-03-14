@@ -1,0 +1,15 @@
+{
+  "prefixes": [
+    "company/config/",
+    "company/personas/",
+    "company/schemas/",
+    "company/plugins/",
+    "crates/"
+  ],
+  "files": [
+    "opencode.json"
+  ],
+  "personas_dir": "company/personas",
+  "personas_out": "company/config/personas.yml",
+  "db_path": "company/data/orchestrator.db"
+}

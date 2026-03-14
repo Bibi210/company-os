@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://companyos.dev/schemas/_base.schema.json",
+  "type": "object",
+  "properties": {
+    "api_version": {
+      "type": "string",
+      "const": "companyos/v1"
+    },
+    "kind": {
+      "type": "string"
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "created_at": { "type": "string" },
+        "author": { "type": "string" },
+        "changelog": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "date": { "type": "string", "description": "ISO 8601 date of the change" },
+              "author": { "type": "string", "description": "Persona who made the change" },
+              "description": { "type": "string", "description": "What changed and why" }
+            },
+            "required": ["date", "author", "description"]
+          },
+          "description": "History of modifications to this artifact, most recent first"
+        },
+        "related": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                "description": "metadata.id of the referenced artifact (UUID)"
+              },
+              "kind": {
+                "type": "string",
+                "description": "Kind of the referenced artifact"
+              },
+              "relationship": {
+                "type": "string",
+                "enum": ["input", "derived-from", "supersedes", "related"],
+                "description": "How this artifact relates to the referenced one"
+              }
+            },
+            "required": ["id", "relationship"]
+          },
+          "description": "References to other artifacts used or consulted during creation"
+        }
+      },
+      "required": ["id", "title", "author", "created_at"]
+    }
+  },
+  "required": ["api_version", "kind", "metadata"]
+}

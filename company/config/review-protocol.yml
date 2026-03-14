@@ -1,0 +1,46 @@
+api_version: companyos/v1
+kind: review-protocol
+metadata:
+  id: dad0345e-5e9d-420d-ac45-a52f12f498bd
+  title: Review Protocol
+  author: ceo
+  created_at: "2026-03-14"
+
+spec:
+  self_review_forbidden:
+    description: >
+      Un agent ne peut JAMAIS reviewer un artifact qu'il a lui-même produit.
+      Le reviewer doit toujours être un persona différent de l'auteur (metadata.author).
+      Si le protocole ne désigne qu'un seul reviewer et que c'est l'auteur, escalader au CEO.
+  review_analysis_framework:
+    description: >
+      Chaque review DOIT analyser l'artifact selon ces 3 axes, sans exception :
+      1. Cas nominal — Le happy path fonctionne-t-il correctement ? Les acceptance criteria
+         sont-ils satisfaits dans le scénario standard ?
+      2. Cas négatif — Les cas d'erreur et d'échec sont-ils gérés ? Que se passe-t-il quand
+         un input est invalide, une dépendance indisponible, une permission manquante ?
+      3. Edge cases — Les cas limites sont-ils couverts ? Valeurs vides, doublons, concurrence,
+         overflow, chemins avec espaces, Unicode, permissions partielles, etc.
+      Le review-report DOIT contenir une section par axe avec le verdict pour chacun.
+      Un artifact qui ne couvre que le cas nominal est insuffisant — request_changes obligatoire.
+  reviewers_by_artifact_type:
+    design-doc:
+      - pm
+      - implementer
+    implementation-plan:
+      - architect
+    rfc:
+      - all
+    lesson-learned:
+      - pm
+    task-request:
+      - architect
+    diagnostic-report:
+      - architect
+  escalation_rules:
+    max_iterations_before_ceo: 3
+    ceo_cannot_approve_alone:
+      - modify-access-matrix
+      - modify-ceo-persona
+      - breaking-schema-change
+      - delete-persona

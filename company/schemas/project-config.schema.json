@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://companyos.dev/schemas/project-config.schema.json",
+  "allOf": [
+    { "$ref": "_base.schema.json" },
+    {
+      "properties": {
+        "kind": { "const": "project-config" },
+        "metadata": {
+          "properties": {
+            "project_name": { "type": "string" }
+          },
+          "required": ["project_name"]
+        },
+        "spec": {
+          "type": "object",
+          "properties": {
+            "repo_url": { "type": "string" },
+            "ownership": {
+              "type": "string",
+              "enum": ["owned", "contributed"]
+            }
+          },
+          "required": ["ownership"]
+        }
+      },
+      "required": ["spec"]
+    }
+  ]
+}

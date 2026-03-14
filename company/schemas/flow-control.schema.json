@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://companyos.dev/schemas/flow-control.schema.json",
+  "allOf": [
+    { "$ref": "_base.schema.json" },
+    {
+      "properties": {
+        "kind": { "const": "flow-control" },
+        "spec": {
+          "type": "object",
+          "properties": {
+            "max_review_iterations": { "type": "integer", "minimum": 1 },
+            "budget_limits": {
+              "type": "object",
+              "properties": {
+                "max_tokens_per_task": { "type": "integer" },
+                "max_subagent_spawns": { "type": "integer" }
+              }
+            },
+            "circuit_breaker": {
+              "type": "object",
+              "properties": {
+                "consecutive_failures_threshold": { "type": "integer" },
+                "cooldown_seconds": { "type": "integer" }
+              }
+            }
+          },
+          "required": ["max_review_iterations"]
+        }
+      },
+      "required": ["spec"]
+    }
+  ]
+}

@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# Layer 3 — CI at commit time
+#
+# Validates all staged YAML artifacts against their JSON Schemas.
+# Checks that protected zone files have proper write permit audit trail.
+# Blocks commits that violate the access matrix.
+#
+# Diagnostic format: [companyos:pre-commit] SEVERITY: message
+#                    | context: ...
+#                    | reason:  ...
+#                    | fix:     ...
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+export COMPANYOS_ROOT="$ROOT"
+
+# --- Diagnostic helpers ---
+diag_error() {
+    local msg="$1" ctx="${2:-}" reason="${3:-}" fix="${4:-}"
+    echo "[companyos:pre-commit] ERROR: $msg"
+    [ -n "$ctx" ]    && echo "| context: $ctx"
+    [ -n "$reason" ] && echo "| reason:  $reason"
+    [ -n "$fix" ]    && echo "| fix:     $fix"
+}
+
+diag_warn() {
+    local msg="$1" ctx="${2:-}" reason="${3:-}" fix="${4:-}"
+    echo "[companyos:pre-commit] WARN: $msg"
+    [ -n "$ctx" ]    && echo "| context: $ctx"
+    [ -n "$reason" ] && echo "| reason:  $reason"
+    [ -n "$fix" ]    && echo "| fix:     $fix"
+}
+
+diag_ok() {
+    echo "[companyos:pre-commit] OK: $1"
+}
+
+VALIDATOR="$ROOT/target/release/companyos-yaml-validator"
+if [ ! -x "$VALIDATOR" ]; then
+    VALIDATOR="$ROOT/target/debug/companyos-yaml-validator"
+fi
+
+if [ ! -x "$VALIDATOR" ]; then
+    diag_error "YAML validator binary not found" \
+        "pre-commit hook startup" \
+        "Neither target/release/ nor target/debug/ contain companyos-yaml-validator" \
+        "Run 'make build' or 'make release' to compile the validator"
+    exit 1
+fi
+
+ERRORS=0
+
+# Get staged files (added or modified)
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
+
+# 1. Validate all staged YAML files against their schemas
+for file in $STAGED_FILES; do
+    case "$file" in
+        *.yml|*.yaml)
+            if ! "$VALIDATOR" --file "$file" > /dev/null 2>&1; then
+                diag_error "Schema validation failed: $file" \
+                    "validate_file(path=$file)" \
+                    "$("$VALIDATOR" --file "$file" 2>&1 || true)" \
+                    "Fix the YAML to match its JSON Schema, then re-stage"
+                ERRORS=$((ERRORS + 1))
+            fi
+            ;;
+    esac
+done
+
+# 2. Check protected zone modifications have audit trail
+# Single source of truth: company/config/protected-zones.json
+ZONES_FILE="$ROOT/company/config/protected-zones.json"
+readarray -t PROTECTED_PREFIXES < <(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); [print(p) for p in d.get('prefixes',[])]" "$ZONES_FILE" 2>/dev/null)
+readarray -t PROTECTED_FILES < <(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); [print(f) for f in d.get('files',[])]" "$ZONES_FILE" 2>/dev/null)
+DB="$ROOT/company/data/orchestrator.db"
+
+is_protected() {
+    local f="$1"
+    for prefix in "${PROTECTED_PREFIXES[@]}"; do
+        [[ "$f" == "$prefix"* ]] && return 0
+    done
+    for pf in "${PROTECTED_FILES[@]}"; do
+        [[ "$f" == "$pf" ]] && return 0
+    done
+    return 1
+}
+
+for file in $STAGED_FILES; do
+    if is_protected "$file"; then
+        prefix="(protected zone)"
+        for p in "${PROTECTED_PREFIXES[@]}"; do
+            [[ "$file" == "$p"* ]] && prefix="$p" && break
+        done
+            if [ -f "$DB" ]; then
+                # Check if there's a consumed or active permit for this path
+                PERMIT_COUNT=$(sqlite3 "$DB" \
+                    "SELECT COUNT(*) FROM write_permits WHERE status IN ('active', 'consumed') AND target_paths LIKE '%${file}%'" 2>/dev/null || echo "0")
+                if [ "$PERMIT_COUNT" = "0" ]; then
+                    diag_error "Protected zone: no write permit" \
+                        "check_write_permit(path=$file)" \
+                        "File is in protected zone '$prefix' but no active or consumed permit covers it" \
+                        "Get a write permit via grant_write_permit (CEO only, requires approved RFC)"
+                    ERRORS=$((ERRORS + 1))
+                fi
+            else
+                diag_warn "Protected zone: no audit DB" \
+                    "check_write_permit(path=$file)" \
+                    "File is in protected zone '$prefix' but orchestrator.db does not exist" \
+                    "Run 'make setup' to initialize the orchestrator database"
+            fi
+    fi
+done
+
+# 3. Full CI pipeline (fmt + clippy + tests + YAML validation)
+if ! make -C "$ROOT" ci > /dev/null 2>&1; then
+    diag_error "CI pipeline failed" \
+        "make ci (fmt + clippy + test + validate)" \
+        "One or more CI checks failed" \
+        "Run 'make ci' to see details and fix the issues"
+    ERRORS=$((ERRORS + 1))
+fi
+
+if [ "$ERRORS" -gt 0 ]; then
+    echo ""
+    diag_error "$ERRORS check(s) failed — commit blocked" \
+        "pre-commit hook" \
+        "See individual errors above" \
+        "Fix all errors above, re-stage with 'git add', then retry the commit"
+    exit 1
+fi
+
+diag_ok "All checks passed"

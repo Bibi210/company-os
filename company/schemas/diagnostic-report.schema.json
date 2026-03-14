@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://companyos.dev/schemas/diagnostic-report.schema.json",
+  "allOf": [
+    { "$ref": "_base.schema.json" },
+    {
+      "properties": {
+        "kind": { "const": "diagnostic-report" },
+        "spec": {
+          "type": "object",
+          "properties": {
+            "symptom": { "type": "string" },
+            "root_cause": { "type": "string" },
+            "resolution": { "type": "string" },
+            "status": {
+              "type": "string",
+              "enum": ["investigating", "resolved", "wont_fix"]
+            }
+          },
+          "required": ["symptom"]
+        }
+      },
+      "required": ["spec"]
+    }
+  ]
+}

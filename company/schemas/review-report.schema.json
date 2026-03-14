@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://companyos.dev/schemas/review-report.schema.json",
+  "allOf": [
+    { "$ref": "_base.schema.json" },
+    {
+      "properties": {
+        "kind": { "const": "review-report" },
+        "metadata": {
+          "properties": {
+            "round_id": { "type": "string" },
+            "reviewer": { "type": "string" }
+          },
+          "required": ["round_id", "reviewer"]
+        },
+        "spec": {
+          "type": "object",
+          "properties": {
+            "verdict": {
+              "type": "string",
+              "enum": ["approve", "request_changes"]
+            },
+            "findings": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "summary": { "type": "string" }
+          },
+          "required": ["verdict", "findings"]
+        }
+      },
+      "required": ["spec"]
+    }
+  ]
+}

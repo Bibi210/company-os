@@ -1,0 +1,244 @@
+api_version: companyos/v1
+kind: project-config
+metadata:
+  id: f8f5c8d2-ef11-4756-8c9c-c3624bc128e2
+  title: Shared Rules
+  author: ceo
+  created_at: "2026-03-14"
+  description: Rules that ALL personas must follow. Injected globally via instructions.
+  project_name: company-os
+
+spec:
+  ownership: owned
+  companyos_is_a_project:
+    description: >
+      CompanyOS est lui-même un projet qui vit dans CompanyOS. Les modifications au système
+      (workflow, config, schemas, plugins, personas) suivent exactement les mêmes règles que
+      n'importe quel autre projet : task-request → design-doc → implementation-plan → review → merge.
+      Les changements structurels passent par un RFC avec approbation CEO et write permit.
+      Le code Rust des crates vit dans crates/, les artifacts CompanyOS vivent dans company/.
+  artifact_catalog:
+    description: >
+      Liste complète des types d'artifacts du système. Chaque agent doit connaître ces kinds
+      pour naviguer l'index et produire des artifacts correctement typés.
+    kinds:
+      task-request:
+        description: >
+          Demande de tâche créée par le PM. C'est le point d'entrée de tout workflow projet :
+          elle définit CE QUI doit être fait et les CONDITIONS DE SUCCÈS.
+          Contient des critères d'acceptation (obligatoires), une priorité (low/medium/high/critical),
+          et un statut de suivi (backlog → in_progress → done | cancelled).
+          Rattachée à un projet via metadata.project.
+          Déclenche la chaîne : task-request → design-doc → implementation-plan → review → merge.
+          Produite par le PM, consommée par l'Architect pour rédiger le design-doc.
+        schema: company/schemas/task-request.schema.json
+      design-doc:
+        description: >
+          Document d'architecture rédigé par l'Architect. Répond à la question QUOI et POURQUOI :
+          quels composants construire, quelles décisions architecturales prendre, quel rationale.
+          Ne contient PAS de détails d'implémentation (pas de noms de fichiers, pas de code, pas d'ordre d'exécution).
+          C'est la vision technique de haut niveau qui guide l'implémentation.
+          Produit à partir d'un task-request, reviewé par PM + Implementer.
+        schema: company/schemas/design-doc.schema.json
+      implementation-plan:
+        description: >
+          Plan d'implémentation rédigé par l'Implementer. Répond à la question COMMENT et DANS QUEL ORDRE :
+          quels fichiers modifier/créer, dans quel ordre, avec quelles dépendances entre étapes.
+          Chaque étape est concrète et actionnable (chemin de fichier, fonction à modifier, test à écrire).
+          Produit à partir d'un design-doc approuvé, reviewé par l'Architect.
+          Ne remet PAS en question les décisions du design-doc — si un problème est détecté, escalader à l'Architect.
+        schema: company/schemas/implementation-plan.schema.json
+      rfc:
+        description: >
+          Request For Change sur CompanyOS lui-même. Propose un changement structurel au système :
+          workflows, config, schemas, plugins, personas ou zones protégées.
+          Contient une motivation (pourquoi changer), une proposal (quoi changer), un impact (conséquences),
+          un rollback_plan optionnel (comment revenir en arrière), et la liste des affected_files.
+          Cycle de vie : draft → review → approved | rejected → implemented.
+          Nécessite approbation CEO + write permit avant implémentation.
+          Tout agent peut initier un RFC dès qu'il identifie une amélioration possible.
+          Rédigé par l'Architect, reviewé selon le review-protocol.
+        schema: company/schemas/rfc.schema.json
+      review-report:
+        description: >
+          Verdict produit par un reviewer après analyse d'un artifact.
+          Contient un verdict (approve ou request_changes), une liste de findings détaillés,
+          et un summary optionnel. Identifié par un round_id (numéro du round de review)
+          et le reviewer (persona qui a conduit la review).
+          L'analyse doit être triaxiale : cas nominal (happy path), cas négatif (erreurs, échecs),
+          et edge cases (valeurs limites, concurrence). Un artifact qui ne couvre que le cas nominal
+          reçoit automatiquement request_changes.
+          Un agent ne peut JAMAIS reviewer son propre artifact (auto-review interdit).
+          Produit par le reviewer désigné dans le review-protocol, consommé par l'auteur de l'artifact reviewé.
+        schema: company/schemas/review-report.schema.json
+      lesson-learned:
+        description: >
+          Capitalisation de connaissance produite après un artifact ou un problème résolu.
+          Contient trois champs obligatoires : context (situation rencontrée), insight (ce qu'on a appris),
+          et recommendation (quoi faire différemment à l'avenir).
+          metadata.description et metadata.tags sont obligatoires pour permettre la recherche sémantique.
+          Avant d'en créer une, toujours chercher via search(query, kind="lesson-learned") si une lesson
+          similaire existe déjà — si oui, l'améliorer ou en créer une qui la supersede (avec related).
+          Artifact global (vit dans company/lessons/), pas rattaché à un projet spécifique.
+          Tout agent peut en produire. C'est la mémoire collective de l'organisation.
+        schema: company/schemas/lesson-learned.schema.json
+      diagnostic-report:
+        description: >
+          Rapport d'investigation technique produit face à un problème ou une anomalie.
+          Contient un symptom (obligatoire — ce qu'on observe), une root_cause (cause identifiée),
+          une resolution (action corrective appliquée), et un status (investigating → resolved | wont_fix).
+          Utilisé pour les pannes MCP, les échecs de build, les incohérences de données, etc.
+          Le symptom est toujours renseigné en premier ; root_cause et resolution sont ajoutés
+          au fur et à mesure de l'investigation.
+          Artifact projet (vit dans projects/<slug>/diagnostic-reports/).
+          Peut être produit par tout agent confronté à un problème technique.
+        schema: company/schemas/diagnostic-report.schema.json
+      agent-message:
+        description: >
+          Message asynchrone entre deux agents du système.
+          Contient un sender (metadata.from), un recipient (metadata.to), et un content (corps du message).
+          Utilisé pour la coordination inter-agents quand un échange direct n'est pas possible :
+          demandes de clarification, notifications de complétion, escalades, partage d'information.
+          Le thread de conversation est traçable via metadata.related (relationship: related).
+          Artifact global (vit dans company/agent-messages/).
+          Tout agent peut en produire et en consommer.
+        schema: company/schemas/agent-message.schema.json
+      persona:
+        description: >
+          Définition complète d'un agent du système CompanyOS.
+          Contient : identity (description de son rôle et sa mission), rules.must (obligations)
+          et rules.never (interdictions), artifacts.produces et artifacts.consumes (quels kinds
+          il crée et lesquels il lit), et review_behavior (comment il conduit ses reviews).
+          metadata.id est l'identifiant unique de la persona (ex: "pm", "architect", "implementer"),
+          metadata.display_name est son nom lisible.
+          C'est le contrat d'un agent : ce qu'il fait, ce qu'il ne fait pas, et comment il interagit
+          avec les autres. Modifier une persona est un changement structurel qui passe par un RFC.
+          Artifact global (vit dans company/personas/).
+        schema: company/schemas/persona.schema.json
+      project-config:
+        description: >
+          Configuration d'un projet géré par CompanyOS.
+          Contient le project_name (identifiant kebab-case du projet), le type d'ownership
+          (owned = projet interne, contributed = contribution à un projet externe),
+          et un repo_url optionnel.
+          C'est aussi le conteneur pour les règles partagées (shared-rules) et toute
+          configuration spécifique au projet. Le fichier shared-rules.yml est lui-même un project-config.
+          Artifact global (vit dans company/config/).
+        schema: company/schemas/project-config.schema.json
+      flow-control:
+        description: >
+          Garde-fous opérationnels du système pour éviter les boucles infinies et la surconsommation.
+          Contient : max_review_iterations (nombre max de rounds review avant escalade, obligatoire),
+          budget_limits (max_tokens_per_task, max_subagent_spawns — plafonds de ressources par tâche),
+          et circuit_breaker (consecutive_failures_threshold, cooldown_seconds — coupe-circuit en cas
+          d'échecs en série). Ces paramètres protègent contre les spirales de review,
+          les agents emballés, et les pannes en cascade.
+          Artifact global (vit dans company/config/).
+        schema: company/schemas/flow-control.schema.json
+      review-protocol:
+        description: >
+          Configuration centrale du processus de review.
+          Contient reviewers_by_artifact_type (obligatoire — mapping kind → liste de personas reviewers)
+          et escalation_rules (max_iterations_before_ceo — seuil avant escalade au CEO,
+          ceo_cannot_approve_alone — kinds que le CEO ne peut pas approuver seul).
+          Consulté par tout agent avant de lancer ou conduire une review.
+          Définit QUI review QUOI et les règles d'escalade quand le processus bloque.
+          Artifact global (vit dans company/config/).
+        schema: company/schemas/review-protocol.schema.json
+      human-review-triggers:
+        description: >
+          Liste des conditions qui imposent une intervention humaine avant de poursuivre.
+          Contient un tableau de triggers, chacun avec : condition (critère évalué, ex: "rfc modifie
+          des zones protégées"), action (ce qui se passe, ex: "bloquer et notifier le CEO"),
+          et description (explication lisible du trigger).
+          Sert de filet de sécurité : certaines actions sont trop critiques pour être approuvées
+          uniquement par des agents. Exemples : modification de personas, changement de permissions,
+          suppression de données, modifications de zones protégées.
+          Artifact global (vit dans company/config/).
+        schema: company/schemas/human-review-triggers.schema.json
+  rules:
+    artifact_id:
+      description: >
+        metadata.id de tout artifact DOIT être un UUID v4 obtenu via generate_id() avant l'écriture du fichier YAML.
+        Ne jamais inventer un ID manuellement (pas de slug, pas de nom lisible).
+        Le titre de l'artifact reste lisible dans metadata.title — c'est lui qu'on lit, pas l'ID.
+    lessons:
+      description: >
+        Après chaque artifact produit ou problème résolu, cherche une lesson existante via search(query, kind="lesson-learned").
+        Si une lesson similaire existe : soit tu l'ameliore ou tu en crée une nouvelle améliorée,
+        et lie les deux avec related (relationship: supersedes vers l'ancienne, derived-from depuis la nouvelle).
+        Si aucune lesson similaire n'existe : crée-en une nouvelle via direct write.
+    related_artifacts:
+      description: >
+        Tout artifact produit doit référencer ses artifacts liés dans metadata.related.
+        Les références utilisent metadata.id (pas des chemins fichiers).
+        Utilise le bon type de relationship : input, derived-from, supersedes, related.
+    artifact_index:
+      description: >
+        L'index unifié est le Wikipedia de l'entreprise. Avant de produire un artifact, consulte l'index :
+        1. search(query) pour scanner les titres/descriptions liés à ton sujet
+        2. get(id) pour lire le détail de ce qui t'intéresse
+        3. related(id) pour naviguer le graphe de connaissances
+        L'indexation est automatique : chaque écriture de fichier YAML est auto-indexée par le plugin defense-in-depth.
+        Tu n'as PAS besoin d'appeler index_artifact manuellement après un write/edit.
+        Note : les artifacts techniques (task-request, design-doc, implementation-plan, review-report, diagnostic-report)
+        résident dans projects/<project-slug>/<kind>s/ et non dans company/<kind>/.
+    file_placement:
+      description: >
+        Règle de placement des fichiers YAML par kind :
+        - Artifacts projet  → projects/<project-slug>/<kind>s/<artifact-id>.yml
+        - Artifacts globaux → company/<folder>/<artifact-id>.yml
+        Kinds projet  : task-request, design-doc, implementation-plan, review-report, diagnostic-report
+        Kinds globaux : lesson-learned, persona, rfc, project-config, flow-control, review-protocol,
+                        human-review-triggers, agent-message
+        Le project-slug doit être un identifiant kebab-case unique et immuable.
+    review_protocol:
+      description: >
+        Le protocole de review est défini dans company/config/review-protocol.yml. Consulte-le avant chaque review round.
+        Deux règles absolues :
+        (1) Auto-review interdit — un agent ne peut JAMAIS reviewer son propre artifact. Si le protocole
+        ne désigne que l'auteur comme reviewer, escalader au CEO.
+        (2) Analyse triaxiale obligatoire — chaque review doit couvrir : cas nominal (happy path),
+        cas négatif (erreurs, échecs, inputs invalides), et edge cases (valeurs limites, concurrence, etc.).
+        Le review-report doit contenir un verdict par axe. Un artifact qui ne couvre que le cas nominal
+        est insuffisant et doit recevoir request_changes.
+        Les reviewers listés sont le minimum requis — un agent peut ajouter d'autres reviewers
+        s'il estime que leur expertise est pertinente pour l'artifact en question.
+    authentication:
+      description: >
+        Chaque persona doit appeler authenticate(persona=<son id>) au début de chaque session
+        pour obtenir un token secret. Ce token est requis pour les opérations privilégiées :
+        grant_write_permit (CEO uniquement), submit_review_vote, consume_write_permit.
+        Ne jamais écrire le token dans un fichier ni le partager avec un autre agent.
+    mcp_reconnect:
+      description: >
+        Le serveur MCP peut redémarrer à tout moment pour deux raisons :
+        (a) un appel explicite à reload_config(),
+        (b) un cargo build qui recompile le binaire MCP (le watcher détecte le changement et relance le serveur).
+        Quand un appel MCP échoue avec une erreur de connexion (timeout, connection refused,
+        broken pipe, EOF, ou tool not found), NE PAS considérer l'opération comme échouée.
+        Procédure : attendre quelques secondes, puis réessayer l'appel. Répéter jusqu'à 3 tentatives
+        espacées de quelques secondes. Si après 3 tentatives le serveur ne répond toujours pas,
+        signaler le problème dans un diagnostic-report et escalader à l'utilisateur.
+        Ne jamais abandonner un workflow en cours à cause d'une coupure MCP transitoire.
+    continuous_improvement:
+          description: >
+            Chaque agent doit être consciencieux et proactif dans l'amélioration des processus.
+            Si tu identifies un point de friction, une incohérence, un workflow inefficace ou une
+            opportunité d'amélioration, ne te contente pas de le noter en lesson learned.
+            Si le problème nécessite non pas de changer le contexte (c'est-à-dire solliciter des
+            lessons learned) mais de changer les règles du jeu, les workflows, les outils ou la
+            configuration, propose un RFC pour changer les choses. Les RFC ne sont pas réservés aux
+            demandes explicites de l'utilisateur : tout agent peut en initier un dès qu'il estime
+            que CompanyOS peut être amélioré.
+            L'Architect rédige le RFC, mais l'idée peut venir de n'importe quel persona.
+            Exemples de déclencheurs :
+            - Un workflow qui demande trop d'étapes manuelles
+            - Une règle qui bloque systématiquement sans raison valable
+            - Un schéma trop laxiste
+            - Un manque d'outillage
+            - Une duplication d'information entre fichiers
+            Le cycle reste le même : RFC → review → approbation CEO → remontée utilisateur
+            (optionnelle) → write permit → implémentation.
+            L'objectif n'est pas seulement de proposer des RFC : les problèmes doivent remonter
+            à la surface et être pris en charge.
