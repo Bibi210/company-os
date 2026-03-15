@@ -1,0 +1,120 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: e532e29c-69db-47e5-9d53-cd7129b3e695
+  title: "Retirer la règle staging build redondante de la persona Implementer"
+  author: architect
+  created_at: "2026-03-15"
+  status: implemented
+  approved_at: "2026-03-15T17:39:29.803813280+00:00"
+  description: >
+    La règle must de la persona Implementer décrivant la séquence de build isolé via
+    --target-dir fait doublon avec write_permit_full_sequence et la règle CI-validation.
+    Ce RFC la retire pour éliminer la contradiction latente et simplifier la persona.
+  tags:
+    - persona
+    - implementer
+    - cleanup
+    - rules
+  related: []
+
+spec:
+  motivation: >
+    La persona `company/personas/implementer.yml` contient dans `rules.must` (5e entrée sur 6)
+    la règle suivante :
+
+      "Pour les modifications dans crates/ : d'abord compiler et tester dans un répertoire
+      isolé (cargo build --target-dir /tmp/companyos-staging && cargo test --target-dir
+      /tmp/companyos-staging). Ne faire cargo build (sans --target-dir) qu'après succès —
+      c'est lui qui trigger le hot-reload des MCP servers. Ne consommer le write permit
+      qu'après le build final réussi."
+
+    Cette règle est redondante à deux titres :
+
+    1. Doublon avec `write_permit_full_sequence` (lignes 14–25) : cette règle structurée couvre
+    déjà la séquence complète et canonique — l'étape 6 précise "cargo build && cargo test — APRÈS
+    consommation du permit". La mention d'un répertoire isolé /tmp/companyos-staging introduit
+    une procédure alternative non alignée avec la séquence principale : la séquence canonique
+    prescrit consume_write_permit() AVANT cargo build, tandis que la règle redondante dit
+    "Ne consommer le write permit qu'après le build final réussi" — contradiction directe.
+
+    Pourquoi l'ordre consume_write_permit() AVANT cargo build est correct : la séquence
+    write_permit_full_sequence impose que consume_write_permit() intervienne APRÈS le commit git
+    (étape 5) mais AVANT cargo build (étape 6). La raison est mécanique — le hook git vérifie
+    l'état du permit au moment du commit ; si le permit est consommé avant le commit, le hook
+    le détecte comme absent et rejette le commit. L'ordre consume → build n'est donc pas
+    arbitraire : il découle d'une contrainte d'intégrité imposée par le hook.
+
+    2. Doublon partiel avec la règle CI-validation (6e entrée) : cette règle déclare que
+    "les étapes cargo build + cargo test de la séquence write_permit_full_sequence constituent
+    la CI interne", réaffirmant la primauté de write_permit_full_sequence et rendant explicitement
+    obsolète toute procédure alternative dans rules.must.
+
+  proposal: >
+    Deux modifications dans `company/personas/implementer.yml` :
+
+    MODIFICATION 1 — Retirer la 5e entrée de `rules.must`.
+    La séquence canonique `write_permit_full_sequence` et la règle CI-validation couvrent
+    intégralement le cas d'usage ; la règle redondante crée une contradiction et doit être
+    supprimée.
+
+    BEFORE (rules.must, 6 entrées) :
+      - Produire des tests pour chaque acceptance criterion
+      - Suivre le design doc approuvé
+      - Produire un diagnostic report en cas d'échec
+      - Appliquer les RFC avec un write permit valide
+      - "Pour les modifications dans crates/ : d'abord compiler et tester dans un répertoire isolé (cargo build --target-dir /tmp/companyos-staging && cargo test --target-dir /tmp/companyos-staging). Ne faire cargo build (sans --target-dir) qu'après succès — c'est lui qui trigger le hot-reload des MCP servers. Ne consommer le write permit qu'après le build final réussi."
+      - "Valider l'implémentation via la CI du projet avant de la déclarer terminée. [...]"
+
+    AFTER (rules.must, 5 entrées — la 5e entrée ci-dessus est retirée) :
+      - Produire des tests pour chaque acceptance criterion
+      - Suivre le design doc approuvé
+      - Produire un diagnostic report en cas d'échec
+      - Appliquer les RFC avec un write permit valide
+      - "Valider l'implémentation via la CI du projet avant de la déclarer terminée. [...]"
+
+    MODIFICATION 2 — Absorber le fait technique "cargo build sans --target-dir déclenche le
+    hot-reload MCP" dans la règle `hotreload_last`.
+    Ce fait technique était documenté uniquement dans la règle redondante supprimée. Il doit
+    être préservé dans hotreload_last, la règle sémantiquement la plus proche.
+
+    BEFORE (hotreload_last.description) :
+      reload_config() est TOUJOURS la dernière étape d'un workflow d'implémentation.
+      Conditions préalables obligatoires :
+      (a) tous les write permits actifs consommés via consume_write_permit(),
+      (b) cargo build exécuté avec succès,
+      (c) cargo test exécuté avec succès (0 failed).
+      Raison : reload_config() peut recharger le binaire MCP et couper la connexion active,
+      perdant le contexte de session.
+
+    AFTER (hotreload_last.description — ajout de la note sur cargo build sans --target-dir) :
+      reload_config() est TOUJOURS la dernière étape d'un workflow d'implémentation.
+      Conditions préalables obligatoires :
+      (a) tous les write permits actifs consommés via consume_write_permit(),
+      (b) cargo build (sans --target-dir) exécuté avec succès — c'est cet appel précis,
+          sans --target-dir, qui déclenche le hot-reload des MCP servers,
+      (c) cargo test exécuté avec succès (0 failed).
+      Raison : reload_config() peut recharger le binaire MCP et couper la connexion active,
+      perdant le contexte de session.
+
+  impact: >
+    Modification mineure de la persona Implementer : retrait d'une seule entrée dans rules.must.
+    Aucun comportement fonctionnel ne change — la séquence canonique write_permit_full_sequence
+    reste l'unique source de vérité pour le workflow build/test/consume. La règle CI-validation
+    reste intacte et continue à pointer vers write_permit_full_sequence. La contradiction entre
+    les deux procédures (consume avant vs. après build) est résolue en faveur de la séquence
+    canonique. Risque : nul.
+
+  affected_files:
+    - company/personas/implementer.yml
+
+  rollback_plan: >
+    En cas de besoin de restauration : réinsérer dans rules.must, entre l'entrée
+    "Appliquer les RFC avec un write permit valide" et la règle CI-validation, l'entrée suivante :
+    "Pour les modifications dans crates/ : d'abord compiler et tester dans un répertoire isolé
+    (cargo build --target-dir /tmp/companyos-staging && cargo test --target-dir
+    /tmp/companyos-staging). Ne faire cargo build (sans --target-dir) qu'après succès —
+    c'est lui qui trigger le hot-reload des MCP servers. Ne consommer le write permit qu'après
+    le build final réussi."
+    Un write permit sera requis pour modifier company/personas/implementer.yml (zone protégée).
+    Probabilité de rollback : très faible.

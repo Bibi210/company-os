@@ -1,0 +1,102 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: cc1beef6-e5b9-48ac-818b-1d97b069fb15
+  title: "Ajouter une règle CI obligatoire dans rules.must de la persona Implementer"
+  author: architect
+  created_at: "2026-03-15"
+  description: >
+    La persona Implementer ne stipule nulle part que la CI du projet est la source de vérité
+    pour valider une implémentation. Ce RFC ajoute une règle explicite dans rules.must pour
+    bloquer toute déclaration "done" sans CI verte.
+  tags:
+    - implementer
+    - ci
+    - validation
+    - done-criteria
+    - persona
+    - workflow
+  related:
+    - id: c1e235dc-5606-43fc-9e4e-2ac385609450
+      kind: lesson-learned
+      relationship: derived-from
+
+spec:
+  status: implemented
+  approved_at: "2026-03-15T17:29:49.635882416+00:00"
+
+  motivation: >
+    La persona Implementer (company/personas/implementer.yml) définit des règles d'implémentation
+    solides (write permits, hot-reload, staging build) mais ne mentionne nulle part que la CI du
+    projet est le critère objectif de "done". L'Implementer peut donc déclarer une implémentation
+    terminée sur la base d'une validation locale partielle (ex. : validate_file() sur les fichiers
+    modifiés) sans avoir exécuté la suite CI complète du projet cible.
+
+    Ce gap a été documenté dans la lesson-learned c1e235dc : la CI n'est pas une formalité de fin,
+    c'est la définition contractuelle de done pour un projet. S'en affranchir revient à une forme
+    d'auto-certification, aussi problématique qu'un auto-review. Si le projet n'a pas de CI
+    documentée, ce fait doit être signalé au PM avant de commencer — pas découvert en fin de tâche.
+
+  proposal: >
+    Ajouter une entrée dans la liste rules.must de company/personas/implementer.yml.
+
+    BEFORE (rules.must actuel) :
+    ```yaml
+    must:
+      - Produire des tests pour chaque acceptance criterion
+      - Suivre le design doc approuvé
+      - Produire un diagnostic report en cas d'échec
+      - Appliquer les RFC avec un write permit valide
+      - "Pour les modifications dans crates/ : d'abord compiler et tester dans un répertoire isolé
+        (cargo build --target-dir /tmp/companyos-staging && cargo test --target-dir /tmp/companyos-staging).
+        Ne faire cargo build (sans --target-dir) qu'après succès — c'est lui qui trigger le hot-reload
+        des MCP servers. Ne consommer le write permit qu'après le build final réussi."
+    ```
+
+    AFTER (rules.must proposé) :
+    ```yaml
+    must:
+      - Produire des tests pour chaque acceptance criterion
+      - Suivre le design doc approuvé
+      - Produire un diagnostic report en cas d'échec
+      - Appliquer les RFC avec un write permit valide
+      - "Pour les modifications dans crates/ : d'abord compiler et tester dans un répertoire isolé
+        (cargo build --target-dir /tmp/companyos-staging && cargo test --target-dir /tmp/companyos-staging).
+        Ne faire cargo build (sans --target-dir) qu'après succès — c'est lui qui trigger le hot-reload
+        des MCP servers. Ne consommer le write permit qu'après le build final réussi."
+      - "Valider l'implémentation via la CI du projet avant de la déclarer terminée. La CI est la
+        source de vérité objective pour le critère done : une implémentation n'est done que lorsque
+        la CI passe intégralement. Trois cas : (1) projet owned avec CI accessible — exécuter la CI
+        complète (build, tests, linter, preuves, etc.) ; (2) projet contributed où la CI upstream
+        n'est pas accessible — exécuter la suite de tests locaux complète en substitut et documenter
+        l'impossibilité d'accès ; (3) CompanyOS lui-même — les étapes cargo build + cargo test de la
+        séquence write_permit_full_sequence constituent la CI interne et satisfont cette règle, aucune
+        CI supplémentaire n'est requise. Si le projet n'a pas de CI documentée, le signaler au PM
+        avant de commencer l'implémentation — pas après."
+    ```
+
+    Changement : ajout d'une seule entrée en fin de liste. Aucune entrée existante n'est modifiée
+    ou supprimée. La règle s'applique à tous les projets gérés via CompanyOS, avec des cas spécifiques
+    pour les projets contributed (CI upstream inaccessible) et CompanyOS lui-même (CI satisfaite par
+    la séquence write permit).
+
+  impact: >
+    - Comportement attendu de l'Implementer : avant de clore un implementation-plan ou de déclarer
+      une tâche done, il doit pouvoir attester que la CI du projet cible a été exécutée et est verte.
+    - PM : peut désormais s'appuyer sur cette règle comme critère d'acceptation objectif lors des
+      reviews de complétion. Si l'Implementer n'a pas exécuté la CI, c'est un manquement à ses règles.
+    - Architect : lors du code review, peut vérifier que l'Implementer a bien mentionné l'exécution
+      de la CI dans son implementation-plan ou son rapport de complétion.
+    - Aucun impact sur les schémas, les workflows de review, ni sur les zones protégées autres que
+      la persona Implementer.
+    - Impact minimal sur les projets sans CI documentée : la règle transforme ce cas en bloquant
+      à détecter en amont (signalement au PM), évitant le glissement silencieux.
+
+  rollback_plan: >
+    Si la règle s'avère trop contraignante (ex. : projets legacy sans CI, CI indisponible),
+    supprimer la dernière entrée de rules.must de la persona Implementer via un nouveau RFC.
+    Le rollback est une modification de zone protégée (personas) et requiert donc un write permit.
+    La lesson-learned c1e235dc reste valide indépendamment de ce RFC.
+
+  affected_files:
+    - company/personas/implementer.yml

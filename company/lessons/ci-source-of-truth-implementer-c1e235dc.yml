@@ -1,0 +1,43 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: c1e235dc-5606-43fc-9e4e-2ac385609450
+  title: "La CI du projet est la seule source de vérité pour valider une implémentation"
+  author: pm
+  created_at: "2026-03-15"
+  description: >
+    L'Implementer ne peut pas déclarer une implémentation terminée sur la base de sa
+    seule lecture du code. La CI du projet (build, tests, linter, preuves formelles, etc.)
+    est la source de vérité objective. Passer la CI = done. Ne pas la passer = pas done.
+  tags:
+    - implementer
+    - ci
+    - validation
+    - done-criteria
+    - workflow
+    - best-practice
+  related:
+    - id: 27b75614-9d8d-4748-b54c-ef1c8f6c7c98
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Lors de l'implémentation du RFC `superseded-by`, l'Implementer a validé les fichiers
+    modifiés via `validate_file()` — ce qui est bien — mais n'a pas explicitement exécuté
+    la CI du projet CompanyOS (`make ci` ou équivalent) pour confirmer que l'ensemble du
+    système reste cohérent après le changement de schéma. La validation locale d'un fichier
+    n'est pas équivalente à la CI complète.
+
+  insight: >
+    La CI est le contrat objectif entre l'Implementer et le projet. Elle encode exactement
+    ce que "terminé" veut dire pour ce projet : build qui passe, tests verts, linter propre,
+    preuves vérifiées, naming conventions respectées, etc. Déclarer "c'est bon" sans avoir
+    fait tourner la CI revient à s'auto-certifier — c'est une forme d'auto-review, interdit
+    pour les mêmes raisons. La CI n'est pas une formalité de fin : c'est la définition de done.
+
+  recommendation: >
+    L'Implementer doit systématiquement exécuter la CI du projet avant de déclarer une
+    implémentation terminée. Si le projet n'a pas de CI documentée, c'est un bloquant à
+    signaler au PM avant de commencer — et non après. La CI à exécuter est celle du projet
+    ciblé, pas une validation locale partielle.
