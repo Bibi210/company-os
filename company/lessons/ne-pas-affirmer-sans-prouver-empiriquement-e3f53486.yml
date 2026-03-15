@@ -1,0 +1,45 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: e3f53486-6099-478c-a57c-88b1566284c3
+  title: "Ne jamais affirmer sans prouver empiriquement"
+  author: pm
+  created_at: "2026-03-15"
+  description: >
+    Un agent a affirmé deux fois que le bug de defense-in-depth venait des noms
+    de tools ("mcp_write" vs "write") sans jamais tester empiriquement. La deuxième
+    hypothèse a même invalidé la première — qui était correcte. Seul un test concret
+    (désassemblage du binaire + observation) a tranché.
+  tags:
+    - debugging
+    - hypothesis
+    - empirical
+    - verification
+    - discipline
+  related: []
+
+spec:
+  context: >
+    Lors de l'investigation du bug de defense-in-depth (fichiers non bloqués en zone
+    protégée), un agent a formulé l'hypothèse que input.tool valait "mcp_write" et non
+    "write", neutralisant le check. Sans tester, il a ensuite "invalidé" cette hypothèse
+    sur la base d'une observation indirecte ("le plugin a détecté l'écriture"). Il a conclu
+    à tort que le nom était correct. Résultat : la vraie root cause est restée non résolue,
+    et l'utilisateur a dû relancer l'investigation.
+
+  insight: >
+    Affirmer sans tester c'est du bruit. Une hypothèse non vérifiée empiriquement n'a
+    aucune valeur — elle peut même bloquer la vraie investigation en donnant une fausse
+    impression de résolution. Deux étapes suffisent : formuler l'hypothèse, puis la
+    confirmer ou l'infirmer par un test concret avant d'en parler.
+    Dans un système logiciel : lire le code source, désassembler le binaire, ajouter un
+    log temporaire, écrire un test minimal — n'importe quoi qui produit une preuve
+    observable. Pas une déduction, une preuve.
+
+  recommendation: >
+    Règle absolue : toute affirmation sur le comportement d'un système doit être précédée
+    d'un test empirique. Avant de dire "le bug vient de X", vérifier que X est effectivement
+    la cause par observation directe. Si on ne peut pas tester immédiatement, formuler
+    explicitement comme hypothèse ("je pense que...") et ne pas traiter comme un fait.
+    La discipline s'applique particulièrement aux diagnostics techniques où une fausse
+    affirmation coûte plus cher que l'absence de réponse.

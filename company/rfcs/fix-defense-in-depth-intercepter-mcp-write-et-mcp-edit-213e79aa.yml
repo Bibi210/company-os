@@ -1,0 +1,54 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 213e79aa-bd4e-46a6-b176-76ad935bbdd1
+  title: "Fix defense-in-depth : intercepter mcp_write et mcp_edit"
+  author: pm
+  created_at: "2026-03-15"
+  status: approved
+  approved_at: "2026-03-15T16:25:27.522213877+00:00"
+  description: >
+    Le plugin defense-in-depth n'intercepte pas les writes effectués par les sous-agents
+    via le Task tool. Ceux-ci utilisent "mcp_write"/"mcp_edit" au lieu de "write"/"edit".
+    Fix : ajouter ces deux noms dans la condition du handler tool.execute.after.
+  tags:
+    - defense-in-depth
+    - security
+    - mcp
+    - sub-agents
+    - fix
+
+spec:
+  motivation: >
+    La root cause du bug "defense-in-depth ne bloque pas les writes" est empiriquement
+    prouvée : les sub-agents (lancés via le Task tool) écrivent leurs fichiers via
+    "mcp_write" et "mcp_edit", pas "write" et "edit". OpenCode passe le nom MCP du tool
+    dans input.tool pour les tools exposés via MCP. La condition actuelle ne couvre que
+    "write" et "edit", laissant passer tous les writes des sous-agents sans vérification.
+    Preuve : Plugin.trigger est appelé avec tool=item.id pour les MCP tools, où item.id
+    vaut "mcp_write" (préfixe mcp_ + nom du serveur + _ + nom du tool).
+
+  proposal: >
+    Dans company/plugins/defense-in-depth-core.mjs, dans tool.execute.after, modifier
+    la condition de Layer 1 :
+
+    AVANT :
+      if ((input.tool === "edit" || input.tool === "write") && typeof filePath === "string")
+
+    APRÈS :
+      if ((input.tool === "edit" || input.tool === "write" ||
+           input.tool === "mcp_edit" || input.tool === "mcp_write") &&
+          typeof filePath === "string")
+
+    Le reste du handler est inchangé. Le fix est une ligne.
+
+  impact: >
+    Tous les writes des sous-agents seront désormais soumis aux mêmes règles que les
+    writes directs : naming check, zone protégée, validation YAML. C'est le comportement
+    attendu depuis le début.
+
+  rollback_plan: >
+    Retirer "mcp_edit" et "mcp_write" de la condition. Modification d'une ligne.
+
+  affected_files:
+    - company/plugins/defense-in-depth-core.mjs

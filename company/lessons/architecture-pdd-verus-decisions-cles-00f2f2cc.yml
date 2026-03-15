@@ -1,0 +1,89 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 00f2f2cc-472b-483a-a8e8-77d1a28e07c3
+  title: "Architecture PDD Verus : décisions clés pour un jeu avec preuves formelles"
+  author: architect
+  created_at: "2026-03-15"
+  description: >
+    Retour sur les décisions architecturales du design-doc Puissance 4 Verus. Couvre les
+    choix qui rendent la vérification formelle faisable : type énuméré vs entier, état calculé
+    vs stocké, profondeur bornée, hiérarchie de preuves à 3 niveaux, et couplage preuve/code.
+    Applicable à tout projet Rust+Verus avec logique métier à prouver.
+  tags:
+    - architecture
+    - verus
+    - formal-verification
+    - pdd
+    - rust
+    - design-doc
+    - minimax
+    - game
+  related:
+    - id: d71e9987-1eda-4fe1-9d2a-34fa0e7c50fc
+      kind: design-doc
+      relationship: derived-from
+    - id: b2c68c30-29ab-4150-90b3-df02b6c616aa
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    En concevant l'architecture de Puissance 4 Verus (jeu classique avec IA minimax et preuves
+    formelles Verus), plusieurs décisions architecturales ont un impact direct sur la
+    faisabilité des preuves. Ces décisions ne sont pas évidentes a priori : certains choix
+    "naturels" en Rust (entier u8 pour une cellule, état de jeu stocké séparément) rendent
+    les preuves nettement plus coûteuses ou impossibles.
+
+  insight: >
+    Six patterns architecturaux facilitent la vérification formelle dans un projet Rust+Verus :
+
+    1. TYPES ENUMERES PLUTOT QU'ENTIERS : un type énuméré (vide/joueur1/joueur2) borne les
+    valeurs par construction. Le compilateur Rust garantit l'invariant de domaine avant même
+    que Verus intervienne. Avec un entier u8, chaque spec doit vérifier que la valeur est dans
+    {0,1,2} — overhead de preuve répétitif et fragile.
+
+    2. ETAT CALCULE PLUTOT QUE STOCKE : si l'état de la partie (en cours / victoire / match nul)
+    est recalculé depuis la grille à la demande, l'invariant de cohérence "état stocké = état
+    réel" disparaît par construction. Maintenir un état séparé crée un invariant supplémentaire
+    à prouver partout où l'état est modifié.
+
+    3. PROFONDEUR BORNEE POUR LA TERMINAISON : un algorithme récursif sans borne explicite est
+    impossible à prouver terminant avec un solveur SMT. Pour minimax sur Puissance 4, la
+    profondeur bornée (decreases depth) est le seul variant de terminaison praticable. Le minimax
+    complet (profondeur non bornée) est non-vérifiable formellement dans des temps raisonnables.
+
+    4. HIERARCHIE DE PREUVES A 3 NIVEAUX : organiser les preuves en niveaux dépendants
+    (structurel → fonctionnel → algorithmique) garantit que les fondations sont solides avant
+    de prouver les propriétés de haut niveau. Chaque niveau ne dépend que des post-conditions
+    des niveaux inférieurs (pas de leurs détails d'implémentation), ce qui préserve la
+    modularité et l'opacité Verus.
+
+    5. COUPLAGE PREUVE/CODE : les preuves Verus doivent vivre dans la même unité de compilation
+    que le code exec. Un module de preuves séparé crée un risque de drift silencieux : le code
+    évolue sans invalider les preuves car elles ne sont pas recompilées ensemble.
+
+    6. SEPARATION I/O : les composants prouvables (game-core, ai-engine) ne doivent avoir
+    aucune dépendance vers les primitives I/O. Verus ne peut pas raisonner sur les effets de
+    bord. La couche I/O (CLI) doit être strictement séparée de la logique vérifiée.
+
+  recommendation: >
+    Pour tout projet Rust+Verus nécessitant des preuves formelles sur une logique métier :
+
+    (1) Choisir les types Rust en pensant aux invariants Verus dès le départ. Un type énuméré
+    coûte la même chose en Rust mais simplifie drastiquement les preuves.
+
+    (2) Calculer plutôt que stocker l'état dérivé. Si une valeur peut être recalculée depuis
+    l'état canonique (ici : la grille), ne pas la stocker séparément — cela élimine un invariant
+    de cohérence entier.
+
+    (3) Borner toute récursion avec un variant explicite (decreases). Ne jamais laisser une
+    récursion "implicitement bornée" — le solveur SMT ne la prouvera pas.
+
+    (4) Organiser les preuves en hiérarchie dépendante. Écrire d'abord les preuves de bas niveau
+    (invariants structurels), puis les preuves fonctionnelles, puis les preuves algorithmiques.
+    Ne pas essayer de prouver le tout en une seule passe.
+
+    (5) Prouver l'élagage alpha-beta séparément de la correction minimax. L'élagage est une
+    optimisation : prouver d'abord que minimax sans élagage est correct, puis que l'élagage
+    retourne le même résultat. La séparabilité évite une preuve monolithique complexe.
