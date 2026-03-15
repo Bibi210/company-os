@@ -41,6 +41,15 @@ const VOLATILE_PATTERNS = [
   /\.db$/, /\.db-shm$/, /\.db-wal$/, /\.db-journal$/, /\.lock$/, /\.pid$/,
 ];
 
+// Artifact dirs subject to naming convention enforcement.
+// Keep in sync with spec.rules.file_placement in company/config/shared-rules.yml.
+const ARTIFACT_NAMING_PREFIXES = [
+  "projects/",
+  "company/rfcs/",
+  "company/lessons/",
+  "company/agent-messages/",
+];
+
 const C = "defense-in-depth";
 
 function diag(severity, message, { context, reason, fix } = {}) {
@@ -63,6 +72,19 @@ function isSafeBashPath(filePath) {
 
 function isVolatile(filePath) {
   return VOLATILE_PATTERNS.some((pattern) => pattern.test(filePath));
+}
+
+function isArtifactPath(rel) {
+  return ARTIFACT_NAMING_PREFIXES.some((prefix) => rel.startsWith(prefix));
+}
+
+function checkNaming(rootDir, rel) {
+  // Delegate to check-artifact-naming.sh (single source of truth for the regex).
+  // Returns null on non-zero exit (= naming violation).
+  return run(
+    `FILE="${rel}" ./company/scripts/check-artifact-naming.sh`,
+    rootDir,
+  );
 }
 
 function run(cmd, cwd) {
@@ -273,6 +295,21 @@ export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
         typeof filePath === "string"
       ) {
         const rel = relative(rootDir, resolve(rootDir, filePath));
+
+        // [1] Naming convention: must precede protected-zone check to avoid
+        //     triggering onProtectedZoneWrite for a write that will be reverted.
+        if (isYaml(filePath) && isArtifactPath(rel)) {
+          if (checkNaming(rootDir, rel) === null) {
+            revertFile(rootDir, rel);
+            throw new Error(
+              diag("ERROR", `UUID-only filename forbidden: ${rel}`, {
+                context: `${input.tool}(file_path=${rel})`,
+                reason: `Artifact files must follow the <slug>-<8chars-uuid>.yml naming convention. UUID-only names are forbidden. Change reverted.`,
+                fix: `Rename to <slug-of-title>-<first-8-chars-of-uuid>.yml (e.g. my-artifact-49354fcb.yml). See RFC 2492822c for slugification rules.`,
+              }),
+            );
+          }
+        }
 
         if (isInProtectedZone(rel)) {
           if (!hasActivePermit(rootDir, filePath)) {

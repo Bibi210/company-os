@@ -4,6 +4,17 @@
 set -euo pipefail
 ROOT="${1:-.}"
 UUID_PATTERN='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.ya?ml$'
+
+# Mode fichier unique (appelé par defense-in-depth au moment du write)
+if [ -n "${FILE:-}" ]; then
+	basename=$(basename "$FILE")
+	if echo "$basename" | grep -qE "$UUID_PATTERN"; then
+		echo "ERROR: UUID-only filename forbidden: $FILE" >&2
+		exit 1
+	fi
+	exit 0
+fi
+
 FOUND=0
 while IFS= read -r -d '' file; do
 	basename=$(basename "$file")
