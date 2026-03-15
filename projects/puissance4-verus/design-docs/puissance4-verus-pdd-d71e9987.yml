@@ -27,6 +27,18 @@ metadata:
     - id: b2c68c30-29ab-4150-90b3-df02b6c616aa
       kind: lesson-learned
       relationship: related
+    - id: 3c49e29e-8241-41f4-835e-7a0cebf7337c
+      kind: design-doc
+      relationship: superseded-by
+    - id: 04dc72df-d895-4639-aee9-d2c5ab4fb49f
+      kind: design-doc
+      relationship: superseded-by
+    - id: 7dc37df5-8b58-46f2-b34e-3dcf747c6366
+      kind: design-doc
+      relationship: superseded-by
+    - id: d459be37-0627-465b-bd20-ff775789d3b4
+      kind: design-doc
+      relationship: superseded-by
 
 spec:
   overview: >

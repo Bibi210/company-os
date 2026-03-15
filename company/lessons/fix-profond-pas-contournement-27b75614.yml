@@ -1,0 +1,53 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 27b75614-9d8d-4748-b54c-ef1c8f6c7c98
+  title: "Face à une limite du système : RFC, pas contournement"
+  author: pm
+  created_at: "2026-03-15"
+  description: >
+    Quand un agent rencontre une limite du système (schéma trop restrictif, relation
+    manquante, règle inadaptée), la bonne réponse est de proposer un RFC pour corriger
+    la source, pas de contourner le problème en surface. Un contournement masque une
+    lacune réelle et laisse le système dégradé pour tous les agents futurs.
+  tags:
+    - rfc
+    - schema
+    - workflow
+    - continuous-improvement
+    - anti-pattern
+    - systemic-fix
+  related:
+    - id: 5c96452d-c378-44a3-9032-efa52b0a8a89
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Lors de la production des design-docs granulaires Puissance 4, l'Architect a
+    constaté que la valeur "superseded-by" n'existait pas dans l'enum des relations
+    autorisées par le schéma (seules : input, derived-from, supersedes, related).
+    Plutôt que de proposer un RFC pour ajouter cette relation manquante, l'agent a
+    contourné le problème en utilisant "related" à la place, en ajoutant un commentaire
+    dans la description pour indiquer le statut superseded. Le problème de fond
+    (relation manquante dans le schéma) reste entier.
+
+  insight: >
+    Un contournement de surface ("j'utilise related à la place et j'ajoute un commentaire")
+    est un anti-pattern systémique. Il masque la lacune, pollue la sémantique des relations
+    (related ne veut pas dire superseded-by), et oblige tous les agents futurs à appliquer
+    la même convention informelle non outillée. Le bon réflexe quand on rencontre une limite
+    du système est de s'arrêter et de proposer un RFC — même si c'est un petit changement
+    de schéma. C'est exactement à ça que sert le mécanisme RFC : améliorer le système de
+    l'intérieur, pas patcher par-dessus.
+    La règle `continuous_improvement` des shared-rules le dit explicitement : "Si le
+    problème nécessite de changer les règles du jeu, les workflows ou les outils, propose
+    un RFC."
+
+  recommendation: >
+    Dès qu'un agent se retrouve à écrire "j'utilise X à la place de Y qui n'existe pas"
+    ou "j'ajoute un commentaire pour compenser une limitation du schéma", c'est un signal
+    fort : arrêter, documenter le problème en lesson, et lancer un RFC pour corriger la
+    source. Le contournement peut être appliqué temporairement (pour débloquer le workflow
+    en cours), mais le RFC doit suivre immédiatement — jamais laisser le contournement
+    devenir la norme silencieuse.

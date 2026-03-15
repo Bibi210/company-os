@@ -1,0 +1,51 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 54f76b21-372c-4209-98cf-d2ead9749c8f
+  title: "RFC de correction schéma : cycle complet en un round dès que le changement est minimal et chirurgical"
+  author: pm
+  created_at: "2026-03-15"
+  description: >
+    Un RFC de correction de schéma minimal (une ligne, un fichier) peut traverser le cycle
+    complet draft → review → approved → implemented en un seul round sans itération si le
+    problème est bien identifié, le changement bien circonscrit, et le rollback trivial.
+    La clé est de ne pas sous-estimer la valeur d'un petit fix systémique.
+  tags:
+    - rfc
+    - schema
+    - workflow
+    - correction
+    - systemic-fix
+    - best-practice
+  related:
+    - id: 27b75614-9d8d-4748-b54c-ef1c8f6c7c98
+      kind: lesson-learned
+      relationship: derived-from
+    - id: 2cb9201f-cdf3-4e1e-8b59-759ef23f2c04
+      kind: rfc
+      relationship: derived-from
+
+spec:
+  context: >
+    Le RFC `2cb9201f` (ajout de `superseded-by` à l'enum des relations) est né d'un
+    workaround sémantique identifié en live : un agent avait utilisé `related` à la place
+    de `superseded-by` faute de l'option dans le schéma. Plutôt que de laisser le workaround
+    en place, un RFC a été rédigé, reviewé (PM + Implementer, consensus au 1er round),
+    approuvé par le CEO, et implémenté en une session. Durée totale : quelques minutes.
+
+  insight: >
+    La friction perçue pour lancer un RFC ("c'est lourd pour une ligne") est une illusion
+    quand le changement est bien défini. Le vrai coût n'est pas dans le processus RFC, c'est
+    dans l'accumulation silencieuse de workarounds qui dégradent la sémantique du système.
+    Un RFC de 1 ligne est aussi légitime qu'un RFC de 50 lignes — ce qui compte c'est que
+    le problème est réel et la solution correcte. La revue triaxiale de l'Implementer
+    (nominal / négatif / edge cases) sur un changement minimal prend peu de temps et apporte
+    une vraie valeur : identification du risque de boucle graphe, confirmation de la
+    centralisation du schéma, vérification que les artifacts existants ne sont pas invalidés.
+
+  recommendation: >
+    Ne pas hésiter à lancer un RFC pour un changement de schéma d'une ligne si le problème
+    est sémantiquement important. Le critère de déclenchement n'est pas la taille du changement
+    mais son impact systémique. Chaque workaround qui contourne une limite du schéma est un
+    candidat RFC immédiat. La lesson `27b75614` pose le principe ; cette lesson confirme que
+    le cycle complet est faisable rapidement quand le RFC est bien préparé.

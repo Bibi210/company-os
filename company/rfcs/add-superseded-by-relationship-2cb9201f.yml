@@ -1,0 +1,93 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 2cb9201f-cdf3-4e1e-8b59-759ef23f2c04
+  title: "Ajouter la relation superseded-by à l'enum des relations d'artifacts"
+  author: architect
+  created_at: "2026-03-15"
+  description: >
+    Ajoute superseded-by à l'enum des relations autorisées dans metadata.related de
+    _base.schema.json. Corrige une lacune sémantique : la relation supersedes existe
+    dans une seule direction (B → A) sans permettre à A de déclarer qu'il est remplacé
+    par B (A → B). La correction rend le graphe de relations bidirectionnel et cohérent.
+  tags:
+    - schema
+    - metadata
+    - relationship
+    - graph
+    - superseded-by
+    - companyos
+
+spec:
+  status: implemented
+  approved_at: "2026-03-15T17:22:17.196961218+00:00"
+
+  motivation: >
+    L'enum actuel des relations dans metadata.related est :
+    ["input", "derived-from", "supersedes", "related"]
+
+    Quand un artifact B remplace un artifact A (ex : un design-doc découpé remplace un
+    monolithe), B peut déclarer `supersedes` vers A. Cependant, A ne peut PAS déclarer
+    qu'il est remplacé par B. Le seul workaround est d'utiliser `related`, ce qui est
+    sémantiquement incorrect : `related` ne véhicule aucune information de remplacement,
+    de direction, ni d'obsolescence.
+
+    Exemple concret (projet puissance4-verus) :
+    - L'artifact d71e9987 (design-doc monolithique) a été découpé en 4 design-docs.
+    - Les 4 nouveaux design-docs déclarent `supersedes` vers d71e9987. ✅
+    - d71e9987 doit déclarer qu'il est remplacé par les 4 nouveaux, mais ne peut qu'utiliser
+      `related` — ce qui noie la sémantique dans du bruit générique. ❌
+
+    Cette asymétrie pose deux problèmes :
+    1. Navigation dégradée : depuis un vieil artifact, on ne sait pas qu'il est obsolète
+       sans lire chaque artifact qui le référence.
+    2. Sémantique incorrecte : `related` est utilisé comme palliatif, polluant le graphe
+       avec des liens génériques là où une information précise est disponible.
+
+    La relation est dirigée et asymétrique par nature :
+    - `supersedes`    : "je remplace X"           (B → A, du nouveau vers l'ancien)
+    - `superseded-by` : "je suis remplacé par Y"  (A → B, de l'ancien vers le nouveau)
+    Les deux directions sont indépendantes et utiles. Le graphe doit pouvoir être parcouru
+    dans les deux sens avec la bonne sémantique.
+
+  proposal: >
+    Modifier le fichier company/schemas/_base.schema.json, ligne 55, pour ajouter
+    "superseded-by" à l'enum de la propriété relationship dans metadata.related.
+
+    Changement exact — avant :
+      "enum": ["input", "derived-from", "supersedes", "related"]
+
+    Après :
+      "enum": ["input", "derived-from", "supersedes", "superseded-by", "related"]
+
+    Aucun autre schéma n'est à modifier : la définition des relations est centralisée
+    dans _base.schema.json et tous les schémas spécifiques en héritent.
+
+    Action post-approbation (hors scope de ce RFC, exécutée après write permit) :
+    Mettre à jour l'artifact d71e9987 (projects/puissance4-verus/design-docs/
+    puissance4-verus-pdd-d71e9987.yml) pour remplacer les 4 entrées
+    `relationship: related` pointant vers les design-docs de remplacement
+    (3c49e29e, 04dc72df, 7dc37df5, d459be37) par `relationship: superseded-by`.
+
+  impact: >
+    - Tous les agents : peuvent désormais déclarer superseded-by dans metadata.related
+      pour indiquer qu'un artifact est remplacé par un autre.
+    - Aucun artifact existant n'est invalidé : superseded-by est un ajout à l'enum,
+      pas un remplacement. Les fichiers YAML existants restent valides sans modification.
+    - Le moteur de recherche / graphe (MCP orchestrator) bénéficie d'une sémantique
+      enrichie : les requêtes related(id) pourront distinguer un lien générique d'un
+      lien d'obsolescence.
+    - Les schemas qui héritent de _base.schema.json via $ref n'ont pas besoin de mise
+      à jour (la définition est centralisée).
+
+  rollback_plan: >
+    Si la modification introduit un problème inattendu :
+    1. Retirer "superseded-by" de l'enum dans _base.schema.json (revert de la ligne 55).
+    2. Revenir à ["input", "derived-from", "supersedes", "related"].
+    3. Tout artifact ayant déclaré superseded-by entre l'approbation et le rollback
+       devra être corrigé (relationship: related en remplacement) — mais ce cas de figure
+       est peu probable dans la fenêtre temporelle d'un rollback.
+
+  affected_files:
+    - company/schemas/_base.schema.json
+    - projects/puissance4-verus/design-docs/puissance4-verus-pdd-d71e9987.yml

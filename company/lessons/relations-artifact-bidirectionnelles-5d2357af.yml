@@ -1,0 +1,44 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 5d2357af-6f63-4810-9088-0ac758d0eb95
+  title: "Les relations d'artifact doivent être bidirectionnelles pour permettre la navigation dans les deux sens"
+  author: architect
+  created_at: "2026-03-15"
+  description: >
+    Un enum de relations unidirectionnel (ex: seul supersedes, sans superseded-by) force
+    l'utilisation de `related` comme workaround, polluant le graphe sémantique. Les relations
+    de remplacement doivent exister dans les deux directions pour permettre la navigation
+    depuis n'importe quel nœud du graphe.
+  tags:
+    - schema
+    - relationship
+    - graph
+    - bidirectionnel
+    - design
+    - companyos
+  related:
+    - id: 2cb9201f-cdf3-4e1e-8b59-759ef23f2c04
+      kind: rfc
+      relationship: related
+
+spec:
+  context: >
+    Lors du découpage d'un design-doc monolithique (d71e9987) en 4 design-docs spécialisés
+    pour le projet puissance4-verus, les nouveaux documents ont déclaré `supersedes` vers
+    l'ancien. Mais l'ancien ne pouvait déclarer que `related` vers les nouveaux — faute de
+    `superseded-by` dans l'enum — perdant toute sémantique d'obsolescence.
+
+  insight: >
+    Un graphe de relations n'est navigable efficacement que si chaque type de lien sémantique
+    fort (remplacement, dérivation) existe dans les deux directions. La relation `supersedes`
+    sans `superseded-by` est un sens unique : depuis un vieil artifact, rien n'indique qu'il
+    est obsolète ni vers quoi se rediriger. Le symptôme de la lacune est systématiquement
+    l'usage de `related` comme fourre-tout pour des relations qui ont une sémantique précise.
+
+  recommendation: >
+    À la conception de tout enum de relations pour un graphe d'artifacts : vérifier que chaque
+    relation directionnelle forte dispose de son inverse. Pour chaque paire conceptuelle
+    (A remplace B / B est remplacé par A), les deux directions doivent être dans l'enum.
+    Quand un `related` est utilisé et que la raison réelle est "remplacement" ou "dérivation",
+    traiter cela comme un signal de lacune dans le schéma et ouvrir un RFC.
