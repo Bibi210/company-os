@@ -52,7 +52,7 @@
               },
               "relationship": {
                 "type": "string",
-                "enum": ["input", "derived-from", "supersedes", "related"],
+                "enum": ["input", "derived-from", "supersedes", "superseded-by", "related"],
                 "description": "How this artifact relates to the referenced one"
               }
             },
