@@ -1,0 +1,257 @@
+api_version: companyos/v1
+kind: design-doc
+metadata:
+  id: 7dc37df5-8b58-46f2-b34e-3dcf747c6366
+  title: "Puissance 4 — AI Engine"
+  author: architect
+  created_at: "2026-03-15"
+  project: puissance4-verus
+  description: >
+    Algorithme minimax avec élagage alpha-beta et fonction d'évaluation heuristique pour
+    l'IA Puissance 4. Couvre les preuves Verus de niveau 3 (légalité du coup IA, terminaison,
+    bornes de score, séparabilité alpha-beta). Dépend des preuves N1+N2 de game-core.
+  tags:
+    - rust
+    - verus
+    - formal-verification
+    - pdd
+    - connect-four
+    - ai-engine
+    - minimax
+    - alpha-beta
+    - heuristique
+  related:
+    - id: ffe3306d-d703-43fd-b11a-d154f67bc719
+      kind: task-request
+      relationship: input
+    - id: d71e9987-1eda-4fe1-9d2a-34fa0e7c50fc
+      kind: design-doc
+      relationship: supersedes
+    - id: 3c49e29e-8241-41f4-835e-7a0cebf7337c
+      kind: design-doc
+      relationship: related
+    - id: 04dc72df-d895-4639-aee9-d2c5ab4fb49f
+      kind: design-doc
+      relationship: related
+    - id: d459be37-0627-465b-bd20-ff775789d3b4
+      kind: design-doc
+      relationship: related
+    - id: b2c68c30-29ab-4150-90b3-df02b6c616aa
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  overview: >
+    ai-engine implémente l'algorithme minimax avec élagage alpha-beta pour l'IA du jeu
+    Puissance 4. Étant donné une grille courante, il retourne le meilleur coup possible
+    selon l'algorithme minimax jusqu'à la profondeur D (minimum D=4).
+
+    ai-engine dépend de game-core (types Cell, Board, légalité des coups, détection de
+    victoire) mais ne dépend d'aucune primitive I/O ni de cli-frontend. C'est un composant
+    pur — son seul effet observable est le coup retourné.
+
+    Les preuves Verus de ai-engine sont de niveau 3 (N3) dans la hiérarchie de preuves
+    définie dans le design-doc verus-strategy. Elles dépendent des preuves N1 (légalité,
+    gravité) et N2 (has_won) de game-core. Les preuves N1+N2 doivent être établies avant
+    que les preuves N3 puissent être rédigées et vérifiées.
+
+    Propriétés prouvées (N3) :
+    1. Légalité du coup retourné : le coup suggéré par l'IA est toujours légal (is_legal).
+    2. Terminaison : minimax termine toujours via le variant decreases(depth).
+    3. Bornes de score : le score retourné est dans [MIN_SCORE, MAX_SCORE].
+    4. Séparabilité alpha-beta : minimax avec élagage retourne le même score que sans élagage.
+
+  components:
+    - name: "Constantes de score et sentinels"
+      description: >
+        Le système de scoring utilise 4 constantes symboliques :
+        - `WIN_SCORE` : score assigné quand l'IA (joueur maximisant) gagne. Valeur : +10000.
+        - `LOSE_SCORE` : score assigné quand l'IA perd. Valeur : -10000.
+        - `MAX_SCORE` : borne supérieure des scores heuristiques. Valeur : +999.
+        - `MIN_SCORE` : borne inférieure des scores heuristiques. Valeur : -999.
+
+        Invariant fondamental : LOSE_SCORE < MIN_SCORE < 0 < MAX_SCORE < WIN_SCORE.
+        Les scores terminaux (WIN_SCORE, LOSE_SCORE) sont strictement en dehors de
+        [MIN_SCORE, MAX_SCORE]. Cette séparation est essentielle pour la preuve de bornes :
+        elle permet de distinguer un état terminal (victoire/défaite) d'une évaluation
+        heuristique par la seule valeur du score.
+
+        Propriétés Verus :
+        - Les constantes sont déclarées comme `const` Rust avec des ensures statiques.
+        - L'invariant LOSE_SCORE < MIN_SCORE < MAX_SCORE < WIN_SCORE est un lemme trivial
+          (preuve par calcul sur les constantes, Z3 vérifie en une étape).
+        - Le score de `evaluate(board)` (heuristique) est dans [MIN_SCORE, MAX_SCORE].
+          Post-condition de la fonction `evaluate`.
+        - Le score de `minimax(board, depth)` est dans [LOSE_SCORE, WIN_SCORE].
+          Post-condition de la fonction `minimax`, prouvée par récurrence sur depth.
+
+    - name: "Fonction heuristique d'évaluation"
+      description: >
+        La fonction `evaluate(board: &Board) -> i32` évalue la "qualité" d'une position
+        non-terminale. Elle est appelée quand la profondeur maximale D est atteinte sans
+        que la partie soit terminée.
+
+        Structure de la heuristique (composants linéaires) :
+        - Score de positionnement : les jetons dans les colonnes centrales valent plus
+          (colonne 3 = +6, colonnes 2,4 = +4, colonnes 1,5 = +2, colonnes 0,6 = +1).
+          Somme sur tous les jetons IA, soustraction sur tous les jetons adversaire.
+        - Score d'alignement partiel : pour chaque fenêtre de 4 cellules (horizontal,
+          vertical, diagonal), compter les alignements partiels de l'IA (3 jetons + 1 vide
+          = menaçant, 2 jetons + 2 vides = potentiel). Valeurs : 3-jetons = +50, 2-jetons = +10.
+        - Symétrique pour l'adversaire avec des valeurs négatives.
+
+        Contrainte critique : tous les termes sont linéaires (constante × indicateur).
+        Aucun produit de deux variables — respecte la règle AD-VS-04 de verus-strategy
+        pour éviter l'arithmétique non-linéaire avec Z3.
+
+        Propriétés Verus :
+        - Post-condition : `ensures MIN_SCORE <= result <= MAX_SCORE`.
+          Prouvée par: chaque terme contribue au plus X à la somme totale ; somme de toutes
+          les contributions maximales ≤ MAX_SCORE. La borne est vérifiée par calcul sur les
+          constantes et les dimensions de la grille (6×7 = 42 cellules, domaine fini).
+          Les assertions intermédiaires calculent la contribution max par fenêtre, puis par
+          direction, puis totale.
+
+    - name: "Algorithme minimax sans élagage"
+      description: >
+        La fonction `minimax_pure(board, depth, maximizing) -> i32` implémente le minimax
+        récursif sans optimisation alpha-beta. Elle est la référence de correction pour la
+        preuve de séparabilité alpha-beta.
+
+        Structure :
+        1. Si game_state(board) est terminal (victoire/défaite/match nul) : retourner le
+           score terminal correspondant (WIN_SCORE, LOSE_SCORE, ou 0).
+        2. Si depth == 0 : retourner evaluate(board).
+        3. Sinon : itérer sur toutes les colonnes légales, appeler récursivement avec
+           depth-1, retourner le max (joueur maximisant) ou le min (joueur minimisant).
+
+        Propriétés Verus (N3) :
+        - Terminaison : `decreases depth` est le variant principal. À chaque appel récursif,
+          depth décroît de 1. depth est non-négatif (u32 ou nat). Verus vérifie ce variant
+          automatiquement sur la récursion directe.
+        - Légalité : la récursion n'appelle `apply_move` que sur des coups légaux.
+          Preuve : l'itération filtre `is_legal(board, col)` avant tout appel récursif.
+          Utilise le lemme is_legal de N1 game-core.
+        - Bornes de score (récurrence) :
+          - Cas de base : résultat ∈ {WIN_SCORE, LOSE_SCORE, 0} ∪ [MIN_SCORE, MAX_SCORE].
+            Tous dans [LOSE_SCORE, WIN_SCORE]. Trivial.
+          - Cas récursif : le max/min de valeurs dans [LOSE_SCORE, WIN_SCORE] est dans
+            [LOSE_SCORE, WIN_SCORE]. Prouvé par induction sur depth (decreases).
+        Note : les bornes de score de minimax_pure couvrent [LOSE_SCORE, WIN_SCORE], plus
+        large que [MIN_SCORE, MAX_SCORE] de la heuristique, car les états terminaux peuvent
+        retourner WIN_SCORE ou LOSE_SCORE.
+
+    - name: "Élagage alpha-beta"
+      description: >
+        La fonction `minimax_ab(board, depth, alpha, beta, maximizing) -> i32` implémente
+        l'élagage alpha-beta. Alpha est la meilleure valeur garantie pour le maximisant,
+        beta pour le minimisant. Une branche est élagée quand alpha >= beta (cutoff).
+
+        Invariant alpha-beta : `alpha <= beta` avant chaque appel. C'est une pré-condition.
+
+        Stratégie de preuve de séparabilité (AD-AI-04) :
+        La preuve procède en 2 étapes distinctes :
+        1. Prouver `minimax_pure` correct (voir composant précédent).
+        2. Prouver `lemma_ab_equals_pure` : pour toute board, depth, avec alpha = LOSE_SCORE
+           et beta = WIN_SCORE (pas d'élagage initial),
+           `minimax_ab(board, depth, LOSE_SCORE, WIN_SCORE, max) == minimax_pure(board, depth, max)`.
+        La preuve du lemme procède par induction sur depth :
+        - Cas de base (depth=0 ou état terminal) : trivial, même valeur retournée.
+        - Cas inductif : si l'hypothèse d'induction tient pour depth-1, et que les enfants
+          sont explorés dans le même ordre, alors le max/min des valeurs alpha-betées est
+          identique au max/min pur — sauf pour les branches élagées, qui ne modifient pas
+          le résultat final (preuve de correctness de l'élagage).
+
+        Cette approche en 2 temps suit la lesson b2c68c30 : prouver minimax sans élagage
+        d'abord, puis prouver que l'élagage retourne le même résultat.
+
+    - name: "Interface publique de ai-engine"
+      description: >
+        La fonction publique `best_move(board: &Board, depth: u32) -> Option<usize>` est
+        le point d'entrée de ai-engine. Elle appelle `minimax_ab` sur chaque coup légal
+        et retourne le coup avec le meilleur score, ou None si la grille est pleine.
+
+        Propriétés Verus (N3 — synthèse) :
+        - `ensures result.is_some() ==> is_legal(board, result.unwrap())` : si un coup est
+          retourné, il est légal. Preuve : best_move n'itère que sur les coups légaux
+          (filtre is_legal), donc tout coup retourné provient de cette liste.
+        - Post-condition de terminaison : implicite, car best_move appelle minimax_ab un
+          nombre fini de fois (au plus 7 coups légaux × terminaison de minimax_ab).
+
+        Précaution : best_move retourne `Option<usize>` et non un usize. La valeur `None`
+        représente l'absence de coup légal (grille pleine, partie terminée). cli-frontend
+        doit traiter ce cas — il ne peut pas assumer que best_move retourne toujours Some.
+
+  decisions:
+    - decision: >
+        AD-AI-01 — Profondeur bornée D configurable (minimum D=4), terminaison via decreases(depth).
+      rationale: >
+        Un minimax complet sur Puissance 4 ne termine pas en temps raisonnable (facteur de
+        branchement ~7, arbre de ~4×10^12 noeuds). La profondeur bornée est l'unique moyen
+        de rendre la terminaison prouvable avec un variant de boucle compréhensible par Z3.
+        `decreases depth` est un variant entier naturel décroissant strictement — Z3 accepte
+        ce pattern immédiatement. D=4 est le minimum requis par la task-request. Alternative
+        écartée : minimax complet avec mémo/table de transposition (non-terminaison prouvable
+        dans un temps raisonnable avec Z3, complexité de preuve trop élevée).
+
+    - decision: >
+        AD-AI-02 — Scores sentinels WIN_SCORE et LOSE_SCORE strictement hors de [MIN_SCORE, MAX_SCORE].
+      rationale: >
+        La distinction score terminal vs score heuristique par la valeur (pas par un tag) est
+        essentielle pour la preuve de bornes par récurrence. Si les scores terminaux étaient
+        dans [MIN_SCORE, MAX_SCORE], la preuve ne pourrait pas distinguer "cet état est bon
+        heuristiquement" de "cet état est une victoire certaine". Les sentinels permettent
+        au code appelant (best_move) de donner la priorité absolue aux victoires immédiates
+        sans if/else supplémentaire. Alternative écartée : tag énuméré {Terminal(score), Heuristic(score)}
+        (plus lisible, mais complique la preuve de récurrence et l'interface avec best_move).
+
+    - decision: >
+        AD-AI-03 — Heuristique avec termes linéaires uniquement (pas de produit de variables).
+      rationale: >
+        Décision découlant de AD-VS-04 dans verus-strategy. L'arithmétique non-linéaire
+        résiste au solveur SMT Z3. Une heuristique dont chaque terme est `constante × indicateur`
+        permet une preuve de bornes par sommation de contributions maximales — entièrement
+        linéaire. La qualité heuristique n'est pas compromise : les pondérations sont choisies
+        empiriquement, pas prouvées. Alternative écartée : heuristique avec produits
+        (ex: longueur × densité) — preuve de bornes impraticable avec Z3.
+
+    - decision: >
+        AD-AI-04 — Séparation minimax_pure / minimax_ab pour la preuve de séparabilité.
+      rationale: >
+        Prouver directement que minimax_ab est correct demande à la fois la preuve de
+        terminaison ET la preuve que l'élagage ne change pas le résultat — deux propriétés
+        entrelacées dans une seule récursion complexe. Séparer en deux fonctions (pure puis
+        ab) découple les deux preuves : terminaison sur pure (simple), séparabilité ab=pure
+        (induction sur depth sur un lemme dédié). Cela suit le principe de décomposition
+        modulaire de verus-strategy. Alternative écartée : preuve monolithique directe sur
+        minimax_ab (complexité de preuve trop élevée, timeout SMT probable).
+
+    - decision: >
+        AD-AI-05 — ai-engine ne dépend d'aucune primitive I/O ni de cli-frontend.
+      rationale: >
+        Le découplage strict est la condition pour que les preuves Verus de N3 soient
+        possibles. Verus ne peut pas raisonner sur les effets I/O. Si ai-engine dépendait
+        de la CLI (ex: pour logguer les scores), les preuves deviendraient impossibles ou
+        devraient exclure les parties "avec I/O". De plus, le découplage permet d'utiliser
+        ai-engine dans un contexte sans terminal (tests automatiques, UI future). Alternative
+        écartée : ai-engine avec logging intégré (trace les scores minimax) — incompatible
+        avec les preuves Verus et l'extensibilité future.
+
+  open_questions:
+    - >
+      Variant auxiliaire pour les états terminaux : si l'implémentation détecte un état
+      terminal dans la récursion (victoire détectée à mi-parcours), le variant `decreases depth`
+      reste valide — la détection terminale est un cas de base de la récursion, pas une
+      branche qui re-appellerait avec la même depth. À confirmer lors de l'implémentation ;
+      si un cas limite émerge, ajouter le nombre de cellules vides comme mesure auxiliaire.
+    - >
+      Ordre d'exploration des colonnes : best_move itère sur les colonnes 0 à 6. Une
+      heuristique d'ordre (explorer le centre d'abord) améliorerait l'élagage alpha-beta
+      en pratique. Si une telle heuristique est ajoutée, vérifier qu'elle ne casse pas la
+      preuve de séparabilité (l'ordre d'exploration n'est pas pertinent pour la preuve du
+      score final, uniquement pour les performances).
+    - >
+      Profondeur D adaptative : pour les fins de parties (peu de cellules vides), D pourrait
+      être augmenté sans coût de preuve supplémentaire (le variant decreases(depth) tient
+      quel que soit D). Ce serait une amélioration de qualité IA sans impact sur les preuves.
+      À évaluer lors de la phase d'implémentation.

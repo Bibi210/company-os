@@ -1,0 +1,251 @@
+api_version: companyos/v1
+kind: design-doc
+metadata:
+  id: 3c49e29e-8241-41f4-835e-7a0cebf7337c
+  title: "Puissance 4 — Game Core"
+  author: architect
+  created_at: "2026-03-15"
+  project: puissance4-verus
+  description: >
+    Représentation de la grille 6×7, modèle de coup avec gravité, détection de victoire
+    dans les 4 directions, et état de partie calculé. Couvre les preuves Verus de niveaux 1
+    (invariants structurels) et 2 (correction fonctionnelle soundness + completeness).
+    Composant central dont dépendent ai-engine et cli-frontend.
+  tags:
+    - rust
+    - verus
+    - formal-verification
+    - pdd
+    - connect-four
+    - game-core
+    - grille
+    - détection-victoire
+  related:
+    - id: ffe3306d-d703-43fd-b11a-d154f67bc719
+      kind: task-request
+      relationship: input
+    - id: d71e9987-1eda-4fe1-9d2a-34fa0e7c50fc
+      kind: design-doc
+      relationship: supersedes
+    - id: 04dc72df-d895-4639-aee9-d2c5ab4fb49f
+      kind: design-doc
+      relationship: related
+    - id: 7dc37df5-8b58-46f2-b34e-3dcf747c6366
+      kind: design-doc
+      relationship: related
+    - id: d459be37-0627-465b-bd20-ff775789d3b4
+      kind: design-doc
+      relationship: related
+    - id: b2c68c30-29ab-4150-90b3-df02b6c616aa
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  overview: >
+    game-core est le noyau logique du jeu Puissance 4. Il modélise la grille 6×7,
+    les règles de jeu (coup avec gravité, alternance des joueurs), la détection de victoire
+    dans les 4 directions, et l'état courant de la partie. C'est le seul composant qui
+    contient la logique de jeu — ai-engine et cli-frontend en dépendent sans la dupliquer.
+
+    game-core est un composant pur : aucune dépendance vers l'I/O, aucune dépendance vers
+    ai-engine. Il expose une interface publique stable que les autres couches consomment.
+
+    Les preuves Verus de game-core couvrent deux niveaux hiérarchiques (voir design-doc
+    verus-strategy pour la hiérarchie complète) :
+    - Niveau 1 (N1) — Invariants structurels : validité des cellules, légalité des coups,
+      gravité, alternance des joueurs.
+    - Niveau 2 (N2) — Correction fonctionnelle : soundness et completeness de la détection
+      de victoire dans les 4 directions.
+
+    Les preuves N1 et N2 de game-core sont les fondations dont dépendent les preuves N3
+    de l'ai-engine. Elles doivent être établies en premier dans l'ordre d'implémentation.
+
+  components:
+    - name: "Cell — Type énuméré de cellule"
+      description: >
+        Chaque cellule de la grille est un type énuméré à 3 variants : Empty, Player1,
+        Player2. Ce type est le seul type autorisé dans la grille — aucun entier ne
+        représente une cellule.
+
+        Le type énuméré borne les valeurs par construction au niveau du type système Rust.
+        Verus n'a pas besoin de prouver qu'une cellule est dans {0,1,2} — le compilateur
+        refuse tout autre valeur. C'est le niveau 0 de vérification : la garantie la plus
+        forte possible, zéro coût de preuve.
+
+        Propriétés Verus (N1) :
+        - Invariant structurel trivial : toute cellule est forcément Empty | Player1 | Player2.
+          Prouvé par exhaustivité du type énuméré, sans require ni ensures explicites.
+
+    - name: "Board — Grille 6×7"
+      description: >
+        La grille est un tableau bidimensionnel de 6 lignes × 7 colonnes, chaque case étant
+        de type Cell. La grille est la seule structure mutable de game-core — tout le reste
+        (état de partie, joueur courant, coups légaux) en est dérivé.
+
+        Représentation interne : `[[Cell; 7]; 6]`. La ligne 0 est le bas de la grille (là
+        où tombent les jetons), la ligne 5 est le haut. Les colonnes sont indexées 0 à 6.
+        Ce choix de convention (ligne 0 = bas) simplifie la propriété de gravité : un coup
+        en colonne c place le jeton à la plus petite ligne i telle que board[i][c] == Empty.
+
+        Propriétés Verus (N1) :
+        - Validité de la grille : dimensions constantes 6×7 par construction du type.
+          Prouvé sans lemme supplémentaire — `[[Cell; 7]; 6]` garantit statiquement la taille.
+        - Bounds : tout accès board[i][c] avec 0 ≤ i < 6, 0 ≤ c < 7 est dans les bornes.
+          Verus doit vérifier ces bornes à chaque accès dans les fonctions exec.
+
+    - name: "Move — Modèle de coup avec gravité"
+      description: >
+        Un coup est représenté par un index de colonne (0 à 6). La gravité est encapsulée
+        dans la fonction `apply_move(board, col)` : le jeton tombe automatiquement à la
+        case la plus basse disponible. Il n'est pas possible de placer un jeton à une
+        hauteur arbitraire — la gravité est un invariant structurel du modèle.
+
+        Légalité d'un coup : la colonne c est jouable si et seulement si la cellule du haut
+        de la colonne (board[5][c]) est Empty, c'est-à-dire que la colonne n'est pas pleine.
+        La fonction `is_legal(board, col) -> bool` encode ce prédicat.
+
+        Propriétés Verus (N1) :
+        - Légalité : `is_legal(board, col)` est vrai ssi la colonne col a au moins une case
+          vide. Post-condition de la fonction.
+        - Gravité (placement) : après `apply_move(board, col)` sur un coup légal, le jeton
+          est placé à la ligne la plus basse vide dans col. Propriété ensures sur apply_move.
+        - Gravité (pas de vide sous un jeton) : après apply_move, il n'existe pas d'index
+          i tel que board[i][col] == Empty et board[i+1][col] == Player1 | Player2. Cette
+          implication sur indices bornés est accessible au solveur SMT.
+        - Alternance : le joueur courant est déterminé par la parité du nombre de jetons
+          sur la grille. `current_player(board) = if count_pieces(board) % 2 == 0 { Player1 } else { Player2 }`.
+          Arithmétique modulo 2, linéaire, gérée nativement par Z3.
+
+        Précaution SMT : apply_move modifie la grille en place (mutation). La preuve de
+        gravité porte sur l'état après mutation. Utiliser une spec function `board_after`
+        qui retourne la grille résultante pour permettre les assertions pre/post sans
+        opacité problématique.
+
+    - name: "WinDetection — Détection de victoire dans 4 directions"
+      description: >
+        La détection de victoire vérifie si un joueur P a 4 jetons consécutifs dans au
+        moins une des 4 directions : horizontal, vertical, diagonale NE (↗), diagonale SE (↘).
+        La fonction `has_won(board, player) -> bool` est un prédicat pur (pas d'effet de bord).
+
+        Chaque direction est vérifiée par une fonction auxiliaire dédiée :
+        - `check_horizontal(board, player) -> bool`
+        - `check_vertical(board, player) -> bool`
+        - `check_diagonal_ne(board, player) -> bool`
+        - `check_diagonal_se(board, player) -> bool`
+
+        `has_won` = OR des 4 fonctions auxiliaires.
+
+        Propriétés Verus (N2 — les plus importantes de game-core) :
+        - Soundness (par direction) : si `check_horizontal(board, player)` retourne true,
+          alors il existe (i, j) tel que board[i][j..j+4] contient 4 fois player.
+          Post-condition existentielle sur domaine fini — Z3 peut instancier l'existentiel.
+          Même structure pour les 3 autres directions.
+        - Completeness (par direction) : si il existe (i, j) tel que board[i][j..j+4]
+          contient 4 fois player, alors `check_horizontal(board, player)` retourne true.
+          Implication universelle sur domaine fini (au plus 6×4 positions) — accessible
+          à Z3 par quantification bornée.
+        - Soundness totale : `has_won(board, player) = true` implique soundness dans au
+          moins une direction. Dérive directement des lemmes par direction.
+        - Completeness totale : symétrique.
+
+        Stratégie de preuve (lesson b2c68c30) :
+        1. Prouver soundness + completeness pour chaque direction séparément (4 paires de
+           lemmes). Cela évite les timeouts SMT causés par une preuve trop large.
+        2. Dans chaque lemme, utiliser des assertions intermédiaires comme checkpoints.
+           Par exemple : asserter d'abord que les indices sont dans les bornes, puis que
+           les cellules matchent, puis conclure l'existentiel.
+        3. Les fonctions `check_*` doivent être reveal-ées dans les lemmes qui les utilisent
+           (piège opacité de la lesson b2c68c30). Utiliser `reveal(check_horizontal)` en
+           tête du lemme de soundness horizontal.
+        4. Déclarer les fonctions `check_*` comme `spec fn` et les exposer avec `reveal`
+           uniquement dans les contextes de preuve — les appelants exec utilisent `has_won`
+           directement.
+
+    - name: "GameState — État de partie calculé"
+      description: >
+        L'état de la partie (InProgress, WonBy(Player), Draw) est calculé à la demande
+        depuis la grille courante via `game_state(board) -> GameState`. Il n'est pas stocké
+        comme un champ séparé de la structure principale.
+
+        `game_state` retourne :
+        - `WonBy(Player1)` si `has_won(board, Player1)` est vrai
+        - `WonBy(Player2)` si `has_won(board, Player2)` est vrai
+        - `Draw` si la grille est pleine et aucun joueur n'a gagné
+        - `InProgress` sinon
+
+        Propriétés Verus : game_state est une composition de has_won (déjà prouvé) et d'un
+        test de grille pleine. Pas de preuve supplémentaire majeure nécessaire — les
+        propriétés de game_state dérivent directement de celles de has_won. La cohérence
+        de l'état est garantie par construction (pas d'état séparé à synchroniser).
+
+  decisions:
+    - decision: >
+        AD-GC-01 — Type Cell énuméré (Empty/Player1/Player2), pas un entier.
+      rationale: >
+        Un entier u8 autoriserait les valeurs 3, 255, etc. comme état de cellule. Un type
+        énuméré à 3 variants rend ces états invalides par construction — le compilateur Rust
+        refuse de compiler du code qui utiliserait une valeur hors enum. Verus hérite de
+        cette garantie gratuitement, sans requires supplémentaires sur chaque fonction.
+        C'est la forme de vérification la plus robuste : une garantie de typage, pas une
+        assertion runtime. Alternative écartée : u8 avec invariant Verus (valeur ∈ {0,1,2})
+        — invariant à transporter partout dans les specs, coût élevé pour zéro bénéfice.
+
+    - decision: >
+        AD-GC-02 — Convention ligne 0 = bas de grille pour simplifier la preuve de gravité.
+      rationale: >
+        Si la ligne 0 est le bas, la gravité s'exprime : "le jeton est placé à l'indice i
+        minimal tel que board[i][col] == Empty". Cette formulation utilise une minimisation
+        sur les entiers naturels, directement gérée par Z3. Si la ligne 0 était en haut,
+        la formulation serait une maximisation et nécessiterait un raisonnement inverse.
+        Alternative écartée : ligne 0 = haut (convention affichage) — la propriété de
+        gravité devient plus complexe à exprimer et à prouver.
+
+    - decision: >
+        AD-GC-03 — Détection de victoire décomposée en 4 fonctions auxiliaires par direction.
+      rationale: >
+        Une fonction monolithique `has_won` qui vérifie les 4 directions en une passe serait
+        difficile à prouver (timeout SMT probable sur la preuve de completeness, qui implique
+        un quantificateur universel sur toutes les positions et toutes les directions).
+        4 fonctions auxiliaires permettent 4 paires de lemmes indépendantes — Z3 travaille
+        sur des problèmes plus petits et converge. Lesson b2c68c30 : décomposer par direction
+        est la stratégie recommandée pour éviter les timeouts. Alternative écartée : preuve
+        monolithique (timeout SMT, preuve illisible et non maintenable).
+
+    - decision: >
+        AD-GC-04 — GameState calculé depuis la grille, pas stocké séparément.
+      rationale: >
+        Un champ `state: GameState` séparé crée un invariant de cohérence : "l'état stocké
+        correspond à ce que retournerait game_state(board)". Cet invariant doit être prouvé
+        à chaque mutation de la grille. En calculant l'état à la demande, l'invariant est
+        éliminé par construction — il est impossible que l'état soit incohérent avec la
+        grille s'il n'a pas d'existence propre. Alternative écartée : état séparé avec cache
+        (optimisation prématurée, coût de preuve non justifié sur une grille 6×7).
+
+    - decision: >
+        AD-GC-05 — Légalité de coup via is_legal(), pré-condition de apply_move().
+      rationale: >
+        Toute fonction qui applique un coup déclare `requires is_legal(board, col)` en
+        pré-condition. Cela garantit qu'aucun code ne peut appliquer un coup illégal sans
+        que le vérificateur Verus le signale. La légalité est un contrat, pas une vérification
+        runtime. L'appelant (ai-engine ou cli-frontend) est responsable de s'assurer que
+        le coup est légal avant d'appeler apply_move. Alternative écartée : vérification
+        dans apply_move avec return d'erreur (mélange logique exec et contrat formel, rend
+        la preuve plus complexe).
+
+  open_questions:
+    - >
+      Timeout SMT sur la completeness de la détection de victoire : la décomposition en 4
+      lemmes par direction devrait suffire, mais il faudra valider empiriquement lors de
+      l'implémentation. Si un lemme timeout encore, introduire des assertions intermédiaires
+      supplémentaires sur les sous-segments de 4 cellules.
+    - >
+      Variant de `apply_move` : la fonction modifie la grille en place. Pour la preuve de
+      gravité post-mutation, l'implémenteur devra choisir entre (a) une spec function
+      `board_after(board, col)` qui retourne la grille résultante, ou (b) des assertions
+      sur l'état de la grille après modification. La stratégie (a) est recommandée pour
+      la lisibilité des lemmes.
+    - >
+      Draw condition : le match nul est détecté quand toutes les colonnes sont pleines.
+      L'implémenteur devra vérifier que la condition "grille pleine" est correctement
+      spécifiée — cas limite si une victoire survient exactement quand la grille se remplit
+      (WonBy prend la priorité sur Draw).

@@ -1,0 +1,315 @@
+api_version: companyos/v1
+kind: design-doc
+metadata:
+  id: 04dc72df-d895-4639-aee9-d2c5ab4fb49f
+  title: "Puissance 4 — Verus Strategy"
+  author: architect
+  created_at: "2026-03-15"
+  project: puissance4-verus
+  description: >
+    Guide de style et stratégie transversale de vérification formelle Verus pour le projet
+    Puissance 4. Définit la hiérarchie de preuves à 3 niveaux, les conventions de style,
+    les pièges SMT connus et leurs stratégies d'évitement. Référencé par tous les autres
+    design-docs du projet.
+  tags:
+    - rust
+    - verus
+    - formal-verification
+    - pdd
+    - stratégie-preuve
+    - smt
+    - style-guide
+    - hiérarchie-preuves
+  related:
+    - id: ffe3306d-d703-43fd-b11a-d154f67bc719
+      kind: task-request
+      relationship: input
+    - id: d71e9987-1eda-4fe1-9d2a-34fa0e7c50fc
+      kind: design-doc
+      relationship: supersedes
+    - id: 3c49e29e-8241-41f4-835e-7a0cebf7337c
+      kind: design-doc
+      relationship: related
+    - id: 7dc37df5-8b58-46f2-b34e-3dcf747c6366
+      kind: design-doc
+      relationship: related
+    - id: d459be37-0627-465b-bd20-ff775789d3b4
+      kind: design-doc
+      relationship: related
+    - id: b2c68c30-29ab-4150-90b3-df02b6c616aa
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  overview: >
+    Ce design-doc est le guide de stratégie Verus transversal du projet Puissance 4. Il ne
+    décrit aucun composant fonctionnel du jeu — il définit les règles, conventions et
+    stratégies qui s'appliquent à tous les composants : game-core, ai-engine, et cli-frontend.
+
+    Tout développeur qui écrit des preuves Verus dans ce projet doit lire ce document en
+    premier. Les 3 autres design-docs granulaires (game-core, ai-engine, cli-frontend) en
+    dépendent pour les détails de style et de stratégie, et s'y réfèrent explicitement.
+
+    Structure de ce document :
+    1. Hiérarchie de preuves à 3 niveaux et leurs dépendances
+    2. Conventions de style Verus : organisation des specs, requires/ensures, reveal
+    3. Pièges SMT connus et stratégies d'évitement
+    4. Conventions pour les lemmes auxiliaires et assertions intermédiaires
+    5. Périmètre de la vérification : ce qui est prouvé vs hors scope
+
+  components:
+    - name: "Hiérarchie de preuves à 3 niveaux"
+      description: >
+        Les preuves du projet sont organisées en 3 niveaux hiérarchiques. Un niveau supérieur
+        dépend des preuves du niveau inférieur — on ne peut pas prouver N3 sans N1 et N2.
+        Cette dépendance est à la fois logique (les lemmes N3 utilisent les lemmes N1/N2)
+        et organisationnelle (l'ordre d'implémentation respecte la hiérarchie).
+
+        NIVEAU 1 — Invariants structurels (game-core) :
+        - Validité des cellules : type Cell énuméré, jamais de valeur invalide.
+        - Légalité d'un coup : is_legal(board, col) bien défini et calculable.
+        - Gravité : après apply_move légal, le jeton est à la case la plus basse ; aucune
+          cellule vide n'existe sous un jeton dans la même colonne.
+        - Alternance des joueurs : current_player(board) = f(parité du nombre de jetons).
+        Composant : game-core. Ces propriétés sont prouvées en premier, sans dépendance.
+
+        NIVEAU 2 — Correction fonctionnelle (game-core) :
+        - Soundness de la détection de victoire : si has_won(board, P) = true, alors il
+          existe 4 cellules consécutives de P dans au moins une direction.
+        - Completeness de la détection de victoire : si 4 cellules consécutives de P
+          existent dans une direction, alors has_won(board, P) = true.
+        Composant : game-core. Dépend de N1 (légalité, validité cellules).
+
+        NIVEAU 3 — Propriétés algorithmiques (ai-engine) :
+        - Légalité du coup IA : minimax retourne toujours un coup légal.
+        - Terminaison de minimax : le variant decreases(depth) décroît strictement.
+        - Bornes de score : le score retourné est dans [min_score, max_score].
+        - Séparation alpha-beta : minimax avec élagage retourne le même score que sans.
+        Composant : ai-engine. Dépend de N1 (légalité) et N2 (has_won dans les états terminaux).
+
+        Règle d'or de la hiérarchie : un lemme de niveau N ne doit jamais "voir" les détails
+        d'implémentation d'un niveau inférieur — uniquement leurs post-conditions (ensures).
+        L'opacité par défaut de Verus enforece cette règle automatiquement.
+
+    - name: "Conventions de style Verus"
+      description: >
+        Ces conventions s'appliquent uniformément à tout le code Verus du projet.
+
+        ORGANISATION DES FICHIERS :
+        Les preuves Verus sont tightly coupled au code exec (AD-VS-01). Chaque module Rust
+        contient : les types (exec), les fonctions exec annotées, les spec functions, et les
+        lemmes de preuve. Pas de module `proofs/` séparé.
+        Organisation type d'un module :
+          1. Types et enums (exec)
+          2. Spec functions (`spec fn`) — définitions mathématiques
+          3. Fonctions exec avec requires/ensures
+          4. Lemmes de preuve (`proof fn`) — dans l'ordre du plus bas niveau au plus haut
+
+        REQUIRES / ENSURES :
+        - `requires` minimal : ne déclarer que les pré-conditions strictement nécessaires.
+          Une pré-condition inutile restreint les appelants sans bénéfice de preuve.
+        - `ensures` maximal : exprimer tout ce que la fonction garantit. C'est le contrat
+          que les appelants pourront utiliser — une propriété vraie mais non déclarée en
+          ensures est invisible aux preuves supérieures.
+        - Format : aligner `requires` et `ensures` sur des lignes séparées pour la lisibilité.
+          Grouper les pré-conditions liées (bornes d'indices d'abord, puis propriétés logiques).
+
+        SPEC FUNCTIONS :
+        - Utiliser `spec fn` pour tout prédicat ou fonction mathématique qui ne s'exécute pas.
+        - Nommer les spec functions avec le suffixe `_spec` ou en snake_case descriptif
+          (ex: `is_legal_spec`, `all_cells_valid`).
+        - Les spec functions sont opaques par défaut — ne pas les révéler globalement.
+          Les révéler uniquement dans les contextes de preuve où leur corps est nécessaire.
+
+        REVEAL :
+        - `reveal(fn_name)` en tête d'un lemme pour exposer le corps d'une spec function.
+        - Ne jamais utiliser `reveal` dans du code exec — uniquement dans les proof fn.
+        - Règle : si un lemme timeout, vérifier d'abord qu'il manque un reveal avant d'ajouter
+          des assertions. Un reveal manquant est le piège le plus fréquent (lesson b2c68c30).
+
+        INVARIANTS DE BOUCLE :
+        - Chaque boucle `for` ou `while` en code exec annoté doit avoir un invariant explicite.
+        - L'invariant doit être suffisant pour impliquer la post-condition à la sortie.
+        - Le variant `decreases` est obligatoire pour toute récursion ou boucle prouvée.
+        - Structurer l'invariant de boucle en 3 parties : (a) bornes d'indices dans domaine
+          valide, (b) propriété partielle sur les éléments traités, (c) relation avec le reste.
+
+    - name: "Pièges SMT et stratégies d'évitement"
+      description: >
+        Ces pièges sont documentés dans la lesson b2c68c30 et adaptés au contexte Puissance 4.
+        Chaque implémenteur doit les connaître avant d'écrire des preuves.
+
+        PIÈGE 1 — Opacité des fonctions spec (le plus fréquent) :
+        Symptôme : un lemme échoue alors que la propriété semble évidente.
+        Cause : le corps d'une spec function n'est pas visible dans ce contexte.
+        Solution : ajouter `reveal(nom_de_la_fonction)` en tête du lemme. Si ça ne suffit
+        pas, utiliser `reveal_with_fuel(fn_name, n)` pour une expansion limitée.
+        Exemple dans ce projet : les lemmes de soundness/completeness de has_won doivent
+        reveal les fonctions check_horizontal, check_vertical, etc.
+
+        PIÈGE 2 — Arithmétique non-linéaire :
+        Symptôme : un lemme impliquant a * b ou a % b timeout.
+        Cause : Z3 a des difficultés avec les produits et modulos de variables.
+        Stratégie pour ce projet :
+          (a) Heuristique de score : utiliser des sommes pondérées avec des constantes
+              (pas de produit de deux variables). Si un produit est inévitable, le remplacer
+              par une lookup table de constantes.
+          (b) Alternance des joueurs : count_pieces(board) % 2 est linéaire si count_pieces
+              est spec fn — Z3 gère bien le modulo sur une expression spec.
+          (c) Si non-linéarité inévitable : introduire un lemme intermédiaire qui établit
+              la propriété sur les cas entiers spécifiques (0 à 42 coups maximum).
+
+        PIÈGE 3 — Timeout sur preuve complexe :
+        Symptôme : `verus` rapporte un timeout ou "could not prove" sans message d'erreur clair.
+        Causes possibles : preuve trop large (quantificateurs sur grand domaine), opacité
+        manquante (cf. Piège 1), invariant de boucle incomplet.
+        Solution : ajouter des assertions intermédiaires `assert(...)` qui découpent la
+        preuve en sous-buts. Chaque assert est un checkpoint que Z3 vérifie indépendamment.
+        Règle de décomposition : si une preuve fait plus de 10 lignes sans assert intermédiaire,
+        la décomposer. Dans ce projet, la détection de victoire et la terminaison minimax
+        sont les zones à risque.
+
+        PIÈGE 4 — Quantificateurs universels sur grand domaine :
+        Symptôme : lemme de completeness timeout (∀ position, propriété).
+        Cause : Z3 a du mal à instancier les quantificateurs universels sur des domaines
+        de taille non triviale (42 positions pour Puissance 4).
+        Solution : réduire le domaine en décomposant par direction (4 lemmes séparés au
+        lieu d'un lemme "toutes directions"). Chaque lemme travaille sur au plus ~24 positions.
+
+        PIÈGE 5 — Spec qui réplique l'implémentation :
+        Symptôme : la spec est une traduction mot-pour-mot du code exec.
+        Cause : tendance naturelle à "transcrire" le code plutôt qu'à spécifier la propriété.
+        Solution : la spec doit décrire la propriété mathématique à un niveau d'abstraction
+        supérieur. Exemple mauvais : `ensures result == board[i][j] == Player1 && ...`.
+        Exemple bon : `ensures exists_consecutive_4(board, player, Horizontal)`.
+
+    - name: "Conventions pour les lemmes auxiliaires"
+      description: >
+        Règles de nommage et d'organisation des lemmes dans le projet.
+
+        NOMMAGE :
+        - Lemmes de soundness : `lemma_<composant>_sound` (ex: `lemma_win_detection_horizontal_sound`)
+        - Lemmes de completeness : `lemma_<composant>_complete`
+        - Lemmes de terminaison : `lemma_<composant>_terminates`
+        - Lemmes de bornes : `lemma_<composant>_bounded`
+        - Lemmes auxiliaires locaux : `lemma_aux_<description>` (prefixe aux pour signaler
+          qu'ils ne font pas partie de l'interface publique de preuve)
+
+        ORGANISATION :
+        Les lemmes sont groupés par niveau hiérarchique (N1, N2, N3) dans le code.
+        Commentaire section obligatoire avant chaque groupe :
+          `// === NIVEAU 1 — Invariants structurels ===`
+          `// === NIVEAU 2 — Correction fonctionnelle ===`
+          `// === NIVEAU 3 — Propriétés algorithmiques ===`
+
+        ASSERTIONS INTERMÉDIAIRES :
+        Les assertions intermédiaires (`assert`) sont des checkpoints de preuve — elles
+        guident Z3 sans être des lemmes standalone. Convention :
+        - Commenter chaque assert non-trivial avec `// checkpoint: <description>`.
+        - Les asserts apparaissent en ordre logique (du plus simple au plus fort).
+        - Un assert qui passe sans explication est suspect — soit il est trivial (à supprimer),
+          soit il cache un piège d'opacité (vérifier le reveal).
+
+        DÉPENDANCES ENTRE LEMMES :
+        Documenter les appels de lemmes dans les proof fn avec un commentaire :
+          `lemma_win_detection_horizontal_sound(board, player); // N2 → soundness horizontale`
+        Cela rend les chaînes de dépendance explicites sans avoir à lire chaque lemme.
+
+    - name: "Périmètre de la vérification formelle"
+      description: >
+        Définition explicite de ce qui est prouvé formellement et de ce qui est hors scope.
+
+        CE QUI EST PROUVÉ (dans scope) :
+        - N1 game-core : validité des cellules, légalité, gravité, alternance (voir game-core design-doc)
+        - N2 game-core : soundness + completeness has_won dans les 4 directions
+        - N3 ai-engine : légalité du coup IA, terminaison minimax, bornes de score
+        - N3 ai-engine (partiel) : séparabilité alpha-beta (minimax avec = sans élagage)
+
+        HORS SCOPE (décision explicite) :
+        - Optimalité complète de l'IA : "l'IA joue le coup parfait" implique la théorie du
+          jeu combinatoire sur l'arbre entier de Puissance 4 — hors portée de Z3 en temps
+          raisonnable. Hors scope par décision de la task-request.
+        - Qualité heuristique : "l'heuristique est bonne" est un jugement empirique, pas une
+          propriété prouvable formellement. Validation par tests et parties test.
+        - Comportement de la CLI / couche I/O : Verus ne raisonne pas sur les effets de bord
+          I/O. La couche cli-frontend ne contient aucune preuve (AD-CLI-01 dans cli-frontend).
+        - Performance et complexité algorithmique : les preuves ne couvrent pas la complexité
+          en temps ou espace. La profondeur bornée D est une décision de conception, pas une
+          preuve de performance.
+        - Mode multijoueur, réseau, persistance : hors scope du projet.
+
+        ENGAGEMENT DE NON-RÉGRESSION :
+        Une preuve qui passe est un contrat. Tout refactoring qui casse une preuve doit être
+        traité comme une régression critique — il signale une violation du contrat architectural.
+        L'implémenteur ne doit jamais contourner une preuve cassée (ex: commenter un lemme).
+        Si un lemme ne passe plus après refactoring, escalader à l'Architect pour réévaluation.
+
+  decisions:
+    - decision: >
+        AD-VS-01 — Preuves Verus tightly coupled au code exec, pas de module séparé.
+      rationale: >
+        Si les preuves vivaient dans un module `proofs/` séparé, il serait possible de
+        modifier le code exec sans mettre à jour les preuves (drift silencieux). Le couplage
+        fort garantit que toute violation de contrat est détectée immédiatement par `verus`.
+        C'est une feature architecturale, pas une contrainte — la preuve ET le code évoluent
+        ensemble, toujours synchronisés. Lesson b2c68c30 : "les preuves Verus sont tightly
+        coupled à l'implémentation (pas de module séparé)". Alternative écartée : module
+        de preuves séparé (risque de drift, fausse sensation de sécurité).
+
+    - decision: >
+        AD-VS-02 — Hiérarchie de preuves à 3 niveaux avec dépendances explicites.
+      rationale: >
+        Organiser les preuves en niveaux dépendants garantit que les fondations (invariants
+        structurels N1) sont prouvées avant les propriétés de plus haut niveau (algorithme N3).
+        Cela suit le principe de modularité des preuves de la lesson b2c68c30 : les preuves
+        de niveau supérieur ne voient que les post-conditions des niveaux inférieurs, jamais
+        leurs détails d'implémentation. L'opacité par défaut de Verus enforce cela
+        automatiquement. Alternative écartée : preuves plates sans hiérarchie (couplage fort
+        entre preuves, timeouts fréquents, non-maintenabilité).
+
+    - decision: >
+        AD-VS-03 — Décomposition par direction pour la détection de victoire (4 lemmes séparés).
+      rationale: >
+        Une preuve monolithique de soundness/completeness sur les 4 directions simultanément
+        implique un quantificateur universel sur un domaine de ~96 positions (4 directions ×
+        ~24 positions). Z3 peut timeout sur ce type de problème. Décomposer en 4 paires de
+        lemmes réduit le domaine par lemme à ~24 positions maximum, dans une seule direction.
+        Lesson b2c68c30 : "décomposer par direction pour la détection victoire". Alternative
+        écartée : lemme monolithique (timeout SMT probable, preuve illisible).
+
+    - decision: >
+        AD-VS-04 — Heuristique IA avec sous-scores linéaires uniquement (pas de produit de variables).
+      rationale: >
+        L'arithmétique non-linéaire (produit de deux variables) résiste au solveur SMT Z3.
+        En imposant que la fonction heuristique soit une somme de termes linéaires (chaque
+        terme est une constante × un indicateur booléen transformé en entier), la preuve de
+        bornes de score reste dans le domaine linéaire. Si une pondération non-linéaire est
+        nécessaire, la remplacer par une lookup table de constantes. Lesson b2c68c30 :
+        "arithmétique non-linéaire résiste au SMT". Alternative écartée : heuristique avec
+        produits (preuve de bornes impraticable avec Z3).
+
+    - decision: >
+        AD-VS-05 — Optimalité IA hors scope de la vérification formelle.
+      rationale: >
+        Prouver qu'un minimax à profondeur D joue "parfaitement" nécessiterait la preuve
+        que l'arbre de jeu à partir de toute position est gagnant pour l'IA à cette profondeur.
+        Cela requiert la résolution théorique de Puissance 4 (connue empiriquement, mais la
+        preuve formelle complète est hors portée de Z3 en temps raisonnable). Le scope retenu
+        couvre la légalité, la terminaison, et les bornes de score — propriétés vérifiables
+        mécaniquement. L'optimalité empirique est validée par tests de parties test.
+
+  open_questions:
+    - >
+      Niveau de verbosité des commentaires de proof : les assertions intermédiaires doivent
+      être commentées, mais le niveau de détail optimal reste à affiner lors de l'implémentation.
+      Trop de commentaires nuisent à la lisibilité du code proof ; trop peu rendent les
+      checkpoints opaques.
+    - >
+      Outillage CI : la vérification Verus doit-elle bloquer la CI (comme les tests) ou être
+      un check séparé optionnel ? À décider lors de la mise en place du pipeline. Recommandation :
+      bloquer la CI — une preuve cassée est une régression critique.
+    - >
+      reveal_with_fuel vs reveal : pour les fonctions spec récursives (ex: count_pieces),
+      `reveal_with_fuel` peut être nécessaire pour contrôler la profondeur d'expansion. À
+      documenter au fur et à mesure de l'implémentation. Si un pattern récurrent émerge,
+      l'ajouter comme convention dans ce document via une mise à jour.

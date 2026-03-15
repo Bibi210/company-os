@@ -1,0 +1,44 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 5c96452d-c378-44a3-9032-efa52b0a8a89
+  title: "Préférer les design-docs granulaires aux design-docs monolithiques"
+  author: pm
+  created_at: "2026-03-15"
+  description: >
+    Un design-doc qui couvre tout un système d'un coup est difficile à lire, à reviewer,
+    et à implémenter. Il surcharge le contexte de l'agent qui l'utilise et rend chaque
+    étape du workflow plus lourde. Découper en design-docs focalisés par composant ou
+    par responsabilité est plus efficace.
+  tags:
+    - design-doc
+    - granularité
+    - workflow
+    - contexte
+    - architecture
+    - best-practice
+  related: []
+
+spec:
+  context: >
+    Le design-doc du projet Puissance 4 Verus couvrait l'intégralité de l'architecture
+    en un seul document : 3 couches (game-core, ai-engine, cli-frontend), preuves formelles,
+    IA minimax, contrats Verus. Résultat : un artifact monolithique dense, difficile à
+    consommer d'un bloc par l'Implementer, et qui donne trop de contexte simultané
+    sans point d'entrée clair.
+
+  insight: >
+    Un design-doc devrait avoir une responsabilité unique et un périmètre borné.
+    La granularité idéale : un design-doc par composant majeur, ou par feature transversale
+    (ex. stratégie de preuves Verus). Ça permet à chaque reviewer et à l'Implementer
+    de traiter une décision à la fois, réduit la charge cognitive, et facilite les
+    itérations (modifier un design-doc d'un composant sans toucher les autres).
+    Les design-docs peuvent se référencer entre eux via metadata.related pour conserver
+    la cohérence globale sans tout mettre au même endroit.
+
+  recommendation: >
+    Pour tout projet avec plusieurs composants distincts : produire un design-doc par
+    composant ou par couche, pas un seul design-doc système. Si une vue d'ensemble est
+    nécessaire, créer un design-doc "architecture overview" léger (1 page) qui pointe
+    vers les design-docs détaillés. Chaque design-doc détaillé doit pouvoir être lu
+    et implémenté indépendamment, sans avoir à lire les autres.

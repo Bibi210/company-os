@@ -1,0 +1,216 @@
+api_version: companyos/v1
+kind: design-doc
+metadata:
+  id: d459be37-0627-465b-bd20-ff775789d3b4
+  title: "Puissance 4 — CLI Frontend"
+  author: architect
+  created_at: "2026-03-15"
+  project: puissance4-verus
+  description: >
+    Interface terminal du jeu Puissance 4 : boucle de jeu, affichage de la grille, lecture
+    du coup humain avec validation, orchestration des appels à game-core et ai-engine.
+    Aucune logique de jeu ni preuve Verus dans cette couche — découplage strict de l'I/O.
+  tags:
+    - rust
+    - connect-four
+    - cli
+    - frontend
+    - ui
+    - boucle-jeu
+    - découplage
+  related:
+    - id: ffe3306d-d703-43fd-b11a-d154f67bc719
+      kind: task-request
+      relationship: input
+    - id: d71e9987-1eda-4fe1-9d2a-34fa0e7c50fc
+      kind: design-doc
+      relationship: supersedes
+    - id: 3c49e29e-8241-41f4-835e-7a0cebf7337c
+      kind: design-doc
+      relationship: related
+    - id: 7dc37df5-8b58-46f2-b34e-3dcf747c6366
+      kind: design-doc
+      relationship: related
+    - id: 04dc72df-d895-4639-aee9-d2c5ab4fb49f
+      kind: design-doc
+      relationship: related
+
+spec:
+  overview: >
+    cli-frontend est la couche de présentation du jeu Puissance 4. Elle est responsable de :
+    - Afficher la grille dans le terminal après chaque coup.
+    - Lire et valider le coup de l'humain (colonne 1-7 saisie au clavier, traduite en 0-6).
+    - Orchestrer la boucle de jeu : humain joue → IA joue → afficher → détecter fin.
+    - Gérer les erreurs de saisie utilisateur (colonne hors bornes, colonne pleine) en
+      ré-affichant un message d'erreur et en re-promptant, sans crash.
+
+    cli-frontend ne contient aucune logique de jeu. Elle délègue entièrement à game-core
+    (apply_move, is_legal, game_state) et à ai-engine (best_move). Cette règle de découplage
+    strict est une décision architecturale non négociable (AD-CLI-01).
+
+    cli-frontend ne contient aucune preuve Verus. L'I/O (stdin/stdout) n'est pas raisonnable
+    formellement dans Verus. Les propriétés critiques (légalité, correction) sont prouvées
+    dans game-core et ai-engine — cli-frontend n'a pas à les redémontrer.
+
+    Extensibilité : game-core et ai-engine sont UI-agnostiques. Une UI future (interface
+    graphique, UI web, API) remplacerait uniquement cli-frontend sans modifier la logique
+    vérifiée.
+
+  components:
+    - name: "Affichage — Rendu de la grille"
+      description: >
+        La fonction `display_board(board: &Board)` affiche la grille 6×7 dans le terminal.
+
+        Format d'affichage :
+        - Grille affichée de haut en bas (ligne 5 en premier, ligne 0 en dernier) pour que
+          l'affichage corresponde à l'intuition visuelle (les jetons "tombent" vers le bas).
+        - Chaque cellule est représentée par un caractère : `.` pour vide, `X` pour Player1
+          (humain), `O` pour Player2 (IA).
+        - Séparateurs visuels entre les cellules (pipes `|`).
+        - Numéros de colonnes affichés sous la grille (1 à 7 en affichage, traduits en 0-6
+          en interne).
+        - Message d'état (tour du joueur / victoire / match nul) affiché après la grille.
+
+        Note d'implémentation : la convention ligne 0 = bas (définie dans game-core
+        AD-GC-02) impose d'itérer de la ligne 5 à la ligne 0 pour l'affichage. L'implémenteur
+        doit inverser l'ordre des lignes dans la boucle d'affichage.
+
+    - name: "Lecture du coup humain avec validation"
+      description: >
+        La fonction `read_human_move(board: &Board) -> usize` lit un coup au clavier et
+        retourne l'index de colonne interne (0-6) d'un coup valide.
+
+        Flux de lecture :
+        1. Afficher le prompt : "Votre coup (colonne 1-7) : ".
+        2. Lire une ligne depuis stdin.
+        3. Parser comme entier. Si parsing échoue : afficher "Saisie invalide, entrez un
+           chiffre de 1 à 7." et revenir à l'étape 1.
+        4. Vérifier que la valeur est dans [1, 7]. Si hors bornes : afficher "Colonne hors
+           limites (1-7)." et revenir à l'étape 1.
+        5. Traduire en index interne : col_interne = col_saisie - 1.
+        6. Vérifier `is_legal(board, col_interne)`. Si illégal (colonne pleine) : afficher
+           "Cette colonne est pleine, choisissez-en une autre." et revenir à l'étape 1.
+        7. Retourner col_interne.
+
+        La fonction ne retourne que quand un coup légal a été saisi. Elle ne crashe pas sur
+        une saisie invalide — elle re-prompte. C'est la gestion d'erreurs utilisateur standard
+        pour une CLI interactive.
+
+        Note : `read_human_move` appelle `is_legal` de game-core pour la validation en
+        étape 6. Elle ne réimplémente pas la logique de légalité — elle délègue.
+
+    - name: "Boucle de jeu principale"
+      description: >
+        La fonction `run_game(depth: u32)` orchestre une partie complète.
+
+        Boucle de jeu (itération jusqu'à fin de partie) :
+        1. Afficher la grille courante (`display_board`).
+        2. Calculer `game_state(board)`. Si terminal (victoire / match nul) : afficher le
+           résultat final et terminer la boucle.
+        3. Si c'est le tour de l'humain (Player1) :
+           a. Lire le coup humain via `read_human_move`.
+           b. Appliquer via `apply_move(board, col)`.
+        4. Si c'est le tour de l'IA (Player2) :
+           a. Afficher "L'IA réfléchit...".
+           b. Appeler `best_move(board, depth)`. Si None (grille pleine) : fin de partie.
+           c. Appliquer le coup retourné via `apply_move(board, col)`.
+        5. Revenir à l'étape 1.
+
+        Détermination du joueur courant : via `current_player(board)` de game-core (parité
+        du nombre de jetons — prouvé en N1). cli-frontend ne maintient pas de variable
+        "joueur courant" séparée — elle délègue à game-core.
+
+        Fin de partie :
+        - Victoire Player1 : afficher "Vous avez gagné !"
+        - Victoire Player2 : afficher "L'IA a gagné !"
+        - Draw : afficher "Match nul !"
+        - Dans tous les cas : afficher la grille finale.
+
+    - name: "Point d'entrée main()"
+      description: >
+        La fonction `main()` initialise le jeu et appelle `run_game`.
+
+        Responsabilités de main() :
+        - Afficher un message de bienvenue.
+        - Créer une grille vide (`Board::new()` de game-core).
+        - Optionnellement : lire la profondeur D depuis les arguments CLI (avec valeur par
+          défaut D=4 si non spécifiée).
+        - Appeler `run_game(board, depth)`.
+
+        La profondeur D est le seul paramètre configurable exposé à l'utilisateur. Elle
+        contrôle la difficulté de l'IA (profondeur de recherche minimax).
+
+        Gestion d'erreur de main() : si les arguments sont malformés, afficher un message
+        d'aide et terminer avec exit code 1. Pas de panic dans main().
+
+  decisions:
+    - decision: >
+        AD-CLI-01 — cli-frontend ne contient aucune logique de jeu. Découplage strict.
+      rationale: >
+        Toute logique de jeu dans cli-frontend serait une duplication de game-core, non
+        couverte par les preuves Verus, et un vecteur de divergence (la CLI et game-core
+        pourraient avoir des comportements différents). En déléguant entièrement à game-core
+        et ai-engine, cli-frontend reste un simple orchestrateur I/O. Ce découplage est aussi
+        la condition pour l'extensibilité : remplacer cli-frontend par une autre UI ne
+        nécessite pas de dupliquer ou modifier la logique vérifiée. Alternative écartée :
+        logique de validation dupliquée dans la CLI (ex: vérifier la légalité dans la CLI
+        ET dans game-core) — incohérence silencieuse possible entre les deux.
+
+    - decision: >
+        AD-CLI-02 — Pas de preuves Verus dans cli-frontend.
+      rationale: >
+        Verus ne peut pas raisonner sur les effets I/O (stdin, stdout). Tenter d'annoter
+        les fonctions d'affichage ou de lecture avec des requires/ensures Verus produirait
+        des preuves vides ou trompeuses. La couche I/O est intrinsèquement non-formelle.
+        Les propriétés critiques (légalité des coups, correction de la détection de victoire)
+        sont prouvées dans game-core et ai-engine — cli-frontend en bénéficie transitivement
+        en appelant leurs fonctions prouvées. Alternative écartée : preuves partielles dans
+        la CLI sur les portions non-I/O (complexité injustifiée, pas de valeur ajoutée).
+
+    - decision: >
+        AD-CLI-03 — Re-prompt sur coup invalide (pas de crash, pas d'exit).
+      rationale: >
+        Une CLI qui crash sur une saisie invalide est une mauvaise expérience utilisateur.
+        Le re-prompt est le comportement standard pour les CLIs interactives. De plus, le
+        re-prompt garantit que `read_human_move` ne retourne que des coups légaux — invariant
+        simple que cli-frontend peut assurer localement sans preuve formelle. Alternative
+        écartée : retourner un Result<usize, Error> et gérer l'erreur dans run_game (complexifie
+        la boucle de jeu pour gérer un cas qui n'est pas une erreur de logique mais une
+        erreur de saisie).
+
+    - decision: >
+        AD-CLI-04 — Affichage de la grille de haut en bas (ligne 5 en premier).
+      rationale: >
+        L'affichage doit correspondre à l'intuition physique du Puissance 4 : les jetons
+        tombent vers le bas. Afficher ligne 5 (haut) en premier et ligne 0 (bas) en dernier
+        reproduit cette intuition. La convention interne ligne 0 = bas (AD-GC-02 de game-core)
+        est une décision de modélisation pour simplifier les preuves — l'affichage inverse
+        est la traduction nécessaire entre le modèle interne et la présentation utilisateur.
+        Alternative écartée : afficher ligne 0 en premier (bas affiché en haut — contre-intuitif,
+        grille apparaît "à l'envers").
+
+    - decision: >
+        AD-CLI-05 — Numérotation des colonnes 1-7 en affichage, traduction en 0-6 en interne.
+      rationale: >
+        Les utilisateurs s'attendent à une numérotation commençant à 1. Les indices internes
+        commencent à 0 (convention Rust). La traduction `col_interne = col_saisie - 1` est
+        localisée dans `read_human_move` — aucun autre code ne voit la numérotation 1-7.
+        Alternative écartée : numérotation 0-6 en affichage (inhabituel pour les utilisateurs
+        non-développeurs, source de confusion potentielle).
+
+  open_questions:
+    - >
+      Couleurs dans le terminal : afficher les jetons Player1 et Player2 en couleurs
+      différentes (ANSI escape codes) améliorerait la lisibilité. À évaluer selon les
+      contraintes de portabilité (Windows CMD vs ANSI). Peut être ajouté sans impact sur
+      l'architecture (uniquement display_board).
+    - >
+      Paramètre de profondeur D via argument CLI : la syntaxe recommandée est
+      `puissance4 --depth 6` (argument nommé). Si une crate d'argument parsing (clap) est
+      utilisée, documenter ce choix dans l'implementation-plan. L'architecture de cli-frontend
+      ne dépend pas de ce choix — main() reste le seul consommateur de D.
+    - >
+      Mode "IA vs IA" pour le débogage : permettre deux joueurs IA de s'affronter serait
+      utile pour valider l'implémentation de ai-engine en observant des parties complètes.
+      Ce mode ne modifie pas l'architecture (run_game appelle best_move pour les deux joueurs).
+      À considérer comme extension dans l'implementation-plan.

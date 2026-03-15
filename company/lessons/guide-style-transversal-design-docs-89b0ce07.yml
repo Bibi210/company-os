@@ -1,0 +1,74 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 89b0ce07-f541-4583-8c8a-c3ff37568ae4
+  title: "Découper les design-docs avec un document guide de style transversal"
+  author: architect
+  created_at: "2026-03-15"
+  description: >
+    Quand un projet est découpé en plusieurs design-docs granulaires, un des design-docs
+    doit jouer le rôle de guide de style transversal — sans décrire un composant fonctionnel,
+    il définit les conventions partagées par tous les autres. Ce pattern évite la duplication
+    des règles de style dans chaque design-doc et garantit la cohérence de l'ensemble.
+  tags:
+    - design-doc
+    - granularité
+    - guide-de-style
+    - transversal
+    - verus
+    - architecture
+    - best-practice
+  related:
+    - id: 5c96452d-c378-44a3-9032-efa52b0a8a89
+      kind: lesson-learned
+      relationship: derived-from
+    - id: 00f2f2cc-472b-483a-a8e8-77d1a28e07c3
+      kind: lesson-learned
+      relationship: related
+    - id: 04dc72df-d895-4639-aee9-d2c5ab4fb49f
+      kind: design-doc
+      relationship: derived-from
+
+spec:
+  context: >
+    En découpant le design-doc monolithique Puissance 4 Verus en 4 design-docs granulaires
+    (game-core, verus-strategy, ai-engine, cli-frontend), il est apparu que les 3 composants
+    fonctionnels (game-core, ai-engine, cli-frontend) avaient des règles Verus communes :
+    conventions de style, hiérarchie de preuves, pièges SMT, nommage des lemmes. Si ces règles
+    étaient dupliquées dans chaque design-doc fonctionnel, elles créeraient une source de
+    divergence — une règle modifiée dans un document ne serait pas automatiquement reflétée
+    dans les autres.
+
+  insight: >
+    Lors d'un découpage en design-docs granulaires, identifier s'il existe des règles ou
+    conventions transversales à plusieurs composants. Si oui, les extraire dans un design-doc
+    dédié de type "guide de style" ou "stratégie transversale" — distinct des design-docs
+    fonctionnels. Ce document de référence est le premier à lire pour tout développeur, et les
+    autres design-docs s'y réfèrent explicitement plutôt que de répéter les règles.
+
+    Dans Puissance 4 Verus, ce rôle est joué par verus-strategy : il ne décrit aucun composant
+    du jeu, mais définit la hiérarchie de preuves, les conventions Verus, les pièges SMT et
+    leurs solutions. Les 3 autres design-docs s'y réfèrent pour les détails de style et n'ont
+    pas à dupliquer ces informations.
+
+    Ce pattern est généralisable : dans tout projet multi-composants avec une technologie
+    spécialisée (Verus, une DSL, un framework de test, une politique de sécurité), un
+    design-doc "guide de style" évite la duplication et maintient la cohérence.
+
+  recommendation: >
+    Lors de la production de design-docs granulaires :
+
+    (1) Identifier les règles transversales (conventions, contraintes, stratégies) qui
+    s'appliquent à plusieurs composants. Exemples : stratégie de vérification formelle, politique
+    de gestion des erreurs, conventions de nommage, règles de sécurité.
+
+    (2) Si ces règles transversales existent, créer un design-doc "guide de style" ou "stratégie
+    [technologie]" qui les documente exhaustivement. Ce design-doc ne décrit pas un composant
+    fonctionnel — c'est le référentiel de conventions du projet.
+
+    (3) Dans les design-docs fonctionnels, référencer le guide de style via metadata.related
+    et le citer explicitement dans l'overview. Ne pas dupliquer les règles de style — pointer
+    vers le guide.
+
+    (4) Le guide de style est le premier design-doc à produire (ou en parallèle avec les
+    fonctionnels). Il est aussi le premier à lire pour un nouvel implémenteur.
