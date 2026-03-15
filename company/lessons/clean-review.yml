@@ -1,0 +1,127 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 13fdf5bc-2713-4ad9-b79d-0ae53a208fc9
+  title: "Clean Review : pratiques de review de code efficaces et rigoureuses"
+  author: ceo
+  created_at: "2026-03-15"
+  description: >
+    Synthèse des pratiques de code review issues de la recherche Google (Rigby, Bird 2013),
+    Microsoft (MacLeod et al.), les anti-patterns courants, et la psychologie de la review.
+    Focus sur l'analyse triaxiale, les pièges du rubber-stamping, et la review comme outil
+    d'apprentissage collectif.
+  tags:
+    - clean-review
+    - code-review
+    - quality
+    - process
+    - og-memory
+  related:
+    - id: e8be5814-8e94-4561-ac6d-27a1785809c7
+      kind: lesson-learned
+      relationship: related
+    - id: 78b74101-a23a-4841-a2da-c76651399883
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    La review de code est le dernier filet de sécurité avant le merge. Mais une review
+    bâclée est pire que pas de review : elle donne une fausse confiance. Dans CompanyOS,
+    chaque artifact passe par un processus de review avec des reviewers désignés. Il faut
+    que chaque reviewer sache exactement ce que signifie "une bonne review" pour que le
+    processus soit un réel garde-fou et pas du théâtre.
+
+  insight: >
+    La review efficace repose sur des pratiques vérifiées par la recherche et l'expérience :
+
+
+    1. ANALYSE TRIAXIALE — Toute review doit couvrir trois axes :
+
+    - Cas nominal (happy path) : Le code fonctionne-t-il quand tout va bien ? Les inputs
+    sont valides, les services répondent, les données sont cohérentes.
+
+    - Cas négatif (error paths) : Que se passe-t-il quand ça échoue ? Erreur réseau, input
+    invalide, permission refusée, timeout, disque plein. Le code gère-t-il ces cas
+    explicitement ou les ignore-t-il silencieusement ?
+
+    - Edge cases : Valeurs limites (0, -1, MAX_INT, string vide, liste vide, None/null),
+    concurrence (race conditions, double-submit), état incohérent (cache désynchronisé,
+    transaction partielle). C'est ici que vivent la majorité des bugs de production.
+
+    Un artifact qui ne couvre que le cas nominal est incomplet par définition.
+
+
+    2. RUBBER-STAMPING — L'anti-pattern le plus dangereux. Approuver sans vraiment lire.
+    Indicateurs : review en moins de 5 minutes pour un changement non-trivial, commentaires
+    génériques ("LGTM", "looks good"), aucun finding. Causes : surcharge de travail,
+    pression sociale pour ne pas bloquer, confiance excessive dans l'auteur. Contre-mesure :
+    chaque review DOIT avoir au moins un finding ou une observation spécifique au code
+    reviewé, même si le verdict est "approve". "Rien à dire" n'est pas un verdict valide.
+
+
+    3. TAILLE DES CHANGEMENTS — La recherche Google (Rigby, Bird 2013) montre que l'efficacité
+    de la review chute dramatiquement au-delà de 200-400 lignes modifiées. Au-delà de 400 lignes,
+    les reviewers commencent à survoler. Pour les design-docs et implementation-plans : si le
+    changement est massif, le découper en phases reviewables indépendamment. Un design-doc de
+    50 pages ne sera pas reviewé avec la même rigueur qu'un design-doc de 5 pages.
+
+
+    4. AUTO-REVIEW INTERDITE — Un agent ne peut jamais reviewer son propre artifact. C'est
+    un biais cognitif fondamental : l'auteur est "blind" aux défauts de son propre travail
+    parce qu'il a un modèle mental de ce que le code devrait faire, pas de ce qu'il fait
+    réellement. La review par un tiers apporte un regard naïf qui détecte les hypothèses
+    implicites, les noms ambigus, et les cas non couverts.
+
+
+    5. REVIEW COMME APPRENTISSAGE — La review n'est pas un tribunal. C'est un processus
+    d'apprentissage bidirectionnel : le reviewer apprend le contexte du changement, l'auteur
+    apprend les angles morts de son travail. Les findings doivent être formulés comme des
+    questions ou des suggestions, pas comme des jugements. "Que se passe-t-il si X est null ?"
+    est plus productif que "Tu n'as pas géré le cas null".
+
+
+    6. REVIEW DE DESIGN vs REVIEW DE CODE — Deux activités distinctes. La review de design
+    vérifie les décisions architecturales (choix de patterns, frontières de modules, gestion
+    des dépendances). La review de code vérifie l'implémentation (nommage, edge cases, tests,
+    performance). Reviewer le design au moment du code est trop tard — les décisions sont déjà
+    prises et coûteuses à changer. C'est pour ça que CompanyOS sépare design-doc et
+    implementation-plan : chacun est reviewé à son niveau d'abstraction.
+
+
+    7. CHECKLIST MENTALE DU REVIEWER — Pour chaque changement, le reviewer doit vérifier :
+
+    - Correction : le code fait-il ce qu'il prétend faire ? (pas juste "ça compile")
+    - Complétude : les 3 axes (nominal, négatif, edge) sont-ils couverts ?
+    - Cohérence : le changement suit-il les patterns existants du codebase ?
+    - Clarté : un nouveau contributeur comprendrait-il ce code sans explication orale ?
+    - Sécurité : y a-t-il des inputs non validés, des injections possibles, des secrets exposés ?
+
+
+    8. ESCALADE — Quand une review tourne en boucle (> 2 rounds sans convergence), c'est
+    un signe de désaccord architectural, pas de détails d'implémentation. Escalader à un
+    niveau supérieur (architect ou CEO) plutôt que de s'enliser dans des micro-corrections.
+    Le flow-control de CompanyOS impose un max de rounds avant escalade pour éviter les
+    spirales infinies.
+
+  recommendation: >
+    Appliquer ces pratiques à chaque review round :
+
+    (1) Analyse triaxiale systématique — Vérifier explicitement les 3 axes pour chaque
+    changement. Si un axe n'est pas couvert, c'est un finding automatique.
+
+    (2) Zéro rubber-stamp — Chaque review contient au moins un finding ou une observation
+    spécifique. "LGTM" seul n'est jamais un verdict valide.
+
+    (3) Découper les gros changements — Si un artifact dépasse un seuil de complexité raisonnable,
+    demander un découpage avant de reviewer. Mieux vaut 3 reviews de 100 lignes qu'une review
+    de 300 lignes.
+
+    (4) Design avant code — Reviewer les décisions architecturales au stade design-doc,
+    pas au stade implementation-plan. Chaque review se fait au bon niveau d'abstraction.
+
+    (5) Questions plutôt que jugements — Formuler les findings comme des questions qui
+    poussent l'auteur à réfléchir, pas comme des verdicts qui le mettent sur la défensive.
+
+    (6) Escalade rapide — Si 2 rounds ne convergent pas, escalader. Le temps passé en
+    boucle de review est du temps perdu.

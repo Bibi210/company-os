@@ -1,0 +1,161 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: b2c68c30-29ab-4150-90b3-df02b6c616aa
+  title: "Vérification déductive avec Verus : prouver la correction du code Rust"
+  author: ceo
+  created_at: "2026-03-15"
+  description: >
+    Synthèse des principes de vérification formelle déductive avec Verus pour Rust. Couvre
+    le modèle trois modes (spec/proof/exec), la structure des preuves, les pièges courants,
+    et les critères de qualité d'une bonne preuve. Sources : documentation officielle Verus,
+    articles académiques du projet (Lattuada et al.), guide de référence Verus.
+  tags:
+    - formal-verification
+    - verus
+    - rust
+    - deductive-verification
+    - proofs
+    - og-memory
+  related:
+    - id: e8be5814-8e94-4561-ac6d-27a1785809c7
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Le testing vérifie un nombre fini de cas. La vérification formelle prouve que le code
+    est correct pour TOUS les inputs possibles. Dans un système critique comme CompanyOS
+    (permissions, write permits, zones protégées), certains invariants doivent être
+    mathématiquement garantis, pas juste testés. Verus est un outil de vérification déductive
+    pour Rust qui permet de prouver des propriétés directement dans le code source, sans
+    quitter l'écosystème Rust.
+
+  insight: >
+    Verus repose sur la vérification déductive : on écrit des spécifications formelles
+    (pré-conditions, post-conditions, invariants) et un solveur SMT (Z3) vérifie automatiquement
+    que le code satisfait ces spécifications pour tous les inputs possibles.
+
+
+    1. MODÈLE TROIS MODES — Verus sépare le code en trois modes :
+
+    - spec (spécification) : Code mathématique pur. Décrit CE QUE le programme doit faire.
+    N'est pas compilé, n'existe qu'à la vérification. Peut utiliser des types mathématiques
+    (Seq, Set, Map) sans contraintes d'efficacité. Exemple : `spec fn sorted(s: Seq<i64>) -> bool`
+    qui définit mathématiquement ce que "trié" signifie.
+
+    - proof (preuve) : Code qui guide le solveur SMT. N'est pas compilé non plus. Sert à
+    construire le raisonnement qui connecte la spec au code exec. Contient les lemmes, les
+    assertions intermédiaires, les invocations de lemmes externes. C'est le "brouillon de
+    raisonnement" qui aide Z3 à voir pourquoi le code est correct.
+
+    - exec (exécution) : Le code Rust réel qui tourne en production. Annoté avec des
+    `requires` (pré-conditions) et `ensures` (post-conditions) qui le lient à la spec.
+    C'est le seul code compilé.
+
+
+    2. STRUCTURE D'UNE BONNE PREUVE :
+
+    - Pré-conditions (`requires`) minimales : ne demander que ce qui est strictement nécessaire.
+    Des pré-conditions trop larges rendent la fonction inutilisable en pratique, trop strictes
+    rendent la preuve triviale mais la fonction restreinte.
+
+    - Post-conditions (`ensures`) maximales : exprimer tout ce que la fonction garantit.
+    C'est le contrat vérifiable par les appelants. Si une propriété est vraie mais non
+    déclarée en `ensures`, personne ne peut s'en servir.
+
+    - Invariants de boucle : chaque boucle doit avoir un invariant qui est vrai avant la
+    boucle, préservé par chaque itération, et qui combiné avec la condition de sortie
+    implique la post-condition. L'invariant de boucle est souvent la partie la plus difficile
+    à écrire — c'est le coeur de la preuve.
+
+    - Variant de boucle (decreases) : une expression entière qui décroît strictement à chaque
+    itération et est bornée inférieurement. Prouve la terminaison.
+
+
+    3. CE QU'IL FAUT PROUVER — Tous les codes ne méritent pas une preuve formelle. Prioriser :
+
+    - Invariants de sécurité : "seul le CEO peut grant un write permit", "un fichier en zone
+    protégée ne peut être modifié sans permit valide". Ce sont des propriétés critiques où
+    un bug = une faille de sécurité.
+
+    - Structures de données : les opérations sur les structures critiques (insert, delete,
+    lookup) préservent les invariants de la structure. Exemple : un arbre rouge-noir reste
+    équilibré après insertion.
+
+    - Protocoles à états : les machines à états (workflow d'un artifact, cycle de vie d'un
+    permit) ne peuvent pas atteindre un état invalide. Prouver que les transitions sont
+    exhaustives et que les états terminaux sont atteignables.
+
+    - Arithmétique critique : absence d'overflow, division par zéro, bornes d'index.
+    Verus excelle ici car le solveur SMT gère nativement l'arithmétique.
+
+
+    4. PIÈGES COURANTS :
+
+    - Spec qui répète le code : si la spec est une copie mot-pour-mot de l'implémentation,
+    elle ne prouve rien d'utile. La spec doit exprimer la propriété à un niveau d'abstraction
+    SUPÉRIEUR au code. Exemple mauvais : `ensures |r| r == a + b`. Exemple bon :
+    `ensures |r| r == sum_of(sequence)` où `sum_of` est défini indépendamment.
+
+    - Pré-conditions trop fortes : mettre `requires false` rend tout prouvable trivialement
+    (ex falso quodlibet). Vérifier que les pré-conditions sont satisfaisables et que la
+    fonction est effectivement appelable dans des contextes réels.
+
+    - Non-linéarité : le solveur SMT a des difficultés avec l'arithmétique non-linéaire
+    (multiplication de deux variables, modulo). Stratégie : introduire des lemmes intermédiaires
+    qui découpent le raisonnement en étapes linéaires, ou utiliser les lemmes de la
+    bibliothèque standard Verus pour l'arithmétique.
+
+    - Timeout du solveur : si Z3 timeout, ce n'est pas un bug dans le code — c'est un signe
+    que la preuve est trop complexe pour le solveur. Solution : ajouter des assertions
+    intermédiaires (`assert`) qui découpent la preuve en étapes plus petites. Chaque assert
+    est un "checkpoint" que le solveur vérifie indépendamment.
+
+    - Opacité et révélation : par défaut, les fonctions spec sont opaques (le solveur ne
+    voit que la signature). Utiliser `reveal` ou `reveal_with_fuel` pour exposer le corps
+    d'une fonction spec quand le solveur en a besoin. L'opacité par défaut est une feature :
+    elle force la modularité des preuves.
+
+
+    5. VERUS vs TESTING — Verus ne remplace pas le testing. Il le complète :
+
+    - Verus prouve que le code satisfait sa spec. Si la spec est fausse (mauvaise
+    compréhension du besoin), la preuve est correcte mais inutile.
+
+    - Les tests vérifient que la spec correspond au besoin réel (tests d'intégration,
+    tests end-to-end, tests de propriétés avec des exemples concrets).
+
+    - L'approche optimale : prouver les invariants critiques avec Verus, tester le
+    comportement de bout en bout avec des tests classiques.
+
+
+    6. VERUS EN PRATIQUE — Verus est un compilateur Rust modifié. Le code Verus est du Rust
+    valide avec des macros et attributs supplémentaires. Workflow : écrire le code exec →
+    ajouter les specs (requires/ensures) → écrire la preuve (assertions, lemmes, invariants
+    de boucle) → lancer `verus` qui vérifie statiquement → si ça passe, compiler normalement
+    avec rustc. Le code proof/spec est erasé à la compilation — zéro coût runtime.
+
+  recommendation: >
+    Pour intégrer la vérification déductive dans CompanyOS :
+
+    (1) Identifier les invariants critiques — Commencer par les propriétés de sécurité
+    (permissions, zones protégées, workflow des permits). Ce sont les candidats prioritaires
+    pour la preuve formelle.
+
+    (2) Écrire la spec AVANT le code — La spec force à clarifier le contrat de chaque
+    fonction. Si on ne peut pas écrire la spec, on ne comprend pas assez le problème.
+
+    (3) Spec de haut niveau — La spec doit être plus abstraite que le code. Utiliser des
+    types mathématiques (Seq, Set, Map) dans la spec même si le code utilise Vec, HashMap.
+
+    (4) Preuves modulaires — Prouver chaque fonction indépendamment. Utiliser l'opacité
+    par défaut et reveal sélectivement. Une preuve de 500 lignes est un signe que la
+    décomposition est insuffisante.
+
+    (5) Invariants de boucle explicites — Chaque boucle a un invariant documenté. C'est
+    la partie la plus critique de la preuve.
+
+    (6) Ne pas prouver ce qui ne le mérite pas — Le code de présentation, les scripts
+    de build, les tests eux-mêmes n'ont pas besoin de preuve formelle. Concentrer l'effort
+    sur le noyau critique.

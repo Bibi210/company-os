@@ -1,0 +1,131 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 78b74101-a23a-4841-a2da-c76651399883
+  title: "Clean Design : principes d'architecture logicielle durable"
+  author: ceo
+  created_at: "2026-03-15"
+  description: >
+    Synthèse des principes d'architecture issus de Martin (Clean Architecture), Evans (DDD),
+    Ousterhout, et les pratiques modernes (vertical slices, modular monolith). Focus sur la
+    gestion des dépendances, les bounded contexts, la loi de Conway, et les pièges de
+    l'over-engineering architectural.
+  tags:
+    - clean-design
+    - architecture
+    - ddd
+    - solid
+    - og-memory
+  related:
+    - id: e8be5814-8e94-4561-ac6d-27a1785809c7
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Les décisions d'architecture sont les plus coûteuses à corriger. Un mauvais nommage se
+    corrige en secondes, une mauvaise abstraction en heures, mais une mauvaise architecture
+    en semaines ou mois. Dans un système où des agents produisent des design-docs et des
+    implementation-plans, il faut un référentiel commun de ce que signifie "bonne architecture"
+    pour éviter les designs over-engineered ou sous-structurés.
+
+  insight: >
+    L'architecture logicielle durable repose sur quelques principes structurants :
+
+
+    1. DEPENDENCY RULE (Clean Architecture, Martin) — Les dépendances pointent vers l'intérieur.
+    Le domaine métier ne dépend jamais de l'infrastructure (DB, HTTP, filesystem). L'infrastructure
+    dépend du domaine via des interfaces/traits. Cela ne signifie pas "mettre des interfaces
+    partout" — ça signifie que le code métier doit pouvoir tourner sans base de données, sans
+    serveur HTTP, sans framework. Si retirer une dépendance externe casse la logique métier,
+    l'architecture est inversée.
+
+
+    2. SOLID — DEEP CUTS :
+
+    - Open/Closed (OCP) : Un module est ouvert à l'extension, fermé à la modification. En
+    pratique : on peut ajouter un nouveau comportement sans modifier le code existant. Le pattern
+    Strategy, les traits/interfaces, et le polymorphisme sont les mécanismes. Mais attention :
+    appliquer OCP partout mène à l'abstraction prématurée. L'appliquer uniquement aux points
+    d'extension identifiés (là où le changement est probable).
+
+    - Liskov Substitution (LSP) : Un sous-type doit être substituable à son type parent sans
+    casser le programme. La violation classique : `Square extends Rectangle` où `setWidth()`
+    casse l'invariant du carré. En Rust avec les traits : si un type implémente un trait,
+    il doit respecter le contrat sémantique du trait, pas juste la signature.
+
+    - Interface Segregation (ISP) : Aucun client ne devrait dépendre de méthodes qu'il
+    n'utilise pas. Préférer plusieurs traits fins à un gros trait monolithique. En Rust :
+    `Read + Write` plutôt qu'un trait `ReadWrite` monolithique.
+
+    - Dependency Inversion (DIP) : Les modules de haut niveau ne dépendent pas des modules
+    de bas niveau. Les deux dépendent d'abstractions. En Rust : le domaine définit un trait
+    `Repository`, l'infrastructure fournit `SqliteRepository` qui l'implémente. Le domaine
+    ne connaît pas SQLite.
+
+
+    3. BOUNDED CONTEXTS (DDD, Evans) — Un modèle de domaine n'est valide que dans un contexte
+    borné. "Client" dans le contexte Vente n'est pas le même "Client" que dans le contexte
+    Support. Forcer un modèle unique crée un God Object qui couple tous les contextes. Chaque
+    bounded context a son propre vocabulaire (Ubiquitous Language), ses propres types, et ses
+    propres règles. La communication entre contextes passe par des events ou des Anti-Corruption
+    Layers, jamais par des références directes aux types internes d'un autre contexte.
+
+
+    4. AGGREGATES (DDD) — Un agrégat est un cluster d'entités et value objects traité comme
+    une unité de cohérence. L'agrégat root est le seul point d'entrée. Règle : les transactions
+    ne traversent jamais les frontières d'agrégat. Si deux opérations doivent être atomiques
+    et touchent deux agrégats différents, c'est soit un signe que les agrégats sont mal découpés,
+    soit qu'il faut de l'eventual consistency avec des domain events.
+
+
+    5. CONWAY'S LAW — La structure du logiciel reflète la structure de communication de
+    l'organisation qui le produit. Ce n'est pas un bug, c'est une loi. Plutôt que la combattre,
+    l'utiliser : structurer les équipes (ou les agents) pour que leurs frontières de communication
+    correspondent aux frontières architecturales souhaitées. Dans CompanyOS : chaque persona
+    a un périmètre clair (produces/consumes) qui reflète les frontières du système.
+
+
+    6. VERTICAL SLICES vs LAYERED ARCHITECTURE — L'architecture en couches (controllers →
+    services → repositories) découpe par aspect technique. Les vertical slices découpent par
+    fonctionnalité : chaque feature contient son handler, sa validation, son accès DB. Avantage :
+    modifier une feature ne touche qu'un seul slice. Inconvénient : risque de duplication entre
+    slices. Le bon compromis : vertical slices pour les features, couches partagées pour
+    l'infrastructure transverse (auth, logging, error handling).
+
+
+    7. MODULAR MONOLITH — Avant de distribuer en microservices, structurer le monolith en
+    modules à frontières claires. Chaque module a son API publique, ses types internes cachés,
+    et communique avec les autres modules uniquement via l'API publique. Si les frontières
+    sont respectées, extraire un module en service devient une opération mécanique. Si elles
+    ne le sont pas, les microservices ne feront qu'ajouter de la latence réseau à un couplage
+    existant.
+
+
+    8. YAGNI + KISS > ANTICIPATION — Ne pas designer pour des besoins hypothétiques. La bonne
+    quantité de complexité est le minimum nécessaire pour le besoin actuel. Un design "flexible"
+    qui anticipe 5 cas d'usage futurs mais n'en sert qu'un est plus complexe qu'un design rigide
+    qui sert parfaitement le cas actuel. L'extensibilité se gagne par la simplicité, pas par
+    l'abstraction préventive.
+
+  recommendation: >
+    Appliquer ces principes lors de la production de design-docs :
+
+    (1) Identifier les bounded contexts — Avant de modéliser, identifier les frontières
+    contextuelles. Deux concepts avec le même nom dans deux contextes différents sont deux types
+    différents.
+
+    (2) Dependency Rule — Vérifier que les dépendances pointent vers le domaine, jamais
+    l'inverse. Si le domaine import l'infrastructure, refactorer.
+
+    (3) Agrégats minimaux — Chaque agrégat doit être aussi petit que possible. Si un agrégat
+    contient des données qui ne participent pas aux mêmes invariants, le découper.
+
+    (4) YAGNI d'abord — Ne pas ajouter d'abstractions "au cas où". Ajouter une abstraction
+    quand le deuxième cas d'usage concret apparaît, pas avant.
+
+    (5) Vertical slices pour les features — Organiser le code par fonctionnalité métier,
+    pas par couche technique. Partager uniquement l'infrastructure transverse.
+
+    (6) Conway's Law conscient — Vérifier que la structure du code reflète la structure
+    de communication souhaitée entre agents/équipes.

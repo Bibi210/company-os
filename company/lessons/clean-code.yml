@@ -1,0 +1,105 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: e8be5814-8e94-4561-ac6d-27a1785809c7
+  title: "Clean Code : principes fondamentaux pour un code maintenable"
+  author: ceo
+  created_at: "2026-03-15"
+  description: >
+    Synthèse des principes de clean code issus de la recherche sur Ousterhout (A Philosophy of Software Design),
+    Martin (Clean Code), et les pratiques modernes. Focus sur la profondeur des modules, la séparation
+    command/query, le typage expressif, et les pièges courants (DRY mal appliqué, commentaires inutiles).
+  tags:
+    - clean-code
+    - maintainability
+    - software-design
+    - og-memory
+
+spec:
+  context: >
+    Un système multi-agents produit et modifie du code en continu. Sans principes partagés
+    de qualité de code, chaque agent développe ses propres habitudes, le code diverge en style
+    et en structure, et la dette technique s'accumule silencieusement. Il faut un référentiel
+    commun de ce que signifie "bon code" pour que les reviews soient cohérentes et que
+    le code reste maintenable à long terme.
+
+  insight: >
+    Le clean code ne se résume pas à du formatage ou des noms de variables. Les principes
+    structurants sont :
+
+
+    1. MODULES PROFONDS (Ousterhout) — Un bon module offre une interface simple qui cache
+    une implémentation riche. La profondeur = fonctionnalité fournie / complexité de l'interface.
+    Un module "shallow" (beaucoup de paramètres, peu de logique) est un signe de mauvaise
+    abstraction. Exemple : l'API de fichiers Unix (open/read/write/close) est profonde —
+    5 appels cachent des milliers de lignes de gestion de buffers, de filesystem et de permissions.
+    À l'inverse, une classe Java `FileInputStream` qui wrap un `BufferedInputStream` qui wrap
+    un `InputStreamReader` est shallow — la complexité fuit dans l'interface.
+
+
+    2. COMMAND-QUERY SEPARATION (CQS, Meyer) — Une fonction soit modifie l'état (command),
+    soit retourne de l'information (query), jamais les deux. Cela élimine les effets de bord
+    surprenants et rend le code prédictible. Exceptions acceptées : pop() sur une stack,
+    getOrCreate() quand l'atomicité est requise. Mais ce sont des exceptions conscientes,
+    pas des accidents.
+
+
+    3. MAKE ILLEGAL STATES UNREPRESENTABLE — Le typage doit rendre les états invalides
+    impossibles à construire. Plutôt qu'un `status: string` validé à runtime, utiliser un
+    enum `Status::Draft | Status::Published | Status::Archived`. Plutôt qu'un `Option<User>`
+    avec un check `is_authenticated`, utiliser deux types distincts `Anonymous` et `Authenticated(User)`.
+    Le compilateur devient le premier reviewer.
+
+
+    4. SINGLE RESPONSIBILITY correctement comprise — SRP ne signifie pas "une classe fait une
+    chose". Ça signifie "un module n'a qu'une seule raison de changer" (un seul acteur/stakeholder).
+    Une classe `Employee` qui calcule le salaire ET génère le rapport RH a deux raisons de
+    changer (comptabilité et RH). C'est une violation de SRP même si elle ne "fait qu'une chose"
+    (gérer un employé).
+
+
+    5. DRY — PIÈGE PRINCIPAL — Deux blocs de code identiques ne sont pas forcément de la
+    duplication. Si ils changent pour des raisons différentes, les fusionner crée un couplage
+    artificiel. Le vrai DRY élimine la duplication de connaissance (une règle métier exprimée
+    à deux endroits), pas la duplication de texte. Trois lignes similaires valent mieux qu'une
+    abstraction prématurée qui couple deux contextes indépendants.
+
+
+    6. COMMENTAIRES — Un bon commentaire explique POURQUOI, pas QUOI. Le code dit quoi,
+    le commentaire dit pourquoi cette approche a été choisie plutôt qu'une autre. Les commentaires
+    de type `// increment i` ou `// get user` sont du bruit. Les commentaires de type
+    `// On utilise un retry exponentiel ici car le service X a des pics de latence à 17h`
+    sont de la connaissance irremplaçable. Les TODO sont acceptables s'ils sont actionnables
+    et datés.
+
+
+    7. NOMMAGE — Le nom d'une variable/fonction doit refléter son intention, pas son
+    implémentation. `userList` → `activeUsers`. `processData()` → `validateAndRouteOrder()`.
+    La longueur du nom doit être proportionnelle à la portée : `i` est acceptable dans une
+    boucle de 3 lignes, pas dans une variable de module.
+
+
+    8. FONCTIONS — Courtes par nécessité, pas par dogme. Une fonction de 50 lignes qui fait
+    une chose clairement est meilleure que 10 fonctions de 5 lignes qui s'appellent en cascade
+    et forcent le lecteur à naviguer entre 10 endroits. Le critère est la cohésion, pas la taille.
+
+  recommendation: >
+    Appliquer ces principes dans cet ordre de priorité lors de la production et review de code :
+
+    (1) Types expressifs d'abord — Modéliser le domaine avec des types qui rendent les états
+    invalides impossibles. C'est le levier le plus puissant car le compilateur enforce la règle 24/7.
+
+    (2) Modules profonds — Viser des interfaces minimales qui cachent la complexité. Si une
+    fonction prend plus de 3 paramètres, c'est probablement un module shallow qui doit être
+    repensé.
+
+    (3) CQS par défaut — Séparer commands et queries. Documenter explicitement les exceptions.
+
+    (4) Nommage intentionnel — Le nom doit répondre à "qu'est-ce que ça représente dans le
+    domaine ?" pas "comment c'est implémenté ?".
+
+    (5) DRY avec discernement — Avant de factoriser, se demander : "ces deux morceaux
+    changeront-ils pour la même raison ?" Si non, la duplication est acceptable.
+
+    (6) Commentaires stratégiques — Commenter les décisions non évidentes et les contraintes
+    externes. Ne jamais commenter ce que le code dit déjà.
