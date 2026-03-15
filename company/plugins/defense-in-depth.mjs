@@ -134,8 +134,9 @@ function onProtectedZoneWrite(rootDir, relPath) {
 
 // ---------------------------------------------------------------------------
 
-// Test bridge — plain object, not an async function, so opencode ignores it.
-export const _test = {
+// Test bridge — NOT exported. Exporting a plain object crashes the OpenCode plugin loader
+// (it tries to call all exports as plugin functions). Access via globalThis in tests.
+const _test = {
   parsePersonaYaml,
   parseYamlList,
   loadZones,
@@ -145,6 +146,11 @@ export const _test = {
   getCachedCreateHandlers: () => cachedCreateHandlers,
   getZones: () => zones,
 };
+
+// Make _test accessible for tests without exporting it as a named export
+if (typeof globalThis !== "undefined") {
+  globalThis.__defenseInDepthTest = _test;
+}
 
 export const DefenseInDepth = async ({ directory }) => {
   const rootDir = directory;

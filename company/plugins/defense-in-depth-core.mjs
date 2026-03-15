@@ -290,8 +290,11 @@ export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
       // ---------------------------------------------------------------
       // Layer 1: write/edit enforcement
       // ---------------------------------------------------------------
+      // "write"/"edit"         = native OpenCode tools (direct agent session)
+      // "mcp_write"/"mcp_edit" = same tools exposed via MCP to sub-agents (Task tool)
       if (
-        (input.tool === "edit" || input.tool === "write") &&
+        (input.tool === "edit" || input.tool === "write" ||
+         input.tool === "mcp_edit" || input.tool === "mcp_write") &&
         typeof filePath === "string"
       ) {
         const rel = relative(rootDir, resolve(rootDir, filePath));

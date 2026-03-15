@@ -1,0 +1,40 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: cc4d9f8a-f3ff-4c9d-8b70-fd5d79bbd1d7
+  title: "Fix export _test dans defense-in-depth.mjs"
+  author: ceo
+  created_at: "2026-03-15"
+  status: approved
+  description: >
+    Fix de sécurité critique : le plugin defense-in-depth crashe au chargement
+    d'OpenCode car export const _test exporte un plain object, ce qui fait
+    que le loader le confond avec une fonction de plugin et leve
+    fn5 is not a function. Le fix supprime l'export et rend _test local.
+  tags:
+    - security
+    - critical
+    - plugin
+    - defense-in-depth
+
+spec:
+  motivation: >
+    Le plugin defense-in-depth n'a jamais fonctionne depuis sa creation.
+    A chaque chargement d'OpenCode, le loader JS tente d'appeler tous les
+    exports comme des fonctions de plugin. export const _test est un plain
+    object pas une fonction async ce qui provoque le crash immediat.
+    Consequence : AUCUNE protection defense-in-depth n'est active en production.
+  proposal: >
+    Dans company/plugins/defense-in-depth.mjs, ligne 138 :
+    remplacer export const _test par const _test (supprimer le mot export).
+    Les fichiers de test impactes doivent etre mis a jour pour ne plus
+    utiliser named import _test mais acceder via une autre methode.
+  impact: >
+    Le plugin defense-in-depth sera fonctionnel pour la premiere fois.
+    Les tests existants qui utilisent import _test devront etre adaptes.
+  rollback_plan: >
+    Remettre export const _test a la ligne 138.
+  affected_files:
+    - company/plugins/defense-in-depth.mjs
+    - company/plugins/tests/hot-reload.test.mjs
+    - company/plugins/tests/defense-in-depth.test.mjs

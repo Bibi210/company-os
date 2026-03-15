@@ -13,7 +13,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { _test } from "../defense-in-depth.mjs";
+import "../defense-in-depth.mjs";
+const _test = globalThis.__defenseInDepthTest;
 const {
   loadZones,
   invalidateCore,

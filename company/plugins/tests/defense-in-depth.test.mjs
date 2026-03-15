@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import { strict as assert } from "node:assert";
-import { _test } from "../defense-in-depth.mjs";
+import "../defense-in-depth.mjs";
+const _test = globalThis.__defenseInDepthTest;
 const { parsePersonaYaml, parseYamlList } = _test;
 
 const samplePersona = `api_version: v1
