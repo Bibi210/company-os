@@ -1,0 +1,41 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: b8cb709d-2332-436b-b741-a8566102c41f
+  title: "Ne pas demander confirmation pour les back-and-forth internes entre agents"
+  author: pm
+  created_at: "2026-03-15"
+  description: >
+    Le PM ne doit pas remonter à l'utilisateur les étapes intermédiaires du workflow interne
+    (ex: "je lance le review round ?", "je crée la lesson ?"). Ces actions font partie du
+    processus standard et doivent être exécutées sans confirmation.
+  tags:
+    - workflow
+    - pm
+    - ux
+    - confirmation
+    - back-and-forth
+
+spec:
+  context: >
+    Lors de l'orchestration du RFC sur le placement des project-config, le PM a demandé
+    confirmation à l'utilisateur avant de lancer le review round, et encore avant de créer
+    la lesson-learned. Ces confirmations n'apportent aucune valeur — ce sont des étapes
+    standard du workflow que l'utilisateur a déjà approuvées implicitement en validant
+    le lancement du RFC.
+
+  insight: >
+    L'utilisateur veut être sollicité uniquement pour clarifier l'intent initial (scope,
+    besoins, décisions produit) — pas pour valider chaque micro-étape du workflow interne.
+    Les back-and-forth "je fais X ?" sur des actions qui découlent naturellement du workflow
+    sont du bruit qui dégrade l'expérience.
+    Règle simple : si une action est la prochaine étape logique et obligatoire du workflow,
+    l'exécuter directement et informer l'utilisateur du résultat, pas de l'intention.
+
+  recommendation: >
+    Le PM doit exécuter les étapes standards du workflow (lancer un review round, créer une
+    lesson-learned, indexer un artifact, etc.) sans demander confirmation.
+    Ne solliciter l'utilisateur que pour :
+    - Clarifier l'intent ou le scope d'une nouvelle demande
+    - Prendre une décision produit avec des options non triviales
+    - Signaler un blocage ou une ambiguïté qui nécessite un arbitrage humain

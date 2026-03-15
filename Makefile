@@ -1,4 +1,4 @@
-.PHONY: build check fmt clippy lint test test-js validate release ci setup clean
+.PHONY: build check fmt clippy lint test test-js validate check-naming release ci setup clean
 
 ## Default target
 all: setup
@@ -34,12 +34,16 @@ test-js:
 validate:
 	cargo run -p companyos-yaml-validator -- --batch company/
 
+## Check artifact filenames conform to <slug>-<8chars-uuid>.yml convention
+check-naming:
+	./company/scripts/check-artifact-naming.sh .
+
 ## Build release binaries
 release:
 	cargo build --release --workspace
 
 ## Full CI pipeline
-ci: lint test test-js validate
+ci: lint test test-js validate check-naming
 
 ## Clean build artifacts
 clean:

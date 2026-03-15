@@ -1,0 +1,50 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: da65c0c6-e876-4ffd-8db6-97a4af8b7426
+  title: "Defense-in-depth — revert silencieux sur nouveaux fichiers"
+  author: pm
+  created_at: "2026-03-15"
+  project: company-os
+  description: >
+    Le plugin defense-in-depth détecte bien les écritures en zone protégée mais
+    le revert échoue silencieusement pour les nouveaux fichiers (untracked git).
+    Diagnostic initial sur les noms de tools corrigé : le plugin fonctionne bien,
+    c'est le revert qui est incomplet.
+  tags:
+    - defense-in-depth
+    - security
+    - protected-zones
+    - bug
+    - git
+    - revert
+
+spec:
+  status: investigating
+  symptom: >
+    Le PM a écrit company/config/504e2e24-...yml (zone protégée) sans write permit.
+    Le plugin a bien détecté l'écriture et tenté un revert, mais le fichier est
+    resté sur le disque. L'erreur a été retournée à l'agent mais le fichier n'a
+    pas été supprimé.
+
+  root_cause: >
+    Bug 1 — revert incomplet sur fichiers nouveaux (confirmé) :
+    La fonction revertFile() utilise "git checkout -- <file>" qui ne fonctionne
+    que pour les fichiers déjà trackés par git. Pour un nouveau fichier (untracked),
+    git checkout -- ne fait rien et retourne silencieusement sans erreur.
+    Le fichier reste donc sur le disque malgré le blocage.
+    Fix requis : détecter si le fichier est untracked (git ls-files --error-unmatch)
+    et dans ce cas utiliser "rm <file>" au lieu de "git checkout --".
+
+    Bug 2 — noms de tools (hypothèse initiale invalidée) :
+    La première analyse supposait que input.tool valait "mcp_write" et non "write",
+    neutralisant la détection. Cette hypothèse est incorrecte : le plugin a bien
+    détecté et réagi à l'écriture, donc les noms de tools sont corrects dans le
+    runtime OpenCode. À confirmer lors de l'implémentation du fix.
+
+  resolution: >
+    RFC requis pour modifier revertFile() dans defense-in-depth-core.mjs :
+    vérifier si le fichier est untracked avant de choisir la stratégie de revert
+    (git checkout -- pour fichiers trackés, rm pour fichiers nouveaux).
+    Vérifier également que les noms de tools (input.tool) sont bien "write"/"edit"
+    et non "mcp_write"/"mcp_edit" lors de l'implémentation.

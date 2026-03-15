@@ -1,0 +1,34 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 3e7f8d48-a540-4712-8c62-92ae8672604b
+  title: "Créer un project-config au démarrage de tout nouveau projet"
+  author: pm
+  created_at: "2026-03-15"
+  description: >
+    Quand un nouveau projet est initié pour la première fois, il faut créer un artifact
+    project-config avant de créer la task-request, pour enregistrer le projet dans le système.
+  tags:
+    - project-config
+    - workflow
+    - nouveau-projet
+    - onboarding
+
+spec:
+  context: >
+    Lors de la création du projet puissance4-verus, on a directement créé la task-request
+    sans créer au préalable un artifact project-config décrivant le projet (nom, ownership,
+    description). Le projet existe dans le système via ses artifacts mais n'a pas de fiche
+    d'identité formelle dans l'index.
+
+  insight: >
+    Un project-config est la "fiche d'identité" d'un projet dans CompanyOS. Sans lui,
+    le projet n'est pas formellement enregistré dans l'index et ses métadonnées
+    (nom, type d'ownership, repo, description) ne sont pas consultables. C'est l'équivalent
+    d'un README pour le système d'orchestration.
+
+  recommendation: >
+    Dès qu'un nouveau projet est initié (première task-request), créer en premier un artifact
+    project-config dans company/config/<project-slug>.yml (ou projects/<project-slug>/config.yml)
+    avant tout autre artifact. Ce project-config doit contenir au minimum : project_name,
+    ownership (owned/contributed), et une description du projet.

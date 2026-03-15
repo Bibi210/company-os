@@ -1,0 +1,285 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 2492822c-b2ef-43e2-aa00-ff662f82b8c5
+  title: "Convention de nommage des fichiers YAML d'artifacts"
+  author: architect
+  created_at: "2026-03-15"
+  description: >
+    Introduce une convention de nommage lisible pour tous les fichiers YAML d'artifacts
+    CompanyOS : <slug-du-titre>-<8-premiers-chars-uuid>.yml. Interdit les noms UUID purs
+    illisibles. Enforcement CI via make ci (qui dépend de check-naming), migration
+    atomique des fichiers existants, et mise à jour de shared-rules.
+  tags:
+    - naming-convention
+    - yaml
+    - artifacts
+    - ci
+    - migration
+    - readability
+  related:
+    - id: 7bfc784c-51f3-4d82-a9cf-21351e71e1c1
+      relationship: related
+    - id: e1ebf14b-34e8-4884-84e6-2458930006ce
+      relationship: related
+
+spec:
+  status: approved
+  approved_at: "2026-03-15T15:17:19.844899145+00:00"
+
+  motivation: >
+    Depuis la création de CompanyOS, les fichiers YAML d'artifacts sont nommés avec leur UUID
+    complet (ex: ffe3306d-d703-43fd-b11a-d154f67bc719.yml). Ce choix avait l'avantage de
+    l'unicité garantie, mais présente de sérieux problèmes opérationnels en pratique :
+
+    1. ILLISIBILITÉ — Un UUID pur ne donne aucune information sur le contenu du fichier.
+    Dans un listing `ls` ou dans un `git log`, on voit "7bfc784c-51f3-4d82-a9cf-21351e71e1c1.yml"
+    sans savoir s'il s'agit d'un RFC sur le revert defense-in-depth, d'une lesson-learned, ou
+    d'un task-request. Il faut ouvrir chaque fichier pour identifier son contenu.
+
+    2. GIT HISTORY ILLISIBLE — Les commits qui modifient un artifact affichent le nom UUID dans
+    le diff. "modified: e1ebf14b-34e8-4884-84e6-2458930006ce.yml" est incompréhensible sans
+    contexte. "modified: reclassifier-project-config-comme-artifact-projet-e1ebf14b.yml" est
+    immédiatement compréhensible.
+
+    3. NAVIGATION REPO DIFFICILE — Parcourir company/rfcs/ ou company/lessons/ avec des UUIDs
+    purs est impossible sans l'index. Le repo git lui-même doit être navigable sans outil tiers.
+    Un développeur qui clone le repo et fait `ls company/rfcs/` doit comprendre ce qu'il voit.
+
+    4. SLUGS SANS SUFFIXE = COLLISIONS POTENTIELLES — Un slug pur sans suffixe UUID risque des
+    collisions pour des artifacts avec des titres similaires. Le suffixe de 8 chars UUID garantit
+    l'unicité tout en maintenant la lisibilité.
+
+    5. INCOHÉRENCE EXISTANTE — Certains fichiers ont déjà un nom lisible (clean-code.yml,
+    verus-formal-verification.yml) mais sans suffixe UUID, tandis que d'autres sont des UUIDs
+    purs. L'absence de convention unifiée crée une incohérence dans le repo.
+
+  proposal: >
+    Adopter le format universel suivant pour tous les fichiers YAML d'artifacts CompanyOS :
+
+      <slug-du-titre>-<8-premiers-chars-uuid>.yml
+
+    RÈGLES DE CONSTRUCTION DU NOM :
+
+    1. Slug : dérivé de metadata.title, calculé à la création et immuable (non mis à jour
+       si metadata.title change ultérieurement)
+       - Normaliser les caractères accentués avant toute autre opération (é→e, è→e, ê→e,
+         à→a, â→a, ù→u, û→u, î→i, ô→o, ç→c, etc.)
+       - Convertir en lowercase
+       - Remplacer tout caractère non alphanumérique (ni lettre ASCII, ni chiffre) par un tiret
+         (cette règle couvre tous les cas : espaces, tirets longs —, apostrophes ', +, /,
+         (, ), [, ], :, ., et tout autre caractère spécial)
+       - Supprimer les tirets multiples consécutifs (-- → -)
+       - Supprimer les tirets en début/fin
+       - Tronquer le slug à 50 caractères maximum : couper au dernier tiret présent dans les
+         50 premiers caractères (pour ne pas couper un mot en plein milieu) ; si aucun tiret
+         n'existe dans les 50 premiers caractères, tronquer dur à 50
+       - FALLBACK : si le slug résultant est vide (titre entièrement composé de caractères
+         non translittérables), utiliser le kind de l'artifact comme slug
+         (ex : "rfc", "lesson-learned")
+
+    2. Suffixe UUID : les 8 premiers caractères hexadécimaux de metadata.id
+       - Exemple : metadata.id = "ffe3306d-d703-43fd-..." → suffixe = "ffe3306d"
+       - Séparateur : tiret (-)
+
+    3. Extension : .yml (jamais .yaml)
+
+    EXEMPLES CONCRETS (application mécanique de l'algorithme) :
+
+    Exemple A — id: 7bfc784c | title: "Fix revert des fichiers untracked dans defense-in-depth (scope complet)"
+      1. Pas d'accents
+      2. lowercase : "fix revert des fichiers untracked dans defense-in-depth (scope complet)"
+      3. non-alnum→- : "fix-revert-des-fichiers-untracked-dans-defense-in-depth--scope-complet-"
+      4. dédoublon+trim : "fix-revert-des-fichiers-untracked-dans-defense-in-depth-scope-complet"
+      5. longueur 69 > 50 ; dernier - dans les 50 premiers chars est à pos 49 ("-in-")
+         → slug = "fix-revert-des-fichiers-untracked-dans-defense-in" (49 chars)
+      → fix-revert-des-fichiers-untracked-dans-defense-in-7bfc784c.yml
+
+    Exemple B — id: ffe3306d | title: "Puissance 4 — Proof-Driven Development avec Verus + Rust"
+      1. Pas d'accents
+      2. lowercase : "puissance 4 — proof-driven development avec verus + rust"
+      3. non-alnum→- : "puissance-4---proof-driven-development-avec-verus---rust"
+      4. dédoublon+trim : "puissance-4-proof-driven-development-avec-verus-rust"
+      5. longueur 51 > 50 ; dernier - dans les 50 premiers chars est à pos 48 ("-verus-")
+         → slug = "puissance-4-proof-driven-development-avec-verus" (47 chars)
+      → puissance-4-proof-driven-development-avec-verus-ffe3306d.yml
+
+    Exemple C — id: 2492822c | title: "Convention de nommage des fichiers YAML d'artifacts"
+      1. Pas d'accents
+      2. lowercase : "convention de nommage des fichiers yaml d'artifacts"
+      3. non-alnum→- : "convention-de-nommage-des-fichiers-yaml-d-artifacts"
+      4. dédoublon+trim : "convention-de-nommage-des-fichiers-yaml-d-artifacts"
+      5. longueur 50 = 50 → pas de troncature
+      → convention-de-nommage-des-fichiers-yaml-d-artifacts-2492822c.yml
+
+    Exemple D — id: abcd1234 | title: "Créer un project-config au démarrage"
+      1. accents : "Creer un project-config au demarrage"
+      2. lowercase : "creer un project-config au demarrage"
+      3. non-alnum→- : "creer-un-project-config-au-demarrage"
+      4. dédoublon+trim : "creer-un-project-config-au-demarrage"
+      5. longueur 36 ≤ 50 → pas de troncature
+      → creer-un-project-config-au-demarrage-abcd1234.yml
+
+    Exemple E — id: ef012345 | title: "★★★" (fallback slug vide)
+      1-5. Tous les caractères sont non-translittérables → slug vide → fallback : kind
+      → lesson-learned-ef012345.yml
+
+    FORMAT INTERDIT :
+    Tout fichier YAML d'artifact dont le nom correspond au pattern UUID pur est interdit :
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.ya?ml$/
+
+    ENFORCEMENT CI — intégration : make ci dépend de check-naming :
+    Le script est exposé comme cible Make autonome (`make check-naming`).
+    La cible `make ci` existante est enrichie pour dépendre de `check-naming`.
+    Le pre-commit existant appelle déjà `make ci` — il n'est PAS modifié. `check-naming`
+    s'exécute automatiquement via la dépendance Makefile, sans double exécution.
+
+    Ajouts dans le Makefile :
+    ```makefile
+    check-naming:
+        ./company/scripts/check-artifact-naming.sh .
+
+    ci: check-naming  ## check-naming ajouté comme dépendance de ci
+    ```
+
+    Activer le hook une fois la migration terminée (si pas encore configuré) :
+    ```bash
+    git config core.hooksPath .githooks
+    chmod +x .githooks/pre-commit
+    ```
+
+    Contenu du script company/scripts/check-artifact-naming.sh :
+    ```bash
+    #!/usr/bin/env bash
+    # Vérifie qu'aucun fichier YAML d'artifact n'est nommé avec un UUID pur.
+    # Usage : ./company/scripts/check-artifact-naming.sh [root_dir]
+    set -euo pipefail
+    ROOT="${1:-.}"
+    UUID_PATTERN='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.ya?ml$'
+    FOUND=0
+    while IFS= read -r -d '' file; do
+      basename=$(basename "$file")
+      if echo "$basename" | grep -qE "$UUID_PATTERN"; then
+        echo "ERROR: UUID filename forbidden: $file" >&2
+        FOUND=1
+      fi
+    done < <(find "$ROOT/company" "$ROOT/projects" \( -name '*.yml' -o -name '*.yaml' \) -print0 2>/dev/null)
+    if [ "$FOUND" -eq 1 ]; then
+      echo "FAIL: rename artifact files to <slug>-<8chars-uuid>.yml format" >&2
+      exit 1
+    fi
+    echo "OK: all artifact filenames conform to naming convention"
+    ```
+
+    ORDRE D'ACTIVATION — migration atomique obligatoire :
+    Le hook CI NE DOIT PAS être activé avant que la migration soit complète. L'ordre strict est :
+    1. Effectuer TOUS les renommages du Groupe 1 (fichiers UUID purs) en un seul commit git
+    2. Seulement après ce commit : activer le hook via `git config core.hooksPath .githooks`
+    Activer le hook avant la migration provoquerait le rejet de chaque commit intermédiaire.
+
+    FICHIERS NON CONCERNÉS PAR LE CI :
+    Les fichiers avec nom lisible sans suffixe UUID (clean-code.yml, clean-review.yml,
+    clean-design.yml, verus-formal-verification.yml) ne matchent PAS le pattern UUID pur et
+    ne seront donc PAS rejetés par le script CI. Leur migration vers le format complet
+    <slug>-<8chars>.yml est documentée dans l'impact mais reste une migration manuelle
+    non bloquante — elle peut être effectuée dans un commit séparé, après l'activation du hook.
+
+    MISE À JOUR shared-rules.yml :
+    La règle spec.rules.file_placement est enrichie pour documenter le format de nommage :
+    "Le nom du fichier suit le format <slug-du-titre>-<8-premiers-chars-uuid>.yml,
+    où le slug est calculé à la création et est immuable."
+
+  impact: >
+    FICHIERS À MIGRER (liste exhaustive) :
+
+    Groupe 1 — Fichiers UUID purs (rejetés par CI — migration OBLIGATOIRE en commit atomique) :
+    1. company/rfcs/7bfc784c-51f3-4d82-a9cf-21351e71e1c1.yml
+       → company/rfcs/fix-revert-des-fichiers-untracked-dans-defense-in-7bfc784c.yml
+       (title: "Fix revert des fichiers untracked dans defense-in-depth (scope complet)"
+        slug: "fix-revert-des-fichiers-untracked-dans-defense-in", 49 chars)
+
+    2. company/rfcs/e1ebf14b-34e8-4884-84e6-2458930006ce.yml
+       → company/rfcs/reclassifier-project-config-comme-artifact-projet-e1ebf14b.yml
+       (title: "Reclassifier project-config comme artifact projet"
+        slug: "reclassifier-project-config-comme-artifact-projet", 49 chars)
+
+    3. company/lessons/b8cb709d-2332-436b-b741-a8566102c41f.yml
+       → company/lessons/ne-pas-demander-confirmation-pour-les-back-and-b8cb709d.yml
+       (title: "Ne pas demander confirmation pour les back-and-forth internes entre agents"
+        slug: "ne-pas-demander-confirmation-pour-les-back-and", 46 chars)
+
+    4. company/lessons/3e7f8d48-a540-4712-8c62-92ae8672604b.yml
+       → company/lessons/creer-un-project-config-au-demarrage-de-tout-3e7f8d48.yml
+       (title: "Créer un project-config au démarrage de tout nouveau projet"
+        slug: "creer-un-project-config-au-demarrage-de-tout", 44 chars)
+
+    5. projects/company-os/diagnostic-reports/da65c0c6-e876-4ffd-8db6-97a4af8b7426.yml
+       → projects/company-os/diagnostic-reports/defense-in-depth-revert-silencieux-sur-nouveaux-da65c0c6.yml
+       (title: "Defense-in-depth — revert silencieux sur nouveaux fichiers"
+        slug: "defense-in-depth-revert-silencieux-sur-nouveaux", 47 chars)
+
+    6. projects/puissance4-verus/config/504e2e24-8487-46c8-b05e-46b8ae36ed01.yml
+       → projects/puissance4-verus/config/puissance-4-proof-driven-development-504e2e24.yml
+       (title: "Puissance 4 — Proof-Driven Development"
+        slug: "puissance-4-proof-driven-development", 36 chars)
+
+    7. projects/puissance4-verus/task-requests/ffe3306d-d703-43fd-b11a-d154f67bc719.yml
+       → projects/puissance4-verus/task-requests/puissance-4-proof-driven-development-avec-verus-ffe3306d.yml
+       (title: "Puissance 4 — Proof-Driven Development avec Verus + Rust"
+        slug: "puissance-4-proof-driven-development-avec-verus", 47 chars)
+
+    Groupe 2 — Fichiers lisibles sans suffixe UUID (NON rejetés par CI — migration manuelle
+    recommandée, non bloquante, peut être faite dans un commit séparé après activation du hook) :
+    8. company/lessons/clean-code.yml → à renommer avec son metadata.id réel
+    9. company/lessons/clean-review.yml → à renommer avec son metadata.id réel
+    10. company/lessons/clean-design.yml → à renommer avec son metadata.id réel
+    11. company/lessons/verus-formal-verification.yml → à renommer avec son metadata.id réel
+
+    IMPACT SUR LES AGENTS :
+    Avant d'écrire un artifact, chaque agent doit désormais construire le nom de fichier
+    en trois étapes : (1) obtenir l'UUID via generate_id(), (2) construire le slug à partir
+    du titre prévu en appliquant les règles de slugification (normalisation accents, lowercase,
+    tout char non-alphanumérique → tiret, dédoublonnage, troncature à 50 chars sur le slug,
+    fallback kind), (3) assembler <slug>-<8chars>.yml. La règle file_placement dans
+    shared-rules.yml sera mise à jour pour documenter ce comportement obligatoire.
+
+    IMPACT SUR L'INDEX :
+    Après migration, tous les artifacts renommés doivent être re-indexés. L'index MCP
+    utilise metadata.id comme clé primaire — les IDs ne changent pas, seuls les chemins
+    fichiers changent. Un reindex_all() après la migration restaure l'index complet.
+    Les références entre artifacts (metadata.related) utilisent les IDs, pas les chemins :
+    aucune mise à jour des références n'est requise.
+
+    IMPACT CI :
+    Le script check-artifact-naming.sh est exposé via `make check-naming`, dépendance ajoutée
+    à `make ci`. Le pre-commit existant (qui appelle `make ci`) n'est pas modifié.
+    L'activation du hook est différée après la migration atomique du Groupe 1.
+
+  rollback_plan: >
+    En cas de rollback :
+    1. Désactiver le hook : `git config core.hooksPath .git/hooks` (restaurer le défaut)
+    2. Supprimer le script company/scripts/check-artifact-naming.sh
+    3. Retirer la cible check-naming du Makefile et sa dépendance dans ci
+    4. Reverter les renommages de fichiers via git (`git mv` en sens inverse ou `git revert`)
+    5. Reverter la mise à jour de shared-rules.yml (règle file_placement)
+    6. Lancer reindex_all() pour restaurer l'index avec les anciens chemins
+
+    Le rollback est réversible à tout moment via git history.
+    Les metadata.id ne changent jamais — l'index peut être reconstruit à partir des fichiers
+    quel que soit leur nom.
+
+  affected_files:
+    - company/config/shared-rules.yml
+    - company/scripts/check-artifact-naming.sh
+    - Makefile
+    - company/rfcs/7bfc784c-51f3-4d82-a9cf-21351e71e1c1.yml
+    - company/rfcs/e1ebf14b-34e8-4884-84e6-2458930006ce.yml
+    - company/lessons/b8cb709d-2332-436b-b741-a8566102c41f.yml
+    - company/lessons/3e7f8d48-a540-4712-8c62-92ae8672604b.yml
+    - company/lessons/clean-code.yml
+    - company/lessons/clean-review.yml
+    - company/lessons/clean-design.yml
+    - company/lessons/verus-formal-verification.yml
+    - projects/company-os/diagnostic-reports/da65c0c6-e876-4ffd-8db6-97a4af8b7426.yml
+    - projects/puissance4-verus/config/504e2e24-8487-46c8-b05e-46b8ae36ed01.yml
+    - projects/puissance4-verus/task-requests/ffe3306d-d703-43fd-b11a-d154f67bc719.yml

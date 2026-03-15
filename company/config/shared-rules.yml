@@ -123,7 +123,9 @@ spec:
           et un repo_url optionnel.
           C'est aussi le conteneur pour les règles partagées (shared-rules) et toute
           configuration spécifique au projet. Le fichier shared-rules.yml est lui-même un project-config.
-          Artifact global (vit dans company/config/).
+          Artifact projet (vit dans projects/<project-slug>/config/<artifact-id>.yml).
+          Exception : company/config/shared-rules.yml reste dans company/config/ car il représente
+          la configuration système de CompanyOS lui-même.
         schema: company/schemas/project-config.schema.json
       flow-control:
         description: >
@@ -188,8 +190,9 @@ spec:
         Règle de placement des fichiers YAML par kind :
         - Artifacts projet  → projects/<project-slug>/<kind>s/<artifact-id>.yml
         - Artifacts globaux → company/<folder>/<artifact-id>.yml
-        Kinds projet  : task-request, design-doc, implementation-plan, review-report, diagnostic-report
-        Kinds globaux : lesson-learned, persona, rfc, project-config, flow-control, review-protocol,
+        Kinds projet  : task-request, design-doc, implementation-plan, review-report, diagnostic-report,
+                        project-config
+        Kinds globaux : lesson-learned, persona, rfc, flow-control, review-protocol,
                         human-review-triggers, agent-message
         Le project-slug doit être un identifiant kebab-case unique et immuable.
     review_protocol:
@@ -222,23 +225,23 @@ spec:
         signaler le problème dans un diagnostic-report et escalader à l'utilisateur.
         Ne jamais abandonner un workflow en cours à cause d'une coupure MCP transitoire.
     continuous_improvement:
-          description: >
-            Chaque agent doit être consciencieux et proactif dans l'amélioration des processus.
-            Si tu identifies un point de friction, une incohérence, un workflow inefficace ou une
-            opportunité d'amélioration, ne te contente pas de le noter en lesson learned.
-            Si le problème nécessite non pas de changer le contexte (c'est-à-dire solliciter des
-            lessons learned) mais de changer les règles du jeu, les workflows, les outils ou la
-            configuration, propose un RFC pour changer les choses. Les RFC ne sont pas réservés aux
-            demandes explicites de l'utilisateur : tout agent peut en initier un dès qu'il estime
-            que CompanyOS peut être amélioré.
-            L'Architect rédige le RFC, mais l'idée peut venir de n'importe quel persona.
-            Exemples de déclencheurs :
-            - Un workflow qui demande trop d'étapes manuelles
-            - Une règle qui bloque systématiquement sans raison valable
-            - Un schéma trop laxiste
-            - Un manque d'outillage
-            - Une duplication d'information entre fichiers
-            Le cycle reste le même : RFC → review → approbation CEO → remontée utilisateur
-            (optionnelle) → write permit → implémentation.
-            L'objectif n'est pas seulement de proposer des RFC : les problèmes doivent remonter
-            à la surface et être pris en charge.
+      description: >
+        Chaque agent doit être consciencieux et proactif dans l'amélioration des processus.
+        Si tu identifies un point de friction, une incohérence, un workflow inefficace ou une
+        opportunité d'amélioration, ne te contente pas de le noter en lesson learned.
+        Si le problème nécessite non pas de changer le contexte (c'est-à-dire solliciter des
+        lessons learned) mais de changer les règles du jeu, les workflows, les outils ou la
+        configuration, propose un RFC pour changer les choses. Les RFC ne sont pas réservés aux
+        demandes explicites de l'utilisateur : tout agent peut en initier un dès qu'il estime
+        que CompanyOS peut être amélioré.
+        L'Architect rédige le RFC, mais l'idée peut venir de n'importe quel persona.
+        Exemples de déclencheurs :
+        - Un workflow qui demande trop d'étapes manuelles
+        - Une règle qui bloque systématiquement sans raison valable
+        - Un schéma trop laxiste
+        - Un manque d'outillage
+        - Une duplication d'information entre fichiers
+        Le cycle reste le même : RFC → review → approbation CEO → remontée utilisateur
+        (optionnelle) → write permit → implémentation.
+        L'objectif n'est pas seulement de proposer des RFC : les problèmes doivent remonter
+        à la surface et être pris en charge.

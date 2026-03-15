@@ -1,0 +1,71 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: ffe3306d-d703-43fd-b11a-d154f67bc719
+  title: "Puissance 4 — Proof-Driven Development avec Verus + Rust"
+  author: pm
+  created_at: "2026-03-15"
+  project: puissance4-verus
+  description: >
+    Implémentation du jeu Puissance 4 classique en Rust avec une IA minimax,
+    où les preuves formelles Verus remplacent les tests unitaires (PDD).
+    Les spécifications Verus sont tightly coupled à l'implémentation Rust.
+  tags:
+    - rust
+    - verus
+    - formal-verification
+    - pdd
+    - connect-four
+    - minimax
+    - cli
+
+spec:
+  priority: high
+  status: backlog
+
+  context: >
+    Le projet adopte une approche Proof-Driven Development (PDD) : au lieu de tests unitaires,
+    on écrit des preuves formelles Verus directement dans le code Rust. Les preuves sont
+    tightly coupled à l'implémentation — elles vivent dans les mêmes fichiers, pas dans des
+    modules séparés. L'interface initiale est CLI ; l'architecture doit anticiper une UI future
+    sans la construire maintenant.
+
+  what_to_build:
+    - Jeu Puissance 4 classique : grille 6 lignes × 7 colonnes, 2 joueurs (humain vs IA)
+    - IA basée sur minimax (avec élagage alpha-beta si faisable)
+    - Interface CLI jouable en terminal
+    - Preuves Verus intégrées dans le code Rust (pas de fichiers de preuves séparés)
+
+  formal_verification_scope:
+    invariants_du_jeu:
+      - La grille contient uniquement des cellules vides, joueur1 ou joueur2
+      - Un coup ne peut être joué que dans une colonne non pleine (< 6 jetons)
+      - Les jetons tombent toujours à la case la plus basse disponible (gravité)
+      - L'alternance des joueurs est respectée à chaque coup
+      - Une partie terminée (victoire ou match nul) ne peut pas continuer
+
+    correction_detection_victoire:
+      - Soundness — si victoire détectée → il existe bien 4 jetons alignés du même joueur
+      - Completeness — si 4 jetons alignés du même joueur → victoire est détectée
+      - Couvre les 4 directions — horizontal, vertical, diagonale ↗, diagonale ↘
+
+    optimalite_ia_bornee:
+      - L'IA joue toujours un coup légal (colonne valide et non pleine)
+      - À profondeur bornée D (paramètre configurable), l'IA ne perd jamais quand elle joue en premier
+      - La fonction minimax termine toujours (pas de boucle infinie)
+      - Le score retourné est dans les bornes attendues (min_score ≤ score ≤ max_score)
+
+  acceptance_criteria:
+    - Le jeu est jouable en CLI (humain vs IA)
+    - cargo verus passe sans erreur sur toutes les preuves
+    - Les invariants du jeu sont prouvés pour toute séquence de coups valides
+    - La détection de victoire est prouvée sound et complete dans les 4 directions
+    - La propriété d'optimalité bornée de l'IA est prouvée à une profondeur D ≥ 4
+    - Le code compile avec cargo build --release sans warning
+    - L'architecture sépare clairement le game logic, l'IA, et la CLI
+
+  out_of_scope:
+    - Interface graphique (UI) — prévu pour une itération future
+    - Preuve complète d'optimalité (non bornée) de l'IA
+    - Mode multijoueur réseau
+    - Persistance des parties

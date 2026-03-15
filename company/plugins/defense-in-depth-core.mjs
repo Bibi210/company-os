@@ -12,8 +12,8 @@
 //                    | fix:     ...
 
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { resolve, relative } from "node:path";
+import { existsSync, readFileSync, rmdirSync } from "node:fs";
+import { resolve, relative, dirname } from "node:path";
 
 // Bootstrap: the one hardcoded path — everything else is read from it
 const ZONES_FILE = "company/config/protected-zones.json";
@@ -119,8 +119,40 @@ function autoIndex(rootDir, filePath) {
   );
 }
 
+// Supprime les dossiers parents vides remontant jusqu'à la racine projet
+function cleanupEmptyParentDirs(rootDir, filePath) {
+  let dir = dirname(resolve(rootDir, filePath));
+  const root = resolve(rootDir);
+  while (dir !== root && dir.startsWith(root)) {
+    try {
+      rmdirSync(dir); // échoue si non vide — comportement voulu
+      dir = dirname(dir);
+    } catch {
+      break;
+    }
+  }
+}
+
 function revertFile(rootDir, filePath) {
-  run(`git checkout -- "${filePath}"`, rootDir);
+  // Cas A : fichier tracké dans HEAD → restaurer depuis HEAD
+  const isTracked =
+    run(`git ls-files --error-unmatch "${filePath}"`, rootDir) !== null;
+  if (isTracked) {
+    run(`git checkout -- "${filePath}"`, rootDir);
+    return;
+  }
+
+  // Cas B : fichier staged-new (après reset --soft d'un commit) → désindexer
+  const stagedOutput = run(`git ls-files --stage "${filePath}"`, rootDir);
+  if (stagedOutput?.trim()) {
+    run(`git rm --cached "${filePath}"`, rootDir);
+  }
+
+  // Cas B + C : supprimer le fichier du disque
+  run(`rm -f "${filePath}"`, rootDir);
+
+  // Nettoyer les dossiers parents vides créés avec le fichier
+  cleanupEmptyParentDirs(rootDir, filePath);
 }
 
 // Snapshot write_permits to detect tampering via bash
@@ -305,7 +337,7 @@ export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
             if (diffBefore.has(file)) continue;
 
             if (isInProtectedZone(file) && !hasActivePermit(rootDir, file)) {
-              run(`git checkout -- "${file}"`, rootDir);
+              revertFile(rootDir, file);
               throw new Error(
                 diag("ERROR", `Bash modified protected zone: ${file}`, {
                   context: `bash command aftermath check`,
@@ -338,7 +370,7 @@ export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
             if (unauthorized.length > 0) {
               run(`git reset --soft ${state.gitHead}`, rootDir);
               for (const f of unauthorized) {
-                run(`git checkout -- "${f}"`, rootDir);
+                revertFile(rootDir, f);
               }
               throw new Error(
                 diag(

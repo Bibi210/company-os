@@ -1,0 +1,99 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: e1ebf14b-34e8-4884-84e6-2458930006ce
+  title: "Reclassifier project-config comme artifact projet"
+  author: architect
+  created_at: "2026-03-15"
+  status: approved
+  approved_at: "2026-03-15T14:44:46.553890236+00:00"
+  description: >
+    Correction du placement de la règle file_placement dans shared-rules.yml :
+    project-config doit être classé comme artifact projet (projects/<slug>/config/)
+    et non comme artifact global (company/config/).
+  tags:
+    - file-placement
+    - project-config
+    - shared-rules
+    - classification
+  related:
+    - id: 504e2e24-8487-46c8-b05e-46b8ae36ed01
+      relationship: related
+
+spec:
+  motivation: >
+    La règle spec.rules.file_placement dans shared-rules.yml classe actuellement project-config
+    comme un artifact "global" devant vivre dans company/config/. Cette classification est
+    incorrecte pour deux raisons :
+
+    1. Sémantique : un project-config décrit un projet spécifique — son nom (project_name),
+    son type d'ownership, sa description, ses tags. Il est intrinsèquement rattaché à un projet,
+    pas au système CompanyOS dans son ensemble. Le placer dans company/config/ revient à mélanger
+    des configurations système globales (flow-control, review-protocol, personas) avec des
+    configurations spécifiques à chaque projet.
+
+    2. Preuve opérationnelle : lors de la création du projet puissance4-verus, le PM a tenté
+    d'écrire le project-config dans company/config/ et a été bloqué par la zone protégée.
+    Il a dû le placer dans projects/puissance4-verus/config/ à la place — ce qui est exactement
+    le bon endroit. Cette friction confirme que la règle actuelle est mal alignée avec la
+    réalité opérationnelle du système.
+
+    La distinction correcte doit être : company/config/ héberge les artifacts qui s'appliquent
+    à l'ensemble du système CompanyOS (flow-control, review-protocol, human-review-triggers,
+    shared-rules) ; projects/<slug>/config/ héberge la configuration d'un projet spécifique.
+
+  proposal: >
+    Modifier spec.rules.file_placement dans company/config/shared-rules.yml pour
+    reclassifier project-config de "artifact global" à "artifact projet" :
+
+    AVANT :
+      Kinds projet  : task-request, design-doc, implementation-plan, review-report, diagnostic-report
+      Kinds globaux : lesson-learned, persona, rfc, project-config, flow-control, review-protocol,
+                      human-review-triggers, agent-message
+
+    APRÈS :
+      Kinds projet  : task-request, design-doc, implementation-plan, review-report, diagnostic-report,
+                      project-config
+      Kinds globaux : lesson-learned, persona, rfc, flow-control, review-protocol,
+                      human-review-triggers, agent-message
+
+    Changement de placement pour project-config :
+      AVANT : company/config/<artifact-id>.yml
+      APRÈS : projects/<project-slug>/config/<artifact-id>.yml
+
+    Note : le fichier shared-rules.yml lui-même (kind: project-config, project_name: company-os)
+    reste dans company/config/ car il représente la configuration de CompanyOS en tant que projet
+    système — une exception documentée dans le fichier lui-même.
+
+    Mettre également à jour la description du kind project-config dans spec.artifact_catalog.kinds.project-config
+    pour refléter son nouveau statut d'artifact projet et supprimer la mention "Artifact global (vit dans company/config/)".
+
+  impact: >
+    1. Migration des artifacts existants : le project-config de puissance4-verus est déjà au bon
+    endroit (projects/puissance4-verus/config/504e2e24-8487-46c8-b05e-46b8ae36ed01.yml).
+    Aucune migration nécessaire pour ce fichier.
+
+    2. Règle shared-rules.yml : le fichier shared-rules.yml lui-même (kind: project-config) reste
+    dans company/config/ avec une note explicite qu'il s'agit de la configuration du projet
+    CompanyOS lui-même — exception documentée.
+
+    3. Cohérence des zones protégées : company/config/ continue d'héberger uniquement les artifacts
+    système globaux. Les project-configs de nouveaux projets iront naturellement dans
+    projects/<slug>/config/ sans friction avec les protections de zone.
+
+    4. Documentation : la description du kind project-config dans le catalog doit être mise à jour
+    pour clarifier qu'il s'agit d'un artifact projet (et non global).
+
+    5. Impact agents : les agents qui produisent des project-configs (le PM principalement) devront
+    utiliser le bon chemin dès la prochaine tâche. Le changement est rétrocompatible puisque
+    le projet puissance4-verus est déjà conforme.
+
+  rollback_plan: >
+    En cas de rollback, remettre project-config dans la liste des kinds globaux dans
+    spec.rules.file_placement de shared-rules.yml, et mettre à jour la description du kind
+    dans spec.artifact_catalog.kinds.project-config pour réajouter "Artifact global (vit dans company/config/)".
+    Aucune migration de fichier nécessaire car les project-configs projets dans projects/<slug>/config/
+    restent fonctionnels — seule la règle documentée change.
+
+  affected_files:
+    - company/config/shared-rules.yml

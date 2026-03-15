@@ -1,0 +1,192 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 7bfc784c-51f3-4d82-a9cf-21351e71e1c1
+  title: "Fix revert des fichiers untracked dans defense-in-depth (scope complet)"
+  author: architect
+  created_at: "2026-03-15"
+  description: >
+    Correction complète du bug de revert dans defense-in-depth-core.mjs :
+    revertFile() et les deux autres sites d'appel inline (bash aftermath L308
+    et post-reset-soft L339-341) ne gèrent pas les fichiers untracked.
+    Le RFC élargit le scope pour centraliser toute logique de revert dans
+    revertFile() et couvrir les cas tracked, untracked, et staged-after-reset.
+  tags:
+    - defense-in-depth
+    - security
+    - bug-fix
+    - git
+    - protected-zones
+    - refactor
+  related:
+    - id: da65c0c6-e876-4ffd-8db6-97a4af8b7426
+      relationship: related
+
+spec:
+  status: approved
+  approved_at: "2026-03-15T14:56:23.388043481+00:00"
+  motivation: >
+    La fonction revertFile() et deux autres sites dans defense-in-depth-core.mjs
+    utilisent exclusivement `git checkout -- <file>` pour annuler des écritures
+    non autorisées. Cette commande ne fonctionne que pour les fichiers déjà
+    trackés ET non stagés. Trois cas de défaillance existent :
+
+    CAS 1 — revertFile() (L122-124), appelée depuis Layer 1 (write/edit sans permit)
+    et depuis la validation YAML :
+    Pour un fichier nouveau (untracked), `git checkout -- <file>` retourne
+    silencieusement sans rien faire. Le fichier reste sur le disque.
+    Preuve opérationnelle : diagnostic-report da65c0c6 — le PM a écrit
+    company/config/504e2e24-...yml sans permit, le plugin a bloqué mais le fichier
+    est resté sur le disque.
+
+    CAS 2 — Bash aftermath L308 (`git diff --name-only`) :
+    `git diff --name-only` ne liste que les fichiers trackés modifiés. Un fichier
+    untracked créé via bash n'y apparaît jamais, donc ce chemin ne détecte pas
+    l'intrusion. L'appel `git checkout --` sur ce site est cohérent avec la
+    détection existante (qui ne voit que des fichiers trackés), mais l'angle mort
+    de détection doit être documenté. Résolution dans ce RFC : centraliser l'appel
+    via revertFile() pour la cohérence, et documenter l'angle mort restant.
+
+    CAS 3 — Post-reset-soft L339-341 (commit non autorisé) :
+    Scénario : un agent crée un nouveau fichier dans une zone protégée et le
+    commite. Le plugin détecte l'intrusion, exécute `git reset --soft <prev-HEAD>`
+    pour défaire le commit, puis tente `git checkout -- <file>` pour chaque
+    fichier non autorisé. Après un reset --soft, les fichiers du commit passent
+    en état "staged" (index). Pour un fichier qui était untracked avant le commit,
+    il est désormais staged-new ; `git checkout -- <file>` sur un fichier staged
+    mais sans version antérieure dans HEAD ne fait rien. Le fichier reste sur le
+    disque (staged ou untracked selon le cas). C'est le risque le plus critique :
+    un agent peut contourner la protection en committant un fichier dans une zone
+    protégée — le reset se fait mais le fichier survit.
+
+    CAS 4 (finding mineur) — sous-dossiers vides :
+    Si un agent crée un nouveau répertoire dans une zone protégée et y place un
+    fichier, `rm -f <file>` supprime le fichier mais laisse le répertoire vide.
+    Impact limité (répertoire vide inerte) mais source de bruit dans `git status`.
+
+  proposal: >
+    Option A — Refactorisation centralisée (retenue).
+
+    Toute logique de revert passe par revertFile(). Les appels inline à
+    `git checkout --` aux lignes 308 et 341 sont remplacés par des appels à
+    revertFile(). La fonction revertFile() est enrichie pour couvrir trois cas :
+
+    A) Fichier tracké (existait déjà dans git) → git checkout -- <file>
+    B) Fichier staged-new (untracked commité puis reset --soft) → git rm --cached <file> && rm -f <file>
+    C) Fichier untracked (jamais stagé ni tracké) → rm -f <file>
+
+    La détection se fait par deux commandes git :
+    - `git ls-files --error-unmatch <file>` : exit 0 = tracké (cas A)
+    - `git ls-files --stage <file>` : sortie non vide = staged-new (cas B)
+    - sinon : untracked pur (cas C)
+
+    Pour le finding mineur (sous-dossiers vides), une fonction
+    cleanupEmptyParentDirs() supprime récursivement les dossiers parents vides
+    jusqu'à la racine du projet, sans toucher aux dossiers non vides.
+
+    Implémentation JS complète proposée :
+
+    ```js
+    import { rmdirSync } from "node:fs";
+    import { dirname } from "node:path";
+
+    // Supprime les dossiers parents vides remontant jusqu'à la racine projet
+    function cleanupEmptyParentDirs(rootDir, filePath) {
+      let dir = dirname(resolve(rootDir, filePath));
+      const root = resolve(rootDir);
+      while (dir !== root && dir.startsWith(root)) {
+        try {
+          rmdirSync(dir); // échoue si non vide — comportement voulu
+          dir = dirname(dir);
+        } catch {
+          break;
+        }
+      }
+    }
+
+    function revertFile(rootDir, filePath) {
+      // Cas A : fichier tracké dans HEAD → restaurer depuis HEAD
+      const isTracked =
+        run(`git ls-files --error-unmatch "${filePath}"`, rootDir) !== null;
+      if (isTracked) {
+        run(`git checkout -- "${filePath}"`, rootDir);
+        return;
+      }
+
+      // Cas B : fichier staged-new (après reset --soft d'un commit) → désindexer
+      const stagedOutput =
+        run(`git ls-files --stage "${filePath}"`, rootDir);
+      if (stagedOutput?.trim()) {
+        run(`git rm --cached "${filePath}"`, rootDir);
+      }
+
+      // Cas B + C : supprimer le fichier du disque
+      run(`rm -f "${filePath}"`, rootDir);
+
+      // Nettoyer les dossiers parents vides créés avec le fichier
+      cleanupEmptyParentDirs(rootDir, filePath);
+    }
+    ```
+
+    Note : `run()` retourne null en cas d'erreur (exit code non-0).
+    `git ls-files --error-unmatch` retourne exit 1 si non tracké → null.
+    `git ls-files --stage` retourne une ligne si le fichier est dans l'index,
+    chaîne vide sinon — les deux cas retournent exit 0.
+
+    Changements aux sites d'appel inline :
+
+    Ligne 308 (bash aftermath — fichier tracké modifié) :
+    ```js
+    // Avant
+    run(`git checkout -- "${file}"`, rootDir);
+    // Après
+    revertFile(rootDir, file);
+    ```
+
+    Lignes 339-341 (post-reset-soft — commit non autorisé) :
+    ```js
+    // Avant
+    for (const f of unauthorized) {
+      run(`git checkout -- "${f}"`, rootDir);
+    }
+    // Après
+    for (const f of unauthorized) {
+      revertFile(rootDir, f);
+    }
+    ```
+
+    Note sur l'angle mort L308 (bash aftermath) :
+    Même après ce fix, `git diff --name-only` ne liste pas les fichiers untracked
+    créés via bash. Un fichier untracked créé dans une zone protégée via bash
+    ne sera pas détecté par cette couche. Ce cas reste un angle mort documenté.
+    La correction complète (ajouter `git ls-files --others` à la détection bash)
+    est hors scope de ce RFC et fera l'objet d'un RFC séparé si jugée nécessaire.
+
+  impact: >
+    Scope élargi par rapport à la version v1 du RFC, mais toujours contenu dans
+    un seul fichier. Deux sites d'appel inline supplémentaires sont centralisés
+    via revertFile(). Une fonction auxiliaire cleanupEmptyParentDirs() est ajoutée,
+    ainsi que deux imports supplémentaires (rmdirSync, dirname) en tête de module.
+    Aucun changement de signature publique, aucune modification des exports,
+    aucun changement d'interface MCP. Le comportement pour les fichiers trackés
+    (cas nominal) est identique.
+
+  rollback_plan: >
+    Revenir aux implémentations originales :
+
+    ```js
+    function revertFile(rootDir, filePath) {
+      run(`git checkout -- "${filePath}"`, rootDir);
+    }
+    ```
+
+    Et restaurer les appels inline :
+    - L308 : `run(\`git checkout -- "${file}"\`, rootDir);`
+    - L341 : `run(\`git checkout -- "${f}"\`, rootDir);`
+
+    Supprimer cleanupEmptyParentDirs() et ses imports (rmdirSync, dirname).
+    Le rollback est immédiat. La version précédente était correcte pour les
+    fichiers trackés (seul cas couvert).
+
+  affected_files:
+    - "company/plugins/defense-in-depth-core.mjs"
