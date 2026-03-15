@@ -1,0 +1,158 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 3e318c7e-b226-45d0-9e00-70c056cea411
+  title: "Enrichir project-config pour formaliser la distinction owned / contributed"
+  author: architect
+  created_at: "2026-03-15"
+  status: implemented
+  approved_at: "2026-03-15T18:00:31.222278379+00:00"
+  description: >
+    Enrichit le schéma project-config.schema.json pour formaliser la sémantique des deux
+    types d'ownership (owned vs contributed) : rend repo_url obligatoire, ajoute un objet
+    contribution_rules pour documenter les règles de contribution des projets owned, et
+    documente la sémantique de chaque valeur d'ownership directement dans le schéma.
+  tags:
+    - schema
+    - project-config
+    - ownership
+    - owned
+    - contributed
+    - contribution-rules
+  related:
+    - id: f3b8bbb1-b551-45e0-a2af-77e79589eb50
+      kind: lesson-learned
+      relationship: derived-from
+
+spec:
+  motivation: >
+    Le schéma project-config actuel ne reflète pas la distinction sémantique entre un projet
+    "owned" (dépôt sous notre contrôle, CI et règles de contribution que l'on définit) et un
+    projet "contributed" (dépôt tiers, on est contributeur soumis aux règles du projet hôte).
+
+    Trois lacunes concrètes ont été identifiées lors du bootstrapping du projet puissance4-verus
+    (lesson f3b8bbb1-b551-45e0-a2af-77e79589eb50) :
+
+    1. repo_url est optionnel : rien n'oblige à renseigner le dépôt cible au moment de la
+    création du project-config. Dans le cas "owned", le dépôt doit être prévu dès le début,
+    même s'il n'existe pas encore. Dans le cas "contributed", c'est l'URL upstream obligatoire
+    pour savoir où contribuer.
+
+    2. Aucun endroit formel pour documenter les règles de contribution d'un projet owned :
+    branch strategy, commande CI, politique de review. Ces informations sont aujourd'hui
+    soit absentes, soit éparpillées dans des commentaires informels.
+
+    3. La sémantique de "owned" et "contributed" n'est documentée nulle part dans le schéma
+    lui-même. Un agent qui lit le schéma ne sait pas ce que ces valeurs impliquent
+    opérationnellement.
+
+  proposal: >
+    Trois changements au fichier company/schemas/project-config.schema.json.
+
+
+    BEFORE :
+
+      "spec": {
+        "type": "object",
+        "properties": {
+          "repo_url": { "type": "string" },
+          "ownership": {
+            "type": "string",
+            "enum": ["owned", "contributed"]
+          }
+        },
+        "required": ["ownership"]
+      }
+
+
+    AFTER :
+
+      "spec": {
+        "type": "object",
+        "properties": {
+          "repo_url": {
+            "type": "string",
+            "description": "URL du dépôt git associé au projet. Pour owned : URL du dépôt que l'on gère (peut être un nom prévu si le dépôt n'est pas encore créé, ex: github.com/org/project-name). Pour contributed : URL du dépôt upstream tiers."
+          },
+          "ownership": {
+            "type": "string",
+            "description": "Type de relation au dépôt git. 'owned' = on crée et gère le dépôt, on définit la CI et les règles de contribution, on est maître des décisions. 'contributed' = le dépôt appartient à un tiers (open source, client, partenaire), on est contributeur individuel soumis à ses règles.",
+            "enum": ["owned", "contributed"]
+          },
+          "contribution_rules": {
+            "type": "object",
+            "description": "Règles de contribution spécifiques au projet. Principalement utile pour les projets owned où l'on définit soi-même ces règles. Peut aussi être renseigné pour les projets contributed si l'on veut documenter les règles du projet hôte.",
+            "properties": {
+              "branch_strategy": {
+                "type": "string",
+                "description": "Stratégie de branches du projet (ex: 'main + feature branches', 'trunk-based development', 'gitflow')."
+              },
+              "ci_command": {
+                "type": "string",
+                "description": "Commande à exécuter pour valider le projet en CI (ex: 'make ci', 'cargo test', 'npm test && npm run lint')."
+              },
+              "review_policy": {
+                "type": "string",
+                "description": "Politique de review des pull/merge requests (ex: '1 approval required', '2 approvals for main, 1 for feature branches')."
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "required": ["ownership", "repo_url"]
+      }
+
+
+    Migration des project-config existants : les artifacts sans repo_url devront être mis à jour.
+    Deux artifacts sont concernés par cette migration :
+
+    1. puissance4-verus (projects/puissance4-verus/config/
+       puissance-4-proof-driven-development-504e2e24.yml) — projet owned, ajouter
+       repo_url avec l'URL prévu du dépôt (ex: github.com/bibux/puissance4-verus).
+
+    2. shared-rules.yml (company/config/shared-rules.yml, id: f8f5c8d2-ef11-4756-8c9c-c3624bc128e2)
+       — config système de CompanyOS, ownership: owned. Décision architecturale : Option A retenue.
+       CompanyOS est lui-même un projet géré dans un dépôt git ("CompanyOS est un projet comme les
+       autres" — shared-rules.yml, spec.companyos_is_a_project). Ajouter repo_url pointant vers le
+       dépôt du système (https://github.com/Bibi210/company-os). Aucune exception de schéma n'est
+       nécessaire : la règle générale s'applique uniformément. Les options alternatives ont été
+       écartées :
+       - Option B (exception schéma pour configs système) : introduit une complexité inutile pour
+         un seul cas, et contredit le principe "CompanyOS est un projet comme les autres".
+       - Option C (changer le kind de shared-rules.yml) : hors scope de ce RFC, disproportionné.
+
+    Cette migration est non destructive.
+
+  impact: >
+    Breaking change limité : le passage de repo_url de optionnel à obligatoire invalide les
+    project-config existants sans ce champ. Au moment de ce RFC, deux project-config sont
+    concernés :
+    1. puissance4-verus (projects/puissance4-verus/config/
+       puissance-4-proof-driven-development-504e2e24.yml, id: 504e2e24-8487-46c8-b05e-46b8ae36ed01) :
+       ajouter        repo_url avec l'URL du dépôt prévu.
+    2. shared-rules.yml (company/config/shared-rules.yml, id: f8f5c8d2-ef11-4756-8c9c-c3624bc128e2) :
+       ajouter repo_url: https://github.com/Bibi210/company-os
+    Migration requise pour ces deux artifacts.
+
+    Les champs contribution_rules et les descriptions sont purement additifs et n'impactent
+    aucun artifact existant. L'ajout de additionalProperties: false dans contribution_rules
+    est limité au sous-objet et ne touche pas spec dans son ensemble.
+
+    Impact sur les agents : ils devront désormais renseigner repo_url à la création de tout
+    nouveau project-config. La description inline de chaque valeur d'ownership améliore la
+    lisibilité du schéma sans changer la validation.
+
+  rollback_plan: >
+    En cas de problème après implémentation :
+    1. Restaurer company/schemas/project-config.schema.json à son état précédent via git revert
+       (repo_url redevient optionnel, suppression de contribution_rules et des descriptions).
+    2. Le champ repo_url ajouté dans puissance4-verus peut rester sans impact négatif —
+       il redevient simplement optionnel dans l'ancien schéma.
+    3. Les éventuels champs contribution_rules ajoutés dans des project-config sont ignorés
+       par l'ancien schéma (additionalProperties non contraint dans l'ancien spec).
+    Le rollback est sans perte de données et réversible par simple git revert du fichier schéma.
+
+  affected_files:
+    - company/schemas/project-config.schema.json
+    - projects/puissance4-verus/config/puissance-4-proof-driven-development-504e2e24.yml
+    - company/config/shared-rules.yml
