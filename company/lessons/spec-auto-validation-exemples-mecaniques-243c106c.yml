@@ -1,0 +1,41 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 243c106c-77ad-482a-8bd8-9af637c9051f
+  title: "Une spec qui ne s'auto-valide pas avec ses propres exemples est insuffisante"
+  author: pm
+  created_at: "2026-03-15"
+  description: >
+    Lors du RFC sur le naming des fichiers YAML, 3 rounds de review ont été nécessaires
+    car les exemples ne correspondaient pas à l'application mécanique de l'algorithme décrit.
+    Pattern général : une spec dont les exemples ne sont pas reproductibles mécaniquement
+    est une spec incomplète.
+  tags:
+    - rfc
+    - spec
+    - examples
+    - review
+    - algorithme
+  related: []
+
+spec:
+  context: >
+    Le RFC de naming (`2492822c`) a nécessité 3 rounds de review au lieu d'un.
+    La cause principale : les exemples de slugs dans la proposal avaient été construits
+    avec du jugement éditorial (suppression d'articles, troncatures approximatives)
+    plutôt qu'en appliquant mécaniquement l'algorithme décrit. L'Implementer ne pouvait
+    pas reproduire les exemples sans ambiguïté — ce qui rendait la spec non-actionnable.
+
+  insight: >
+    Une spec technique est insuffisante si ses propres exemples ne sont pas reproductibles
+    par application mécanique des règles qu'elle décrit. Les exemples ne sont pas là pour
+    illustrer vaguement — ils sont le test de cohérence interne de la spec.
+    Si un implémenteur doit exercer du jugement éditorial pour reproduire un exemple,
+    c'est que la spec contient une ambiguïté non résolue.
+
+  recommendation: >
+    Toute spec qui décrit un algorithme déterministe (slugification, nommage, transformation)
+    doit inclure des exemples calculés mécaniquement, étape par étape, avec les valeurs
+    intermédiaires annotées. Avant de soumettre un RFC en review, l'auteur doit vérifier
+    que chaque exemple est reproductible en suivant exactement les règles décrites —
+    sans jugement éditorial.

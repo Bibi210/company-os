@@ -1,0 +1,161 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: f4fe8a04-b654-42a1-b055-bf0b991bbb3a
+  title: "Mémoire collective active : lookup ciblé, lessons systématiques et chaining"
+  author: architect
+  created_at: "2026-03-15"
+  status: approved
+  approved_at: "2026-03-15T15:45:53.576008930+00:00"
+  description: >
+    RFC pour renforcer l'utilisation de la mémoire collective dans CompanyOS. Trois nouvelles
+    règles dans shared-rules.yml : lookup de mémoire par curation avant d'agir, création
+    systématique de lessons après chaque artifact, et chaînage des lessons entre elles.
+  tags:
+    - memory
+    - lessons-learned
+    - knowledge-management
+    - agent-behavior
+    - shared-rules
+
+spec:
+  motivation: >
+    La mémoire collective de CompanyOS (lessons-learned, index d'artifacts) s'accumule mais
+    reste sous-exploitée. Les agents partent du principe qu'ils savent — ils ne consultent
+    pas les lessons avant d'agir, et n'en génèrent pas assez après.
+
+    Le problème est double :
+
+    1. Côté consultation : la règle `artifact_index` demande de faire search() puis get() avant
+    de produire, mais elle est perçue comme un ritual mécanique (« cocher la case »). Les agents
+    font des get() systématiques sur tout ce que search() retourne, noyant leur contexte sans
+    vraiment filtrer — ou inversement, ignorent complètement l'index. Ce qu'il manque, c'est
+    la notion de JUGEMENT : lire les résumés, évaluer la pertinence, et n'aller en profondeur
+    que sur ce qui éclaire réellement la décision en cours.
+
+    2. Côté production : la règle `lessons` ne prescrit que la mécanique de déduplication
+    (chercher avant de créer). Elle ne dit pas QUAND créer une lesson ni comment relier les
+    lessons entre elles. Résultat : les lessons sont créées sporadiquement, principalement
+    après des erreurs, et forment un ensemble de fiches isolées plutôt qu'un graphe de
+    connaissances interconnecté.
+
+    L'objectif de ce RFC est de transformer les règles existantes — qui définissent ce qu'il
+    faut faire — en règles qui définissent aussi la QUALITÉ d'exécution attendue : curation
+    plutôt que mécanique, systématicité plutôt que sporadicité, graphe plutôt que pile.
+
+  proposal: >
+    Ajouter trois nouvelles règles dans `spec.rules` de `company/config/shared-rules.yml`.
+    Ces règles COMPLÈTENT (ne remplacent pas) les règles `artifact_index` et `lessons`
+    existantes — elles précisent le comment et le quand là où ces dernières définissent le quoi.
+
+    ---
+
+    RÈGLE 1 — `memory_lookup_before_acting`
+
+    Avant de produire tout artifact (RFC, design-doc, implementation-plan, diagnostic-report,
+    task-request), tout agent doit effectuer un lookup de mémoire en trois temps :
+
+    Étape 1 — Scanner : appeler search(query) sur le sujet de l'artifact. Lire attentivement
+    les résumés retournés (titre, description, tags). Ce scan est toujours fait, sans exception.
+
+    Étape 2 — Curate : juger quels artifacts éclairent réellement la décision en cours.
+    Appeler get(id) uniquement sur ceux-là. Il n'y a ni quota minimum ni maximum — c'est du
+    jugement. Parfois 0 get() si rien n'est pertinent, parfois plusieurs si le sujet est dense
+    ou si des décisions passées ont un impact direct.
+
+    Étape 3 — Naviguer (optionnel) : une fois un artifact pertinent identifié via get(), appeler
+    related(id) pour remonter les chaînes de connaissance liées. Cela permet de découvrir des
+    lessons ou décisions en amont qui ne seraient pas remontées par le search() initial. Cette
+    étape est optionnelle — elle se justifie quand le sujet est complexe ou interconnecté.
+
+    L'objectif est la CURATION, pas la conformité. Un lookup mécanique qui noie le contexte
+    avec des get() non filtrés est aussi problématique qu'une absence de lookup. Le critère
+    de qualité : « Est-ce que ce que j'ai lu change ou confirme ma décision ? »
+
+    ---
+
+    RÈGLE 2 — `lesson_after_every_artifact`
+
+    Précise et complète la règle `lessons` existante — les deux s'appliquent conjointement.
+    La règle `lessons` dit COMMENT créer (chercher avant, dédupliquer). Cette règle dit QUAND
+    créer et pour quels kinds.
+
+    Une lesson-learned doit être créée après les artifacts de résultat suivants — pas seulement
+    après les erreurs, ce qui a bien fonctionné mérite aussi d'être capturé :
+
+    Déclencheurs (kinds concernés) :
+    - RFC approuvé → lesson sur ce qui a motivé le changement et ce qu'on a appris du processus
+    - Design-doc approuvé → lesson sur les décisions architecturales clés et leur rationale
+    - Implementation-plan terminé → lesson sur les surprises rencontrées (bon et mauvais)
+    - Diagnostic-report résolu → lesson sur la root cause et comment éviter le problème
+    - Review round difficile (plusieurs request_changes successifs) → lesson sur pourquoi
+      le premier jet était insuffisant et ce qui a débloqué la situation
+
+    Kinds explicitement exclus (coordination pure, pas de résultat capitalisable) :
+    - `review-report` — vote intermédiaire, pas un résultat en soi
+    - `agent-message` — échange de coordination, pas de connaissance à capitaliser
+    - `task-request` — entrée du workflow, pas un résultat
+    - `lesson-learned` — créer une lesson sur une lesson crée une récursivité sans fin
+
+    Exception : si une lesson très similaire existe déjà et couvre le sujet de façon complète,
+    l'améliorer plutôt qu'en créer une nouvelle (utiliser supersedes dans metadata.related).
+    La recherche préalable (rule `lessons`) détermine si on crée ou améliore.
+
+    ---
+
+    RÈGLE 3 — `lesson_chaining`
+
+    Toute nouvelle lesson doit référencer les lessons existantes liées dans metadata.related.
+    La mémoire est un graphe, pas une pile de fiches isolées.
+
+    Types de liens à utiliser :
+    - `supersedes` : la nouvelle lesson corrige ou remplace une ancienne (ex. : apprentissage
+      contredit par l'expérience)
+    - `derived-from` : la nouvelle lesson est une spécialisation d'une lesson plus générale
+      (ex. : « erreur de validation YAML en RFC » dérive de « erreur de validation YAML »)
+    - `related` : deux lessons parlent du même pattern sans que l'une remplace l'autre
+      (ex. : deux lessons sur des anti-patterns de workflow différents mais liés)
+
+    Le lookup (search() + get() parcimonieux, cf. `memory_lookup_before_acting`) avant de
+    créer une lesson est obligatoire — pas pour éviter de créer, mais pour savoir où la lesson
+    s'insère dans la chaîne de connaissances existante.
+
+    Cas zéro : si aucune lesson liée n'existe dans l'index, metadata.related peut rester vide.
+    L'absence de lien est une information valide — elle signifie que cette lesson ouvre un
+    nouveau fil dans la mémoire collective.
+
+  impact: >
+    Changement de comportement pour tous les agents, sans migration de fichiers ni modification
+    de schémas.
+
+    Ce qui change dans la pratique :
+    - Avant chaque artifact : un scan search() suivi d'un get() sélectif basé sur la pertinence
+      réelle, au lieu d'un ritual mécanique ou d'une absence de lookup.
+    - Après chaque artifact : une lesson-learned créée systématiquement, avec des déclencheurs
+      explicites qui couvrent les succès autant que les échecs.
+    - À chaque nouvelle lesson : un chaînage vers les lessons existantes liées, construisant
+      progressivement un graphe de connaissances navigable.
+
+    Ce qui ne change pas :
+    - Les règles `artifact_index` et `lessons` existantes restent en vigueur — les nouvelles
+      règles les précisent et les renforcent, elles ne les remplacent pas.
+    - Aucun fichier existant à modifier (pas de migration, pas de re-indexation).
+    - Aucun schéma à changer — les champs utilisés (metadata.related, metadata.tags,
+      metadata.description) sont déjà présents.
+
+    Risque principal : surcharge cognitive si les agents interprètent les déclencheurs de
+    `lesson_after_every_artifact` comme exhaustifs et créent des lessons triviales. La règle
+    de déduplication (Exception dans la règle 2) et le jugement attendu dans
+    `memory_lookup_before_acting` sont les garde-fous contre ce risque.
+
+  rollback_plan: >
+    En cas d'effets négatifs observés (surcharge de context, création excessive de lessons
+    triviales, dégradation de la qualité des artifacts) :
+    1. Retirer les trois règles ajoutées de shared-rules.yml via un nouveau RFC de rollback.
+    2. Les lessons créées pendant la période d'application restent dans l'index — elles ne
+       sont pas supprimées (elles enrichissent la mémoire même si les règles sont annulées).
+    3. Le comportement revient automatiquement aux règles `artifact_index` et `lessons`
+       existantes, sans autre intervention.
+
+  affected_files:
+    - "company/config/shared-rules.yml"

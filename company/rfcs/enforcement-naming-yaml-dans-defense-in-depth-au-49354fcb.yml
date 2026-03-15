@@ -1,0 +1,220 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 49354fcb-fae0-4e6d-9890-4ff70453be1e
+  title: "Enforcement naming YAML dans defense-in-depth au moment du write"
+  author: architect
+  created_at: "2026-03-15"
+  description: >
+    Ajoute dans defense-in-depth-core.mjs un check de naming qui bloque l'écriture
+    d'un artifact YAML dont le nom est un UUID pur, au moment du write/edit,
+    avant même la validation de schéma. Délègue la vérification au script existant
+    check-artifact-naming.sh (source de vérité unique) via make check-naming.
+  tags:
+    - defense-in-depth
+    - naming-convention
+    - yaml
+    - artifacts
+    - enforcement
+  related:
+    - id: 2492822c-b2ef-43e2-aa00-ff662f82b8c5
+      relationship: related
+
+spec:
+  status: approved
+  approved_at: "2026-03-15T15:32:02.022386136+00:00"
+
+  motivation: >
+    Le RFC 2492822c a établi la convention de nommage <slug>-<8chars-uuid>.yml et un script
+    CI (make check-naming) qui rejette les UUID purs au moment du commit. Cette approche
+    est utile mais incomplète : elle détecte la violation trop tard, après que le fichier
+    a été écrit sur disque, potentiellement indexé, et possiblement utilisé par d'autres
+    outils dans la chaîne.
+
+    Le plugin defense-in-depth est conçu exactement pour ce type de garde-fou : intercepter
+    les writes illicites au moment où ils se produisent, les réverter, et renvoyer un
+    diagnostic clair. Le naming est une contrainte structurelle autant que le schéma YAML
+    ou les zones protégées — il mérite le même niveau d'enforcement.
+
+    Actuellement, un agent peut écrire un fichier nommé
+    `49354fcb-fae0-4e6d-9890-4ff70453be1e.yml` et ce fichier passera la validation de
+    schéma, sera auto-indexé, et ne sera rejeté que lors du prochain `make ci` ou commit.
+    Ce délai crée une incohérence dans l'index et laisse des fichiers mal nommés dans
+    le repo pendant toute la durée d'une session de travail.
+
+    En ajoutant le check dans defense-in-depth on obtient :
+    - Un blocage immédiat avec diagnostic actionnable
+    - Cohérence avec la philosophie du plugin (bloquer en amont, pas corriger après)
+    - Double enforcement : au write (defense-in-depth) ET au commit (CI), sans redondance
+      inutile (les deux couches ont des rôles distincts)
+    - Source de vérité unique : la regex et les dossiers concernés restent dans
+      check-artifact-naming.sh ; defense-in-depth délègue, ne duplique pas
+
+  proposal: >
+    DEUX FICHIERS MODIFIÉS :
+
+    ── 1. company/scripts/check-artifact-naming.sh ──────────────────────────────
+
+    Le script actuel scanne tout le repo. Il faut ajouter un mode fichier unique :
+    si la variable FILE est passée en argument, vérifier uniquement ce fichier
+    (code de sortie 1 si UUID pur, 0 sinon). Sinon, comportement inchangé (scan global).
+
+    Nouvelle version :
+
+    ```bash
+    #!/usr/bin/env bash
+    # Vérifie qu'aucun fichier YAML d'artifact n'est nommé avec un UUID pur.
+    # Usage : ./company/scripts/check-artifact-naming.sh [root_dir]
+    #         FILE=<relative-path> ./company/scripts/check-artifact-naming.sh [root_dir]
+    set -euo pipefail
+    ROOT="${1:-.}"
+    UUID_PATTERN='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.ya?ml$'
+
+    # Mode fichier unique (appelé par defense-in-depth au moment du write)
+    if [ -n "${FILE:-}" ]; then
+      basename=$(basename "$FILE")
+      if echo "$basename" | grep -qE "$UUID_PATTERN"; then
+        echo "ERROR: UUID filename forbidden: $FILE" >&2
+        exit 1
+      fi
+      exit 0
+    fi
+
+    # Mode scan global (appelé par make check-naming / CI)
+    FOUND=0
+    while IFS= read -r -d '' file; do
+      basename=$(basename "$file")
+      if echo "$basename" | grep -qE "$UUID_PATTERN"; then
+        echo "ERROR: UUID filename forbidden: $file" >&2
+        FOUND=1
+      fi
+    done < <(find "$ROOT/company" "$ROOT/projects" \( -name '*.yml' -o -name '*.yaml' \) -print0 2>/dev/null)
+    if [ "$FOUND" -eq 1 ]; then
+      echo "FAIL: rename artifact files to <slug>-<8chars-uuid>.yml format" >&2
+      exit 1
+    fi
+    echo "OK: all artifact filenames conform to naming convention"
+    ```
+
+    ── 2. company/plugins/defense-in-depth-core.mjs ─────────────────────────────
+
+    PRÉFIXES CONCERNÉS (dossiers d'artifacts — doit rester synchronisé avec
+    la liste dans spec.rules.file_placement de shared-rules.yml) :
+    - `projects/`
+    - `company/rfcs/`
+    - `company/lessons/`
+    - `company/agent-messages/`
+
+    Sont EXCLUS (conventions de nommage propres) :
+    - `company/config/` (flow-control.yml, review-protocol.yml, etc.)
+    - `company/schemas/`, `company/plugins/`, `company/scripts/`
+    - `company/personas/` (nommage historiquement géré manuellement, hors scope minimal)
+
+    A. Constante à ajouter dans les constantes globales (après VOLATILE_PATTERNS, ligne ~43) :
+
+    ```javascript
+    // Artifact dirs subject to naming convention enforcement.
+    // Keep in sync with spec.rules.file_placement in company/config/shared-rules.yml.
+    const ARTIFACT_NAMING_PREFIXES = [
+      "projects/",
+      "company/rfcs/",
+      "company/lessons/",
+      "company/agent-messages/",
+    ];
+    ```
+
+    B. Fonction utilitaire à ajouter après `isVolatile()` (ligne ~66) :
+
+    ```javascript
+    function isArtifactPath(rel) {
+      return ARTIFACT_NAMING_PREFIXES.some((prefix) => rel.startsWith(prefix));
+    }
+    ```
+
+    C. Fonction de check à ajouter dans la même zone utilitaires :
+
+    ```javascript
+    function checkNaming(rootDir, rel) {
+      // Delegate to check-artifact-naming.sh (single source of truth for the regex).
+      // Returns null on non-zero exit (= naming violation).
+      return run(
+        `FILE="${rel}" ./company/scripts/check-artifact-naming.sh`,
+        rootDir,
+      );
+    }
+    ```
+
+    D. POSITION DANS LE HANDLER — AVANT le bloc isInProtectedZone :
+
+    Le check naming doit être placé en PREMIER dans le bloc write/edit, AVANT la
+    vérification de zone protégée. Raison : si un fichier est en zone protégée avec
+    un permit actif, `onProtectedZoneWrite` serait appelé (signalant un write réussi)
+    avant que le naming ne soit rejeté — le callback aurait signalé un succès pour un
+    write finalement annulé. En plaçant le naming en premier, on évite cet effet de bord.
+
+    ```
+    tool.execute.after:
+      if (edit || write) && filePath:
+        rel = relative(rootDir, filePath)
+        [1] ← NOUVEAU : if isYaml && isArtifactPath(rel) → checkNaming → revert + throw
+        [2] if isInProtectedZone(rel) → check permit → revert or onProtectedZoneWrite
+        [3] if isYaml(filePath) → validateYaml → autoIndex
+    ```
+
+    Bloc à insérer (avant `if (isInProtectedZone(rel))`, vers ligne ~277) :
+
+    ```javascript
+    // [1] Naming convention: must precede protected-zone check to avoid
+    //     triggering onProtectedZoneWrite for a write that will be reverted.
+    if (isYaml(filePath) && isArtifactPath(rel)) {
+      if (checkNaming(rootDir, rel) === null) {
+        revertFile(rootDir, rel);
+        throw new Error(
+          diag("ERROR", `UUID-only filename forbidden: ${rel}`, {
+            context: `${input.tool}(file_path=${rel})`,
+            reason: `Artifact files must follow the <slug>-<8chars-uuid>.yml naming convention. UUID-only names are forbidden. Change reverted.`,
+            fix: `Rename to <slug-of-title>-<first-8-chars-of-uuid>.yml (e.g. my-artifact-49354fcb.yml). See RFC 2492822c for slugification rules.`,
+          }),
+        );
+      }
+    }
+    ```
+
+  impact: >
+    IMPACT TECHNIQUE :
+    - Deux fichiers modifiés : company/plugins/defense-in-depth-core.mjs et
+      company/scripts/check-artifact-naming.sh
+    - check-artifact-naming.sh : ajout d'un mode fichier unique (variable FILE) ;
+      le comportement scan-global (make check-naming / CI) est inchangé
+    - defense-in-depth-core.mjs : une constante ajoutée (ARTIFACT_NAMING_PREFIXES),
+      deux fonctions utilitaires (isArtifactPath, checkNaming), un bloc conditionnel
+      (~8 lignes) inséré en première position dans le bloc write/edit
+    - Aucune duplication de regex : la regex UUID reste dans check-artifact-naming.sh
+      (source de vérité unique)
+    - Aucune modification des interfaces existantes ni de la base de données
+
+    IMPACT SUR LES AGENTS :
+    Tout agent qui tente d'écrire un artifact YAML avec un nom UUID pur dans un dossier
+    d'artifact verra son write immédiatement bloqué avec un message diagnostique clair.
+
+    IMPACT SUR LA MIGRATION EN COURS :
+    Les fichiers UUID purs déjà présents dans le repo ne sont PAS affectés :
+    defense-in-depth ne bloque que les writes/edits, pas les fichiers existants.
+    La migration prévue par le RFC 2492822c reste nécessaire pour ces fichiers.
+
+    RÉTROCOMPATIBILITÉ :
+    Aucun impact sur les fichiers correctement nommés ni sur les fichiers de config.
+    Le hot-reload du plugin active l'enforcement dès la modification du fichier.
+
+  rollback_plan: >
+    En cas de rollback :
+    1. Dans defense-in-depth-core.mjs : retirer ARTIFACT_NAMING_PREFIXES, isArtifactPath(),
+       checkNaming(), et le bloc conditionnel du handler
+    2. Dans check-artifact-naming.sh : retirer le bloc "mode fichier unique" (les lignes
+       après la définition de UUID_PATTERN jusqu'à "# Mode scan global")
+    Le rollback est trivial : suppression pure de code, aucun effet de bord sur les
+    artifacts existants ni sur la base de données.
+
+  affected_files:
+    - company/plugins/defense-in-depth-core.mjs
+    - company/scripts/check-artifact-naming.sh
