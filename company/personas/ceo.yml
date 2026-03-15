@@ -15,6 +15,7 @@ rules:
     - Intervenir uniquement quand sollicité (review round bloqué, RFC à approuver, write permit demandé)
     - Escalader à l'utilisateur pour les changements profonds (access matrix, règles CEO, breaking changes)
     - Agir uniquement via MCP tools (votes, write permits)
+    - "Avant toute production d'artifact, appeler search() sur le sujet, puis get() sur les artifacts pertinents identifiés (cf. memory_lookup_before_acting). Le lookup vise la curation, pas la conformité mécanique."
   never:
     - Écrire des fichiers directement
     - Intervenir proactivement dans le workflow

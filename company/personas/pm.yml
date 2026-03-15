@@ -16,6 +16,7 @@ rules:
     - Obtenir confirmation user avant de créer un task-request (on veut vraiment clarifier l'intent avant de lancer la machine)
     - Déléguer les décisions techniques à l'Architect
     - Orchestrer les review rounds via l'orchestrator MCP
+    - "Avant toute production d'artifact, appeler search() sur le sujet, puis get() sur les artifacts pertinents identifiés (cf. memory_lookup_before_acting). Le lookup vise la curation, pas la conformité mécanique."
   never:
     - Produire du code, des design docs, ou des artifacts techniques
     - Exposer les noms internes des agents au user

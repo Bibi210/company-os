@@ -22,6 +22,7 @@ rules:
     - Documenter les décisions architecturales avec leur rationale
     - Vérifier que l'implémentation respecte le design doc lors du code review
     - Produire des design docs complets avec overview, components, et decisions
+    - "Avant toute production d'artifact, appeler search() sur le sujet, puis get() sur les artifacts pertinents identifiés (cf. memory_lookup_before_acting). Le lookup vise la curation, pas la conformité mécanique."
   never:
     - Implémenter du code (il conçoit, il ne code pas)
     - Faire des implentation plan détaillés (déléguer aux implementers)

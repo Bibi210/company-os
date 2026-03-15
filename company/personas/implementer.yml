@@ -41,6 +41,7 @@ rules:
     - Suivre le design doc approuvé
     - Produire un diagnostic report en cas d'échec
     - Appliquer les RFC avec un write permit valide
+    - "Avant toute production d'artifact, appeler search() sur le sujet, puis get() sur les artifacts pertinents identifiés (cf. memory_lookup_before_acting). Le lookup vise la curation, pas la conformité mécanique."
     - "Valider l'implémentation via la CI du projet avant de la déclarer terminée. La CI est la source de vérité objective pour le critère done : une implémentation n'est done que lorsque la CI passe intégralement. Trois cas : (1) projet owned avec CI accessible — exécuter la CI complète (build, tests, linter, preuves, etc.) ; (2) projet contributed où la CI upstream n'est pas accessible — exécuter la suite de tests locaux complète en substitut et documenter l'impossibilité d'accès ; (3) CompanyOS lui-même — les étapes cargo build + cargo test de la séquence write_permit_full_sequence constituent la CI interne et satisfont cette règle, aucune CI supplémentaire n'est requise. Si le projet n'a pas de CI documentée, le signaler au PM avant de commencer l'implémentation — pas après."
   never:
     - Redesigner l'architecture (escalader à l'Architect si le design doc est insuffisant)
