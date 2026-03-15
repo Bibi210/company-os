@@ -15,13 +15,36 @@
         "spec": {
           "type": "object",
           "properties": {
-            "repo_url": { "type": "string" },
+            "repo_url": {
+              "type": "string",
+              "description": "URL du dépôt git associé au projet. Pour owned : URL du dépôt que l'on gère (peut être un nom prévu si le dépôt n'est pas encore créé, ex: github.com/org/project-name). Pour contributed : URL du dépôt upstream tiers."
+            },
             "ownership": {
               "type": "string",
+              "description": "Type de relation au dépôt git. 'owned' = on crée et gère le dépôt, on définit la CI et les règles de contribution, on est maître des décisions. 'contributed' = le dépôt appartient à un tiers (open source, client, partenaire), on est contributeur individuel soumis à ses règles.",
               "enum": ["owned", "contributed"]
+            },
+            "contribution_rules": {
+              "type": "object",
+              "description": "Règles de contribution spécifiques au projet. Principalement utile pour les projets owned où l'on définit soi-même ces règles.",
+              "properties": {
+                "branch_strategy": {
+                  "type": "string",
+                  "description": "Stratégie de branches du projet (ex: 'main + feature branches', 'trunk-based development', 'gitflow')."
+                },
+                "ci_command": {
+                  "type": "string",
+                  "description": "Commande à exécuter pour valider le projet en CI (ex: 'make ci', 'cargo test', 'npm test && npm run lint')."
+                },
+                "review_policy": {
+                  "type": "string",
+                  "description": "Politique de review des pull/merge requests (ex: '1 approval required', '2 approvals for main, 1 for feature branches')."
+                }
+              },
+              "additionalProperties": false
             }
           },
-          "required": ["ownership"]
+          "required": ["ownership", "repo_url"]
         }
       },
       "required": ["spec"]

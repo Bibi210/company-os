@@ -19,3 +19,8 @@ metadata:
 spec:
   project_name: puissance4-verus
   ownership: owned
+  repo_url: https://github.com/Bibi210/puissance4-verus
+  contribution_rules:
+    branch_strategy: "main + feature branches"
+    ci_command: "cargo build --release && cargo verus"
+    review_policy: "1 approval required"

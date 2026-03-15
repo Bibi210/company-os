@@ -10,6 +10,7 @@ metadata:
 
 spec:
   ownership: owned
+  repo_url: https://github.com/Bibi210/company-os
   companyos_is_a_project:
     description: >
       CompanyOS est lui-même un projet qui vit dans CompanyOS. Les modifications au système
