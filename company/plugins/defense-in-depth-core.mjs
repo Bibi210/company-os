@@ -157,8 +157,11 @@ function cleanupEmptyParentDirs(rootDir, filePath) {
 
 function revertFile(rootDir, filePath) {
   // Cas A : fichier tracké dans HEAD → restaurer depuis HEAD
+  // NOTE: git ls-files --error-unmatch retourne exit 0 pour les fichiers stagés
+  // mais pas encore committés → faux positif. On utilise git cat-file -e HEAD:<file>
+  // qui vérifie uniquement HEAD, pas l'index.
   const isTracked =
-    run(`git ls-files --error-unmatch "${filePath}"`, rootDir) !== null;
+    run(`git cat-file -e "HEAD:${filePath}"`, rootDir) !== null;
   if (isTracked) {
     run(`git checkout -- "${filePath}"`, rootDir);
     return;
