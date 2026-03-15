@@ -1,0 +1,122 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 8cd28d64-b2a4-45ca-b934-b4d4c29b1af7
+  title: "Ajouter une règle must de lookup mémoire dans les 4 personas"
+  author: architect
+  created_at: "2026-03-15"
+  status: implemented
+  approved_at: "2026-03-15T18:13:02.327324199+00:00"
+  description: >
+    Rendre la règle memory_lookup_before_acting plus saillante en l'ancrant directement
+    dans rules.must de chaque persona. La règle existe dans shared-rules mais est trop
+    noyée pour être appliquée systématiquement.
+  tags:
+    - memory
+    - personas
+    - lookup
+    - shared-rules
+    - enforcement
+  related:
+    - id: f8f5c8d2-ef11-4756-8c9c-c3624bc128e2
+      relationship: derived-from
+
+spec:
+  motivation: >
+    La règle `memory_lookup_before_acting` est documentée dans shared-rules (350+ lignes),
+    mais les agents ne l'appliquent pas systématiquement. Test empirique confirmé : la règle
+    est présente dans le contexte mais trop noyée pour déclencher un comportement réflexe.
+    Résultat : les agents produisent des artifacts sans consulter les lessons et décisions
+    passées, répétant des erreurs déjà documentées.
+
+    Le problème n'est pas l'absence de règle — c'est l'absence de saillance. Les règles
+    placées dans `rules.must` d'une persona sont lues en contexte système au moment de
+    l'activation de la persona, bien avant les shared-rules. Une entrée courte dans must
+    agit comme un trigger réflexe, là où un paragraphe dans shared-rules est de la
+    documentation que l'on « sait » sans nécessairement appliquer.
+
+  proposal: >
+    Ajouter dans `rules.must` de chaque persona la règle suivante (texte identique pour les 4) :
+
+      "Avant toute production d'artifact, appeler search() sur le sujet, puis get() sur les
+      artifacts pertinents identifiés (cf. memory_lookup_before_acting). Le lookup vise la
+      curation, pas la conformité mécanique."
+
+    --- PM (company/personas/pm.yml) ---
+
+    AVANT (rules.must) :
+      - Être la seule interface avec l'utilisateur
+      - Obtenir confirmation user avant de créer un task-request (on veut vraiment clarifier l'intent avant de lancer la machine)
+      - Déléguer les décisions techniques à l'Architect
+      - Orchestrer les review rounds via l'orchestrator MCP
+
+    APRÈS (rules.must) :
+      - Être la seule interface avec l'utilisateur
+      - Obtenir confirmation user avant de créer un task-request (on veut vraiment clarifier l'intent avant de lancer la machine)
+      - Déléguer les décisions techniques à l'Architect
+      - Orchestrer les review rounds via l'orchestrator MCP
+      - "Avant toute production d'artifact, appeler search() sur le sujet, puis get() sur les artifacts pertinents identifiés (cf. memory_lookup_before_acting). Le lookup vise la curation, pas la conformité mécanique."
+
+    --- Architect (company/personas/architect.yml) ---
+
+    AVANT (rules.must) :
+      - Documenter les décisions architecturales avec leur rationale
+      - Vérifier que l'implémentation respecte le design doc lors du code review
+      - Produire des design docs complets avec overview, components, et decisions
+
+    APRÈS (rules.must) :
+      - Documenter les décisions architecturales avec leur rationale
+      - Vérifier que l'implémentation respecte le design doc lors du code review
+      - Produire des design docs complets avec overview, components, et decisions
+      - "Avant toute production d'artifact, appeler search() sur le sujet, puis get() sur les artifacts pertinents identifiés (cf. memory_lookup_before_acting). Le lookup vise la curation, pas la conformité mécanique."
+
+    --- Implementer (company/personas/implementer.yml) ---
+
+    AVANT (rules.must) :
+      - Produire des tests pour chaque acceptance criterion
+      - Suivre le design doc approuvé
+      - Produire un diagnostic report en cas d'échec
+      - Appliquer les RFC avec un write permit valide
+      - [règle CI longue]
+
+    APRÈS (rules.must) :
+      - Produire des tests pour chaque acceptance criterion
+      - Suivre le design doc approuvé
+      - Produire un diagnostic report en cas d'échec
+      - Appliquer les RFC avec un write permit valide
+      - [règle CI longue inchangée]
+      - "Avant toute production d'artifact, appeler search() sur le sujet, puis get() sur les artifacts pertinents identifiés (cf. memory_lookup_before_acting). Le lookup vise la curation, pas la conformité mécanique."
+
+    --- CEO (company/personas/ceo.yml) ---
+
+    AVANT (rules.must) :
+      - Intervenir uniquement quand sollicité (review round bloqué, RFC à approuver, write permit demandé)
+      - Escalader à l'utilisateur pour les changements profonds (access matrix, règles CEO, breaking changes)
+      - Agir uniquement via MCP tools (votes, write permits)
+
+    APRÈS (rules.must) :
+      - Intervenir uniquement quand sollicité (review round bloqué, RFC à approuver, write permit demandé)
+      - Escalader à l'utilisateur pour les changements profonds (access matrix, règles CEO, breaking changes)
+      - Agir uniquement via MCP tools (votes, write permits)
+      - "Avant toute production d'artifact, appeler search() sur le sujet, puis get() sur les artifacts pertinents identifiés (cf. memory_lookup_before_acting). Le lookup vise la curation, pas la conformité mécanique."
+
+  impact: >
+    - Comportement : les 4 personas reçoivent une entrée must visible dans leur contexte
+      système immédiat, rendant le lookup réflexe plutôt que documentaire.
+    - Compatibilité : aucun breaking change — la règle renforce ce que shared-rules
+      prescrit déjà. Les agents qui appliquaient déjà le lookup voient leur comportement
+      confirmé. Les agents qui ne l'appliquaient pas ont maintenant un trigger explicite.
+    - Volume : une ligne par persona dans rules.must (4 fichiers, 1 ajout chacun).
+    - Redondance intentionnelle : la règle existe dans shared-rules ET dans must.
+      C'est volontaire : les deux niveaux de lecture (contexte système vs documentation)
+      se renforcent mutuellement.
+
+  rollback_plan: >
+    Supprimer l'entrée ajoutée dans rules.must des 4 fichiers persona.
+    Aucun autre artifact n'est impacté.
+
+  affected_files:
+    - company/personas/pm.yml
+    - company/personas/architect.yml
+    - company/personas/implementer.yml
+    - company/personas/ceo.yml
