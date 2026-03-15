@@ -1,0 +1,48 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 8fd49300-14e5-4e7c-b75f-e0e4bd461aac
+  title: "write_permit_full_sequence : consume APRÈS le commit, jamais avant"
+  author: pm
+  created_at: "2026-03-15"
+  description: >
+    Le Layer 2 defense-in-depth vérifie que le permit est 'active' au moment du commit git.
+    Un permit 'consumed' avant le commit bloque le commit et force un nouveau cycle CEO →
+    grant → commit → consume. L'ordre write → commit → consume est non-négociable.
+  tags:
+    - write-permit
+    - defense-in-depth
+    - sequencing
+    - implementer
+    - workflow
+    - anti-pattern
+  related:
+    - id: 27b75614-9d8d-4748-b54c-ef1c8f6c7c98
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Lors de la création de l'historique de commits pour la session du 2026-03-15,
+    l'Implementer a consommé les permits avant les commits git à plusieurs reprises.
+    Résultat : le Layer 2 (defense-in-depth bash aftermath check) a détecté des commits
+    sur des zones protégées sans permit actif, a resetté les commits et revert les fichiers.
+    Chaque erreur a nécessité un nouveau cycle CEO → grant_write_permit → commit → consume,
+    multipliant les permits et allongeant inutilement la session.
+
+  insight: >
+    La raison technique est dans `defense-in-depth-core.mjs`, fonction `hasActivePermit` :
+    elle requête la DB avec `WHERE status = 'active'`. Un permit `consumed` retourne zéro
+    résultat → le commit est rejeté. L'ordre est donc mécanique, pas arbitraire :
+    (1) write — le permit doit être actif pour autoriser l'écriture (Layer 1)
+    (2) git add + git commit — le permit doit encore être actif pour autoriser le commit (Layer 2)
+    (3) consume_write_permit — seulement APRÈS que le commit est dans git
+    Violer (3) avant (2) casse le Layer 2. La règle `write_permit_full_sequence` de la
+    persona Implementer le dit, mais sans expliquer la mécanique — d'où les erreurs répétées.
+
+  recommendation: >
+    Mémoriser l'image mentale : le permit est le "badge d'accès" que le garde (Layer 2)
+    vérifie à la porte (commit). Si tu rends le badge (consume) avant de passer la porte,
+    le garde te bloque. Rendre le badge APRÈS être passé. En pratique : dès que le CEO
+    émet un permit, la prochaine action est git add + git commit — pas consume. Consume
+    vient toujours en dernier.
