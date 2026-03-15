@@ -1,0 +1,91 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 0b0f3327-0a57-4684-b567-348bf905bcf2
+  title: "Structurer un implementation-plan pour du code Verus : escalier de preuves et clipping"
+  author: implementer
+  created_at: "2026-03-15"
+  description: >
+    Bonnes pratiques pour découper un implementation-plan dont les étapes produisent des
+    preuves Verus interdépendantes : ordre des étapes (constantes → heuristique → récursion
+    → lemmes), gestion du clipping pour les bornes de score, et stratégie de fallback sur
+    le lemme de séparabilité alpha-beta.
+  tags:
+    - verus
+    - formal-verification
+    - implementation-plan
+    - minimax
+    - bornes-score
+    - séparabilité-alpha-beta
+    - pdd
+    - stratégie-preuve
+  related:
+    - id: b2c68c30-29ab-4150-90b3-df02b6c616aa
+      kind: lesson-learned
+      relationship: derived-from
+
+spec:
+  context: >
+    Lors de la rédaction des implementation-plans ai-engine et cli-frontend du projet
+    Puissance 4 Verus, deux tensions récurrentes ont émergé :
+    (1) L'ordre des étapes dans un plan pour code Verus doit respecter les dépendances
+        de preuve, pas seulement les dépendances de compilation.
+    (2) La preuve de bornes de la fonction heuristique (evaluate) nécessite soit des
+        coefficients soigneusement calibrés, soit un clipping explicite — le choix
+        impacte directement la facilité de la preuve.
+    (3) Le lemme de séparabilité alpha-beta est le plus complexe du plan et nécessite
+        une stratégie de décomposition préventive (lemme auxiliaire no-cutoff).
+
+  insight: >
+    STRUCTURATION DES ÉTAPES :
+    Dans un plan qui produit des preuves Verus, les étapes doivent suivre l'ordre
+    de la hiérarchie de preuves, pas l'ordre naturel du code. La séquence optimale est :
+    1. Constantes + lemmes triviaux (fondation — Z3 vérifie par calcul)
+    2. Fonctions de base avec post-conditions simples (bornes, invariants structurels)
+    3. Fonctions récursives avec variant decreases + invariant de boucle
+    4. Lemmes de correction de haut niveau (séparabilité, équivalence)
+    5. Interface publique (point d'entrée — post-condition dérivée des précédentes)
+    Sauter ou inverser ces étapes crée des preuves qui ne peuvent pas référencer les
+    lemmes des étapes précédentes (opacité par défaut de Verus).
+
+    BORNES DE SCORE — CLIPPING vs CALIBRAGE :
+    Pour prouver MIN_SCORE <= evaluate(board) <= MAX_SCORE, deux approches :
+    - Calibrage : choisir des coefficients heuristiques dont la somme maximale théorique
+      est < MAX_SCORE. Nécessite une analyse combinatoire précise (contribution max par
+      fenêtre × nombre de fenêtres). Fragile : ajouter un coefficient peut casser la preuve.
+    - Clipping : calculer librement le score brut, puis clipper avec
+      `if raw > MAX_SCORE { MAX_SCORE } else if raw < MIN_SCORE { MIN_SCORE } else { raw }`.
+      La post-condition est alors triviale par branchement. Robuste : les coefficients
+      peuvent être modifiés sans toucher à la preuve.
+    Recommandation : préférer le clipping pour les fonctions heuristiques. Le calibrage
+    est adapté aux fonctions dont les contributions maximales sont connues statiquement
+    (ex: score d'un coup unique), pas pour une somme de contributions variables.
+
+    LEMME DE SÉPARABILITÉ ALPHA-BETA :
+    La preuve que minimax_ab(board, depth, LOSE_SCORE, WIN_SCORE, _) == minimax_pure(board, depth, _)
+    par induction sur depth est délicate car elle requiert de prouver l'absence de cutoff
+    avec les bornes initiales extrêmes. Si Z3 timeout sur ce lemme :
+    1. Introduire en premier un lemme auxiliaire lemma_no_cutoff_full_window qui prouve
+       séparément que les bornes initiales ne permettent jamais un cutoff prématuré.
+    2. Utiliser ce lemme dans l'induction principale comme hypothèse.
+    Cette décomposition suit le principe de la lesson b2c68c30 : si une preuve est trop
+    large, la couper en sous-buts indépendants avec des asserts intermédiaires.
+
+    CLI SANS PREUVE — SÉQUENCE DE VALIDATION :
+    Pour un composant sans preuve Verus (cli-frontend), la validation est :
+    cargo build --target-dir /tmp/staging → test visuel manuel → cargo build --release.
+    Ne pas sauter le test manuel : c'est la seule validation fonctionnelle disponible
+    pour une couche I/O qui ne peut pas être prouvée formellement.
+
+  recommendation: >
+    Pour tout implementation-plan sur du code Verus :
+    (1) Ordonner les étapes selon la hiérarchie de preuves du design-doc (N1 → N2 → N3),
+        pas selon l'ordre naturel du code.
+    (2) Pour les fonctions avec bornes numériques, choisir le clipping sauf si la preuve
+        de calibrage est explicitement demandée et ses coefficients sont documentés.
+    (3) Identifier les lemmes complexes (séparabilité, équivalence) et prévoir un lemme
+        auxiliaire de décomposition dans l'étape correspondante.
+    (4) Chaque étape doit se terminer par cargo verus --target-dir /tmp/staging isolé —
+        pas de validation groupée en fin de plan.
+    (5) Pour les composants sans preuve (CLI), documenter explicitement le test manuel
+        comme validation acceptable et suffisante.

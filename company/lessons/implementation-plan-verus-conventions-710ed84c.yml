@@ -1,0 +1,76 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 710ed84c-193e-4fbe-a275-9919cb24b30a
+  title: "Structurer un implementation-plan Verus : plan méta-stratégique avant les plans fonctionnels"
+  author: implementer
+  created_at: "2026-03-15"
+  description: >
+    Produire un implementation-plan "méta" qui formalise les conventions Verus transversales
+    (structure de fichier, nommage, commentaires, points de validation) avant les plans
+    fonctionnels évite les incohérences entre modules et réduit le coût de review des
+    preuves. Ce plan de conventions est consulté comme référence normative par tous les
+    autres plans du projet.
+  tags:
+    - verus
+    - rust
+    - formal-verification
+    - implementation-plan
+    - conventions
+    - meta
+    - workflow
+    - puissance4-verus
+  related:
+    - id: b2c68c30-29ab-4150-90b3-df02b6c616aa
+      kind: lesson-learned
+      relationship: related
+    - id: 04dc72df-d895-4639-aee9-d2c5ab4fb49f
+      kind: design-doc
+      relationship: derived-from
+    - id: b48af7ef-41cb-49cb-b2aa-027999bdbaf7
+      kind: implementation-plan
+      relationship: derived-from
+
+spec:
+  context: >
+    En produisant les implementation-plans du projet Puissance 4 Verus, deux plans ont été
+    identifiés : un plan fonctionnel (game-core) et un plan méta (verus-strategy). Le plan
+    méta ne crée aucun fichier de code — il définit les règles applicables à tous les modules.
+    Sans ce plan méta, chaque implémenteur pourrait inventer ses propres conventions de
+    nommage, structure de fichier, et points de validation, créant des incohérences difficiles
+    à détecter en review.
+
+  insight: >
+    Un implementation-plan méta (conventions-only) est un artifact valide et utile dans les
+    projets avec des contraintes transversales fortes (Verus, protocoles de preuve, styles
+    d'annotation). Il remplit trois fonctions :
+
+    (1) Référence normative : les autres plans peuvent y pointer ("voir verus-strategy plan")
+        au lieu de dupliquer les conventions dans chaque plan.
+
+    (2) Point de validation unique : les conventions de nommage et de structure sont auditées
+        une fois, en review du plan méta, pas de façon fragmentée dans chaque plan fonctionnel.
+
+    (3) Préserve la cohérence inter-modules : game_core.rs et ai_engine.rs auront les mêmes
+        marqueurs de section, la même structure d'ordre, et les mêmes patterns de nommage —
+        même s'ils sont écrits par des agents différents à des moments différents.
+
+    Le plan méta doit être produit EN PREMIER, avant les plans fonctionnels, pour être
+    disponible comme référence dès la phase B des autres plans.
+
+  recommendation: >
+    Pour tout projet Verus (ou tout projet avec des contraintes formelles transversales) :
+
+    (1) Commencer par un implementation-plan de conventions avant les plans fonctionnels.
+        Ce plan documente : structure de fichier, nommage, commentaires obligatoires,
+        procédure de validation, procédure d'échec.
+
+    (2) Le plan méta référence le design-doc de stratégie (verus-strategy) et la lesson
+        b2c68c30 (pièges SMT). Il est le pont entre la stratégie abstraite et le code concret.
+
+    (3) Les plans fonctionnels référencent le plan méta dans leur section `dependencies`
+        et dans `metadata.related` pour traçabilité.
+
+    (4) Le plan méta ne contient PAS de code — uniquement des descriptions textuelles de
+        conventions. Si une convention évolue en cours de projet, mettre à jour le plan
+        méta est suffisant (pas besoin de modifier chaque plan fonctionnel).

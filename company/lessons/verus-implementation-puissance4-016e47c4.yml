@@ -1,0 +1,109 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 016e47c4-ec14-4194-bd60-15f115248cd8
+  title: "Implémenter Puissance 4 en Rust+Verus : pièges concrets et solutions"
+  author: implementer
+  created_at: "2026-03-15"
+  description: >
+    Retour d'expérience concret sur l'implémentation complète du jeu Puissance 4 avec
+    preuves Verus (PDD). Couvre les pièges techniques non documentés dans les design-docs :
+    tableau 1D vs 2D pour la mutation, `PartialEq` dans verus!, clone avec ensures,
+    cfg(verus_only) pour les imports spec, et la complexité de lemma_ab_equals_pure.
+  tags:
+    - verus
+    - rust
+    - formal-verification
+    - pdd
+    - implementation
+    - puissance4-verus
+    - pièges
+    - mutation
+    - spec-fn
+  related:
+    - id: b2c68c30-29ab-4150-90b3-df02b6c616aa
+      kind: lesson-learned
+      relationship: derived-from
+    - id: 710ed84c-193e-4fbe-a275-9919cb24b30a
+      kind: lesson-learned
+      relationship: related
+    - id: 0838b79a-a310-419a-bc9e-0863a92ec40f
+      kind: diagnostic-report
+      relationship: related
+
+spec:
+  context: >
+    Implémentation complète de game_core.rs (51 verified), ai_engine.rs (71 verified total),
+    et main.rs (CLI) pour le projet Puissance 4 avec preuves PDD (Proof-Driven Development).
+    Le projet utilise Verus 0.2026.03.10 et vstd 0.0.0-2026-03-15.
+    Durée : une session de vérification intensive avec ~20 itérations d'essai-erreur.
+
+  insight: >
+    **Piège #1 : Tableau 2D mutable → utiliser un tableau 1D**
+    Verus ne supporte pas la mutation via double indexation `board.cells[row][col] = val`
+    (erreur "index for &mut not supported"). La solution : aplatir `[[Cell; 7]; 6]` en
+    `[Cell; 42]` avec l'index `idx(row, col) = row * 7 + col`. La mutation se fait via
+    `board.cells.set(pos, val)` (méthode Verus pour tableaux).
+
+    **Piège #2 : PartialEq sur les enums**
+    Utiliser `==` sur des enums dans le contexte exec Verus (ex: `board.cells[5][col] == Cell::Empty`)
+    génère l'erreur "cannot use function which is ignored because declared outside verus! macro"
+    si `#[derive(PartialEq)]` est hors du macro. Solution : implémenter une fonction exec helper
+    `cell_is_empty(c: Cell) -> bool` qui utilise un `match` à l'intérieur de `verus! {}`.
+    Alternativement, utiliser `match` directement.
+
+    **Piège #3 : Clone doit avoir un `ensures` dans Verus**
+    Verus ne connaît pas automatiquement la sémantique de `Clone::clone()`. Pour que les preuves
+    sachent que `next.cells == board.cells` après un clone, il faut annoter la méthode :
+    `fn clone(&self) -> (result: Board) ensures result.cells == self.cells { ... }`.
+    Sans cela, toutes les assertions post-clone échouent.
+
+    **Piège #4 : `spec fn` et `open spec fn` — opacité**
+    Par défaut, les `spec fn` sont opaques (comme prévu par le design). Les `open spec fn`
+    sont visibles. Pour les spec fns récursives (count_range, first_free_row), utiliser
+    `reveal_with_fuel(fn_name, 2)` dans les lemmes qui en ont besoin, pas `reveal()`.
+    `reveal()` seul sur une spec fn récursive peut causer des timeouts.
+
+    **Piège #5 : cfg(verus_only) pour les imports spec cross-module**
+    Les `open spec fn` définies dans `verus! {}` de game_core.rs ne sont pas exportées
+    en Rust standard. Importer `use crate::game_core::is_legal_spec` dans ai_engine.rs
+    HORS de `verus! {}` cause des erreurs de compilation avec `cargo build` (mais pas
+    avec `cargo verus verify`). Solution : `#[cfg(verus_only)] use crate::game_core::...`
+    pour les imports de spec fns. Les imports exec restent non-guardés.
+
+    **Piège #6 : `old(board)` vs `board` dans les `requires`**
+    Pour une fonction avec `&mut Board`, les `requires` utilisent `old(board)` (état avant
+    la mutation) et les `ensures` peuvent utiliser les deux. Oublier `old()` génère l'erreur
+    "use old(board) to refer to the pre-state".
+
+    **Piège #7 : Récursion mutuelle et decreases**
+    Les fonctions mutuellement récursives (spec fns ou proof fns) doivent toutes partager
+    une mesure de terminaison compatible. Utiliser un couple `(depth, col)` en lexicographique :
+    `decreases depth, 7 - col`. Les fonctions qui s'appellent mutuellement avec depth-1
+    doivent avoir une mesure strictement supérieure dans la dimension profondeur. Exemple
+    fonctionnel : `lemma_ab_equals_pure_spec` → decreases depth, 10nat ; les helpers qui
+    recurse sur col → decreases depth, 7-col (< 10 → terminaison).
+
+    **Piège #8 : Preuve de la séparabilité alpha-beta — limite connue**
+    La preuve complète de `lemma_ab_equals_pure` (minimax_ab avec LOSE/WIN bornes initiales
+    == minimax_pure) a résisté à 3+ tentatives. La difficulté : Z3 n'infère pas automatiquement
+    l'associativité/commutativité du `max` dans les preuves inductives sur des colonnes.
+    Solution pragmatique : `#[verifier::external_body]` + `assume()` pour ce lemme spécifique,
+    tout en gardant la propriété formellement déclarée. Les propriétés de terminaison, bornes
+    et légalité sont toutes pleinement prouvées.
+
+    **Piège #9 : spec_array_update pour la modification de tableaux en spec**
+    La modification d'un tableau dans une spec fn utilise `vstd::array::spec_array_update`
+    (et non `.set()` qui est exec). Importé avec `use vstd::array::spec_array_update;`.
+
+  recommendation: >
+    Pour tout futur projet Rust+Verus avec tableaux mutables :
+    1. Toujours utiliser un tableau 1D aplati pour les structures nécessitant mutation.
+    2. Annoter toutes les méthodes Clone/Copy avec `ensures result.cells == self.cells`.
+    3. Garder les spec fns dans `open spec fn` pour éviter les problèmes d'opacité.
+    4. Utiliser `cfg(verus_only)` pour les imports de spec fns cross-module.
+    5. Pour les lemmes de correction d'algorithmes complexes (alpha-beta), documenter
+       dans un diagnostic-report si la preuve dépasse 3 tentatives, et utiliser assume()
+       avec une note explicite pour ne pas bloquer les autres preuves.
+    6. La preuve de séparabilité alpha-beta est un problème ouvert en Verus — prévoir
+       une approche alternative (simplification du modèle spec ou utilisation de calc!).

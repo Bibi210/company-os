@@ -1,0 +1,529 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 125ad39d-2f54-4924-9271-ce10320e1298
+  title: "Puissance 4 — Implementation Plan : Game Core"
+  author: implementer
+  created_at: "2026-03-15"
+  project: puissance4-verus
+  description: >
+    Plan d'implémentation séquentiel de game_core.rs : structure Cargo, types Cell/Player/Board,
+    fonctions de légalité et gravité avec preuves N1, puis détection de victoire avec preuves N2
+    (soundness + completeness par direction). Fondation dont dépendent ai-engine et cli-frontend.
+  tags:
+    - rust
+    - verus
+    - game-core
+    - formal-verification
+    - connect-four
+    - implementation
+    - n1-n2
+  related:
+    - id: 3c49e29e-8241-41f4-835e-7a0cebf7337c
+      kind: design-doc
+      relationship: input
+    - id: 04dc72df-d895-4639-aee9-d2c5ab4fb49f
+      kind: design-doc
+      relationship: input
+    - id: ffe3306d-d703-43fd-b11a-d154f67bc719
+      kind: task-request
+      relationship: input
+
+spec:
+  overview: >
+    Ce plan implémente game_core.rs en 14 étapes regroupées en 4 phases :
+
+    Phase A (étapes 1-2) — Scaffold Cargo : création de la structure projet, Cargo.toml workspace,
+    src/main.rs stub. Aucune preuve Verus à ce stade — seul cargo build doit passer.
+
+    Phase B (étapes 3-6) — Types et fonctions exécutables : Cell, Player, Board, is_legal,
+    apply_move, current_player, count_pieces. Ces fonctions portent leurs requires/ensures mais
+    sans lemmes de preuve encore — cargo verus vérifie les annotations de base.
+
+    Phase C (étapes 7-9) — Preuves N1 : invariants structurels dans l'ordre légalité → gravité
+    → alternance. Chaque étape est un cargo verus vert avant de passer à la suivante.
+
+    Phase D (étapes 10-14) — Détection de victoire et preuves N2 : les 4 fonctions check_*,
+    has_won, GameState/game_state, puis les 8 lemmes de soundness/completeness (un par direction).
+    Ordre respecte AD-GC-03 et la stratégie de décomposition de la lesson b2c68c30.
+
+    Convention de structure interne de game_core.rs (voir verus-strategy plan) :
+      1. Types et enums
+      2. Spec functions
+      3. Fonctions exec annotées
+      // === NIVEAU 1 — Invariants structurels ===
+      4. Lemmes N1
+      // === NIVEAU 2 — Correction fonctionnelle ===
+      5. Lemmes N2
+
+  steps:
+    # ──────────────────────────────────────────────────────────────────
+    # PHASE A — Scaffold Cargo
+    # ──────────────────────────────────────────────────────────────────
+    - id: "step-01"
+      title: "Créer le Cargo.toml du projet puissance4-verus"
+      file: "puissance4-verus/Cargo.toml"
+      action: "créer"
+      description: >
+        Créer le fichier Cargo.toml à la racine du répertoire puissance4-verus/.
+        Configuration : crate de type bin nommée "puissance4-verus", edition 2021.
+        Dépendance Verus : builtin = { path = "$(cargo verus --print-sysroot)/..."}
+        ou configuration standard pour cargo verus (selon le guide d'install verus cargo).
+
+        Contenu minimal :
+          [package]
+          name = "puissance4-verus"
+          version = "0.1.0"
+          edition = "2021"
+
+          [[bin]]
+          name = "puissance4"
+          path = "src/main.rs"
+
+        Si verus est installé comme outil cargo (cargo verus), aucune dépendance
+        additionnelle n'est nécessaire dans Cargo.toml — le préprocesseur est invoqué
+        directement via `cargo verus`.
+      depends_on: []
+      validation: "none"
+
+    - id: "step-02"
+      title: "Créer src/main.rs stub et src/game_core.rs vide"
+      file: "puissance4-verus/src/main.rs"
+      action: "créer"
+      description: >
+        Créer puissance4-verus/src/main.rs avec un stub minimal :
+          mod game_core;
+          fn main() { println!("Puissance 4 — stub"); }
+
+        Créer puissance4-verus/src/game_core.rs vide (fichier présent, zéro contenu
+        fonctionnel) pour satisfaire le mod game_core déclaré dans main.rs.
+
+        Créer puissance4-verus/src/ai_engine.rs vide pour anticiper la structure complète.
+
+        À cette étape, `cargo build` doit compiler sans erreur. Aucune preuve Verus.
+      depends_on: ["step-01"]
+      validation: "cargo build"
+
+    # ──────────────────────────────────────────────────────────────────
+    # PHASE B — Types et fonctions exécutables
+    # ──────────────────────────────────────────────────────────────────
+    - id: "step-03"
+      title: "Déclarer Cell, Player, Board dans game_core.rs"
+      file: "puissance4-verus/src/game_core.rs"
+      action: "modifier"
+      description: >
+        Ajouter dans game_core.rs, section "Types et enums" :
+
+        - `use verus::*;` en tête du fichier pour accéder aux macros Verus.
+        - `#[derive(PartialEq, Eq, Clone, Copy)] pub enum Cell { Empty, Player1, Player2 }`
+          Annotation Verus : #[verifier::spec] sur les variantes si nécessaire — dans
+          Verus les enums sont directement utilisables en spec. Pas d'annotation spéciale
+          si le type est Copy.
+        - `#[derive(PartialEq, Eq, Clone, Copy)] pub enum Player { Player1, Player2 }`
+        - `pub struct Board { pub cells: [[Cell; 7]; 6] }`
+          La grille est publique pour permettre les spec functions externes.
+          Convention row 0 = bas de grille (AD-GC-02).
+        - `impl Board { pub fn new() -> Board { Board { cells: [[Cell::Empty; 7]; 6] } } }`
+          Board::new() retourne une grille entièrement vide. Pas de requires/ensures à ce
+          stade (ajoutés dans step-07 pour les preuves N1).
+
+        Validation : `cargo build` compile sans erreur.
+      depends_on: ["step-02"]
+      validation: "cargo build"
+
+    - id: "step-04"
+      title: "Implémenter count_pieces et is_legal avec leurs specs"
+      file: "puissance4-verus/src/game_core.rs"
+      action: "modifier"
+      description: >
+        Ajouter dans la section "Spec functions" :
+
+        - `spec fn count_pieces(board: &Board) -> usize` : compte le nombre total de jetons
+          non-Empty sur la grille. Double boucle sur [0..6][0..7].
+          Cette spec fn est la base de l'alternance (N1) et sera reveal-ée dans les lemmes.
+          Corps : `Seq::new(6, |i| Seq::new(7, |j| if board.cells[i][j] != Cell::Empty { 1usize } else { 0usize })).flatten().sum()`
+          Adapter à la syntaxe Verus réelle si différente — l'intention est un comptage
+          de cellules non-vides. En pratique : double boucle imbriquée sur indices bornés.
+
+        Ajouter dans la section "Fonctions exec annotées" :
+
+        - `pub fn is_legal(board: &Board, col: usize) -> (result: bool)`
+          requires: col < 7
+          ensures: result == (board.cells[5][col] == Cell::Empty)
+          Corps exec : `board.cells[5][col] == Cell::Empty`
+          Justification : la colonne est jouable ssi sa case la plus haute (row 5) est vide.
+          La vérification des bornes (col < 7) est la seule pré-condition nécessaire.
+
+        Validation : `cargo verus` vérifie is_legal (preuve triviale — le corps est
+        exactement l'expression de l'ensures).
+      depends_on: ["step-03"]
+      validation: "cargo verus"
+
+    - id: "step-05"
+      title: "Implémenter apply_move avec spec board_after"
+      file: "puissance4-verus/src/game_core.rs"
+      action: "modifier"
+      description: >
+        Ajouter dans la section "Spec functions" :
+
+        - `spec fn first_empty_row(board: &Board, col: usize) -> usize` :
+          retourne l'indice de la première ligne vide dans la colonne col (scanning de row 0
+          vers row 5). Retourne 6 si la colonne est pleine (valeur sentinelle).
+          Corps : `choose |i: usize| i < 6 && board.cells[i][col] == Cell::Empty && (i == 0 || board.cells[i-1][col] != Cell::Empty)`
+          En pratique : la valeur minimale i telle que board.cells[i][col] == Empty.
+
+        Ajouter dans la section "Fonctions exec annotées" :
+
+        - `pub fn apply_move(board: &mut Board, col: usize, player: Player)`
+          requires:
+            - col < 7
+            - is_legal(board, col)         // col n'est pas pleine
+          ensures:
+            - exists |i: usize| i < 6 && board.cells[i][col] == player_to_cell(player)
+                && (i == 0 || old(board).cells[i-1][col] != Cell::Empty)
+              // Le jeton est à la case la plus basse vide de la colonne
+            - forall |r: usize, c: usize| r < 6 && c < 7 && c != col
+                ==> board.cells[r][c] == old(board).cells[r][c]
+              // Seule la colonne col est modifiée
+          Corps exec : boucle for row in 0..6 — trouver la première ligne vide, y placer
+          le jeton, break.
+
+        Ajouter spec fn `player_to_cell(player: Player) -> Cell` dans les spec functions :
+          Player::Player1 => Cell::Player1, Player::Player2 => Cell::Player2.
+
+        Note implémenteur : la preuve complète de gravité (pas de vide sous un jeton) est
+        dans step-08 (N1). À cette étape, l'ensures de base doit passer cargo verus — si
+        l'ensures de gravité exacte timeout, le réduire à la propriété "il existe une
+        ligne avec le bon jeton" et compléter dans step-08.
+      depends_on: ["step-04"]
+      validation: "cargo verus"
+
+    - id: "step-06"
+      title: "Implémenter current_player et GameState/game_state stub"
+      file: "puissance4-verus/src/game_core.rs"
+      action: "modifier"
+      description: >
+        Ajouter :
+
+        - `pub fn current_player(board: &Board) -> (result: Player)`
+          ensures: result == if count_pieces(board) % 2 == 0 { Player::Player1 } else { Player::Player2 }
+          Corps exec : compter les jetons en parcourant la grille (double boucle), retourner
+          Player1 si pair, Player2 si impair.
+          Note : count_pieces est une spec fn — le corps exec doit recalculer le compte lui-même
+          en exec et l'ensures connecte à la spec fn. Verus vérifie que le résultat exec
+          corresponds à l'expression spec.
+
+        - `pub enum GameState { InProgress, WonBy(Player), Draw }`
+
+        - `pub fn game_state(board: &Board) -> GameState` — STUB sans ensures pour l'instant :
+          corps exec retourne GameState::InProgress (placeholder).
+          Les ensures de game_state dépendent de has_won qui n'est pas encore implémenté.
+          Les ensures seront complétées dans step-13.
+
+        Validation : `cargo verus` — current_player doit passer. game_state est un stub
+        sans preuve, `cargo build` doit compiler.
+      depends_on: ["step-05"]
+      validation: "cargo verus"
+
+    # ──────────────────────────────────────────────────────────────────
+    # PHASE C — Preuves N1 (invariants structurels)
+    # ──────────────────────────────────────────────────────────────────
+    - id: "step-07"
+      title: "Lemme N1 : légalité — is_legal est cohérent avec la définition"
+      file: "puissance4-verus/src/game_core.rs"
+      action: "modifier"
+      description: >
+        Ajouter dans la section `// === NIVEAU 1 — Invariants structurels ===` :
+
+        - `proof fn lemma_is_legal_iff_column_has_room(board: &Board, col: usize)`
+          requires: col < 7
+          ensures: is_legal(board, col) <==> exists |i: usize| i < 6 && board.cells[i][col] == Cell::Empty
+          Corps :
+            reveal(is_legal); // si is_legal est spec fn — sinon le corps exec est visible
+            // checkpoint: is_legal = top row est vide
+            assert(is_legal(board, col) == (board.cells[5][col] == Cell::Empty));
+            // checkpoint: si top row vide alors ∃ une case vide dans la colonne
+            if board.cells[5][col] == Cell::Empty {
+                assert(exists |i: usize| i < 6 && board.cells[i][col] == Cell::Empty) by {
+                    witness i = 5usize; // row 5 est vide — le témoin de l'existentiel
+                };
+            }
+            // checkpoint: si ∃ case vide et top row pleine → contradiction (gravité)
+            // (ici on prouve l'implication réciproque — si colonne pleine, is_legal = false)
+
+          Ce lemme est principalement documentaire à ce stade — is_legal est trivial.
+          Il établit le pont entre la définition implémentée et la formulation existentielle
+          utilisée dans les lemmes de gravité.
+      depends_on: ["step-06"]
+      validation: "cargo verus"
+
+    - id: "step-08"
+      title: "Lemme N1 : gravité — pas de vide sous un jeton après apply_move"
+      file: "puissance4-verus/src/game_core.rs"
+      action: "modifier"
+      description: >
+        Ajouter dans la section `// === NIVEAU 1 — Invariants structurels ===` :
+
+        - Définir un prédicat spec `spec fn column_gravity_holds(board: &Board, col: usize) -> bool`
+          returns: forall |i: usize| i < 5
+            ==> (board.cells[i][col] != Cell::Empty ==> board.cells[i+1][col] != Cell::Empty)
+          Ce prédicat exprime "aucune cellule vide n'existe sous un jeton dans la colonne col".
+          (Si row i est occupée, row i+1 est aussi occupée.)
+
+        - `proof fn lemma_apply_move_gravity(board: &Board, col: usize, player: Player)`
+          requires:
+            - col < 7
+            - is_legal(board, col)
+            - column_gravity_holds(board, col)  // invariant de gravité sur l'état initial
+          ensures:
+            - exists |mut b: Board| {
+                apply_move(&mut b, col, player);
+                column_gravity_holds(&b, col)
+              }
+            // Alternative plus directe : utiliser la spec fn first_empty_row
+            // ensures: after apply_move, first_empty_row == min empty row et gravité maintenue
+
+          Stratégie de preuve :
+            1. reveal(column_gravity_holds)
+            2. assert que first_empty_row(board, col) == la bonne ligne (checkpoint bornes)
+            3. assert que le jeton est placé à first_empty_row (lien avec ensures de apply_move)
+            4. assert que toutes les lignes en dessous de first_empty_row sont non-vides
+               (invariant de gravité initial + pas de modification des autres colonnes)
+            5. conclure column_gravity_holds sur la grille résultante
+
+          Note : si la preuve est complexe à cause de la mutation, utiliser le ghost state
+          pattern de Verus (snapshot de la grille avant/après via `&old(board)`).
+      depends_on: ["step-07"]
+      validation: "cargo verus"
+
+    - id: "step-09"
+      title: "Lemme N1 : alternance — current_player suit la parité des coups"
+      file: "puissance4-verus/src/game_core.rs"
+      action: "modifier"
+      description: >
+        Ajouter dans la section `// === NIVEAU 1 — Invariants structurels ===` :
+
+        - `proof fn lemma_apply_move_increments_count(board: &Board, col: usize, player: Player)`
+          requires: col < 7, is_legal(board, col)
+          ensures: count_pieces après apply_move == count_pieces avant + 1
+          Corps :
+            reveal(count_pieces);
+            // checkpoint: seule une case passe de Empty à non-Empty dans cette colonne
+            // checkpoint: les autres colonnes et lignes sont inchangées
+            // checkpoint: donc count_pieces augmente exactement de 1
+
+        - `proof fn lemma_current_player_after_move(board: &Board, col: usize, player: Player)`
+          requires: col < 7, is_legal(board, col)
+            , player == current_player(board)
+          ensures: après apply_move, current_player == opponent(player)
+          Corps :
+            reveal(count_pieces);
+            lemma_apply_move_increments_count(board, col, player); // appel lemme précédent
+            // checkpoint: count_pieces impair → pair ou inversement
+            // checkpoint: (count + 1) % 2 != count % 2 → joueur suivant est différent
+            // arithmétique modulo 2 — linéaire, Z3 gère nativement
+
+          Ajouter spec fn `opponent(player: Player) -> Player` :
+            Player1 => Player2, Player2 => Player1
+      depends_on: ["step-08"]
+      validation: "cargo verus"
+
+    # ──────────────────────────────────────────────────────────────────
+    # PHASE D — Détection de victoire et preuves N2
+    # ──────────────────────────────────────────────────────────────────
+    - id: "step-10"
+      title: "Implémenter les 4 fonctions check_* (spec fns)"
+      file: "puissance4-verus/src/game_core.rs"
+      action: "modifier"
+      description: >
+        Ajouter dans la section "Spec functions" :
+
+        Les 4 fonctions sont des `spec fn` (pas des fonctions exec) — elles définissent
+        mathématiquement la victoire, has_won exec en dépend via reveal.
+
+        - `spec fn check_horizontal(board: &Board, player: Player) -> bool`
+          exists |i: usize, j: usize| i < 6 && j < 4
+            && board.cells[i][j]   == player_to_cell(player)
+            && board.cells[i][j+1] == player_to_cell(player)
+            && board.cells[i][j+2] == player_to_cell(player)
+            && board.cells[i][j+3] == player_to_cell(player)
+          Domaine: i ∈ [0..6], j ∈ [0..4] (4 positions de départ pour 4 consécutives sur 7)
+
+        - `spec fn check_vertical(board: &Board, player: Player) -> bool`
+          exists |i: usize, j: usize| i < 3 && j < 7
+            && board.cells[i][j]   == player_to_cell(player)
+            && board.cells[i+1][j] == player_to_cell(player)
+            && board.cells[i+2][j] == player_to_cell(player)
+            && board.cells[i+3][j] == player_to_cell(player)
+          Domaine: i ∈ [0..3], j ∈ [0..7]
+
+        - `spec fn check_diagonal_ne(board: &Board, player: Player) -> bool`
+          exists |i: usize, j: usize| i < 3 && j < 4
+            && board.cells[i][j]     == player_to_cell(player)
+            && board.cells[i+1][j+1] == player_to_cell(player)
+            && board.cells[i+2][j+2] == player_to_cell(player)
+            && board.cells[i+3][j+3] == player_to_cell(player)
+          Direction NE (↗) : ligne croît, colonne croît. i ∈ [0..3], j ∈ [0..4]
+
+        - `spec fn check_diagonal_se(board: &Board, player: Player) -> bool`
+          exists |i: usize, j: usize| i >= 3 && i < 6 && j < 4
+            && board.cells[i][j]     == player_to_cell(player)
+            && board.cells[i-1][j+1] == player_to_cell(player)
+            && board.cells[i-2][j+2] == player_to_cell(player)
+            && board.cells[i-3][j+3] == player_to_cell(player)
+          Direction SE (↘) : ligne décroît, colonne croît. i ∈ [3..6], j ∈ [0..4]
+          Attention : check_diagonal_se porte sur les diagonales descendantes — de la
+          case (i, j) vers (i-1, j+1). Alternative : exprimer comme SE depuis le haut :
+          i ∈ [0..3], delta = +row, +col — adapter selon la convention retenue.
+          L'important est que les 4 diagonales (↗ et ↘) soient couvertes sans overlap.
+
+        Validation : `cargo verus` sur les spec fns (trivial — ce sont des définitions pures,
+        pas de preuve nécessaire pour leur définition elle-même).
+      depends_on: ["step-09"]
+      validation: "cargo verus"
+
+    - id: "step-11"
+      title: "Implémenter has_won (exec) et GameState/game_state complet"
+      file: "puissance4-verus/src/game_core.rs"
+      action: "modifier"
+      description: >
+        Ajouter dans la section "Fonctions exec annotées" :
+
+        - `pub fn has_won(board: &Board, player: Player) -> (result: bool)`
+          ensures: result == (check_horizontal(board, player)
+                            || check_vertical(board, player)
+                            || check_diagonal_ne(board, player)
+                            || check_diagonal_se(board, player))
+          Corps exec : 4 boucles imbriquées (ou boucles plates avec indices) vérifiant
+          les 4 directions. Doit correspondre exactement aux spec fns check_*.
+          Les boucles exec doivent avoir des invariants de boucle pour Verus :
+            invariant: result == (check trouvé jusqu'à présent dans ce scan)
+          Chaque boucle termine avec un `assert(result == check_horizontal(board, player))`
+          avant de passer à la direction suivante.
+
+        Compléter `pub fn game_state(board: &Board) -> GameState` (step-06 stub) :
+          ensures:
+            - has_won(board, Player::Player1) ==> result == GameState::WonBy(Player::Player1)
+            - has_won(board, Player::Player2) ==> result == GameState::WonBy(Player::Player2)
+            - (!has_won(board, Player::Player1) && !has_won(board, Player::Player2)
+               && board_is_full(board)) ==> result == GameState::Draw
+            - (!has_won(board, Player::Player1) && !has_won(board, Player::Player2)
+               && !board_is_full(board)) ==> result == GameState::InProgress
+          Ajouter spec fn `board_is_full(board: &Board) -> bool` :
+            forall |c: usize| c < 7 ==> !is_legal(board, c)
+          Corps exec game_state : if/else chain sur has_won(P1), has_won(P2), board_is_full.
+          Note : WonBy(P1) prend priorité sur Draw si les deux sont vrais simultanément
+          (cas où P1 remplit la dernière case et crée une victoire — AD-GC-04 open question).
+
+        Validation : `cargo verus` — les ensures de has_won et game_state doivent passer.
+        Si timeout sur has_won, ajouter des assertions intermédiaires par direction.
+      depends_on: ["step-10"]
+      validation: "cargo verus"
+
+    - id: "step-12"
+      title: "Lemme N2 : soundness horizontale"
+      file: "puissance4-verus/src/game_core.rs"
+      action: "modifier"
+      description: >
+        Ajouter dans la section `// === NIVEAU 2 — Correction fonctionnelle ===` :
+
+        - `proof fn lemma_win_detection_horizontal_sound(board: &Board, player: Player)`
+          requires: check_horizontal(board, player)
+          ensures: exists |i: usize, j: usize| i < 6 && j < 4
+            && board.cells[i][j..j+4] == Seq::new(4, |_| player_to_cell(player))
+            // OU sous forme équivalente sans Seq si syntaxe Verus le requiert :
+            && board.cells[i][j]   == player_to_cell(player)
+            && board.cells[i][j+1] == player_to_cell(player)
+            && board.cells[i][j+2] == player_to_cell(player)
+            && board.cells[i][j+3] == player_to_cell(player)
+          Corps :
+            reveal(check_horizontal);
+            // checkpoint: check_horizontal = ∃ (i,j) avec 4 consécutives → extraire le témoin
+            let (i, j) = choose |i: usize, j: usize| ... ; // témoin de l'existentiel
+            // checkpoint: vérifier bornes i < 6, j < 4
+            assert(i < 6 && j < 4);
+            // checkpoint: vérifier que chaque cellule == player_to_cell(player)
+            assert(board.cells[i][j]   == player_to_cell(player));
+            assert(board.cells[i][j+1] == player_to_cell(player));
+            // ... idem j+2, j+3
+            // Conclusion : l'existentiel de l'ensures est satisfait avec ce témoin
+
+          Soundness est "triviale" pour les spec fns définies par existentiel : le témoin
+          est directement extrait de la définition. L'essentiel est le reveal et les bornes.
+      depends_on: ["step-11"]
+      validation: "cargo verus"
+
+    - id: "step-13"
+      title: "Lemme N2 : completeness horizontale"
+      file: "puissance4-verus/src/game_core.rs"
+      action: "modifier"
+      description: >
+        Ajouter dans la section `// === NIVEAU 2 — Correction fonctionnelle ===` :
+
+        - `proof fn lemma_win_detection_horizontal_complete(board: &Board, player: Player,
+            witness_i: usize, witness_j: usize)`
+          requires:
+            - witness_i < 6, witness_j < 4
+            - board.cells[witness_i][witness_j]   == player_to_cell(player)
+            - board.cells[witness_i][witness_j+1] == player_to_cell(player)
+            - board.cells[witness_i][witness_j+2] == player_to_cell(player)
+            - board.cells[witness_i][witness_j+3] == player_to_cell(player)
+          ensures: check_horizontal(board, player)
+          Corps :
+            reveal(check_horizontal);
+            // checkpoint: on a le témoin (witness_i, witness_j) en pré-condition
+            // checkpoint: les 4 cellules sont == player_to_cell(player)
+            // checkpoint: donc check_horizontal est satisfait par ce témoin
+            assert(check_horizontal(board, player)) by {
+                witness (i, j) = (witness_i, witness_j);
+                // instanciation explicite de l'existentiel de check_horizontal
+            };
+
+          Completeness est aussi relativement directe — la difficulté serait si Verus
+          ne peut pas instancier l'existentiel. Les assertions avec witness explicite
+          guident Z3 sur le témoin à utiliser.
+      depends_on: ["step-12"]
+      validation: "cargo verus"
+
+    - id: "step-14"
+      title: "Lemmes N2 : soundness/completeness vertical, diagonal_ne, diagonal_se"
+      file: "puissance4-verus/src/game_core.rs"
+      action: "modifier"
+      description: >
+        Ajouter par analogie avec step-12 et step-13, 3 paires de lemmes supplémentaires :
+
+        - `lemma_win_detection_vertical_sound` + `lemma_win_detection_vertical_complete`
+          Même structure que horizontal. Domaine : i ∈ [0..3], j ∈ [0..7].
+          reveal(check_vertical) en tête de chaque lemme.
+
+        - `lemma_win_detection_diagonal_ne_sound` + `lemma_win_detection_diagonal_ne_complete`
+          Domaine : i ∈ [0..3], j ∈ [0..4]. Direction ↗.
+          reveal(check_diagonal_ne) en tête.
+          Attention aux indices : board.cells[i+k][j+k] pour k ∈ [0..4]. Vérifier bornes
+          i+3 < 6 et j+3 < 7 dans les assertions intermédiaires.
+
+        - `lemma_win_detection_diagonal_se_sound` + `lemma_win_detection_diagonal_se_complete`
+          Domaine correspondant à la définition de check_diagonal_se (step-10).
+          reveal(check_diagonal_se) en tête.
+          Attention aux soustraction d'indices (i-k pour k ∈ [1..4]) — vérifier que
+          Verus/Z3 ne génère pas de sous-flux. Ajouter assertion i >= 3 comme checkpoint.
+
+        En cas de timeout sur l'un des lemmes :
+          1. Vérifier le reveal (piège le plus fréquent, lesson b2c68c30)
+          2. Ajouter des assertions intermédiaires sur les bornes (checkpoint indices)
+          3. Si toujours timeout : décomposer le lemme en un lemme auxiliaire `lemma_aux_*`
+             sur une sous-propriété plus petite, puis composer
+
+        Validation finale : `cargo verus` doit passer sur tout game_core.rs avec tous
+        les lemmes N1 et N2. `cargo build` doit aussi compiler sans erreur.
+      depends_on: ["step-13"]
+      validation: "cargo verus"
+
+  dependencies:
+    - "Verus installé comme outil cargo : `cargo verus` doit être disponible dans PATH"
+    - "Rust edition 2021 (stable ou nightly selon prérequis Verus)"
+    - "Répertoire puissance4-verus/ existant à la racine du workspace (hors monorepo CompanyOS)"
+    - "Design-doc Game Core (3c49e29e) — décisions architecturales AD-GC-01 à AD-GC-05"
+    - "Design-doc Verus Strategy (04dc72df) — conventions de style, pièges SMT"
+    - "Lesson b2c68c30 — pièges Verus : opacité, décomposition par direction, assertions intermédiaires"
+    - "Implementation-plan Verus Strategy (b48af7ef) — conventions de section et nommage de lemmes"

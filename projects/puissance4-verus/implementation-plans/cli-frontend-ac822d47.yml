@@ -1,0 +1,376 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: ac822d47-2761-4161-87f1-3f66d4c8f238
+  title: "Puissance 4 — Implementation Plan : CLI Frontend"
+  author: implementer
+  created_at: "2026-03-15"
+  project: puissance4-verus
+  description: >
+    Plan d'implémentation de cli-frontend : interface terminal jouable, affichage de la
+    grille, lecture du coup humain avec validation, boucle de jeu complète, et point
+    d'entrée main(). Aucune preuve Verus (AD-CLI-02). Dépend de game-core et ai-engine.
+    À exécuter APRÈS les implementation-plans game-core et ai-engine.
+  tags:
+    - rust
+    - connect-four
+    - cli
+    - frontend
+    - boucle-jeu
+    - découplage
+  related:
+    - id: d459be37-0627-465b-bd20-ff775789d3b4
+      kind: design-doc
+      relationship: input
+    - id: ffe3306d-d703-43fd-b11a-d154f67bc719
+      kind: task-request
+      relationship: input
+
+spec:
+  overview: >
+    Ce plan complète src/main.rs en trois étapes : fonctions utilitaires et d'affichage,
+    boucle de jeu principale, et point d'entrée main() avec parsing d'arguments.
+    Aucune preuve Verus ne doit être présente dans ce fichier (décision AD-CLI-02).
+    La couche cli-frontend délègue strictement à game-core et ai-engine — aucune logique
+    de jeu n'est réimplémentée ici (décision AD-CLI-01).
+    La validation finale inclut un test de compilation, un test de jeu manuel, et la
+    vérification que cargo build --release passe sans warning.
+
+  steps:
+    - id: "step-01"
+      title: "Déclarer les modules et compléter l'en-tête de main.rs"
+      file: "puissance4-verus/src/main.rs"
+      action: "modifier"
+      description: >
+        Ouvrir src/main.rs (créé vide ou avec un stub) et ajouter :
+
+        1. Déclarations de modules en tête de fichier :
+           ```rust
+           mod game_core;
+           mod ai_engine;
+           ```
+           Ces deux déclarations rendent les types et fonctions des deux modules
+           accessibles depuis main.rs via `use game_core::...` et `use ai_engine::...`.
+
+        2. Imports nécessaires :
+           ```rust
+           use game_core::{Board, Cell, GameState, is_legal, apply_move, game_state,
+                           current_player};
+           use ai_engine::{best_move};
+           use std::io::{self, BufRead, Write};
+           ```
+
+        3. Vérification de compilation isolée :
+           cargo build --target-dir /tmp/companyos-staging doit passer avec uniquement
+           ces déclarations (aucune fonction définie encore, donc des warnings "unused import"
+           sont attendus à cette étape — ils disparaîtront aux étapes suivantes).
+
+        Validation : compilation sans erreur (warnings autorisés à cette étape).
+      depends_on: []
+      validation: "cargo build"
+
+    - id: "step-02"
+      title: "Implémenter display_board(board)"
+      file: "puissance4-verus/src/main.rs"
+      action: "modifier"
+      description: >
+        Ajouter la fonction d'affichage de la grille.
+
+        1. Signature :
+           ```rust
+           fn display_board(board: &Board) {
+           ```
+           Pas de valeur de retour — effet de bord sur stdout uniquement.
+
+        2. Corps — affichage ligne 5 → ligne 0 (convention AD-CLI-04) :
+           ```rust
+           println!();
+           for row in (0..6).rev() {           // ligne 5 en premier, ligne 0 en dernier
+               print!("|");
+               for col in 0..7 {
+                   let ch = match board[row][col] {
+                       Cell::Empty   => '.',
+                       Cell::Player1 => 'X',
+                       Cell::Player2 => 'O',
+                   };
+                   print!(" {} |", ch);
+               }
+               println!();
+           }
+           println!("+---+---+---+---+---+---+---+");
+           println!("  1   2   3   4   5   6   7  ");  // numérotation 1-7 (AD-CLI-05)
+           println!();
+           ```
+
+        3. Conformité aux décisions architecturales :
+           - Itération de la ligne 5 à la ligne 0 : implémente AD-CLI-04 (affichage
+             intuitif haut → bas alors que le modèle interne est bas → haut).
+           - Caractères `.` / `X` / `O` : conformes à la spec du design-doc CLI.
+           - Numérotation 1-7 sous la grille : conformes à AD-CLI-05.
+           - Pas de logique de jeu : display_board ne calcule rien, n'appelle aucune
+             fonction de game-core. Pur affichage.
+
+        4. Test visuel manuel :
+           Créer temporairement dans main() une grille vide et appeler display_board.
+           Vérifier que l'affichage est :
+           ```
+           | . | . | . | . | . | . | . |
+           | . | . | . | . | . | . | . |
+           | . | . | . | . | . | . | . |
+           | . | . | . | . | . | . | . |
+           | . | . | . | . | . | . | . |
+           | . | . | . | . | . | . | . |
+           +---+---+---+---+---+---+---+
+             1   2   3   4   5   6   7
+           ```
+           Supprimer le test temporaire avant de passer à step-03.
+
+        Validation : cargo build --target-dir /tmp/companyos-staging (pas d'erreur).
+      depends_on: ["step-01"]
+      validation: "cargo build"
+
+    - id: "step-03"
+      title: "Implémenter read_human_move(board) — boucle de lecture avec re-prompt"
+      file: "puissance4-verus/src/main.rs"
+      action: "modifier"
+      description: >
+        Ajouter la fonction de lecture du coup humain avec validation complète.
+
+        1. Signature :
+           ```rust
+           fn read_human_move(board: &Board) -> usize {
+           ```
+           La fonction retourne uniquement quand un coup légal a été saisi (postcondition
+           informelle — pas de preuve Verus, mais garantie par construction via la boucle
+           infinie avec break uniquement sur coup légal).
+
+        2. Corps — flux en 7 étapes (cf. design-doc CLI, section "Lecture du coup humain") :
+           ```rust
+           let stdin = io::stdin();
+           loop {
+               // Étape 1 : prompt
+               print!("Votre coup (colonne 1-7) : ");
+               io::stdout().flush().expect("flush stdout");
+
+               // Étape 2 : lecture ligne
+               let mut line = String::new();
+               stdin.lock().read_line(&mut line)
+                   .expect("erreur lecture stdin");
+
+               // Étape 3 : parsing
+               let parsed = line.trim().parse::<u32>();
+               let col_input = match parsed {
+                   Ok(n) => n,
+                   Err(_) => {
+                       println!("Saisie invalide, entrez un chiffre de 1 à 7.");
+                       continue;
+                   }
+               };
+
+               // Étape 4 : bornes [1, 7]
+               if col_input < 1 || col_input > 7 {
+                   println!("Colonne hors limites (1-7).");
+                   continue;
+               }
+
+               // Étape 5 : traduction 1-based → 0-based
+               let col_internal = (col_input - 1) as usize;
+
+               // Étape 6 : légalité (colonne non pleine)
+               if !is_legal(board, col_internal) {
+                   println!("Cette colonne est pleine, choisissez-en une autre.");
+                   continue;
+               }
+
+               // Étape 7 : coup légal — retourner
+               return col_internal;
+           }
+           ```
+
+        3. Points d'attention implémentation :
+           - `io::stdout().flush()` est obligatoire avant la lecture pour que le prompt
+             apparaisse avant que l'utilisateur tape (stdout peut être bufferisé en mode
+             line-buffered, flush force l'affichage du prompt sans `\n`).
+           - `read_line` ajoute le `\n` dans la string — `trim()` est obligatoire avant
+             le parsing pour éviter une erreur de parse systématique.
+           - La traduction `col_input - 1` est localisée ici uniquement (AD-CLI-05) —
+             aucun autre code dans main.rs ne voit la numérotation 1-7.
+           - Pas de `unwrap()` ni `expect()` dans le chemin normal — seulement sur les
+             erreurs I/O vraiment fatales (lecture stdin qui échoue = état terminal du process).
+
+        Validation : cargo build --target-dir /tmp/companyos-staging.
+      depends_on: ["step-02"]
+      validation: "cargo build"
+
+    - id: "step-04"
+      title: "Implémenter run_game(depth) — boucle de jeu principale"
+      file: "puissance4-verus/src/main.rs"
+      action: "modifier"
+      description: >
+        Ajouter la boucle de jeu complète.
+
+        1. Signature :
+           ```rust
+           fn run_game(depth: u32) {
+           ```
+
+        2. Initialisation :
+           ```rust
+           let mut board = Board::new();  // grille vide
+           ```
+           `Board::new()` doit être exportée par game_core. Si game_core expose
+           `Board` comme `[[Cell; 7]; 6]`, initialiser avec
+           `[[Cell::Empty; 7]; 6]` directement, ou via une fonction `Board::new()`.
+
+        3. Boucle principale (cf. design-doc CLI, section "Boucle de jeu") :
+           ```rust
+           loop {
+               // Étape 1 : afficher grille
+               display_board(&board);
+
+               // Étape 2 : vérifier état de partie
+               match game_state(&board) {
+                   GameState::WonBy(Cell::Player1) => {
+                       println!("Vous avez gagné !");
+                       break;
+                   }
+                   GameState::WonBy(_) => {
+                       println!("L'IA a gagné !");
+                       break;
+                   }
+                   GameState::Draw => {
+                       println!("Match nul !");
+                       break;
+                   }
+                   GameState::InProgress => {}
+               }
+
+               // Étape 3/4 : coup selon joueur courant
+               match current_player(&board) {
+                   Cell::Player1 => {
+                       // Tour humain
+                       let col = read_human_move(&board);
+                       apply_move(&mut board, col);
+                   }
+                   _ => {
+                       // Tour IA (Player2)
+                       println!("L'IA réfléchit...");
+                       match best_move(&board, depth) {
+                           Some(col) => {
+                               println!("L'IA joue en colonne {}.", col + 1);
+                               apply_move(&mut board, col);
+                           }
+                           None => {
+                               // Grille pleine sans victoire — ne devrait pas arriver
+                               // car game_state aurait retourné Draw avant
+                               println!("Match nul !");
+                               break;
+                           }
+                       }
+                   }
+               }
+           }
+           ```
+
+        4. Conformité décisions architecturales :
+           - `current_player(&board)` délégué à game-core (pas de variable "tour" locale
+             dans cli-frontend — AD-CLI-01).
+           - `is_legal` n'est PAS appelé ici pour le coup IA : best_move garantit la
+             légalité par sa post-condition Verus (N3). La CLI bénéficie transitivement
+             de la preuve de ai-engine.
+           - `game_state` est appelé en tête de chaque itération pour détecter la fin
+             de partie immédiatement après un coup (y compris le tout dernier coup qui
+             remplit la grille).
+           - Affichage de la grille finale : la boucle affiche la grille en tête de chaque
+             itération, donc la grille finale est affichée avant la détection de victoire.
+             Si la victoire survient sur le dernier coup de l'IA, l'affichage se produit
+             à l'itération suivante (avant le `match game_state`). Ce comportement est
+             correct et conforme au design-doc.
+
+        Validation : cargo build --target-dir /tmp/companyos-staging.
+      depends_on: ["step-03"]
+      validation: "cargo build"
+
+    - id: "step-05"
+      title: "Implémenter main() avec parsing --depth et test de compilation + jeu manuel"
+      file: "puissance4-verus/src/main.rs"
+      action: "modifier"
+      description: >
+        Compléter le fichier avec main() et procéder aux validations finales.
+
+        1. Fonction main() :
+           ```rust
+           fn main() {
+               println!("=== Puissance 4 — Humain (X) vs IA (O) ===");
+               println!("Jouez en entrant le numéro de colonne (1-7).\n");
+
+               // Parsing argument --depth (défaut D=4)
+               let depth: u32 = parse_depth_arg().unwrap_or(4);
+               println!("Profondeur IA : {}.\n", depth);
+
+               run_game(depth);
+
+               println!("Merci d'avoir joué !");
+           }
+           ```
+
+        2. Fonction auxiliaire parse_depth_arg() :
+           ```rust
+           fn parse_depth_arg() -> Option<u32> {
+               let args: Vec<String> = std::env::args().collect();
+               // Cherche "--depth" suivi d'une valeur
+               for i in 0..args.len() {
+                   if args[i] == "--depth" {
+                       if let Some(val) = args.get(i + 1) {
+                           return val.parse::<u32>().ok();
+                       }
+                   }
+               }
+               None
+           }
+           ```
+           Si `--depth` est absent ou mal formé : retourner None → main() utilise D=4.
+           Pas de `panic!` ni `process::exit` sur argument manquant — comportement
+           "défaut silencieux" (AD-CLI-03 : pas de crash sur entrée invalide).
+
+           Note design-doc open_question : si clap est ajouté plus tard comme dépendance
+           Cargo pour un parsing plus robuste, parse_depth_arg() est le seul point à
+           modifier. Pour l'instant, implémentation manuelle suffisante.
+
+        3. Validation compilation complète :
+           a. cargo build --target-dir /tmp/companyos-staging
+              → doit passer sans erreur, sans warning (--deny warnings recommandé).
+           b. cargo build --release --target-dir /tmp/companyos-staging
+              → doit passer (critère d'acceptance task-request : "compile sans warning").
+
+        4. Test de jeu manuel :
+           Lancer le binaire compilé :
+           ```
+           /tmp/companyos-staging/debug/puissance4 --depth 4
+           ```
+           Vérifier manuellement :
+           - La grille s'affiche correctement (ligne 5 en haut, colonnes 1-7).
+           - La saisie invalide ("abc", "0", "8") déclenche le re-prompt.
+           - La saisie d'une colonne pleine déclenche le re-prompt.
+           - L'IA joue sans crash.
+           - La victoire humaine, la victoire IA, et le match nul sont détectés
+             et affichés correctement.
+           - Le message "Merci d'avoir joué !" s'affiche à la fin de la partie.
+
+        5. Validation finale (séquence complète selon règle write_permit_full_sequence) :
+           a. cargo build --target-dir /tmp/companyos-staging (staging, déjà fait)
+           b. cargo test --target-dir /tmp/companyos-staging (tests existants de game-core)
+           c. cargo build (sans --target-dir — déclenche hot-reload MCP si applicable)
+
+        Note : il n'y a pas de tests unitaires pour cli-frontend (PDD — la CLI est la
+        couche I/O non prouvable). La validation est manuelle (test de jeu) + compilation.
+      depends_on: ["step-04"]
+      validation: "cargo build"
+
+  dependencies:
+    - "game-core (src/game_core.rs) doit être implémenté et compilé"
+    - "ai-engine (src/ai_engine.rs) doit être implémenté et ses preuves N3 vérifiées"
+    - "Board::new() (ou équivalent) doit être exporté par game_core pour créer une grille vide"
+    - "Cell, Board, GameState, is_legal, apply_move, game_state, current_player : pub dans game_core"
+    - "best_move : pub dans ai_engine"
+    - "Aucune dépendance externe nouvelle dans Cargo.toml (std::io et std::env suffisent)"

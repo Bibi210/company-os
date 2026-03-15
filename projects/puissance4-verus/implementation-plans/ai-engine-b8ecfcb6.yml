@@ -1,0 +1,422 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: b8ecfcb6-6573-4d0c-b49c-4ae248678e25
+  title: "Puissance 4 — Implementation Plan : AI Engine"
+  author: implementer
+  created_at: "2026-03-15"
+  project: puissance4-verus
+  description: >
+    Plan d'implémentation de ai-engine : algorithme minimax avec élagage alpha-beta,
+    fonction heuristique d'évaluation, et preuves Verus de niveau 3 (terminaison,
+    bornes de score, légalité du coup IA, séparabilité alpha-beta). Dépend des preuves
+    N1+N2 de game-core. À exécuter APRÈS l'implementation-plan game-core.
+  tags:
+    - rust
+    - verus
+    - formal-verification
+    - pdd
+    - ai-engine
+    - minimax
+    - alpha-beta
+    - connect-four
+  related:
+    - id: 7dc37df5-8b58-46f2-b34e-3dcf747c6366
+      kind: design-doc
+      relationship: input
+    - id: ffe3306d-d703-43fd-b11a-d154f67bc719
+      kind: task-request
+      relationship: input
+
+spec:
+  overview: >
+    Ce plan implémente src/ai_engine.rs en six étapes séquentielles. Chaque étape
+    s'appuie sur la précédente ; les preuves Verus progressent du plus simple (constantes,
+    lemme trivial) vers le plus complexe (séparabilité alpha-beta). La validation
+    intermédiaire se fait avec cargo verus --target-dir /tmp/companyos-staging à chaque
+    étape ; le cargo build final (sans --target-dir) n'est exécuté qu'une seule fois,
+    après toutes les étapes validées.
+
+    Prérequis : game-core (src/game_core.rs) est déjà compilé et ses preuves N1+N2
+    passent. Les types Cell, Board, GameState, is_legal, apply_move, game_state,
+    current_player sont exportés depuis game_core.
+
+  steps:
+    - id: "step-01"
+      title: "Créer src/ai_engine.rs — constantes de score et lemme d'invariant trivial"
+      file: "puissance4-verus/src/ai_engine.rs"
+      action: "créer"
+      description: >
+        Créer le fichier src/ai_engine.rs avec :
+
+        1. Imports : `use crate::game_core::{Board, Cell, GameState, is_legal, apply_move,
+           game_state, current_player};` et le prélude Verus `use vstd::prelude::*;`.
+
+        2. Déclaration des quatre constantes de score sous `verus! { ... }` :
+           ```rust
+           pub const WIN_SCORE:  i32 = 10000;
+           pub const LOSE_SCORE: i32 = -10000;
+           pub const MAX_SCORE:  i32 = 999;
+           pub const MIN_SCORE:  i32 = -999;
+           ```
+
+        3. Lemme trivial d'invariant des constantes :
+           ```rust
+           proof fn lemma_score_constants_ordered()
+               ensures LOSE_SCORE < MIN_SCORE < 0 < MAX_SCORE < WIN_SCORE,
+           { /* Z3 vérifie par calcul direct sur les literaux */ }
+           ```
+           Ce lemme est la fondation pour les preuves de bornes. Il doit passer
+           immédiatement (preuve par évaluation des constantes, aucune assertion
+           intermédiaire nécessaire).
+
+        4. Section-header en commentaire :
+           ```rust
+           // === NIVEAU 3 — Propriétés algorithmiques (ai-engine) ===
+           // Dépend des preuves N1+N2 de game-core (is_legal, apply_move, game_state).
+           ```
+
+        Validation : cargo verus --target-dir /tmp/companyos-staging doit passer
+        uniquement sur ce fichier (0 erreur, lemme_score_constants_ordered vérifié).
+      depends_on: []
+      validation: "cargo verus"
+
+    - id: "step-02"
+      title: "Implémenter evaluate(board) avec post-condition de bornes et preuve"
+      file: "puissance4-verus/src/ai_engine.rs"
+      action: "modifier"
+      description: >
+        Ajouter la fonction heuristique d'évaluation après les constantes.
+
+        1. Spec helper pour le score d'une cellule (score de positionnement) :
+           ```rust
+           spec fn col_weight(col: usize) -> i32 {
+               match col {
+                   3 => 6,
+                   2 | 4 => 4,
+                   1 | 5 => 2,
+                   _ => 1,
+               }
+           }
+           ```
+
+        2. Fonction exec evaluate avec post-condition :
+           ```rust
+           pub fn evaluate(board: &Board) -> (result: i32)
+               ensures MIN_SCORE <= result <= MAX_SCORE,
+           ```
+           Corps : itérer sur les 42 cellules (6 lignes × 7 colonnes).
+           Pour chaque cellule :
+           - Player2 (IA) : ajouter col_weight(col) au score.
+           - Player1 (humain) : soustraire col_weight(col).
+           Ensuite, itérer sur toutes les fenêtres de 4 cellules dans les 4 directions
+           (horizontal, vertical, diag NE, diag SE). Pour chaque fenêtre :
+           - 3 jetons IA + 1 vide : +50 ; 2 jetons IA + 2 vides : +10.
+           - 3 jetons humain + 1 vide : -50 ; 2 jetons humain + 2 vides : -10.
+           Tous les coefficients sont des constantes — pas de produit de deux variables
+           (règle AD-AI-03 / AD-VS-04).
+
+        3. Preuve de bornes — assertions intermédiaires :
+           Calculer la contribution maximale théorique :
+           - Positionnement : au plus 42 cellules × 6 (col_weight max) = 252.
+           - Fenêtres horizontales : 6 lignes × 4 fenêtres × 50 = 1200 (worst case).
+           - Fenêtres verticales : 7 colonnes × 3 fenêtres × 50 = 1050.
+           - Diagonales : au plus 12 diagonales × 50 = 600 (approximation conservative).
+           Total max théorique ~ 3000 ; MAX_SCORE = 999. Il faut soit (a) clipper le
+           résultat à [MIN_SCORE, MAX_SCORE] avec `score = score.clamp(MIN_SCORE, MAX_SCORE)`,
+           soit (b) choisir des coefficients garantissant que la somme reste dans la borne.
+
+           CHOIX RETENU (a) — clipper à la fin :
+           La preuve de la post-condition est alors triviale : `clamp` garantit
+           `MIN_SCORE <= result <= MAX_SCORE` par définition. Assertions intermédiaires :
+           ```rust
+           // checkpoint: clamp assure la borne supérieure
+           assert(result.clamp(MIN_SCORE, MAX_SCORE) >= MIN_SCORE);
+           assert(result.clamp(MIN_SCORE, MAX_SCORE) <= MAX_SCORE);
+           ```
+           Verus doit vérifier que `i32::clamp` a les bonnes ensures dans vstd.
+           Si non disponible dans vstd, implémenter comme :
+           ```rust
+           let result = if raw > MAX_SCORE { MAX_SCORE }
+                        else if raw < MIN_SCORE { MIN_SCORE }
+                        else { raw };
+           ```
+           La preuve de bornes devient alors triviale par branchement.
+
+        Validation : cargo verus --target-dir /tmp/companyos-staging, lemme +
+        post-condition evaluate vérifiés.
+      depends_on: ["step-01"]
+      validation: "cargo verus"
+
+    - id: "step-03"
+      title: "Implémenter minimax_pure avec decreases et preuve de terminaison + bornes"
+      file: "puissance4-verus/src/ai_engine.rs"
+      action: "modifier"
+      description: >
+        Ajouter la fonction minimax sans élagage après evaluate.
+
+        1. Signature avec variant de terminaison et post-condition :
+           ```rust
+           pub fn minimax_pure(board: &Board, depth: u32, maximizing: bool) -> (result: i32)
+               requires depth <= 42,  // au plus 42 coups possibles dans une partie
+               ensures LOSE_SCORE <= result <= WIN_SCORE,
+               decreases depth,
+           ```
+
+        2. Corps — cas de base en premier :
+           ```rust
+           match game_state(board) {
+               GameState::WonBy(p) if p == Cell::Player2 => return WIN_SCORE,
+               GameState::WonBy(_)                       => return LOSE_SCORE,
+               GameState::Draw                           => return 0,
+               GameState::InProgress => {}
+           }
+           if depth == 0 {
+               return evaluate(board);
+           }
+           ```
+           Note : `evaluate(board)` retourne dans [MIN_SCORE, MAX_SCORE] ⊂ [LOSE_SCORE, WIN_SCORE].
+           Checkpoint d'assertion obligatoire :
+           ```rust
+           // checkpoint: evaluate est dans [LOSE_SCORE, WIN_SCORE] (car MIN_SCORE > LOSE_SCORE)
+           assert(evaluate(board) >= LOSE_SCORE && evaluate(board) <= WIN_SCORE);
+           ```
+
+        3. Cas récursif :
+           ```rust
+           let mut best = if maximizing { LOSE_SCORE } else { WIN_SCORE };
+           for col in 0..7usize {
+               if is_legal(board, col) {
+                   let mut next = board.clone();
+                   apply_move(&mut next, col);
+                   let score = minimax_pure(&next, depth - 1, !maximizing);
+                   // checkpoint: score dans bornes par hypothèse d'induction (decreases)
+                   assert(LOSE_SCORE <= score <= WIN_SCORE);
+                   best = if maximizing { best.max(score) } else { best.min(score) };
+               }
+           }
+           ```
+           Invariant de boucle explicite :
+           ```rust
+           invariant
+               LOSE_SCORE <= best <= WIN_SCORE,
+               // (l'invariant porte sur best, mis à jour via max/min de valeurs bornées)
+           ```
+
+        4. Preuve de bornes par récurrence :
+           - Cas de base : résultats dans {WIN_SCORE, LOSE_SCORE, 0} ∪ [MIN_SCORE, MAX_SCORE],
+             tous dans [LOSE_SCORE, WIN_SCORE]. Assertion triviale.
+           - Cas récursif : `best` initialisé à LOSE_SCORE (≥ LOSE_SCORE) ou WIN_SCORE
+             (≤ WIN_SCORE), puis mis à jour par max/min de valeurs dans [LOSE_SCORE, WIN_SCORE].
+             L'invariant de boucle est préservé à chaque itération.
+           - `decreases depth` : depth est u32 > 0 dans le cas récursif, on appelle avec
+             depth - 1. Verus vérifie la décroissance stricte automatiquement sur u32.
+
+        Validation : cargo verus --target-dir /tmp/companyos-staging. Les deux propriétés
+        (terminaison via decreases, bornes via invariant de boucle) doivent passer.
+      depends_on: ["step-02"]
+      validation: "cargo verus"
+
+    - id: "step-04"
+      title: "Implémenter minimax_ab avec pré-condition alpha <= beta"
+      file: "puissance4-verus/src/ai_engine.rs"
+      action: "modifier"
+      description: >
+        Ajouter la fonction avec élagage alpha-beta après minimax_pure.
+
+        1. Signature :
+           ```rust
+           pub fn minimax_ab(
+               board: &Board, depth: u32,
+               alpha: i32, beta: i32,
+               maximizing: bool,
+           ) -> (result: i32)
+               requires
+                   depth <= 42,
+                   alpha <= beta,
+                   LOSE_SCORE <= alpha <= WIN_SCORE,
+                   LOSE_SCORE <= beta  <= WIN_SCORE,
+               ensures LOSE_SCORE <= result <= WIN_SCORE,
+               decreases depth,
+           ```
+
+        2. Corps — même structure que minimax_pure, avec gestion alpha-beta :
+           - Pour le joueur maximisant :
+             ```rust
+             let mut alpha_cur = alpha;
+             for col in 0..7usize {
+                 if is_legal(board, col) {
+                     let mut next = board.clone();
+                     apply_move(&mut next, col);
+                     let score = minimax_ab(&next, depth - 1, alpha_cur, beta, false);
+                     assert(LOSE_SCORE <= score <= WIN_SCORE);
+                     alpha_cur = alpha_cur.max(score);
+                     if alpha_cur >= beta {
+                         break;  // cutoff beta
+                     }
+                 }
+             }
+             return alpha_cur;
+             ```
+           - Symétrique pour le joueur minimisant (beta_cur, cutoff alpha).
+
+        3. Invariants de boucle :
+           ```rust
+           invariant
+               LOSE_SCORE <= alpha_cur <= WIN_SCORE,
+               alpha_cur >= alpha,  // alpha_cur est non-décroissant
+               alpha_cur <= beta || (break condition satisfaite),
+           ```
+
+        4. Note : la pré-condition `alpha <= beta` garantit que le cutoff est cohérent.
+           Verus vérifie que les appelants passent des valeurs respectant cette contrainte.
+           Les assertions `LOSE_SCORE <= alpha <= WIN_SCORE` et `LOSE_SCORE <= beta <= WIN_SCORE`
+           évitent les dépassements i32 dans les comparaisons.
+
+        Validation : cargo verus --target-dir /tmp/companyos-staging. La pré-condition
+        et la post-condition doivent passer.
+      depends_on: ["step-03"]
+      validation: "cargo verus"
+
+    - id: "step-05"
+      title: "Prouver lemma_ab_equals_pure : séparabilité alpha-beta"
+      file: "puissance4-verus/src/ai_engine.rs"
+      action: "modifier"
+      description: >
+        Ajouter le lemme de séparabilité après minimax_ab. Ce lemme est la propriété
+        de correction fondamentale de l'élagage alpha-beta.
+
+        1. Signature du lemme :
+           ```rust
+           proof fn lemma_ab_equals_pure(board: &Board, depth: u32, maximizing: bool)
+               requires depth <= 42,
+               ensures
+                   minimax_ab(board, depth, LOSE_SCORE, WIN_SCORE, maximizing)
+                   == minimax_pure(board, depth, maximizing),
+               decreases depth,
+           ```
+
+        2. Stratégie de preuve (AD-AI-04 + lesson b2c68c30) — induction sur depth :
+
+           Cas de base (depth == 0 ou état terminal) :
+           ```rust
+           if depth == 0 || game_state(board) != GameState::InProgress {
+               // checkpoint: les deux fonctions retournent la même valeur (evaluate ou terminal)
+               assert(minimax_ab(board, depth, LOSE_SCORE, WIN_SCORE, maximizing)
+                   == minimax_pure(board, depth, maximizing));
+               return;
+           }
+           ```
+
+           Cas récursif — raisonnement par colonne :
+           Pour chaque colonne légale, invoquer l'hypothèse d'induction :
+           ```rust
+           for col in 0..7usize {
+               if is_legal(board, col) {
+                   let mut next = board.clone();
+                   apply_move(&mut next, col);
+                   // Hypothèse d'induction pour depth-1
+                   lemma_ab_equals_pure(&next, depth - 1, !maximizing);
+                   // checkpoint: les scores enfants sont égaux
+                   assert(
+                       minimax_ab(&next, depth - 1, LOSE_SCORE, WIN_SCORE, !maximizing)
+                       == minimax_pure(&next, depth - 1, !maximizing)
+                   );
+               }
+           }
+           ```
+
+           Raisonnement de non-élagage avec alpha=LOSE_SCORE, beta=WIN_SCORE :
+           Avec ces bornes extrêmes, alpha_cur (ou beta_cur) ne peut jamais satisfaire
+           la condition de cutoff avant d'avoir exploré toutes les branches (car aucune
+           valeur retournée ne peut dépasser WIN_SCORE ou être en dessous de LOSE_SCORE).
+           Checkpoint clé :
+           ```rust
+           // checkpoint: pas de cutoff possible avec alpha=LOSE_SCORE, beta=WIN_SCORE
+           // car LOSE_SCORE <= tout score <= WIN_SCORE implique jamais alpha_cur >= beta
+           // avant la dernière colonne (sauf si toutes les valeurs = WIN_SCORE).
+           ```
+           Note : ce raisonnement est délicat. Si Z3 timeout, décomposer en lemme auxiliaire
+           `lemma_no_cutoff_full_window` qui prouve formellement l'absence de cutoff avec
+           les bornes initiales.
+
+        3. Reveal nécessaires :
+           ```rust
+           reveal(minimax_ab);
+           reveal(minimax_pure);
+           ```
+           Si les fonctions sont opaques par défaut (AD-VS-01 + conventions Verus).
+
+        Validation : cargo verus --target-dir /tmp/companyos-staging. C'est l'étape la
+        plus complexe — prévoir des itérations avec assertions intermédiaires supplémentaires
+        si Z3 timeout.
+      depends_on: ["step-04"]
+      validation: "cargo verus"
+
+    - id: "step-06"
+      title: "Implémenter best_move avec post-condition de légalité et validation finale"
+      file: "puissance4-verus/src/ai_engine.rs"
+      action: "modifier"
+      description: >
+        Ajouter la fonction publique best_move, dernière étape de ai-engine.
+
+        1. Signature avec post-condition de légalité :
+           ```rust
+           pub fn best_move(board: &Board, depth: u32) -> (result: Option<usize>)
+               requires depth <= 42,
+               ensures
+                   result.is_some() ==>
+                       (result.unwrap() < 7 && is_legal(board, result.unwrap())),
+           ```
+
+        2. Corps — itération sur les 7 colonnes :
+           ```rust
+           let mut best_col: Option<usize> = None;
+           let mut best_score = LOSE_SCORE - 1;  // en dessous de tout score possible
+           for col in 0..7usize {
+               if is_legal(board, col) {
+                   let mut next = board.clone();
+                   apply_move(&mut next, col);
+                   let score = minimax_ab(&next, depth, LOSE_SCORE, WIN_SCORE, false);
+                   if best_col.is_none() || score > best_score {
+                       best_score = score;
+                       best_col = Some(col);
+                   }
+               }
+           }
+           best_col
+           ```
+
+        3. Preuve de la post-condition :
+           `best_col` est mis à jour uniquement quand `is_legal(board, col)` est vrai
+           ET col ∈ [0, 6]. Donc si `best_col.is_some()`, sa valeur a été assignée depuis
+           un col légal. Assertion intermédiaire dans le corps de la boucle :
+           ```rust
+           // checkpoint: si on assigne best_col = Some(col), alors col est légal
+           assert(col < 7);
+           assert(is_legal(board, col));
+           ```
+           Invariant de boucle :
+           ```rust
+           invariant
+               best_col.is_some() ==>
+                   (best_col.unwrap() < 7 && is_legal(board, best_col.unwrap())),
+           ```
+
+        4. Validation finale — séquence complète :
+           a. cargo verus --target-dir /tmp/companyos-staging (tous les lemmes du fichier)
+           b. Si verus passe : cargo build --target-dir /tmp/companyos-staging (compilation)
+           c. cargo test --target-dir /tmp/companyos-staging (tests game-core + ai-engine)
+           d. Si tout est vert : cargo build (sans --target-dir — déclenche hot-reload MCP)
+
+        Note : aucun test unitaire n'est requis pour ai-engine (PDD — les preuves Verus
+        remplacent les tests). La validation empirique se fait via la CLI (plan 4).
+      depends_on: ["step-05"]
+      validation: "cargo build"
+
+  dependencies:
+    - "game-core (src/game_core.rs) doit être implémenté et ses preuves N1+N2 vérifiées avant de commencer ce plan"
+    - "Les types Cell, Board, GameState doivent être pub dans game_core"
+    - "Les fonctions is_legal, apply_move, game_state, current_player doivent être pub dans game_core"
+    - "vstd (bibliothèque standard Verus) doit être une dépendance Cargo du projet"
+    - "Le compilateur verus doit être disponible dans PATH (cargo verus)"

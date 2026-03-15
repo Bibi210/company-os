@@ -1,0 +1,378 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: b48af7ef-41cb-49cb-b2aa-027999bdbaf7
+  title: "Puissance 4 — Implementation Plan : Verus Strategy"
+  author: implementer
+  created_at: "2026-03-15"
+  project: puissance4-verus
+  description: >
+    Plan méta-transversal qui définit les conventions Verus applicables à tous les modules
+    du projet : structure de fichier, commentaires de section obligatoires, nommage des lemmes,
+    et points de validation cargo verus dans le workflow global. Ne crée pas de fichiers de
+    code — produit une référence normative consultée avant chaque implémentation.
+  tags:
+    - rust
+    - verus
+    - formal-verification
+    - conventions
+    - style-guide
+    - nommage
+    - workflow
+    - meta
+  related:
+    - id: 04dc72df-d895-4639-aee9-d2c5ab4fb49f
+      kind: design-doc
+      relationship: input
+    - id: ffe3306d-d703-43fd-b11a-d154f67bc719
+      kind: task-request
+      relationship: input
+    - id: b2c68c30-29ab-4150-90b3-df02b6c616aa
+      kind: lesson-learned
+      relationship: input
+
+spec:
+  overview: >
+    Ce plan est méta — il ne produit pas de fichiers .rs ni de logique de jeu. Il formalise
+    les conventions d'implémentation Verus pour le projet, en traduisant les décisions du
+    design-doc verus-strategy (04dc72df) en règles concrètes actionnables par l'Implementer.
+
+    Quatre zones sont couvertes :
+    1. Structure de fichier normative : ordre des sections dans chaque module .rs
+    2. Commentaires de section obligatoires : marqueurs textuels pour délimiter les niveaux
+    3. Conventions de nommage des lemmes : préfixes, suffixes, pattern par type de propriété
+    4. Points de validation cargo verus : quand lancer verus, à quelle granularité, quoi
+       faire en cas d'échec
+
+    Ce plan est un prérequis des autres implementation-plans du projet. Il doit être lu
+    avant game-core, ai-engine, et cli-frontend.
+
+  steps:
+    # ──────────────────────────────────────────────────────────────────
+    # SECTION 1 — Structure de fichier normative
+    # ──────────────────────────────────────────────────────────────────
+    - id: "step-01"
+      title: "Convention : structure de fichier normative pour chaque module .rs"
+      file: "N/A — convention appliquée à tous les fichiers .rs"
+      action: "référence"
+      description: >
+        Tout module Rust du projet qui contient des preuves Verus doit respecter l'ordre
+        de sections suivant. L'ordre est non-négociable — il garantit que les définitions
+        sont disponibles avant leur utilisation par Verus.
+
+        STRUCTURE NORMATIVE D'UN MODULE AVEC PREUVES VERUS :
+
+        ┌─────────────────────────────────────────────────────┐
+        │ 1. Imports et use                                   │
+        │    use verus::*;                                    │
+        │    use crate::...; (si applicable)                  │
+        ├─────────────────────────────────────────────────────┤
+        │ 2. Types et enums (exec)                            │
+        │    pub enum Cell { ... }                            │
+        │    pub enum Player { ... }                          │
+        │    pub struct Board { ... }                         │
+        │    pub enum GameState { ... }                       │
+        ├─────────────────────────────────────────────────────┤
+        │ 3. Spec functions (verus_spec)                      │
+        │    spec fn count_pieces(...)                        │
+        │    spec fn is_legal_spec(...)                       │
+        │    spec fn check_horizontal(...)                    │
+        │    spec fn player_to_cell(...)                      │
+        │    spec fn board_is_full(...)                       │
+        │    spec fn column_gravity_holds(...)                │
+        │    (toutes les spec fns, dans l'ordre de dépendance)│
+        ├─────────────────────────────────────────────────────┤
+        │ 4. Fonctions exec annotées                          │
+        │    pub fn is_legal(...)                             │
+        │    pub fn apply_move(...)                           │
+        │    pub fn current_player(...)                       │
+        │    pub fn has_won(...)                              │
+        │    pub fn game_state(...)                           │
+        │    (dans l'ordre de dépendance fonctionnelle)       │
+        ├─────────────────────────────────────────────────────┤
+        │ // === NIVEAU 1 — Invariants structurels ===        │
+        │ 5. Lemmes N1 (proof fn)                             │
+        │    proof fn lemma_is_legal_iff_...                  │
+        │    proof fn lemma_apply_move_gravity(...)           │
+        │    proof fn lemma_current_player_after_move(...)    │
+        ├─────────────────────────────────────────────────────┤
+        │ // === NIVEAU 2 — Correction fonctionnelle ===      │
+        │ 6. Lemmes N2 (proof fn)                             │
+        │    proof fn lemma_win_detection_*_sound(...)        │
+        │    proof fn lemma_win_detection_*_complete(...)     │
+        ├─────────────────────────────────────────────────────┤
+        │ // === NIVEAU 3 — Propriétés algorithmiques ===     │
+        │ 7. Lemmes N3 (proof fn) — ai_engine.rs uniquement  │
+        │    proof fn lemma_minimax_terminates(...)           │
+        │    proof fn lemma_minimax_legal_move(...)           │
+        │    proof fn lemma_minimax_score_bounded(...)        │
+        └─────────────────────────────────────────────────────┘
+
+        MODULES PAR NIVEAU DE PREUVE :
+        - game_core.rs : sections 1-6 (N1 + N2)
+        - ai_engine.rs  : sections 1-7 (N1 via imports game_core + N3)
+        - main.rs       : sections 1-2 uniquement (aucune preuve — AD-CLI-01)
+
+        RÈGLE D'ORDRE : chaque item d'une section peut référencer les items des sections
+        précédentes, jamais des suivantes. En particulier :
+        - Les spec fns peuvent référencer d'autres spec fns, pas les fonctions exec.
+        - Les fonctions exec annotées peuvent appeler des spec fns dans leurs requires/ensures.
+        - Les lemmes N1 peuvent appeler des spec fns et des fonctions exec. Pas de lemmes N2/N3.
+        - Les lemmes N2 peuvent appeler des lemmes N1 et des spec fns. Pas de lemmes N3.
+        - Les lemmes N3 peuvent appeler tous les niveaux inférieurs.
+      depends_on: []
+      validation: "none"
+
+    # ──────────────────────────────────────────────────────────────────
+    # SECTION 2 — Commentaires de section obligatoires
+    # ──────────────────────────────────────────────────────────────────
+    - id: "step-02"
+      title: "Convention : commentaires de section obligatoires dans le code"
+      file: "N/A — convention appliquée à tous les fichiers .rs avec preuves"
+      action: "référence"
+      description: >
+        Les marqueurs de section suivants sont obligatoires dans tout module contenant
+        des preuves Verus. Ils servent à la navigation du code et à l'outillage futur.
+
+        MARQUEURS OBLIGATOIRES :
+
+        // ================================================================
+        // SECTION : Types et enums
+        // ================================================================
+
+        // ================================================================
+        // SECTION : Spec functions
+        // ================================================================
+
+        // ================================================================
+        // SECTION : Fonctions exec annotées
+        // ================================================================
+
+        // === NIVEAU 1 — Invariants structurels ===
+
+        // === NIVEAU 2 — Correction fonctionnelle ===
+
+        // === NIVEAU 3 — Propriétés algorithmiques ===  (ai_engine.rs seulement)
+
+        RÈGLES DE FORMAT :
+        - Les marqueurs `// ===` (longue ligne) délimitent les grandes sections structurelles
+          (types, spec fns, exec fns). Format exact : 64 `=`.
+        - Les marqueurs `// === NIVEAU N ===` délimitent les groupes de lemmes par niveau
+          hiérarchique. Format exact : `// === NIVEAU N — <description> ===`.
+        - Un saut de ligne vide avant et après chaque marqueur de section.
+        - Les marqueurs sont en commentaire simple `//`, pas en doc-comment `///`.
+
+        MARQUEURS DE CHECKPOINT DANS LES LEMMES :
+        Chaque assertion non-triviale dans un lemme porte un commentaire de checkpoint :
+          assert(expr); // checkpoint: <description en français de ce qui est affirmé>
+
+        MARQUEURS DE DÉPENDANCE ENTRE LEMMES :
+        Chaque appel de lemme dans une proof fn porte un commentaire de dépendance :
+          lemma_foo(board, player); // N1 → <nom de la propriété établie>
+          lemma_bar(board, player); // N2 → <nom de la propriété établie>
+
+        Ces marqueurs permettent de tracer les chaînes de dépendance sans lire chaque lemme.
+
+        MARQUEUR D'OPACITÉ :
+        Chaque `reveal(fn_name)` porte un commentaire expliquant pourquoi le corps est exposé :
+          reveal(check_horizontal); // expose le corps de check_horizontal pour instancier l'existentiel
+
+        EXEMPLE COMPLET DE LEMME AVEC TOUS LES MARQUEURS :
+          // N2 → soundness de la détection de victoire horizontale
+          proof fn lemma_win_detection_horizontal_sound(board: &Board, player: Player)
+              requires check_horizontal(board, player)
+              ensures exists |i: usize, j: usize| i < 6 && j < 4
+                        && board.cells[i][j]   == player_to_cell(player)
+                        && board.cells[i][j+1] == player_to_cell(player)
+                        && board.cells[i][j+2] == player_to_cell(player)
+                        && board.cells[i][j+3] == player_to_cell(player)
+          {
+              reveal(check_horizontal); // expose le corps pour extraire le témoin
+              // checkpoint: check_horizontal est vrai → ∃ (i,j) satisfaisant la def
+              assert(exists |i: usize, j: usize| ...);
+              // checkpoint: bornes i < 6 && j < 4 vérifiées
+              // checkpoint: chaque cellule == player_to_cell(player)
+          }
+      depends_on: ["step-01"]
+      validation: "none"
+
+    # ──────────────────────────────────────────────────────────────────
+    # SECTION 3 — Conventions de nommage des lemmes
+    # ──────────────────────────────────────────────────────────────────
+    - id: "step-03"
+      title: "Convention : nommage des lemmes et spec functions"
+      file: "N/A — convention appliquée à tous les fichiers .rs avec preuves"
+      action: "référence"
+      description: >
+        NOMMAGE DES LEMMES (proof fn) :
+
+        Pattern général : `lemma_<composant>_<propriété>[_<qualificateur>]`
+
+        PRÉFIXES PAR TYPE DE PROPRIÉTÉ :
+        - Soundness      : `lemma_<composant>_sound`
+                           ex: `lemma_win_detection_horizontal_sound`
+        - Completeness   : `lemma_<composant>_complete`
+                           ex: `lemma_win_detection_vertical_complete`
+        - Terminaison    : `lemma_<composant>_terminates`
+                           ex: `lemma_minimax_terminates`
+        - Bornes         : `lemma_<composant>_bounded`
+                           ex: `lemma_minimax_score_bounded`
+        - Légalité       : `lemma_<composant>_legal`
+                           ex: `lemma_minimax_legal_move`
+        - Invariant      : `lemma_<composant>_invariant`
+                           ex: `lemma_board_gravity_invariant`
+        - Monotonie      : `lemma_<composant>_monotone`
+        - Auxiliaire     : `lemma_aux_<description>`
+                           ex: `lemma_aux_column_first_empty_bounded`
+                           Le préfixe `aux_` signale que le lemme n'est pas public —
+                           il sert uniquement à décomposer une preuve plus grande.
+
+        COMPOSANTS (second segment du nom) :
+        - `win_detection`   : lemmes sur has_won et check_*
+        - `apply_move`      : lemmes sur la mutation de grille
+        - `is_legal`        : lemmes sur la légalité
+        - `current_player`  : lemmes sur l'alternance
+        - `board_gravity`   : lemmes sur l'invariant de gravité
+        - `minimax`         : lemmes sur l'algorithme minimax
+        - `score`           : lemmes sur les bornes de score heuristique
+
+        DIRECTION (troisième segment, pour win_detection) :
+        - `horizontal`, `vertical`, `diagonal_ne`, `diagonal_se`
+        ex: `lemma_win_detection_diagonal_ne_sound`
+
+        RÈGLES ADDITIONNELLES :
+        - Tout lemme publiquement utile aux autres modules est nommé sans `aux_`.
+        - Tout lemme strictement interne (helper d'un autre lemme) reçoit `aux_`.
+        - Ne jamais abréger : `lemma_wd_h_s` est illisible — écrire le nom complet.
+        - Les noms de lemmes sont en snake_case, jamais en camelCase.
+
+        NOMMAGE DES SPEC FUNCTIONS :
+
+        Pattern général : `<description_verb>_<objet>` ou `<objet>_<propriété>`
+
+        Exemples dans le projet :
+        - `count_pieces(board)` → compte les pièces
+        - `player_to_cell(player)` → convertit un Player en Cell
+        - `board_is_full(board)` → prédicat "grille pleine"
+        - `column_gravity_holds(board, col)` → prédicat "gravité respectée en col"
+        - `first_empty_row(board, col)` → indice de la première ligne vide
+        - `opponent(player)` → le joueur opposé
+        - `check_horizontal(board, player)` → prédicat de victoire horizontale
+        - `is_legal_spec(board, col)` → version spec de is_legal (si dupliquée)
+
+        RÈGLES :
+        - Pas de suffixe `_spec` si le contexte est clair (toutes les spec fns sont spec).
+          Utiliser `_spec` uniquement si une homonyme exec existe (ex: `is_legal` exec +
+          `is_legal_spec` spec — à éviter si possible).
+        - Les spec fns de conversion/mapping : nommer avec le pattern `<source>_to_<cible>`.
+        - Les prédicats booléens : nommer sous forme affirmative (pas `is_not_full`).
+
+        NOMMAGE DES INVARIANTS DE BOUCLE :
+        Pas de nommage formel — les invariants sont inline dans les boucles. Chaque clause
+        de l'invariant porte un commentaire court :
+          invariant
+            col < 7,             // borne supérieure colonne
+            row <= 6,            // borne supérieure ligne (6 inclus → colonne pleine)
+            result == ...,       // propriété partielle calculée jusqu'ici
+      depends_on: ["step-02"]
+      validation: "none"
+
+    # ──────────────────────────────────────────────────────────────────
+    # SECTION 4 — Points de validation cargo verus
+    # ──────────────────────────────────────────────────────────────────
+    - id: "step-04"
+      title: "Convention : points de validation cargo verus dans le workflow"
+      file: "N/A — convention transversale au workflow d'implémentation"
+      action: "référence"
+      description: >
+        QUAND LANCER CARGO VERUS :
+
+        Règle générale : `cargo verus` est lancé à chaque étape de l'implementation-plan
+        qui déclare `validation: "cargo verus"`. On ne passe jamais à l'étape suivante
+        si cargo verus ne passe pas sur l'étape courante.
+
+        GRANULARITÉ PAR PHASE D'IMPLÉMENTATION :
+
+        Phase A — Scaffold Cargo :
+          Validation : `cargo build` uniquement. Pas de Verus à ce stade.
+          Commande : `cargo build` dans puissance4-verus/
+
+        Phase B — Types et fonctions exec :
+          Validation : `cargo verus` après chaque fonction exec annotée.
+          Granularité : par fonction (is_legal, apply_move, current_player, has_won).
+          Commande : `cargo verus` dans puissance4-verus/
+          Attente : les ensures de base des fonctions exec passent. Si un ensures timeout,
+          le réduire à sa version minimale et noter la preuve complète pour les lemmes N1/N2.
+
+        Phase C — Lemmes N1 :
+          Validation : `cargo verus` après chaque lemme ou groupe de lemmes liés.
+          Granularité : par lemme individuel (légalité, gravité, alternance).
+          En cas d'échec : procédure standard (voir ci-dessous).
+
+        Phase D — Lemmes N2 :
+          Validation : `cargo verus` après chaque paire soundness/completeness par direction.
+          Granularité : une direction à la fois (horizontal, puis vertical, puis diagonales).
+          Ne jamais implémenter les 8 lemmes d'un coup — valider par paires.
+
+        COMMANDE DE VALIDATION :
+          cd puissance4-verus && cargo verus
+          (ou selon la syntaxe exacte de l'outil cargo verus installé)
+
+        Si le projet utilise `verus` directement (pas via cargo) :
+          verus src/game_core.rs
+          verus src/ai_engine.rs
+
+        PROCÉDURE EN CAS D'ÉCHEC CARGO VERUS :
+
+        Étape 1 — Vérifier le reveal (piège #1 lesson b2c68c30) :
+          Le lemme reference-t-il une spec fn dont il a besoin du corps ?
+          Si oui : ajouter `reveal(nom_fn)` en tête du lemme. Relancer verus.
+
+        Étape 2 — Ajouter un checkpoint assert :
+          Identifier la première assertion que Z3 ne peut pas vérifier.
+          Ajouter `assert(propriété_intermédiaire)` avant cette assertion.
+          Pattern : assertions des plus simples aux plus complexes.
+
+        Étape 3 — Décomposer le lemme :
+          Si le lemme fait plus de ~10 lignes de preuve sans converger :
+          Extraire un sous-but en `proof fn lemma_aux_*`.
+          Appeler ce lemme auxiliaire depuis le lemme principal.
+
+        Étape 4 — Vérifier les bornes d'indices :
+          Les erreurs d'indices (index out of bounds) en Verus se manifestent comme des
+          échecs de preuve. Ajouter des assertions `assert(i < 6)`, `assert(j < 7)` etc.
+          avant chaque accès `board.cells[i][j]`.
+
+        Étape 5 — Réduire le domaine :
+          Si la preuve porte sur un quantificateur universel sur un grand domaine :
+          Séparer en sous-lemmes par sous-domaine (ex: les 4 directions séparément,
+          les 3 premières lignes vs les 3 dernières).
+
+        Étape 6 — Escalader à l'Architect :
+          Si aucune des étapes 1-5 ne résout le problème après 3 tentatives :
+          Produire un diagnostic-report avec le symptôme, les tentatives, et les messages
+          d'erreur Verus. Escalader à l'Architect pour réévaluation du design.
+          NE PAS contourner une preuve cassée (commenter un lemme = violation de contrat).
+
+        SÉQUENCE DE VALIDATION FINALE (avant livraison game-core) :
+          1. cargo build (compile sans erreur)
+          2. cargo verus (tous les lemmes N1 et N2 passent)
+          3. cargo test (si des tests unitaires exec existent)
+
+          Ces 3 commandes doivent toutes être vertes. Une crate cassée en cargo build mais
+          verte en cargo verus n'est pas acceptable. Une crate verte en cargo build mais
+          rouge en cargo verus n'est pas acceptable.
+
+        INTÉGRATION CONTINUE (recommandation) :
+          cargo verus doit bloquer la CI au même titre que cargo build et cargo test.
+          Une preuve cassée est une régression critique — elle signale une violation du
+          contrat architectural formalisé (AD-VS-01 du design-doc verus-strategy).
+          Cette recommandation est à implémenter lors de la mise en place du pipeline.
+      depends_on: ["step-03"]
+      validation: "none"
+
+  dependencies:
+    - "Design-doc Verus Strategy (04dc72df) — source normative dont ce plan est la traduction concrète"
+    - "Lesson b2c68c30 — pièges Verus courants et stratégies d'évitement"
+    - "Verus installé comme outil cargo : `cargo verus` disponible dans PATH"
+    - "Tous les autres implementation-plans du projet puissance4-verus doivent référencer ce plan"
