@@ -1,0 +1,47 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: f3b8bbb1-b551-45e0-a2af-77e79589eb50
+  title: "Projet owned = dépôt git indépendant avec sa propre CI"
+  author: pm
+  created_at: "2026-03-15"
+  description: >
+    Un projet "owned" ne vit pas dans le dépôt CompanyOS — il a son propre dépôt git,
+    sa propre CI, ses propres règles de contribution. CompanyOS gère les artifacts
+    (task-requests, design-docs, etc.) mais pas le code source du projet. À distinguer
+    de "contributed" où on est contributeur externe sur un dépôt tiers.
+  tags:
+    - project-config
+    - owned
+    - contributed
+    - git
+    - ci
+    - workflow
+  related: []
+
+spec:
+  context: >
+    Le projet Puissance 4 Verus est un projet "owned" — on en est propriétaire et on en
+    contrôle les règles de contribution. L'hypothèse implicite était que le code vivait
+    dans le monorepo CompanyOS, ce qui est incorrect. Chaque projet owned doit avoir
+    son propre dépôt git indépendant, sa propre CI (cargo build, cargo verus, etc.),
+    et ses propres règles de contribution définies par nous. CompanyOS héberge uniquement
+    les artifacts de pilotage du projet (design-docs, task-requests, implementation-plans),
+    pas le code source.
+
+  insight: >
+    La distinction "owned vs contributed" ne porte pas sur la propriété intellectuelle
+    mais sur le contrôle du dépôt et des règles de contribution :
+    - owned : on crée et gère le dépôt git, on définit les règles de contribution,
+      la CI, le processus de PR/merge. On est maître des décisions.
+    - contributed : le dépôt appartient à un tiers (open source, client, partenaire),
+      on est contributeur individuel soumis aux règles du projet hôte.
+    Dans les deux cas, CompanyOS gère les artifacts de pilotage, mais dans le cas
+    "owned", on gère aussi le dépôt cible.
+
+  recommendation: >
+    Lors de la création d'un project-config "owned", toujours spécifier le repo_url
+    cible (même si le dépôt n'est pas encore créé — mettre le nom prévu), et documenter
+    dans le project-config les règles de contribution spécifiques au projet (branch
+    strategy, CI requirements, review policy). Le schéma project-config doit refléter
+    cette distinction plus clairement — voir RFC associé.

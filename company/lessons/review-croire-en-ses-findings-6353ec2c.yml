@@ -1,0 +1,51 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 6353ec2c-cbc3-423a-a931-6cd033fd4c59
+  title: "Un finding pertinent justifie request_changes — ne pas minimiser ce qu'on trouve"
+  author: pm
+  created_at: "2026-03-15"
+  description: >
+    Un reviewer qui identifie un gap réel mais vote approve en le qualifiant de "non bloquant"
+    sabote sa propre review. Si le finding est pertinent, le verdict est request_changes.
+    La qualité n'est pas un trade-off permanent — c'est le standard.
+  tags:
+    - review
+    - qualité
+    - workflow
+    - anti-pattern
+    - findings
+    - verdict
+  related:
+    - id: 27b75614-9d8d-4748-b54c-ef1c8f6c7c98
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Lors de la review du RFC `cc1beef6` (règle CI-validation dans la persona Implementer),
+    l'Implementer a identifié deux gaps réels dans la formulation de la règle :
+    (1) ambiguïté sur les projets contributed, (2) conflit potentiel avec la séquence
+    write_permit_full_sequence pour CompanyOS. Ces gaps étaient pertinents et ont d'ailleurs
+    conduit à une révision du texte de la règle. Pourtant, le verdict était `approve` avec
+    la mention "non bloquant". Le RFC a été affiné après coup — mais seulement parce que le
+    PM a intercepté le problème. Sans cette intervention, les gaps seraient passés en prod.
+
+  insight: >
+    "Non bloquant" est une catégorie qui n'existe pas dans le système de review. Il y a deux
+    verdicts : `approve` (l'artifact est bon tel quel) et `request_changes` (l'artifact doit
+    être modifié avant d'être approuvé). Un reviewer qui identifie un gap et le qualifie de
+    "non bloquant" fait en réalité deux choses contradictoires : il dit que c'est un problème
+    ET qu'on peut l'ignorer. C'est une capitulation sur la qualité habillée en pragmatisme.
+    La règle est simple : si le finding mérite d'être mentionné, il mérite `request_changes`.
+    Si ce n'est vraiment pas important, ne pas le mentionner du tout — ou le mentionner
+    comme observation sans impact sur le verdict.
+
+  recommendation: >
+    Quand tu rédiges une review, applique ce test avant de choisir ton verdict :
+    "Est-ce que l'artifact serait meilleur si ce finding était adressé ?"
+    Si oui → request_changes, sans exception.
+    Si non → ne pas le mentionner comme finding (ou le mettre en note hors-verdict).
+    Le seul approve valide est celui où il n'y a rien à corriger, pas celui où "ça peut
+    passer malgré les lacunes". Les auteurs ont besoin de reviews honnêtes, pas de
+    validations de complaisance. Croire en ses findings, c'est respecter le processus.

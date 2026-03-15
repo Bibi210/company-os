@@ -312,3 +312,42 @@ spec:
         Cas zéro : si aucune lesson liée n'existe dans l'index, metadata.related peut rester vide.
         L'absence de lien est une information valide — elle signifie que cette lesson ouvre un
         nouveau fil dans la mémoire collective.
+    review_findings_honesty:
+      description: >
+        Un reviewer dispose de deux verdicts valides et exclusifs :
+        - `approve`          : l'artifact est bon tel quel. Rien n'est à corriger.
+        - `request_changes`  : quelque chose doit être corrigé avant approbation.
+
+        La catégorie "non bloquant" n'existe pas. Si un finding mérite d'être mentionné
+        comme finding, alors le verdict est request_changes — sans exception, sans gradation.
+
+        Un approve accompagné de findings correctifs est une contradiction logique. Elle
+        est interdite : un tel review-report doit être considéré comme défectueux.
+
+        Critère objectif pour classer chaque observation :
+        (a) Correctif → request_changes : l'observation pointe un gap qui affecte les acceptance
+            criteria du task-request associé, ou qui dégrade l'utilisabilité de l'artifact pour
+            son consommateur direct (ex. : ambiguïté qui bloquerait l'Implementer, incohérence
+            qui invaliderait une décision architecturale). Si oui → finding obligatoire, verdict
+            request_changes.
+        (b) Hors-scope → ne pas mentionner comme finding : l'observation ne touche ni les
+            acceptance criteria ni l'utilisabilité de l'artifact. Elle peut figurer en note
+            informelle hors-verdict si elle apporte de la valeur à l'auteur, mais elle ne pèse
+            pas sur le verdict.
+
+        Le test de classification est simple : "Est-ce qu'un consommateur de cet artifact (PM,
+        Implementer, CEO selon le kind) serait bloqué ou induit en erreur si ce point n'est
+        pas corrigé ?" Si oui → (a). Sinon → (b).
+
+        Cas analyse triaxiale verte : la règle `review_protocol` impose l'analyse des cas
+        nominal, négatif et edge cases. Si cette analyse ne révèle aucun gap au sens (a),
+        le verdict est approve sans findings. Les observations positives (ce qui fonctionne bien)
+        ne sont pas des findings et n'ont pas à figurer dans le review-report. Un approve sans
+        findings n'est pas un approve paresseux — c'est la conclusion d'une analyse complète
+        qui n'a trouvé aucun problème à corriger.
+
+        L'objectif est la protection de la chaîne de qualité : un approve doit signifier
+        que l'artifact peut avancer sans modification, pas qu'il peut avancer "malgré" ses lacunes.
+        Les auteurs ont besoin de reviews honnêtes. Voter approve sur un artifact qu'on sait
+        perfectible (au sens des acceptance criteria), c'est faire passer la diplomatie avant
+        la qualité.

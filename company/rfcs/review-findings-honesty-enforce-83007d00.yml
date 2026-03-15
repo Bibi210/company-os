@@ -1,0 +1,178 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 83007d00-dfe4-4632-9290-a77257f91d42
+  title: "Ancrer la règle review_findings_honesty dans les shared-rules"
+  author: architect
+  created_at: "2026-03-15"
+  description: >
+    Ajouter dans spec.rules de shared-rules.yml une règle systémique interdisant le verdict
+    approve accompagné de findings correctifs. Deux verdicts valides : approve (rien à corriger)
+    ou request_changes (quelque chose doit être corrigé). La catégorie "non bloquant" n'existe pas.
+  tags:
+    - review
+    - qualité
+    - workflow
+    - findings
+    - verdict
+    - shared-rules
+    - systémique
+  status: implemented
+  approved_at: "2026-03-15T17:39:29.494385038+00:00"
+  related:
+    - id: 6353ec2c-cbc3-423a-a931-6cd033fd4c59
+      kind: lesson-learned
+      relationship: derived-from
+
+spec:
+  motivation: >
+    La lesson 6353ec2c documente un anti-pattern observé en production : un reviewer identifie
+    des gaps réels dans un artifact, les qualifie de "non bloquant", et vote quand même approve.
+    Résultat : l'artifact imparfait avance dans le pipeline, parfois jusqu'en prod. Dans le cas
+    documenté (RFC cc1beef6), deux ambiguïtés sémantiques ont été relevées et pourtant approuvées.
+    La correction n'a eu lieu que parce que le PM a intercepté le problème hors-workflow.
+
+    Le problème est structurel : aucune règle explicite n'interdit ce comportement. Les reviewers
+    peuvent rationaliser un approve-avec-findings comme du "pragmatisme" sans violer de règle écrite.
+    Il faut ancrer l'interdiction dans les shared-rules pour qu'elle s'applique à tous les personas
+    sans exception, et pour que les review-reports qui l'enfreignent soient identifiables comme
+    défectueux.
+
+    La sémantique est claire : approve signifie "l'artifact est bon tel quel". Si quelque chose
+    doit être corrigé, le verdict est request_changes — sans gradation, sans catégorie intermédiaire.
+    Les findings correctifs dans un approve sont une contradiction logique, pas une nuance.
+
+  proposal: >
+    Ajouter la clé `review_findings_honesty` dans `spec.rules` de `company/config/shared-rules.yml`.
+
+    === AVANT (extrait de spec.rules, dernière règle existante) ===
+
+        lesson_chaining:
+          description: >
+            Toute nouvelle lesson doit référencer les lessons existantes liées dans metadata.related.
+            [...]
+            Cas zéro : si aucune lesson liée n'existe dans l'index, metadata.related peut rester vide.
+            L'absence de lien est une information valide — elle signifie que cette lesson ouvre un
+            nouveau fil dans la mémoire collective.
+
+    === APRÈS (ajout de la nouvelle règle à la suite) ===
+
+        lesson_chaining:
+          description: >
+            [identique — non modifié]
+
+        review_findings_honesty:
+          description: >
+            Un reviewer dispose de deux verdicts valides et exclusifs :
+            - `approve`          : l'artifact est bon tel quel. Rien n'est à corriger.
+            - `request_changes`  : quelque chose doit être corrigé avant approbation.
+
+            La catégorie "non bloquant" n'existe pas. Si un finding mérite d'être mentionné
+            comme finding, alors le verdict est request_changes — sans exception, sans gradation.
+
+            Un approve accompagné de findings correctifs est une contradiction logique. Elle
+            est interdite : un tel review-report doit être considéré comme défectueux.
+
+            Critère objectif pour classer chaque observation :
+            (a) Correctif → request_changes : l'observation pointe un gap qui affecte les acceptance
+                criteria du task-request associé, ou qui dégrade l'utilisabilité de l'artifact pour
+                son consommateur direct (ex. : ambiguïté qui bloquerait l'Implementer, incohérence
+                qui invaliderait une décision architecturale). Si oui → finding obligatoire, verdict
+                request_changes.
+            (b) Hors-scope → ne pas mentionner comme finding : l'observation ne touche ni les
+                acceptance criteria ni l'utilisabilité de l'artifact. Elle peut figurer en note
+                informelle hors-verdict si elle apporte de la valeur à l'auteur, mais elle ne pèse
+                pas sur le verdict.
+
+            Le test de classification est simple : "Est-ce qu'un consommateur de cet artifact (PM,
+            Implementer, CEO selon le kind) serait bloqué ou induit en erreur si ce point n'est
+            pas corrigé ?" Si oui → (a). Sinon → (b).
+
+            Cas analyse triaxiale verte : la règle `review_protocol` impose l'analyse des cas
+            nominal, négatif et edge cases. Si cette analyse ne révèle aucun gap au sens (a),
+            le verdict est approve sans findings. Les observations positives (ce qui fonctionne bien)
+            ne sont pas des findings et n'ont pas à figurer dans le review-report. Un approve sans
+            findings n'est pas un approve paresseux — c'est la conclusion d'une analyse complète
+            qui n'a trouvé aucun problème à corriger.
+
+            L'objectif est la protection de la chaîne de qualité : un approve doit signifier
+            que l'artifact peut avancer sans modification, pas qu'il peut avancer "malgré" ses lacunes.
+            Les auteurs ont besoin de reviews honnêtes. Voter approve sur un artifact qu'on sait
+            perfectible (au sens des acceptance criteria), c'est faire passer la diplomatie avant
+            la qualité.
+
+    === TEXTE EXACT DE LA RÈGLE À AJOUTER ===
+
+        review_findings_honesty:
+          description: >
+            Un reviewer dispose de deux verdicts valides et exclusifs :
+            - `approve`          : l'artifact est bon tel quel. Rien n'est à corriger.
+            - `request_changes`  : quelque chose doit être corrigé avant approbation.
+
+            La catégorie "non bloquant" n'existe pas. Si un finding mérite d'être mentionné
+            comme finding, alors le verdict est request_changes — sans exception, sans gradation.
+
+            Un approve accompagné de findings correctifs est une contradiction logique. Elle
+            est interdite : un tel review-report doit être considéré comme défectueux.
+
+            Critère objectif pour classer chaque observation :
+            (a) Correctif → request_changes : l'observation pointe un gap qui affecte les acceptance
+                criteria du task-request associé, ou qui dégrade l'utilisabilité de l'artifact pour
+                son consommateur direct (ex. : ambiguïté qui bloquerait l'Implementer, incohérence
+                qui invaliderait une décision architecturale). Si oui → finding obligatoire, verdict
+                request_changes.
+            (b) Hors-scope → ne pas mentionner comme finding : l'observation ne touche ni les
+                acceptance criteria ni l'utilisabilité de l'artifact. Elle peut figurer en note
+                informelle hors-verdict si elle apporte de la valeur à l'auteur, mais elle ne pèse
+                pas sur le verdict.
+
+            Le test de classification est simple : "Est-ce qu'un consommateur de cet artifact (PM,
+            Implementer, CEO selon le kind) serait bloqué ou induit en erreur si ce point n'est
+            pas corrigé ?" Si oui → (a). Sinon → (b).
+
+            Cas analyse triaxiale verte : la règle `review_protocol` impose l'analyse des cas
+            nominal, négatif et edge cases. Si cette analyse ne révèle aucun gap au sens (a),
+            le verdict est approve sans findings. Les observations positives (ce qui fonctionne bien)
+            ne sont pas des findings et n'ont pas à figurer dans le review-report. Un approve sans
+            findings n'est pas un approve paresseux — c'est la conclusion d'une analyse complète
+            qui n'a trouvé aucun problème à corriger.
+
+            L'objectif est la protection de la chaîne de qualité : un approve doit signifier
+            que l'artifact peut avancer sans modification, pas qu'il peut avancer "malgré" ses lacunes.
+            Les auteurs ont besoin de reviews honnêtes. Voter approve sur un artifact qu'on sait
+            perfectible (au sens des acceptance criteria), c'est faire passer la diplomatie avant
+            la qualité.
+
+  impact: >
+    Comportemental (immédiat après approbation et injection dans les personas) :
+    - Tout reviewer qui identifie un gap mais voulait voter approve doit désormais voter
+      request_changes. Il n'existe plus de voie médiane légitimée par le système.
+    - Les review-reports avec approve + findings correctifs deviennent identifiables comme
+      non-conformes. Un reviewer en amont du pipeline peut le signaler.
+    - Les workflows de review peuvent allonger légèrement en première itération (plus de
+      request_changes initiaux) mais raccourcissent sur la durée (moins d'allers-retours
+      post-merge sur des problèmes "approuvés" mais jamais corrigés).
+
+    Scope : tous les personas (shared-rules est injecté globalement). Aucun changement de schéma,
+    aucun changement de code Rust, aucune migration de données. Le changement est purement
+    sémantique et comportemental.
+
+    Risque principal : sur-interprétation. Certains reviewers pourraient hésiter à approuver
+    même quand l'artifact est réellement bon, par peur de paraître laxistes. La règle de
+    décision (a)/(b) est conçue pour adresser cela : si rien ne mérite d'être corrigé,
+    approve est le bon verdict. La règle ne crée pas de biais vers request_changes — elle
+    supprime la fausse catégorie intermédiaire.
+
+  rollback_plan: >
+    Si la règle crée des effets indésirables (blocage excessif des reviews, spirales de
+    request_changes sur des détails mineurs), procéder comme suit :
+    1. Émettre un nouveau RFC pour amender ou retirer la règle `review_findings_honesty`.
+    2. En attendant l'approbation du RFC d'amendement, la règle reste active — pas de
+       retrait informel via edit direct (zone protégée).
+    3. Si le problème est urgent, le CEO peut émettre une note dans un agent-message
+       précisant que la règle est suspendue temporairement, en attendant le RFC d'amendement.
+    Le rollback complet (suppression de la clé dans shared-rules.yml) nécessite un write
+    permit comme toute modification de zone protégée.
+
+  affected_files:
+    - company/config/shared-rules.yml
