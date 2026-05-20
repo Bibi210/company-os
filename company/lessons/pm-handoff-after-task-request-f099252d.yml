@@ -1,0 +1,75 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: f099252d-d079-48f0-b1fd-d53c27cdbf93
+  title: "Après création d'un task-request, le PM rend la main à l'utilisateur"
+  author: pm
+  created_at: "2026-05-20"
+  description: >
+    Une fois le task-request validé par l'utilisateur, écrit et indexé, le rôle
+    immédiat du PM s'arrête. Le PM ne doit pas continuer à pousser le workflow
+    (convoquer l'Architect, lancer un review round, etc.) sauf demande explicite.
+    L'utilisateur reprend la main et décide quand relancer la machine.
+  tags:
+    - pm
+    - workflow
+    - handoff
+    - task-request
+    - orchestration
+
+spec:
+  context: >
+    Le PM est le seul agent visible par l'utilisateur. Son rôle est de clarifier
+    l'intent, créer le task-request, puis orchestrer le workflow. Mais
+    "orchestrer" ne signifie pas "tout enchaîner d'un coup". Une fois le
+    task-request créé, l'utilisateur considère souvent que sa session est
+    terminée : il a transmis son besoin, le système l'a capturé proprement,
+    point. Si le PM enchaîne immédiatement en convoquant l'Architect ou en
+    proposant les étapes suivantes de façon trop active, il alourdit la session
+    et brouille la frontière "qui décide quand on avance".
+
+  insight: >
+    La création du task-request est un point de transition naturel : c'est
+    l'instant où l'intent passe du brouillon (conversation) au formel (artifact
+    indexé). À ce moment précis, le besoin immédiat de l'utilisateur est
+    satisfait. Tout ce qui suit (design-doc, review, implementation) est du
+    travail des autres agents qui peut se faire de façon asynchrone, à un
+    rythme que l'utilisateur contrôle.
+
+    Le PM doit donc :
+    (a) confirmer que le task-request est écrit, validé, indexé,
+    (b) résumer brièvement ce qui va suivre dans le workflow (en information,
+    pas en action),
+    (c) explicitement demander à l'utilisateur s'il veut lancer la suite
+    maintenant, ou si on en reste là.
+
+    Ce qu'il ne faut PAS faire :
+    - convoquer automatiquement l'Architect sans demander,
+    - relancer la conversation avec des questions de relance ("autre chose ?"),
+    - proposer des next steps détaillés que l'utilisateur n'a pas réclamés.
+
+    Le fil conducteur : le task-request est le livrable de la session PM. Une
+    fois livré, la session PM est terminée par défaut.
+
+  recommendation: >
+    Workflow après création d'un task-request :
+
+    (1) Confirmer brièvement la création (ID, fichier, statut, indexation).
+
+    (2) Donner UNE phrase de contexte sur la suite du workflow (qui va prendre
+    le relais, quoi attendre), pour que l'utilisateur sache où ça va, sans
+    proposer d'action.
+
+    (3) Une seule question fermée à la fin : "tu veux que je lance la suite
+    maintenant, ou on en reste là ?" ou équivalent. Pas de relance ouverte.
+
+    (4) Si l'utilisateur ne répond pas ou dit "ok", considérer la session
+    comme terminée. Ne pas relancer.
+
+    Cas particuliers où le PM PEUT enchaîner sans demander :
+    - L'utilisateur a explicitement dit dès le début "fais tout d'un coup".
+    - Le task-request a une priorité "critical" ET un acceptance criterion
+      qui exige une action immédiate. Mais même là, mieux vaut confirmer.
+
+    En résumé : par défaut, le PM s'arrête après le task-request. C'est
+    l'utilisateur qui décide quand relancer la machine.

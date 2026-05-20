@@ -1,0 +1,555 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: a49801aa-911e-45d7-95a3-b21d6ea2bd2d
+  title: "Introduire le kind roadmap pour le tracking et la planification des sujets"
+  author: architect
+  created_at: "2026-05-20"
+  status: approved
+  approved_at: "2026-05-20T09:38:22.109174707+00:00"
+  description: >
+    Introduit un nouveau kind d'artifact `roadmap` permettant de tracker et planifier les
+    sujets en cours, passés et futurs dans CompanyOS. Une roadmap est un artifact global
+    qui organise un domaine (CompanyOS-système, un projet métier, etc.) en référençant
+    indifféremment des projets et des RFC. Elle porte trois dimensions : temporelle
+    (past/present/future, dates ou trimestres), causale (dépendances entre items),
+    narrative (champ libre racontant le pourquoi stratégique). Cet RFC livre le schéma
+    JSON, le placement de fichier, les mises à jour des personas concernées, et l'entrée
+    dans shared-rules.artifact_catalog.
+  tags:
+    - roadmap
+    - tracking
+    - planification
+    - nouveau-kind
+    - schema
+    - personas
+    - shared-rules
+    - meta
+    - revised
+  related:
+    - id: 94dd7ab5-0a21-489b-a88e-45a820e9075e
+      kind: task-request
+      relationship: derived-from
+
+spec:
+  motivation: >
+    Aujourd'hui, le PM peut répondre à "qu'est-ce qui doit être fait ?" via les
+    task-requests et "comment fait-on évoluer le système ?" via les RFCs. Mais il ne peut
+    pas répondre simplement à "où en sont mes sujets ?" sur un horizon plus large que la
+    tâche en cours. Les questions structurantes restent éparpillées :
+
+    1. Quels sont les sujets actifs en ce moment dans le domaine CompanyOS-système ?
+    2. Qu'est-ce qui est terminé récemment, et qu'est-ce qui est planifié pour plus tard ?
+    3. Quels sujets dépendent les uns des autres (ex. : on ne peut pas démarrer X tant
+       que Y n'est pas approuvé) ?
+    4. Pourquoi a-t-on choisi de mener ces sujets dans cet ordre — quel est le récit
+       stratégique qui les relie ?
+
+    L'index permet déjà de retrouver les artifacts individuellement, mais aucun artifact
+    ne joue le rôle de "vue d'ensemble organisée par domaine". Les task-requests sont
+    atomiques et orientées exécution ; les RFCs sont des propositions ponctuelles ; le
+    project-config est volontairement léger (fiche d'identité, pas vue temporelle).
+
+    Le besoin est d'un artifact dédié qui :
+    - existe par DOMAINE (plusieurs roadmaps coexistent : roadmap système, roadmap d'un
+      projet métier, etc.) — pas une roadmap unique imposée par projet ;
+    - peut référencer des éléments HÉTÉROGÈNES (projets via leur slug, RFCs via leur id,
+      éventuellement des sujets non encore formalisés) ;
+    - capture les trois dimensions retenues par le PM dans le task-request :
+      temporelle, causale, narrative ;
+    - donne au PM un point d'entrée clair pour répondre à "où en sont mes sujets ?".
+
+    Le project-config n'est pas modifié par ce RFC : il reste un conteneur léger d'identité
+    du projet (nom, ownership, repo). Toute la richesse de planification vit dans la
+    roadmap. Cette séparation évite de gonfler le project-config avec une responsabilité
+    qui n'est pas la sienne, et permet à une roadmap de transcender un projet unique
+    (cas d'une roadmap système couvrant plusieurs projets internes).
+
+  proposal: >
+    Quatre changements coordonnés.
+
+    === 1. NOUVEAU SCHÉMA : company/schemas/roadmap.schema.json ===
+
+    Contenu complet du fichier à créer :
+
+      {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://companyos.dev/schemas/roadmap.schema.json",
+        "allOf": [
+          { "$ref": "_base.schema.json" },
+          {
+            "properties": {
+              "kind": { "const": "roadmap" },
+              "metadata": {
+                "properties": {
+                  "description": { "type": "string" },
+                  "tags": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["description", "tags"]
+              },
+              "spec": {
+                "type": "object",
+                "properties": {
+                  "domain": {
+                    "type": "string",
+                    "description": "Domaine couvert par la roadmap (ex: 'companyos-system', 'puissance4-verus', 'product-discovery'). Identifiant kebab-case, libre. Plusieurs roadmaps peuvent partager un domaine si elles couvrent des sous-thèmes distincts, mais c'est rare — privilégier une roadmap par domaine."
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": ["active", "archived"],
+                    "description": "active = roadmap vivante, mise à jour au fur et à mesure. archived = roadmap historique, plus mise à jour (ex: roadmap d'un trimestre passé que l'on garde pour mémoire)."
+                  },
+                  "narrative": {
+                    "type": "string",
+                    "description": "Récit stratégique de la roadmap : pourquoi ces sujets, pourquoi cet ordre, quel est le fil conducteur. C'est ce qu'on raconte à quelqu'un qui découvre le domaine. Champ libre, plusieurs paragraphes attendus."
+                  },
+                  "items": {
+                    "type": "array",
+                    "description": "Éléments tracés par la roadmap. Chaque item référence un artifact (projet, RFC) ou un sujet en exploration, et porte ses dimensions temporelle, causale, narrative.",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "key": {
+                          "type": "string",
+                          "description": "Identifiant local de l'item dans la roadmap (kebab-case, unique au sein de spec.items). Sert de cible pour les dépendances (depends_on). Ne pas confondre avec metadata.id — c'est juste un handle local."
+                        },
+                        "title": {
+                          "type": "string",
+                          "description": "Titre lisible de l'item (ex: 'Migrer le schéma project-config', 'Lancer le projet puissance4-verus')."
+                        },
+                        "ref": {
+                          "type": "object",
+                          "description": "Référence vers l'artifact ou le sujet tracé. Trois types supportés : project, rfc, external. Le type discrimine le contenu attendu.",
+                          "oneOf": [
+                            {
+                              "properties": {
+                                "type": { "const": "project" },
+                                "project_slug": {
+                                  "type": "string",
+                                  "description": "Slug kebab-case du projet (correspond au dossier projects/<slug>/ et au project_name du project-config)."
+                                }
+                              },
+                              "required": ["type", "project_slug"],
+                              "additionalProperties": false
+                            },
+                            {
+                              "properties": {
+                                "type": { "const": "rfc" },
+                                "id": {
+                                  "type": "string",
+                                  "format": "uuid",
+                                  "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                                  "description": "metadata.id du RFC référencé."
+                                }
+                              },
+                              "required": ["type", "id"],
+                              "additionalProperties": false
+                            },
+                            {
+                              "properties": {
+                                "type": { "const": "external" },
+                                "label": {
+                                  "type": "string",
+                                  "description": "Label libre pour un sujet pas encore formalisé en projet ou RFC (ex: idée en exploration, dépendance externe). Encourage à formaliser plus tard, mais ne bloque pas le tracking."
+                                }
+                              },
+                              "required": ["type", "label"],
+                              "additionalProperties": false
+                            }
+                          ]
+                        },
+                        "timeframe": {
+                          "type": "string",
+                          "enum": ["past", "present", "future"],
+                          "description": "Position temporelle grossière de l'item. past = livré, present = en cours, future = planifié. Cette information est redondante avec status mais sert au regroupement visuel (un PM veut séparer 'ce qui est fait' de 'ce qui est devant nous')."
+                        },
+                        "status": {
+                          "type": "string",
+                          "enum": ["planned", "in_progress", "done", "blocked", "cancelled"],
+                          "description": "État opérationnel de l'item dans la roadmap. C'est la VÉRITÉ portée par la roadmap (mise à jour manuellement par le PM). Une roadmap n'auto-synchronise PAS avec les artifacts sources — éviter une magie fragile."
+                        },
+                        "target_date": {
+                          "type": "string",
+                          "description": "Cible temporelle libre : date ISO 8601 (2026-09-15), trimestre (2026-Q3), ou label (\"bientôt\", \"post-launch\"). Optionnel. Format libre pour ne pas forcer une rigueur prématurée."
+                        },
+                        "depends_on": {
+                          "type": "array",
+                          "items": { "type": "string" },
+                          "description": "Liste de `key` d'autres items de la même roadmap dont celui-ci dépend. Permet de tracer la causalité (ne pas démarrer X tant que Y n'est pas done). Optionnel."
+                        },
+                        "rationale": {
+                          "type": "string",
+                          "description": "Pourquoi cet item est dans la roadmap, ou pourquoi à cette position. Complète narrative au niveau global avec une justification par item. Optionnel."
+                        }
+                      },
+                      "required": ["key", "title", "ref", "timeframe", "status"],
+                      "additionalProperties": false
+                    }
+                  }
+                },
+                "required": ["domain", "status", "narrative", "items"]
+              }
+            },
+            "required": ["spec"]
+          }
+        ]
+      }
+
+    Notes de conception sur le schéma :
+    - `oneOf` sur `ref` permet d'avoir une référence hétérogène typée et validée. C'est
+      plus strict qu'un champ libre, et plus souple qu'un seul type.
+    - `external` est délibérément permissif (juste un `label`) pour ne pas bloquer le
+      tracking d'idées émergentes — le PM peut formaliser plus tard et passer à `project`
+      ou `rfc`.
+    - `timeframe` ET `status` cohabitent volontairement : `timeframe` est la dimension de
+      lecture (past/present/future), `status` est la dimension opérationnelle. Cohérence
+      attendue mais non enforcée (ex: timeframe=past + status=done est cohérent ; un agent
+      peut signaler en review les incohérences).
+    - `depends_on` référence des `key` locales, pas des IDs UUID, pour rester lisible et
+      auto-contenu dans le YAML d'une roadmap.
+
+    === 2. NOUVEAU PLACEMENT DE FICHIER ===
+
+    Les roadmaps vivent dans : `company/roadmaps/<slug>-<8chars>.yml`
+
+    Rationale : artifact GLOBAL. Une roadmap peut référencer plusieurs projets et des RFCs
+    (qui sont eux-mêmes globaux). Elle organise un domaine transverse, pas un projet
+    unique. Même une roadmap focalisée sur un projet vit en global et porte un `domain`
+    qui identifie son périmètre. Cela évite la question piégeuse "à quel projet appartient
+    une roadmap multi-projet ?" et garde la règle de placement uniforme.
+
+    Conséquence : la règle `file_placement` dans shared-rules.yml doit lister `roadmap`
+    parmi les kinds globaux.
+
+    Sort du dossier company/roadmaps/ au moment du merge (avant qu'une première roadmap
+    n'existe) : DÉCISION = création paresseuse, PAS de .gitkeep, PAS de README. Git ne
+    tracke pas les dossiers vides, c'est accepté. Le dossier sera créé naturellement
+    quand le PM écrira sa première roadmap (le placement étant déjà documenté par la
+    règle `file_placement` mise à jour et par le catalogue). Rationale : (a) éviter un
+    fichier sentinelle qui n'apporte aucune information de pilotage ; (b) éviter un
+    README descriptif qui dupliquerait la description du catalogue dans shared-rules
+    (une seule source de vérité sur ce qu'est une roadmap) ; (c) cohérence avec les
+    autres dossiers globaux du repo (company/lessons/, company/agent-messages/), qui
+    ne portent ni .gitkeep ni README de description. L'implementation-plan ne créera
+    donc pas physiquement le dossier ; il le mentionnera uniquement dans la doc de
+    placement.
+
+    === 3. MISE À JOUR DE company/config/shared-rules.yml ===
+
+    Trois éditions ciblées dans le fichier shared-rules.yml.
+
+    3.a. Ajouter `roadmap` à `spec.artifact_catalog.kinds`, après `human-review-triggers`.
+
+    Texte exact à ajouter (indentation identique aux autres entrées du catalogue) :
+
+          roadmap:
+            description: >
+              Vue d'ensemble d'un domaine (système, projet métier, thématique stratégique)
+              organisée selon trois dimensions : temporelle (past/present/future, dates
+              ou trimestres), causale (dépendances entre items), narrative (récit du
+              pourquoi).
+              Référence des éléments hétérogènes : projets (via project_slug),
+              RFCs (via id UUID), ou sujets en exploration (type external).
+              Une roadmap est un artifact GLOBAL : elle vit dans company/roadmaps/
+              et porte un `domain` qui identifie son périmètre (ex: 'companyos-system',
+              'puissance4-verus'). Plusieurs roadmaps coexistent, une par domaine.
+              Statut : `active` (vivante, mise à jour) ou `archived` (historique).
+              Produite et maintenue par le PM. Pas d'auto-synchronisation avec les
+              artifacts référencés : le `status` de chaque item est la vérité portée par
+              la roadmap, mise à jour manuellement par le PM. Sert au PM à répondre à
+              "où en sont mes sujets ?".
+            schema: company/schemas/roadmap.schema.json
+
+    3.b. Mettre à jour la règle `file_placement` (spec.rules.file_placement.description).
+
+    Avant :
+      Kinds globaux : lesson-learned, persona, rfc, flow-control, review-protocol,
+                      human-review-triggers, agent-message
+
+    Après :
+      Kinds globaux : lesson-learned, persona, rfc, flow-control, review-protocol,
+                      human-review-triggers, agent-message, roadmap
+
+    === 4. MISE À JOUR DES PERSONAS ===
+
+    4.a. company/personas/pm.yml — ajouter `roadmap` à `artifacts.produces`.
+
+    Avant :
+      produces:
+        - task-request
+        - lesson-learned
+
+    Après :
+      produces:
+        - task-request
+        - lesson-learned
+        - roadmap
+
+    4.b. company/personas/architect.yml — ajouter `roadmap` à `artifacts.consumes`.
+
+    Avant :
+      consumes:
+        - task-request
+        - implementation-plan
+        - review-report
+        - diagnostic-report
+
+    Après :
+      consumes:
+        - task-request
+        - implementation-plan
+        - review-report
+        - diagnostic-report
+        - roadmap
+
+    Rationale : l'Architect peut consulter une roadmap pour cadrer un design-doc dans son
+    contexte stratégique (comprendre ce qui précède et ce qui suit l'item). Il ne la
+    produit pas (c'est la responsabilité du PM, qui pilote la planification). Implementer
+    et CEO ne sont pas touchés : Implementer travaille au niveau du design-doc et de
+    l'implementation-plan, le CEO arbitre les RFCs et conflits sans avoir besoin d'éditer
+    une roadmap.
+
+    === 5. CODE RUST : extension de l'enum ArtifactKind ===
+
+    L'audit du code Rust (déclenché par le review round 1) montre que l'énumération
+    `ArtifactKind` est FERMÉE : sans nouvelle variante, ni le validator ni le
+    schema_registry ne reconnaissent un kind inconnu.
+
+    Mécanismes en jeu :
+    - `crates/config/src/types.rs` définit l'enum `ArtifactKind` (variantes,
+      `as_str`, `FromStr`) ET la matrice `access_level(persona, kind)`. Le compilateur
+      Rust impose l'exhaustivité du match dans `access_level` : ajouter une variante
+      sans ajouter ses branches casse la compilation. C'est un filet de sécurité, pas
+      une difficulté.
+    - `crates/validation/src/validator.rs` (autour de la ligne 81) parse la valeur
+      `kind` du YAML via `kind_str.parse::<ArtifactKind>()` et rejette tout kind
+      inconnu avec `ValidationError::UnknownKind`.
+    - `crates/validation/src/schema_registry.rs` (autour de la ligne 51) découvre les
+      schémas en lisant `company/schemas/*.schema.json` et IGNORE silencieusement
+      tout schéma dont le stem ne parse pas en `ArtifactKind`. Conséquence : poser le
+      fichier `roadmap.schema.json` sans étendre l'enum reviendrait à ne pas le poser
+      du tout pour le validator.
+
+    Conclusion : l'auto-découverte mentionnée dans la version initiale du RFC est
+    EXACTE en mécanique (lecture du dossier), mais NE SUFFIT PAS pour les nouveaux
+    kinds — elle ne traite que la (re)découverte des schémas correspondant à des
+    variantes déjà connues de l'enum. Toute extension du catalogue passe donc par une
+    modification de code Rust. Cette décision est tranchée ici, dans le RFC, et n'est
+    pas reportée à l'implementation-plan.
+
+    Modifications EXACTES à apporter à crates/config/src/types.rs :
+
+    5.a. Ajouter une variante à `enum ArtifactKind` (vers la ligne 144, à la fin du
+         bloc, après `HumanReviewTriggers`) :
+
+           Roadmap,
+
+    5.b. Ajouter la branche correspondante dans `impl ArtifactKind { fn as_str(...) }`
+         (vers la ligne 162) :
+
+           Self::Roadmap => "roadmap",
+
+    5.c. Ajouter la branche correspondante dans `impl FromStr for ArtifactKind`
+         (vers la ligne 193) :
+
+           "roadmap" => Ok(Self::Roadmap),
+
+    5.d. Étendre la matrice `access_level(persona, kind)` (lignes 211-239) en ajoutant
+         des branches AVANT les fallbacks `_ => Read` de chaque persona. Le compilateur
+         garantira l'exhaustivité ; les branches explicites sont là pour documenter
+         l'intent :
+
+           - (Pm, Roadmap)          => Write
+             // Le PM produit et maintient les roadmaps. Cohérent avec personas/pm.yml
+             // mis à jour en section 4.a.
+           - (Architect, Roadmap)   => Read
+             // L'Architect consulte les roadmaps pour cadrer ses design-docs. Cohérent
+             // avec personas/architect.yml mis à jour en section 4.b.
+           - (Implementer, Roadmap) => Read
+             // L'Implementer n'édite pas les roadmaps mais peut les lire pour
+             // contextualiser son implementation-plan.
+           - (Ceo, Roadmap)         => Read
+             // Couvert par la branche fallback `(Ceo, _) => Read`. Pas de branche
+             // explicite nécessaire — la branche fallback existante suffit.
+           - (Myself, Roadmap)      => Read
+           - (All, Roadmap)         => Read
+             // Couvertes par les branches fallback existantes `(Myself, _)` et
+             // `(All, _)`. Pas de branche explicite nécessaire.
+
+         Concrètement, le diff dans le bloc `match` se limite à :
+           (Pm, Roadmap) => Write,        // dans la zone Pm, avant `(Pm, _) => Read`
+           (Architect, Roadmap) => Read,  // dans la zone Architect, avant `(Architect, _) => Read`
+           (Implementer, Roadmap) => Read, // dans la zone Implementer, avant `(Implementer, _) => Read`
+
+         Les autres personas sont couvertes par leurs fallbacks `(_, _) => Read`
+         existants, donc aucune ligne supplémentaire requise pour eux.
+
+    5.e. Mettre à jour les tests unitaires du module dans `crates/config/src/types.rs` :
+         - `test_artifact_kind_parse_valid` (ligne 410) : ajouter `"roadmap"` à la
+           liste `cases`.
+         - `test_artifact_kind_display_roundtrip` (ligne 440) : ajouter
+           `ArtifactKind::Roadmap` au tableau `all_kinds`.
+         - Ajouter un test dédié `test_access_level_roadmap` qui vérifie
+           `(Pm, Roadmap) => Write` et `(Architect, Roadmap) => Read`.
+
+    5.f. Mettre à jour le test d'intégration
+         `tests/integration/edge_cases.rs::test_access_matrix_no_panics` (ligne 210) :
+         ajouter `ArtifactKind::Roadmap` au tableau `all_kinds` (lignes 211-224) pour
+         que la matrice soit balayée exhaustivement sur ce kind.
+
+    Cinq personas ? Le code définit SIX variantes de `PersonaId` (types.rs ligne 71) :
+    Pm, Architect, Implementer, Ceo, Myself, All. Les deux dernières (`Myself`, `All`)
+    sont des pseudo-personas système et reçoivent universellement `Read` via la
+    branche fallback existante — aucune entrée explicite n'est nécessaire pour elles.
+    L'access_level pour le Roadmap se résume donc à 3 branches explicites
+    additionnelles (Pm, Architect, Implementer), Ceo/Myself/All étant absorbés par
+    les fallbacks.
+
+    Pas d'autre code Rust à modifier : aucune autre crate ne fait de match exhaustif
+    sur `ArtifactKind` qui dépendrait de la nouvelle variante (les usages sont des
+    références à des variantes spécifiques, ex. `ArtifactKind::Rfc`, qui ne sont pas
+    affectés par l'ajout).
+
+    === REVIEW-PROTOCOL : pas de changement requis dans ce RFC ===
+
+    Le review-protocol.yml liste qui review quel kind. Aucune entrée n'est ajoutée pour
+    `roadmap` dans ce RFC : une roadmap est un artifact de pilotage interne au PM, comme
+    un tableau de bord. Sa modification ne déclenche pas un review round formel. Si plus
+    tard l'usage révèle un besoin de review pair (ex: Architect doit valider la cohérence
+    causale), un RFC ultérieur pourra l'ajouter. Cette restriction est volontaire pour ne
+    pas alourdir l'usage initial, on observe d'abord.
+
+    === EXEMPLE D'USAGE (informatif, hors changement de schéma) ===
+
+    Une roadmap "companyos-system" pourrait contenir :
+      - item key=enrich-project-config, ref={type:rfc, id:3e318c7e-...}, timeframe=past,
+        status=done, rationale="Préparation à l'introduction de la roadmap"
+      - item key=roadmap-kind, ref={type:rfc, id:a49801aa-...}, timeframe=present,
+        status=in_progress
+      - item key=auto-sync-status, ref={type:external, label:"Idée: synchroniser
+        roadmap.status avec task-request.status"}, timeframe=future, status=planned,
+        depends_on=[roadmap-kind]
+
+  impact: >
+    Additif principalement, avec modifications de zones protégées côté config ET côté
+    code Rust.
+
+    NOUVEAUX FICHIERS :
+    - company/schemas/roadmap.schema.json (création)
+    - company/roadmaps/ (dossier créé paresseusement par le PM à la première roadmap,
+      pas physiquement matérialisé au merge ; cf. section 2 de la proposal)
+
+    FICHIERS MODIFIÉS, ZONES PROTÉGÉES CONFIG (nécessitent write permit après
+    approbation) :
+    - company/config/shared-rules.yml : ajout de l'entrée `roadmap` dans
+      artifact_catalog.kinds, et mise à jour de la règle file_placement.
+    - company/personas/pm.yml : ajout de `roadmap` à artifacts.produces.
+    - company/personas/architect.yml : ajout de `roadmap` à artifacts.consumes.
+
+    FICHIERS MODIFIÉS, ZONES PROTÉGÉES CODE RUST (nécessitent write permit après
+    approbation) :
+    - crates/config/src/types.rs : nouvelle variante `Roadmap` dans `enum ArtifactKind`,
+      branches `as_str` et `FromStr`, trois branches dans la matrice `access_level`
+      (Pm=Write, Architect=Read, Implementer=Read ; Ceo/Myself/All couverts par les
+      fallbacks existants), et mises à jour des tests unitaires du module.
+    - tests/integration/edge_cases.rs : ajouter `ArtifactKind::Roadmap` au tableau
+      `all_kinds` de `test_access_matrix_no_panics` pour préserver l'exhaustivité du
+      balayage matriciel.
+
+    AUCUN ARTIFACT EXISTANT N'EST INVALIDÉ : aucune roadmap n'existe encore, donc pas de
+    migration. Les autres kinds ne sont pas touchés et la matrice access_level reste
+    inchangée pour eux (ajout pur, pas de modification de branches existantes).
+
+    CHANGEMENT DE CODE RUST CONFIRMÉ : contrairement à la première version du RFC,
+    l'extension du catalogue d'artifacts EXIGE de toucher au code Rust. L'enum
+    `ArtifactKind` est fermé, le validator rejette les kinds inconnus, et le
+    schema_registry ignore silencieusement les schémas dont le stem ne parse pas en
+    `ArtifactKind`. Le détail des modifications est tranché en section 5 de la
+    proposal. L'implementation-plan se contentera d'exécuter ces modifications, sans
+    décisions structurelles supplémentaires à prendre côté Rust.
+
+    NATURE DE L'ESCALADE : l'ajout d'une variante à `ArtifactKind` combiné à de
+    nouvelles branches dans `access_level` relève de la catégorie
+    `EscalationCategory::ModifyAccessMatrix` (définie dans types.rs ligne 311). Le CEO
+    doit donc voter ce RFC et l'approbation seule du CEO suffit selon le review-protocol
+    actuel pour cette catégorie ; à vérifier au moment du round 2.
+
+    IMPACT COMPORTEMENTAL :
+    - Le PM gagne un format formel pour planifier et restituer l'état des sujets par
+      domaine. C'est un outil, pas une contrainte : il peut continuer à fonctionner sans
+      roadmap, mais il en aura besoin dès que le nombre de sujets actifs dépassera ce qu'on
+      tient mentalement.
+    - L'Architect peut consulter une roadmap quand il cadre un design-doc, pour positionner
+      sa contribution dans le récit stratégique. Optionnel.
+    - Les autres personas (Implementer, CEO) restent inchangés.
+
+    RISQUES IDENTIFIÉS :
+    - Risque 1 : DUPLICATION DE VÉRITÉ. Le `status` d'un item dans la roadmap peut
+      diverger du `status` du task-request sous-jacent. Mitigation : décision explicite
+      de NE PAS auto-synchroniser (cf. proposal). La roadmap porte la VÉRITÉ DE PILOTAGE,
+      le task-request porte la vérité opérationnelle. Le PM est responsable de la
+      cohérence. Si la divergence devient problématique, un RFC ultérieur pourra
+      introduire une synchronisation explicite.
+    - Risque 2 : ROADMAPS ZOMBIES. Des roadmaps `active` non mises à jour deviennent
+      trompeuses. Mitigation : convention sociale (le PM nettoie ses roadmaps) ; pas
+      d'enforcement automatique dans ce RFC pour rester léger.
+    - Risque 3 : SCHÉMA TROP RICHE D'EMBLÉE. Le risque inverse serait un schéma trop
+      restrictif qu'il faudrait élargir vite. Choix retenu : schéma volontairement riche
+      (3 types de ref, timeframe + status, depends_on, rationale) parce que les besoins
+      du task-request sont explicites. Les champs optionnels (target_date, depends_on,
+      rationale) ne pèsent pas si non utilisés.
+
+  rollback_plan: >
+    Le rollback est entièrement réversible par git revert sur le commit (ou la série
+    de commits) qui matérialise ce RFC. Procédure manuelle équivalente, dans l'ordre
+    qui maximise la cohérence intermédiaire (config avant code, pour éviter qu'un
+    binaire avec la variante `Roadmap` rencontre un schéma absent) :
+
+    1. CONFIG : restaurer company/config/shared-rules.yml à son état pré-RFC (retirer
+       l'entrée `roadmap` du catalogue, retirer `roadmap` de la liste des kinds
+       globaux dans file_placement).
+    2. CONFIG : restaurer company/personas/pm.yml (retirer `roadmap` de
+       artifacts.produces).
+    3. CONFIG : restaurer company/personas/architect.yml (retirer `roadmap` de
+       artifacts.consumes).
+    4. ARTIFACTS : supprimer toutes les roadmaps créées dans company/roadmaps/ (ou
+       les déplacer dans un dossier d'archive temporaire, cf. options ci-dessous).
+       Supprimer company/schemas/roadmap.schema.json.
+    5. CODE RUST : restaurer crates/config/src/types.rs (retirer la variante
+       `Roadmap` de `enum ArtifactKind`, retirer les branches `as_str` et `FromStr`,
+       retirer les trois branches explicites dans `access_level`, retirer les
+       assertions sur Roadmap dans les tests unitaires).
+    6. CODE RUST : restaurer tests/integration/edge_cases.rs (retirer
+       `ArtifactKind::Roadmap` du tableau `all_kinds` de
+       `test_access_matrix_no_panics`).
+    7. BUILD & VALIDATION : recompiler les crates `config` et `validation`, lancer
+       `cargo test -p companyos-config -p companyos-validation` et la suite
+       d'intégration pour confirmer que le rollback n'a pas laissé de référence
+       pendante. La compilation exhaustive du `match` dans `access_level` garantit
+       qu'aucune branche orpheline ne reste.
+
+    Les roadmaps déjà créées (s'il y en a au moment du rollback) deviendraient
+    invalides contre l'ancien validator (kind inconnu). Deux options pour les
+    données :
+    (a) les supprimer (perte de données de pilotage, pas de données opérationnelles) ;
+    (b) les déplacer hors company/roadmaps/ dans un dossier d'archive temporaire
+        pour les ré-importer plus tard si un RFC successeur introduit un kind
+        compatible.
+
+    Ordre du rollback : exécuter les étapes 1 à 4 dans la même fenêtre de
+    déploiement que les étapes 5 et 6 ; un état intermédiaire où le code reconnaît
+    encore `Roadmap` alors que le catalogue ne le liste plus serait acceptable mais
+    inutilement bruyant pour les agents. À l'inverse, supprimer la variante Rust
+    avant de supprimer le schéma laisserait `schema_registry` ignorer silencieusement
+    le schéma (pas de crash, mais incohérence).
+
+    Pas de dépendance d'autres artifacts vers `roadmap` : aucun risque de casse en
+    cascade côté données.
+
+  affected_files:
+    - company/schemas/roadmap.schema.json
+    - company/config/shared-rules.yml
+    - company/personas/pm.yml
+    - company/personas/architect.yml
+    - crates/config/src/types.rs
+    - tests/integration/edge_cases.rs

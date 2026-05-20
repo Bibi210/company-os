@@ -1,0 +1,173 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 0ab64171-7ea8-4423-ae5d-8d741a798429
+  title: "Implementation plan : introduire le kind roadmap"
+  author: implementer
+  created_at: "2026-05-20"
+  description: >
+    Plan d'implémentation détaillé du RFC a49801aa (introduction du kind `roadmap`).
+    Exécute strictement les modifications tranchées dans le RFC : nouveau schéma JSON,
+    extension de l'enum Rust `ArtifactKind`, mise à jour des tests, mise à jour de
+    shared-rules.yml et des personas PM/Architect. Aucune décision structurelle
+    supplémentaire n'est prise ici — toutes les décisions sont déjà figées dans le RFC
+    (sections 1 à 5 du proposal). Ce plan en orchestre l'application dans un ordre
+    safe vis-à-vis du write-permit-full-sequence.
+  tags:
+    - roadmap
+    - implementation
+    - rust
+    - schema
+    - personas
+    - shared-rules
+    - nouveau-kind
+  related:
+    - id: a49801aa-911e-45d7-95a3-b21d6ea2bd2d
+      kind: rfc
+      relationship: derived-from
+    - id: 94dd7ab5-0a21-489b-a88e-45a820e9075e
+      kind: task-request
+      relationship: derived-from
+
+spec:
+  steps:
+    - description: >
+        Étape 1 : créer company/schemas/roadmap.schema.json.
+        Contenu copié à l'identique depuis la section 1 du proposal du RFC a49801aa
+        (allOf avec _base.schema.json, kind=roadmap, metadata { description, tags }
+        requis, spec avec domain / status / narrative / items, items[] avec key /
+        title / ref (oneOf project|rfc|external) / timeframe / status, plus les
+        champs optionnels target_date / depends_on / rationale).
+        Validation : appeler validate_file sur le nouveau fichier JSON via le
+        yaml-validator MCP (auto-test que le schéma est bien chargé après reload).
+        Aucune autre dépendance ; ce fichier est isolé et peut être posé avant les
+        autres modifications.
+      files:
+        - company/schemas/roadmap.schema.json
+    - description: >
+        Étape 2 : étendre crates/config/src/types.rs (4 sous-modifications, à appliquer
+        dans le même commit pour garder le code compilable à chaque étape git).
+        (a) Ajouter la variante `Roadmap,` à `enum ArtifactKind` (après
+            `HumanReviewTriggers,`, vers la ligne 143).
+        (b) Ajouter la branche `Self::Roadmap => "roadmap",` dans
+            `impl ArtifactKind { fn as_str(...) }` (vers la ligne 161).
+        (c) Ajouter la branche `"roadmap" => Ok(Self::Roadmap),` dans
+            `impl FromStr for ArtifactKind` (vers la ligne 193).
+        (d) Étendre la fonction `access_level` (vers les lignes 216-238) avec
+            exactement TROIS branches explicites avant les fallbacks `(Persona, _)` :
+              * `(Pm, Roadmap) => Write,` (avant `(Pm, _) => Read,`)
+              * `(Architect, Roadmap) => Read,` (avant `(Architect, _) => Read,`)
+              * `(Implementer, Roadmap) => Read,` (avant `(Implementer, _) => Read,`)
+            Ceo / Myself / All sont absorbés par leurs fallbacks `(_, _) => Read`
+            existants ; pas de branche supplémentaire pour eux (cf. section 5.d du
+            RFC). Le compilateur garantit l'exhaustivité du match.
+      files:
+        - crates/config/src/types.rs
+    - description: >
+        Étape 3 : mettre à jour les tests unitaires du module `tests` dans
+        crates/config/src/types.rs (même fichier, suite des modifications de
+        l'étape 2 — peut être inclus dans le même commit).
+        (a) Dans `test_artifact_kind_parse_valid` (vers la ligne 410), ajouter
+            `"roadmap"` à la liste `cases`.
+        (b) Dans `test_artifact_kind_display_roundtrip` (vers la ligne 440), ajouter
+            `ArtifactKind::Roadmap` au tableau `all_kinds`.
+        (c) Ajouter un test dédié `test_access_level_roadmap` qui vérifie :
+              * `access_level(PersonaId::Pm, ArtifactKind::Roadmap) == AccessLevel::Write`
+              * `access_level(PersonaId::Architect, ArtifactKind::Roadmap) == AccessLevel::Read`
+              * `access_level(PersonaId::Implementer, ArtifactKind::Roadmap) == AccessLevel::Read`
+              * `access_level(PersonaId::Ceo, ArtifactKind::Roadmap) == AccessLevel::Read`
+      files:
+        - crates/config/src/types.rs
+    - description: >
+        Étape 4 : étendre le test d'intégration
+        tests/integration/edge_cases.rs::test_access_matrix_no_panics
+        (vers la ligne 211) en ajoutant `ArtifactKind::Roadmap` au tableau
+        `all_kinds` afin que le balayage exhaustif (PersonaId × ArtifactKind) couvre
+        bien la nouvelle variante.
+      files:
+        - tests/integration/edge_cases.rs
+    - description: >
+        Étape 5 : mettre à jour company/config/shared-rules.yml (deux éditions
+        ciblées, dans le même commit).
+        (a) Ajouter l'entrée `roadmap:` dans `spec.artifact_catalog.kinds`, après
+            l'entrée `human-review-triggers`. Description et `schema:` repris à
+            l'identique depuis la section 3.a du RFC.
+        (b) Mettre à jour la liste des kinds globaux dans
+            `spec.rules.file_placement.description` : ajouter `, roadmap` après
+            `agent-message` dans la ligne "Kinds globaux".
+        Validation : `mcp_Yaml-validator_validate_file` sur shared-rules.yml.
+      files:
+        - company/config/shared-rules.yml
+    - description: >
+        Étape 6 : mettre à jour les deux personas concernées (même commit).
+        (a) company/personas/pm.yml : ajouter `- roadmap` à `artifacts.produces`.
+        (b) company/personas/architect.yml : ajouter `- roadmap` à
+            `artifacts.consumes`.
+        Validation : validate_file sur chacun des deux YAML.
+      files:
+        - company/personas/pm.yml
+        - company/personas/architect.yml
+    - description: >
+        Étape 7 : exécuter la séquence write_permit_full_sequence pour respecter
+        l'ordre opérationnel obligatoire de l'Implementer.
+        (a) Sceller la DB orchestrator (write permit déjà émis 380ad332-...) :
+              `git add -f company/data/orchestrator.db &&
+               git commit -m "chore: seal write permit 380ad332 for roadmap RFC"`
+            AVANT toute modification des fichiers protégés des étapes 1, 2, 3, 4,
+            5, 6. Note opérationnelle : ce scellage est en réalité la PREMIÈRE
+            action d'exécution une fois ce plan approuvé. L'ordre logique du plan
+            (1 → 6) reste valide, mais le commit du scellage doit précéder toute
+            écriture des fichiers concernés. À l'exécution, l'ordre concret sera :
+              [seal DB] → [écritures étapes 1 à 6] → [git commit des changements]
+              → [consume_write_permit] → [cargo build + cargo test]
+              → [reload_config en dernier].
+        (b) Une fois toutes les écritures faites, committer tous les fichiers
+            modifiés (`git add` puis `git commit`).
+        (c) `consume_write_permit(persona=implementer, permit_id=380ad332-...)`
+            APRÈS le commit, jamais avant.
+        (d) `cargo build` (sans --target-dir, pour déclencher le hot-reload du
+            binaire MCP) suivi de `cargo test` (suite complète). Les deux DOIVENT
+            passer ; en cas d'échec, produire un diagnostic-report et stopper la
+            séquence.
+        (e) `reload_config()` en TOUT DERNIER, uniquement si build + test sont
+            verts. Cette étape recharge shared-rules dans l'orchestrateur pour
+            que le nouveau kind soit pris en compte côté config dynamique.
+      files:
+        - company/data/orchestrator.db
+        - crates/config/src/types.rs
+        - tests/integration/edge_cases.rs
+        - company/schemas/roadmap.schema.json
+        - company/config/shared-rules.yml
+        - company/personas/pm.yml
+        - company/personas/architect.yml
+    - description: >
+        Étape 8 : validation finale post-implémentation.
+        (a) `mcp_Yaml-validator_validate_file` sur chacun des fichiers YAML
+            modifiés ou créés (schemas/roadmap.schema.json côté JSON Schema, plus
+            shared-rules.yml, pm.yml, architect.yml côté artifacts).
+        (b) Vérifier qu'aucun diagnostic LSP ne reste sur crates/config/src/types.rs
+            et tests/integration/edge_cases.rs (via get_diagnostics).
+        (c) Re-lancer `cargo test` une dernière fois pour confirmation
+            (l'environnement après reload_config doit toujours être vert).
+        (d) Optionnel : créer un agent-message vers le PM pour annoncer
+            l'achèvement, OU le faire en remontée directe dans la session.
+      files:
+        - company/schemas/roadmap.schema.json
+        - company/config/shared-rules.yml
+        - company/personas/pm.yml
+        - company/personas/architect.yml
+        - crates/config/src/types.rs
+        - tests/integration/edge_cases.rs
+  dependencies:
+    - "RFC a49801aa-911e-45d7-95a3-b21d6ea2bd2d approuvé (statut: approved) — vérifié."
+    - "Write permit 380ad332-f6d4-4925-8955-2b959d91a62d émis par le CEO et couvrant exactement les 6 fichiers ciblés — vérifié."
+    - "Architect doit reviewer ce plan avant exécution (review-protocol)."
+    - "Étape 2 dépend de l'étape 1 uniquement de manière logique (la variante Rust pointera vers un schéma qui existe). En pratique, l'ordre des éditions de fichier importe peu tant qu'elles sont dans le même commit ; ce qui compte est de committer AVANT consume_write_permit."
+    - "Étape 7.e (reload_config) dépend strictement de la réussite de cargo build et cargo test."
+  risks:
+    - "Risque 1 : oublier le scellage de la DB avant les écritures protégées — le hook git rejetterait alors le commit final. Mitigation : suivre l'ordre concret explicité en étape 7.a."
+    - "Risque 2 : consume_write_permit appelé avant le commit git — le hook bloque le commit après coup. Mitigation : la règle write_permit_full_sequence est explicite, on consomme APRÈS le commit."
+    - "Risque 3 : reload_config appelé avant cargo test — risque de couper la session MCP pendant que des tests sont encore en échec, perdant le contexte. Mitigation : reload_config strictement en dernier, conditionné aux verts."
+    - "Risque 4 : un match sur ArtifactKind dans une autre crate (non identifié au scan du RFC) casserait la compilation. Mitigation : confiance dans l'exhaustivité du compilateur Rust, le cargo build de l'étape 7.d révélera toute branche manquante. Plan de contingence : ajouter la branche manquante avant de committer."
+    - "Risque 5 : le validate_file du JSON Schema pourrait ne pas être supporté par le yaml-validator MCP (il ne valide peut-être que des artifacts YAML). Mitigation : si validate_file échoue sur le .json, se rabattre sur cargo test (le test schema_registry chargera le schéma et révélerait une erreur de structure)."
+    - "Risque 6 : l'ordre logique du plan (création schéma → variante Rust) pourrait laisser penser à l'auteur du commit que le schéma est posé avant le code. C'est cosmétique : le scellage de la DB doit précéder TOUT, et le commit final embarque l'ensemble. Mitigation : noter explicitement l'ordre concret d'exécution en étape 7.a."

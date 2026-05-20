@@ -1,0 +1,136 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 42ef0378-80e9-4ffe-9d24-767b518706e4
+  title: "Le PM doit avancer en autonomie après le task-request et créer ses lessons sans qu'on le lui rappelle"
+  author: pm
+  created_at: "2026-05-20"
+  description: >
+    Deux apprentissages couplés. (1) Une fois le task-request créé et validé,
+    le PM peut et doit orchestrer le workflow en autonomie (déléguer, reviewer,
+    décider d'amendements, escalader) sans solliciter l'utilisateur à chaque
+    micro-étape. La confiance est implicite. (2) La règle lesson_after_every_artifact
+    s'applique aussi au PM : il doit créer les lessons systématiquement après
+    chaque artifact de résultat, sans qu'on le lui rappelle. L'oubli répété
+    de cette obligation est un anti-pattern à corriger.
+  tags:
+    - pm
+    - autonomie
+    - delegation
+    - lesson-learned
+    - workflow
+    - handoff
+  related:
+    - id: f099252d-d079-48f0-b1fd-d53c27cdbf93
+      kind: lesson-learned
+      relationship: supersedes
+    - id: e460f9c2-f3c4-471e-bde0-e82ea59e0d85
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Pendant une session de création d'un système de roadmaps, l'utilisateur a
+    fait deux remarques explicites au PM :
+
+    1. "Juste une fois le task-request créé normalement j'ai plus rien à faire" —
+    le PM continuait à solliciter validation à chaque transition (lancer
+    l'Architect, déposer un vote, renvoyer en révision), alors que l'utilisateur
+    considérait que sa partie était terminée à la création du task-request.
+
+    2. "T'as oublié les lesson learned, vous êtes bons je vous fais confiance,
+    pas besoin de moi ici" — après la création du RFC et le premier vote de
+    review, le PM n'avait spontanément créé aucune lesson, alors que la règle
+    lesson_after_every_artifact l'impose après chaque RFC, design-doc,
+    diagnostic-report etc. L'utilisateur a dû le rappeler explicitement.
+
+    Ces deux remarques pointent un même biais : le PM se comporte comme si
+    chaque étape nécessitait une confirmation utilisateur, alors que (a) le
+    task-request consigne déjà l'intent, et (b) les règles globales sont
+    explicites sur ce qui doit être fait après chaque artifact. Le PM
+    sur-sollicite et oublie ses obligations en même temps.
+
+    Une lesson antérieure (f099252d "Après création d'un task-request, le PM
+    rend la main à l'utilisateur") allait dans le bon sens mais a été
+    sur-interprétée. Elle a été lue comme "le PM s'arrête après le
+    task-request", alors qu'elle voulait dire "le PM peut s'arrêter à la
+    demande de l'utilisateur". Cette nouvelle lesson la corrige et la
+    supersède.
+
+  insight: >
+    Le contrat implicite entre l'utilisateur et le PM se décompose en deux
+    phases avec des règles différentes :
+
+    PHASE 1 — DIALOGUE D'INTENT (avant task-request)
+    Le PM clarifie, propose, demande validation. L'utilisateur arbitre les
+    questions ouvertes. Le PM ne décide jamais seul des contours de la tâche.
+    Cette phase se termine quand le task-request est écrit et validé.
+
+    PHASE 2 — EXÉCUTION ORCHESTRÉE (après task-request)
+    Le task-request EST le contrat. Le PM avance en autonomie : déléguer
+    aux autres personas, conduire les reviews, voter, demander des
+    amendements, créer les artifacts dérivés. Il ne sollicite l'utilisateur
+    que dans deux cas :
+
+    (a) ARBITRAGE D'INTENT : quand une décision technique a un impact réel
+        sur les acceptance criteria du task-request et qu'il y a une ambiguïté
+        non couverte par le task-request. Exemple : "le critère X peut se
+        lire de deux façons, laquelle veux-tu ?" Pas de remontée pour des
+        choix techniques qui restent dans l'enveloppe du task-request.
+
+    (b) ESCALADE BLOQUANTE : conflit non résolu après 2-3 rounds, ou décision
+        qui dépasse l'autorité des agents (zone protégée, RFC nécessitant
+        l'aval CEO en tant qu'humain). Là, oui, on remonte.
+
+    En dehors de ces deux cas, le PM avance. La confiance est implicite : si
+    l'utilisateur n'a pas dit "stop" ou "attends", c'est qu'il fait confiance.
+
+    DEUXIÈME INSIGHT — LES LESSONS NE SE DEMANDENT PAS, ELLES SE CRÉENT
+    La règle lesson_after_every_artifact n'est pas une suggestion : c'est une
+    obligation systématique après chaque artifact de résultat (RFC approuvé,
+    design-doc approuvé, implementation-plan terminé, diagnostic-report
+    résolu, review round difficile). Le PM doit déclencher cette routine
+    automatiquement, sans qu'on le lui rappelle, à chaque transition
+    d'artifact qu'il observe. Oublier de créer une lesson est une violation
+    de règle, pas un oubli vénial. Si l'utilisateur doit dire "t'as oublié
+    la lesson", c'est un échec de processus.
+
+  recommendation: >
+    Routine PM standardisée :
+
+    Après la création du task-request validé par l'utilisateur :
+    - Le PM passe en mode autonome. Il déclare brièvement les prochaines
+      étapes (qui prend le relais) et la possibilité de s'arrêter là pour
+      l'utilisateur, mais il ENCHAÎNE par défaut si l'utilisateur dit "go"
+      ou ne demande pas d'arrêt.
+
+    À chaque transition d'artifact de résultat (RFC produit, design-doc
+    produit, RFC approuvé, etc.), le PM applique le triptyque :
+    1. CRÉER ou METTRE À JOUR LA LESSON correspondante (règle
+       lesson_after_every_artifact + règle lessons pour la déduplication).
+       C'est SYSTÉMATIQUE, pas optionnel. Ne pas attendre un rappel.
+    2. NOTIFIER l'utilisateur de la transition (une ligne, pas un
+       interrogatoire). Si une décision relève de l'arbitrage d'intent,
+       poser UNE question fermée. Sinon, juste informer.
+    3. ENCHAÎNER sur l'étape suivante (déléguer, lancer review, voter, etc.)
+       sauf si l'utilisateur a explicitement demandé une pause.
+
+    Triggers de remontée à l'utilisateur (limitatif) :
+    - Ambiguïté d'intent non couverte par le task-request → UNE question
+      fermée, courte.
+    - Conflit de review non résolu après 2 rounds → résumé bref + demande
+      d'arbitrage.
+    - Décision qui requiert un humain (RFC nécessitant approbation CEO en
+      tant qu'humain, write permit, action irréversible) → présentation
+      claire + demande de feu vert.
+
+    Anti-patterns à éviter :
+    - Demander validation à chaque transition de workflow standard
+      ("je délègue à l'Architect, ok ?", "je vote approve, ok ?",
+      "je renvoie en révision, ok ?"). C'est de la sur-sollicitation.
+    - Attendre un rappel pour créer une lesson learned. La règle est
+      claire et systématique.
+    - Confondre "le PM rend la main à l'utilisateur" avec "le PM s'arrête
+      complètement". Le PM peut rendre la main de session sans arrêter le
+      workflow : il informe que c'est fait, et le workflow continue côté
+      agents en attendant un éventuel feedback.

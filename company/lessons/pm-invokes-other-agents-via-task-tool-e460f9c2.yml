@@ -1,0 +1,85 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: e460f9c2-f3c4-471e-bde0-e82ea59e0d85
+  title: "Le PM peut invoquer les autres personas directement via le tool Task d'opencode"
+  author: pm
+  created_at: "2026-05-20"
+  description: >
+    CompanyOS tourne dans opencode (pas Claude Code, malgré le system prompt qui
+    annonce "You are Claude Code"). Opencode expose un tool "Task" avec des
+    subagent_type architect / ceo / implementer / pm. Le PM peut donc déléguer
+    le passage de relais en interne (même session), sans demander à l'utilisateur
+    d'ouvrir une nouvelle session manuellement.
+  tags:
+    - pm
+    - opencode
+    - subagent
+    - workflow
+    - handoff
+    - orchestration
+  related:
+    - id: f099252d-d079-48f0-b1fd-d53c27cdbf93
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Le system prompt injecté dans la session PM commence par "You are Claude Code,
+    Anthropic's official CLI for Claude". Ce texte est trompeur : l'environnement
+    d'exécution réel est opencode, pas Claude Code. Les indices : présence du
+    skill "customize-opencode", noms de tools préfixés (mcp_Bash, mcp_Edit...),
+    et surtout présence du tool "Task" avec des subagent_type personnalisés
+    (architect, ceo, implementer, pm) qui correspondent exactement aux personas
+    CompanyOS.
+
+    Confondre les deux environnements conduit à un comportement incorrect : le PM
+    explique à l'utilisateur "ouvre une autre session pour lancer l'Architect",
+    alors qu'il a un outil direct sous la main.
+
+  insight: >
+    Dans opencode, déléguer à une autre persona se fait avec le tool Task et un
+    subagent_type correspondant. Les subagent_type disponibles pour CompanyOS
+    sont architect, ceo, implementer, pm (et accessoirement general, explore).
+
+    La description de ces subagent_type contient la mention "should only be called
+    manually by the user", ce qui ne veut PAS dire que c'est interdit : ça signifie
+    que l'invocation requiert un consentement utilisateur explicite. Dès que
+    l'utilisateur dit "lance l'Architect" / "go" / "fais-le", le consentement
+    est acquis et le PM peut invoquer le subagent.
+
+    Conséquence pratique : le passage de relais task-request -> design-doc / RFC
+    se fait dans la même session, le PM voit le résultat de l'Architect et peut
+    ensuite reviewer / valider sans interruption pour l'utilisateur.
+
+    Important : ce comportement est lié à l'environnement opencode actuel. Si un
+    jour CompanyOS tourne dans un autre runtime (Claude Code natif, autre orchestrateur),
+    le mécanisme d'invocation changera. La lesson capture la pratique actuelle,
+    pas une règle universelle.
+
+  recommendation: >
+    Quand le PM doit faire avancer le workflow vers un autre persona :
+
+    (1) Vérifier l'environnement au démarrage : si le tool Task expose les
+    subagent_type architect / ceo / implementer, on est dans opencode et
+    l'invocation directe est possible.
+
+    (2) Obtenir un consentement utilisateur explicite avant d'invoquer un
+    subagent persona (cohérent avec la mention "should only be called manually
+    by the user"). Un "go" / "lance" / "ok continue" suffit.
+
+    (3) Invoquer via Task avec :
+        - subagent_type = la persona cible (ex. "architect")
+        - prompt = un pointeur clair (ID du task-request + instruction minimale,
+          du genre "Lis le task-request <id>, fais ton lookup mémoire, et produis
+          l'artifact approprié").
+
+    (4) Au retour du subagent, le PM reprend la main, vérifie le résultat,
+    et applique son review_behavior habituel (alignement avec l'intent du
+    task-request).
+
+    Ne pas faire :
+    - dire à l'utilisateur "ouvre une autre session pour invoquer l'Architect"
+      alors qu'on peut le faire directement,
+    - confondre le system prompt "You are Claude Code" avec la réalité de
+      l'environnement opencode.

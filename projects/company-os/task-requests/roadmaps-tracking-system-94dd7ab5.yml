@@ -1,0 +1,62 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 94dd7ab5-0a21-489b-a88e-45a820e9075e
+  title: "Système de roadmaps pour le tracking et la planification des sujets"
+  author: pm
+  created_at: "2026-05-20"
+  project: company-os
+  description: >
+    Introduire un nouveau kind d'artifact "roadmap" qui permet de tracker et
+    planifier les sujets en cours, passés et futurs dans CompanyOS. Une roadmap
+    existe par domaine (plusieurs roadmaps coexistent) et peut référencer
+    indifféremment des projets et des RFC. Elle porte les dimensions temporelle,
+    causale (dépendances) et narrative (le pourquoi raconté).
+  tags:
+    - roadmap
+    - tracking
+    - planification
+    - workflow
+    - meta
+
+spec:
+  acceptance_criteria:
+    - >
+      Un nouveau kind "roadmap" est défini avec un schéma JSON Schema validé,
+      placé dans company/schemas/roadmap.schema.json.
+    - >
+      Une roadmap peut référencer des éléments hétérogènes : des projets
+      (via leur project slug ou project-config id) ET des RFC (via leur id).
+      Le schéma supporte explicitement les deux types de références.
+    - >
+      Une roadmap porte les trois dimensions retenues :
+      (a) temporelle (passé / présent / futur, ou équivalent),
+      (b) causale (dépendances entre éléments tracés),
+      (c) narrative (un champ qui raconte le pourquoi et le contexte stratégique).
+    - >
+      Plusieurs roadmaps peuvent coexister, chacune sur un domaine différent
+      (ex. roadmap CompanyOS-système, roadmap d'un projet métier précis).
+      Le placement de fichier des roadmaps est décidé et documenté
+      (global ou projet selon ce qui fait sens).
+    - >
+      Le PM dispose d'un workflow clair pour répondre à la question
+      "où en sont mes sujets ?" :
+      lister les roadmaps actives, puis pour une roadmap choisie, restituer
+      l'état de ses éléments (fait / en cours / planifié / bloqué) à partir
+      des artifacts indexés.
+    - >
+      Les personas impactées (au minimum PM, possiblement Architect) ont leurs
+      sections artifacts.produces / artifacts.consumes mises à jour pour
+      refléter le nouveau kind, et le shared-rules.artifact_catalog documente
+      le kind roadmap au même niveau de détail que les autres kinds.
+    - >
+      Le contenu de project-config n'est PAS modifié par cette tâche
+      (le projet reste un conteneur léger ; toute la richesse de tracking
+      vit dans la roadmap).
+    - >
+      Comme il s'agit d'un changement structurel de CompanyOS, l'Architect
+      détermine la forme appropriée (RFC vs design-doc) et la justifie.
+      Si c'est un RFC, il suit le cycle draft -> review -> approved ->
+      write permit -> implemented.
+  priority: medium
+  status: backlog

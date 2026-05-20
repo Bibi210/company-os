@@ -1,0 +1,62 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 8ce26e7f-4b18-49ca-aa9d-674eec5ec0bb
+  title: "Outillage de restitution des roadmaps pour le PM"
+  author: pm
+  created_at: "2026-05-20"
+  project: company-os
+  description: >
+    Suite logique du RFC d'introduction du kind roadmap. Une fois le format
+    formel mergé, le PM a besoin d'un outillage qui agrège les roadmaps actives
+    et restitue leur état de façon synthétique, sans avoir à lire chaque YAML à
+    la main. Ce task-request couvre l'outillage de restitution (commande,
+    appel MCP, ou équivalent) qui permet de répondre vite à "où en sont mes
+    sujets ?" quand l'utilisateur revient après une absence.
+  tags:
+    - roadmap
+    - tooling
+    - pm
+    - restitution
+    - workflow
+  related:
+    - id: a49801aa-911e-45d7-95a3-b21d6ea2bd2d
+      kind: rfc
+      relationship: derived-from
+    - id: 94dd7ab5-0a21-489b-a88e-45a820e9075e
+      kind: task-request
+      relationship: related
+
+spec:
+  acceptance_criteria:
+    - >
+      Le PM dispose d'un mécanisme programmatique (commande CLI, appel MCP,
+      ou équivalent technique à déterminer) pour lister les roadmaps actives,
+      sans avoir à parcourir manuellement company/roadmaps/.
+    - >
+      Pour une roadmap donnée (identifiée par son domain ou son id), le PM
+      peut obtenir une restitution synthétique de son état :
+      items groupés par timeframe (past / present / future) et/ou par status
+      (planned / in_progress / done / blocked / cancelled), avec leur titre,
+      leur référence (project / rfc / external) et leur target_date si présente.
+    - >
+      La restitution affiche aussi le champ narrative de la roadmap, pour que
+      l'utilisateur récupère le récit stratégique en même temps que l'état
+      opérationnel.
+    - >
+      Les items avec status=blocked sont mis en évidence dans la restitution
+      (ce sont les points d'attention prioritaires quand on revient).
+    - >
+      Le mécanisme fonctionne sans état persistant côté outil : il lit la
+      vérité depuis les fichiers YAML indexés, conformément à la décision
+      "pas d'auto-synchronisation" du RFC parent.
+    - >
+      Le scénario d'usage cible est validé de bout en bout : utilisateur
+      revient après une absence -> demande au PM l'état de ses sujets ->
+      PM utilise l'outillage -> restitution claire en quelques secondes.
+    - >
+      Ce task-request reste en backlog tant que le RFC a49801aa
+      (introduction du kind roadmap) n'est pas implémenté et mergé.
+      L'outillage dépend du format formel.
+  priority: medium
+  status: backlog
