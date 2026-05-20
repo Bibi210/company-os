@@ -1,0 +1,915 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: d9399863-254e-42f5-a485-ea019ce56a93
+  title: "Rendre le proxy MCP résilient aux restarts du binaire (buffer + health check + état explicite)"
+  author: architect
+  created_at: "2026-05-20"
+  description: >
+    Rend le proxy MCP (company/plugins/mcp-proxy.mjs) résilient aux restarts du
+    binaire Rust déclenchés par cargo build ou reload_config. Introduit un
+    parser NDJSON pour framing JSON-RPC, un buffer FIFO des messages stdin
+    avec backpressure (pause/resume), un health check actif avant drainage
+    (avec respect du drain event), un circuit breaker contre les restart loops,
+    une machine à états explicite, et un debounce calibré pour absorber un
+    cargo build multi-étape. Met aussi à jour la règle mcp_reconnect dans
+    shared-rules.yml pour refléter le nouveau contrat (la règle devient un
+    filet de sécurité de dernier recours). Tranche pour un test d'intégration
+    scripté en mode standalone pour valider l'acceptance criterion (g).
+  tags:
+    - mcp
+    - proxy
+    - resilience
+    - hot-reload
+    - infrastructure
+    - runtime
+    - dx
+    - revised
+  related:
+    - id: ea91b13b-fab3-4c04-951d-d8377d63707d
+      relationship: derived-from
+    - id: e84b641d-1266-473e-b93c-cd709aa14ac9
+      relationship: related
+
+spec:
+  status: approved
+  approved_at: "2026-05-20T10:15:43.134587077+00:00"
+  motivation: >
+    Le proxy MCP actuel (company/plugins/mcp-proxy.mjs, 149 lignes) gère le
+    redémarrage du binaire Rust quand cargo build le réécrit, mais cinq trous
+    structurels dans son design provoquent des pertes de connexion silencieuses
+    qui obligent l'utilisateur à quitter et resume la session opencode à chaque
+    incident. Le diagnostic-report e84b641d documente l'incident reproduit
+    pendant l'implémentation du RFC roadmap (a49801aa) : 3 tentatives de retry
+    espacées (5s, 10s, 15s) ont toutes échoué après cargo build + reload_config.
+
+    Les cinq causes techniques sous contrôle direct du proxy sont :
+
+    CAUSE 1 — Perte de messages pendant le restart.
+    Le handler process.stdin.on("data") écrit toujours dans child?.stdin.write(chunk).
+    Pendant la fenêtre kill → spawn → re-handshake (1 à 4 secondes), child est
+    soit null soit en cours de fermeture. L'optional chaining ?. masque l'erreur,
+    et un write sur un stream en cours de fermeture est silencieusement jeté.
+    Tous les appels MCP en vol pendant cette fenêtre sont perdus.
+
+    CAUSE 2 — Absence de buffer.
+    Seule la requête initialize est mémorisée (lastInitRequest) pour replay.
+    Les requêtes suivantes (tool calls, notifications) ne sont nulle part
+    bufferisées. Conséquence directe de la cause 1 : il n'y a aucun moyen de
+    récupérer les messages perdus.
+
+    CAUSE 3 — Race condition exit/restarting.
+    Si child.on("exit") se déclenche avant que restarting=true ait été positionné
+    (cas peu probable mais possible : kill externe, crash, signal Unix non
+    intercepté), le proxy s'auto-suicide via process.exit(code ?? 1). Le
+    booléen restarting est insuffisant pour modéliser correctement les
+    transitions running → stopping → starting → running.
+
+    CAUSE 4 — Pas de health check actif.
+    startChild() considère le child comme prêt dès que spawn() retourne. Or le
+    binaire Rust met plusieurs centaines de ms à charger config, schémas, index
+    avant de pouvoir traiter une requête MCP. Si on bufferise des messages et
+    qu'on les rejoue trop tôt, le binaire les reçoit alors qu'il n'est pas
+    encore prêt à les traiter — soit ils sont perdus, soit ils provoquent une
+    erreur d'initialisation.
+
+    CAUSE 5 — Debounce trop court (1.5s).
+    Le watch sur le binaire déclenche un restart 1.5s après le dernier write.
+    Or un cargo build link incrémental peut écrire le binaire en plusieurs
+    étapes espacées de 1 à 2 secondes. Risque : deux restarts en cascade, le
+    second interrompant un re-handshake en cours.
+
+    La 6e cause identifiée dans le diagnostic-report (absence de retry transparent
+    côté opencode) est hors scope : c'est une dépendance externe sur opencode
+    upstream. Le présent RFC se concentre sur ce qui est sous notre contrôle :
+    le proxy mcp-proxy.mjs. Si après ce fix le problème persiste, un RFC séparé
+    pourra envisager une intervention côté orchestrateur Rust (piste B du
+    diagnostic-report).
+
+    Justification du choix RFC vs design-doc :
+    - company/plugins/ est une zone protégée (cf. protected-zones.json).
+    - mcp-proxy.mjs est référencé dans opencode.json et instancié pour les deux
+      MCP servers (orchestrator, yaml-validator) — son comportement impacte tous
+      les agents et toutes les sessions.
+    - La règle mcp_reconnect dans company/config/shared-rules.yml (zone protégée
+      également) doit être amendée.
+    - Il s'agit d'un changement structurel sur de l'infrastructure runtime
+      critique, pas d'un livrable projet.
+
+    --- AMENDEMENTS ROUND 1 (réponse aux findings de l'Implementer) ---
+
+    Cette révision intègre 6 findings bloquants et 1 correctif mineur soulevés
+    en review round 1. Les ajouts portent sur :
+    (a) un parser NDJSON pour framing JSON-RPC propre, qui sécurise l'extraction
+        de lastInitRequestId (BLOQUANTS 1, 2) ;
+    (b) le remplacement du drop silencieux par une backpressure stdin
+        pause/resume (BLOQUANT 3) ;
+    (c) un circuit breaker contre les restart loops (BLOQUANT 4) ;
+    (d) le respect du drain event sur child.stdin pendant le drainage
+        (BLOQUANT 5) ;
+    (e) le choix tranché du test scripté (BLOQUANT 6) ;
+    (f) la clarification de la sémantique de retry du health check
+        (CORRECTIF MINEUR).
+    L'observation hors-verdict (ping JSON-RPC alternatif au filtrage initialize)
+    a été évaluée et le filtrage initialize est conservé, avec rationale
+    documentée dans la DÉCISION 3.
+
+    --- AMENDEMENTS ROUND 2 (corrections ciblées) ---
+
+    Cette seconde révision corrige 3 findings bloquants additionnels soulevés
+    en round 2, et tranche explicitement une observation hors-verdict :
+    (a) Suppression de la contradiction interne dans la DÉCISION 0. La
+        version "full buffering" (ne rien forwarder vers opencode pendant
+        {starting, restarting}) est retenue comme unique mécanisme. Le
+        pseudo-code utilisant `consumedUpTo` a été supprimé. (BLOQUANT 1)
+    (b) Adoption de `StringDecoder` (node:string_decoder) pour le décodage
+        UTF-8 streaming. Le `chunk.toString("utf8")` naïf est remplacé
+        partout par un décodeur persistant par direction, qui gère
+        correctement les caractères multi-octets fragmentés entre chunks.
+        (BLOQUANT 2)
+    (c) Anti-deadlock sur stdinPaused : startChild() est désigné comme le
+        point unique de réinitialisation. Toute (re)entrée en état
+        "starting" résume process.stdin si la backpressure l'avait paused,
+        couvrant le scénario où le child crashe alors que stdin était
+        paused par la backpressure du child précédent. (BLOQUANT 3)
+    (d) Observation hors-verdict (compteur circuit breaker unifié vs
+        séparé) : tranchée explicitement en faveur du compteur unifié,
+        avec rationale documentée dans la DÉCISION 6.
+
+  proposal: >
+    Le RFC introduit sept changements coordonnés dans mcp-proxy.mjs et un
+    changement de texte dans shared-rules.yml. Les choix techniques s'appuient
+    sur la PISTE A recommandée par le diagnostic-report (self-contained,
+    testable, couvre les 5 causes d'un coup).
+
+    --- DÉCISION 0 (NOUVELLE) — Parser NDJSON pour framing JSON-RPC ---
+
+    Rationale : le proxy actuel traite les chunks stdin/stdout comme des
+    blocs opaques transférés directement, parce qu'il n'avait jamais besoin
+    de comprendre les frontières de messages. Avec ce RFC, le proxy doit (a)
+    capturer l'id JSON-RPC d'une requête initialize côté stdin, et (b)
+    intercepter la réponse correspondante côté stdout du child. Les deux
+    opérations exigent un framing fiable — les `data` events Node ne
+    s'alignent pas sur les frontières de messages (un chunk peut contenir
+    plusieurs messages, ou un message tronqué).
+
+    Choix du framing : NDJSON (newline-delimited JSON), conforme au profil
+    stdio MCP. Chaque message JSON-RPC est sur une ligne complète terminée
+    par '\\n'. C'est ce que les binaires Rust écrivent (via rmcp::transport::io::stdio)
+    et ce que opencode envoie via le proxy. Note : LSP-style Content-Length
+    headers (HTTP framing) sont utilisés par LSP mais PAS par MCP en stdio —
+    on ne les implémente pas.
+
+    Mécanisme — accumulateur de buffer + scan de newline, AVEC gestion UTF-8
+    multi-octets via StringDecoder.
+
+    Le décodage `chunk.toString("utf8")` naïf corrompt les caractères UTF-8
+    multi-octets (accent, emoji) si la frontière de chunk tombe au milieu
+    d'une séquence multi-octets. La parade standard Node est
+    `node:string_decoder` : `StringDecoder` retient les octets incomplets
+    en interne entre deux appels à `write(chunk)` et ne restitue que les
+    code points complets.
+
+    Le proxy instancie UN StringDecoder par direction (stdin et stdout).
+    Chaque décodeur a son état interne propre — ne JAMAIS partager un
+    StringDecoder entre les deux directions, sinon les octets de l'une
+    contamineraient l'autre.
+
+    ```
+    import { StringDecoder } from "node:string_decoder"
+
+    // Un décodeur par direction
+    const stdinDecoder  = new StringDecoder("utf8")
+    const stdoutDecoder = new StringDecoder("utf8")
+
+    // Deux accumulateurs distincts, un par direction
+    let stdinAccum  = ""   // lignes pas encore complètes côté stdin
+    let stdoutAccum = ""   // lignes pas encore complètes côté stdout
+
+    function feedAndExtract(decoder, accumRef, chunk) {
+      // decoder.write retient les octets multi-byte incomplets en interne
+      const text = decoder.write(chunk)
+      accumRef.value += text
+      const lines = accumRef.value.split("\\n")
+      const incomplete = lines.pop()  // dernière ligne potentiellement partielle
+      accumRef.value = incomplete
+      return lines.filter(l => l.length > 0)
+    }
+    ```
+
+    Note d'usage : `accumRef` est passé par référence (objet wrapper
+    `{ value: string }`) pour permettre la mise à jour. L'implementer peut
+    choisir une signature équivalente (return tuple, closure, classe), tant
+    que le décodeur reste persistant entre les appels et que l'accumulateur
+    capture le résidu non terminé.
+
+    Sémantique stdin (capture id initialize) — TOUJOURS TRANSPARENT :
+    Le proxy forwarde les chunks stdin vers child.stdin tels quels, et en
+    PARALLÈLE alimente le parser pour extraire `lastInitRequestId` quand
+    une requête initialize est détectée. Les buffers raw stdin ne sont
+    jamais modifiés ni retardés.
+
+    Sémantique stdout (filtrage réponse initialize) — DEUX MODES :
+
+    Mode A (state === "ready") : transit transparent. Chaque chunk stdout
+    du child est forwardé immédiatement à process.stdout, et alimente le
+    parser en parallèle pour rester aligné sur les frontières de lignes
+    (le décodeur stdoutDecoder doit rester continuellement alimenté pour
+    ne pas perdre d'octets incomplets entre la dernière phase {starting,
+    restarting} et la phase ready).
+
+    Mode B (state ∈ {starting, restarting}) : full buffering. AUCUN
+    chunk stdout n'est forwardé vers opencode tant que state ≠ ready. La
+    raison : la réponse initialize peut être fragmentée sur plusieurs
+    chunks, et tant qu'on n'a pas la ligne complète, on ne peut pas savoir
+    s'il faut la consommer ou la forwarder. La fragmentation peut couper
+    une réponse en deux, voire trois chunks selon la taille du payload
+    initialize (qui peut être volumineux quand le serveur retourne la
+    liste des tools/resources/prompts).
+
+    Rationale du full buffering : en phase {starting, restarting}, le
+    binaire vient de démarrer et n'a rien d'autre à dire que sa réponse
+    initialize. Bufferiser tout le stdout pendant cette fenêtre (1-5s
+    typique, 10s max via timeout) ne perd aucune information utile.
+
+    Pseudo-code unifié du handler child stdout :
+
+    ```
+    // Buffer raw stdout pendant {starting, restarting} pour pouvoir
+    // décider après coup quoi forwarder
+    let stdoutRawBuffer = []  // Buffer[]
+
+    on child stdout "data" (chunk):
+      // Toujours alimenter le parser pour rester aligné sur les lignes
+      const ref = { value: stdoutAccum }
+      const messages = feedAndExtract(stdoutDecoder, ref, chunk)
+      stdoutAccum = ref.value
+
+      if state === "ready":
+        // Mode A : transit transparent immédiat
+        process.stdout.write(chunk)
+        return
+
+      // Mode B : full buffering pendant starting/restarting
+      stdoutRawBuffer.push(chunk)
+
+      // Scanner les lignes complètes pour matcher la réponse initialize
+      for (const line of messages):
+        if isInitResponse(line, lastInitRequestId):
+          // Match trouvé : transition vers ready
+          state = "ready"
+          clearTimeout(healthCheckTimer)
+          flushStdoutBufferExcludingInitResponse(line)
+          drainPendingWrites()  // asynchrone, cf. DÉCISION 5
+          stdoutRawBuffer = []
+          return
+    ```
+
+    Mécanique de `flushStdoutBufferExcludingInitResponse(initLine)` :
+    1. Reconcatener stdoutRawBuffer en un seul Buffer total.
+    2. Le décoder pour retrouver la position textuelle de `initLine + "\\n"`
+       à l'intérieur — recherche d'index sur la version texte décodée.
+    3. Construire le payload final = total moins la sous-chaîne
+       `initLine + "\\n"` (un seul `splice` textuel, ré-encoder en Buffer).
+    4. Écrire le payload final sur process.stdout.
+
+    Note : la réécriture passe par une re-encodation UTF-8 du résidu. Pour
+    éviter des problèmes de re-encodage avec des séquences multi-octets
+    déjà partiellement décodées, l'implémentation peut alternativement
+    travailler octet par octet (Buffer.indexOf sur la séquence raw de la
+    ligne + "\\n" recherchée dans le Buffer concaténé). Choix laissé à
+    l'implementer, mais le critère de correction est : aucun caractère ne
+    doit être perdu ni dupliqué entre stdoutRawBuffer concaténé et ce qui
+    est finalement écrit sur process.stdout.
+
+    --- DÉCISION 1 — Machine à états explicite ---
+
+    Rationale : un booléen ne permet pas de distinguer les transitions et
+    expose à des races. Une machine à états explicite documente les transitions
+    légales et bloque les transitions invalides.
+
+    États :
+    - "starting"  : spawn lancé, attente du health check
+    - "ready"     : health check passé, child accepte les messages
+    - "stopping"  : kill en cours, child va sortir
+    - "restarting": état logique de transit entre stopping et starting
+                    (utilisé après on "close" du child quand un respawn est prévu)
+    - "stopped"   : terminal — child mort de manière inattendue, proxy doit
+                    exiter
+
+    Transitions légales :
+    - (initial) → starting → ready
+    - ready → stopping → restarting → starting → ready
+    - ready → stopping → stopped (cas shutdown propre via process.stdin end)
+    - starting/ready → stopped (cas crash non sollicité)
+
+    Le handler child.on("exit") consulte l'état :
+    - si state ∈ {stopping, restarting} → transition vers starting attendue,
+      pas d'auto-suicide
+    - si state ∈ {starting, ready} → crash inattendu → consulter circuit
+      breaker (cf. DÉCISION 6) avant de décider exit vs respawn
+
+    --- DÉCISION 2 — Buffer FIFO + backpressure pause/resume (RÉVISÉE) ---
+
+    Rationale : aucun message ne doit être perdu, ni silencieusement (drop)
+    ni avec une réponse synthétique d'erreur (qui mentirait à opencode). La
+    bonne approche est la **backpressure naturelle de Node** : quand le buffer
+    atteint un seuil, on pause process.stdin, et opencode arrête naturellement
+    d'envoyer.
+
+    Mécanisme :
+
+    ```
+    const HIGH_WATER = 256   // chunks bufferisés avant pause
+    const LOW_WATER  = 64    // chunks restants avant resume
+
+    let pendingWrites = []   // FIFO
+    let stdinPaused = false
+
+    on stdin "data" (chunk):
+      // Extraction du framing pour capture id initialize (cf. DÉCISION 0).
+      // Utilise stdinDecoder (StringDecoder UTF-8) pour gérer les
+      // caractères multi-octets fragmentés entre chunks.
+      const ref = { value: stdinAccum }
+      const messages = feedAndExtract(stdinDecoder, ref, chunk)
+      stdinAccum = ref.value
+      for (const line of messages):
+        captureInitIdIfMatch(line)  // met à jour lastInitRequest + lastInitRequestId
+
+      // Routing chunk (le chunk raw original, jamais le texte décodé)
+      if state === "ready" and child.stdin.writable:
+        const ok = child.stdin.write(chunk)
+        if !ok:
+          // backpressure côté child : pause stdin, attendre drain
+          process.stdin.pause()
+          stdinPaused = true
+          child.stdin.once("drain", () => {
+            process.stdin.resume()
+            stdinPaused = false
+          })
+      else:
+        pendingWrites.push(chunk)
+        if pendingWrites.length >= HIGH_WATER and !stdinPaused:
+          log(`Buffer high water mark (${HIGH_WATER}) hit, pausing stdin`)
+          process.stdin.pause()
+          stdinPaused = true
+    ```
+
+    Reprise après drainage (cf. DÉCISION 5) : quand pendingWrites passe sous
+    LOW_WATER et stdinPaused === true, resume stdin.
+
+    Différence avec la version round 1 : pas de drop, pas de plafond hard.
+    La pression est propagée à opencode via la pause stdin, c'est-à-dire le
+    mécanisme standard Node. Si opencode ne respecte pas la backpressure (cas
+    rare avec une socket TCP saturée), le kernel buffer puis bloque. Aucun
+    message JSON-RPC n'est jamais perdu.
+
+    Pourquoi des seuils différents pour high et low water : éviter le
+    flapping (pause/resume rapide qui dégrade les perfs). Le pattern standard
+    Node est high=4x low. Ici 256 / 64, soit ~64 messages MCP en vol (un
+    chunk ≈ un message en pratique). Largement au-dessus du débit attendu
+    (1-10 messages en vol pendant un restart de 1-5s).
+
+    Anti-deadlock — réinitialisation de stdinPaused à chaque (re)start :
+    si la backpressure a paused process.stdin (HIGH_WATER atteint, ou
+    `child.stdin.write` qui a retourné false), et que le child crashe
+    juste après, le handler de drain `child.stdin.once("drain", ...)` ne
+    se déclenchera jamais — le stream est mort. Sans précaution, stdin
+    reste paused indéfiniment et opencode reste bloqué.
+
+    Règle : toute transition vers state === "starting" DOIT réinitialiser
+    le drapeau et reprendre process.stdin. C'est implémenté en début de
+    startChild() :
+
+    ```
+    function startChild() {
+      // ANTI-DEADLOCK : si stdin avait été paused par la backpressure du
+      // child précédent, on relâche AVANT de respawn. Les nouveaux chunks
+      // entrants seront bufferisés dans pendingWrites (state passera à
+      // "starting" plus bas, donc onStdinData prendra la voie bufferisée).
+      if (stdinPaused) {
+        process.stdin.resume()
+        stdinPaused = false
+      }
+      // Annuler tout listener "drain" pendant sur l'ancien child
+      // (le child précédent est mort, sa stdin aussi → le listener ne
+      // sera jamais appelé, mais autant nettoyer la référence)
+      // → géré naturellement par le spawn d'un nouveau child puisque
+      //   child sera réassigné
+
+      state = "starting"
+      child = spawn(...)
+      // ... reste de la procédure (handlers, envoi initialize, health check)
+    }
+    ```
+
+    Cette réinit est invoquée dans tous les chemins menant à "starting" :
+    démarrage initial, restart volontaire après on "close", respawn après
+    crash inattendu (DÉCISION 6), respawn après health check timeout
+    (DÉCISION 7). Une seule règle, appliquée systématiquement par
+    startChild().
+
+    --- DÉCISION 3 — Health check actif (CLARIFIÉE) ---
+
+    Rationale : le binaire Rust met du temps à charger sa config, ses schémas,
+    son index. Drainer le buffer avant qu'il soit prêt cause des pertes ou
+    erreurs.
+
+    Mécanisme — basé sur l'interception de la réponse initialize via le
+    parser NDJSON de la DÉCISION 0 :
+
+    Évaluation de l'alternative ping JSON-RPC (observation hors-verdict round 1) :
+    - Avantage ping : pas besoin d'intercepter une réponse à un id qu'on n'a
+      pas créé, l'id est généré par le proxy donc match trivial.
+    - Inconvénient ping : (a) ajoute une dépendance sur la disponibilité d'une
+      méthode `ping` ou équivalent dans le binaire (rmcp expose `ping` mais
+      les serveurs custom du repo peuvent ne pas l'implémenter), (b) ajoute
+      un round-trip au démarrage, (c) ne valide pas que le re-handshake
+      MCP lui-même a réussi, seulement que le serveur répond — ce qui est
+      une garantie plus faible.
+    - Avec un parser NDJSON propre (DÉCISION 0), la complexité du filtrage
+      initialize tombe à un niveau acceptable, et on garde la sémantique
+      forte "re-handshake confirmé".
+    - **Choix retenu : filtrage de la réponse initialize**, avec parser
+      NDJSON pour la fiabilité.
+
+    Séquence du health check :
+    1. Après spawn, state = "starting". stdoutAccum est vide.
+    2. Le proxy envoie lastInitRequest sur child.stdin.
+    3. Le proxy écoute child.stdout via le parser NDJSON.
+    4. Pour chaque ligne complète, le proxy parse en JSON et vérifie si le
+       champ `id` matche lastInitRequestId. Si oui → c'est la réponse
+       initialize, state passe à "ready", drainage lancé.
+    5. Si timeout 10s écoulé sans match → handleHealthCheckTimeout()
+       (cf. DÉCISION 7).
+
+    Pseudo-code de match :
+
+    ```
+    function isInitResponse(line, expectedId) {
+      try {
+        const msg = JSON.parse(line)
+        return msg.id === expectedId &&
+               (msg.result !== undefined || msg.error !== undefined)
+      } catch {
+        return false
+      }
+    }
+    ```
+
+    Note : la réponse initialize n'est pas forwardée à opencode lors d'un
+    re-handshake (opencode a déjà reçu la réponse au premier handshake et
+    ne s'attend pas à en recevoir une seconde). L'extraction via parser
+    NDJSON garantit qu'on consomme exactement une ligne, pas un chunk
+    arbitraire (cf. DÉCISION 0).
+
+    --- DÉCISION 4 — Debounce watcher étendu et stabilisation par taille ---
+
+    Rationale : cargo build peut écrire le binaire en plusieurs étapes. Un
+    debounce trop court déclenche des restarts en cascade.
+
+    Nouveau debounce : 4 secondes (au lieu de 1.5s). Cette valeur couvre :
+    - cargo build incrémental simple : 1-2 écritures espacées de < 1s
+    - cargo build avec link long : 2-3 écritures sur 3 secondes
+
+    En plus du debounce temporel, ajout d'une stabilisation par taille :
+    quand le timer expire, on relit stat(binaryPath) deux fois à 200ms
+    d'intervalle. Si la taille est identique entre les deux mesures, le
+    binaire est considéré stable et le restart est déclenché. Sinon, on
+    re-débounce. Cela protège contre un build qui dépasse les 4 secondes.
+
+    --- DÉCISION 5 (NOUVELLE) — Drainage respectant le drain event ---
+
+    Rationale : child.stdin.write retourne false si la high water mark
+    interne du stream est dépassée. Continuer à écrire dans ce cas accumule
+    dans le buffer interne de Node sans backpressure efficace. Le drainage
+    de pendingWrites doit donc être un loop asynchrone qui attend `drain`
+    avant chaque continuation.
+
+    Mécanisme :
+
+    ```
+    async function drainPendingWrites() {
+      while (pendingWrites.length > 0) {
+        const chunk = pendingWrites.shift()
+        const ok = child.stdin.write(chunk)
+        if (!ok) {
+          // Attendre que le buffer interne se vide
+          await new Promise(resolve => child.stdin.once("drain", resolve))
+        }
+        // Reprendre stdin si on était en pause backpressure
+        if (stdinPaused && pendingWrites.length < LOW_WATER) {
+          process.stdin.resume()
+          stdinPaused = false
+        }
+      }
+      // Drainage terminé, dernier check resume
+      if (stdinPaused) {
+        process.stdin.resume()
+        stdinPaused = false
+      }
+    }
+    ```
+
+    Note : drainPendingWrites est appelée depuis la transition state → ready
+    (cf. DÉCISION 3). Elle est async mais on n'attend pas son terme — le
+    transit transparent reprend dès state === ready, et drainPendingWrites
+    s'exécute en arrière-plan. Comme on a stdin paused tant que pendingWrites
+    n'est pas drainé sous LOW_WATER, l'ordre FIFO est respecté : tout nouveau
+    chunk stdin arrivant pendant le drainage sera bufferisé après les chunks
+    existants (puisqu'on est encore en mode buffer durant la phase initiale
+    du drainage).
+
+    Précision sur la transition vers le transit direct : drainPendingWrites
+    ne change pas state. Le mode "buffer vs direct" est dérivé de state ===
+    "ready" ET pendingWrites.length === 0. Pour éviter des chunks qui passent
+    en direct alors que le drainage n'est pas terminé (et casser l'ordre
+    FIFO), le handler stdin push toujours dans pendingWrites tant que
+    pendingWrites.length > 0, même en state ready. Dès que pendingWrites
+    est vidé, le handler bascule en write direct.
+
+    Version finale du handler stdin (consolidée, avec StringDecoder) :
+
+    ```
+    on stdin "data" (chunk):
+      const ref = { value: stdinAccum }
+      const messages = feedAndExtract(stdinDecoder, ref, chunk)
+      stdinAccum = ref.value
+      for (const line of messages):
+        captureInitIdIfMatch(line)
+
+      if state === "ready" and pendingWrites.length === 0 and child.stdin.writable:
+        // Voie rapide : transit direct
+        const ok = child.stdin.write(chunk)
+        if !ok:
+          process.stdin.pause()
+          stdinPaused = true
+          child.stdin.once("drain", () => {
+            process.stdin.resume()
+            stdinPaused = false
+          })
+      else:
+        // Voie bufferisée
+        pendingWrites.push(chunk)
+        if pendingWrites.length >= HIGH_WATER and !stdinPaused:
+          log(`Buffer high water mark (${HIGH_WATER}) hit, pausing stdin`)
+          process.stdin.pause()
+          stdinPaused = true
+    ```
+
+    --- DÉCISION 6 (NOUVELLE) — Circuit breaker contre restart loops ---
+
+    Rationale : si le binaire crashe en boucle (bug Rust, cargo build cassé
+    qui produit un binaire qui exite immédiatement), le proxy va tenter de
+    restarter indéfiniment, consommant CPU et inondant les logs. Il faut une
+    condition d'arrêt explicite.
+
+    Mécanisme — fenêtre glissante :
+
+    ```
+    const RESTART_WINDOW_MS = 30_000   // 30 secondes
+    const MAX_RESTARTS_IN_WINDOW = 3
+
+    let restartTimestamps = []   // timestamps des restarts récents
+
+    function recordRestart() {
+      const now = Date.now()
+      restartTimestamps.push(now)
+      // Purger ceux > fenêtre
+      restartTimestamps = restartTimestamps.filter(
+        ts => now - ts < RESTART_WINDOW_MS
+      )
+    }
+
+    function isCircuitOpen() {
+      return restartTimestamps.length >= MAX_RESTARTS_IN_WINDOW
+    }
+    ```
+
+    Application aux deux sources de restart :
+
+    A) Restart volontaire (watcher détecte binaire modifié) :
+    ```
+    function restartChild() {
+      recordRestart()
+      if (isCircuitOpen()) {
+        log(`Circuit breaker: ${MAX_RESTARTS_IN_WINDOW} restarts in ${RESTART_WINDOW_MS}ms, giving up`)
+        process.exit(1)
+      }
+      // ... séquence kill + respawn
+    }
+    ```
+
+    B) Crash inattendu (child.on("exit") avec state ∈ {starting, ready}) :
+    ```
+    on child "exit" (code, signal):
+      if state ∈ {stopping, restarting}: return  // attendu
+      // Crash inattendu
+      recordRestart()
+      if (isCircuitOpen()):
+        log(`Circuit breaker: child crashed ${MAX_RESTARTS_IN_WINDOW} times in ${RESTART_WINDOW_MS}ms, exiting`)
+        process.exit(code ?? 1)
+      log(`Child crashed unexpectedly (code=${code}), respawning`)
+      state = "restarting"
+      startChild()  // gère la réinit stdinPaused, cf. DÉCISION 2
+    ```
+
+    Note anti-deadlock : startChild() étant le point de passage obligé pour
+    tout (re)spawn, c'est lui qui réinitialise stdinPaused (cf. DÉCISION 2).
+    Cela garantit que même si le child crashe alors que process.stdin était
+    paused par backpressure, le respawn libère stdin et opencode peut
+    continuer à émettre (les nouveaux chunks atterrissent dans pendingWrites
+    puisque state == "starting" ou "restarting").
+
+    Différence avec le comportement actuel : aujourd'hui, n'importe quel exit
+    non-restart provoque process.exit. Avec le RFC, un crash sporadique est
+    récupéré par un respawn automatique, mais une boucle de crash déclenche
+    le circuit breaker. Cela rend le proxy plus résilient SANS le rendre
+    silencieux face à un bug réel.
+
+    Valeurs (3 restarts en 30s) : choix conservateur. Un cargo build répété
+    rapidement (utilisateur qui itère) peut produire 2 rebuilds en 30s, donc
+    3 est la limite acceptable. Un binaire qui crashe à l'init produira 3
+    crashes en quelques secondes, déclenchant rapidement le breaker. Valeurs
+    ajustables empiriquement.
+
+    Arbitrage compteur unifié vs séparé (observation round 2 tranchée) :
+    L'Implementer a noté que recordRestart() est appelée à la fois pour
+    les restarts volontaires (watcher détecte cargo build) et pour les
+    crashes inattendus (child exit non sollicité). Deux compteurs séparés
+    auraient pu être envisagés.
+
+    **Choix retenu : compteur unifié**, pour les raisons suivantes :
+    (a) Du point de vue de la santé du système, un binaire qui rebuild en
+        boucle ET un binaire qui crashe en boucle sont tous les deux des
+        signaux d'instabilité. Les deux situations doivent déclencher un
+        arrêt protecteur.
+    (b) Le seuil 3/30s laisse de la marge pour les cas légitimes : 2
+        cargo build incrémentaux (workflow normal d'itération) + 1 crash
+        sporadique n'ouvrent pas encore le breaker. Un troisième événement
+        en 30s suggère un problème réel qui mérite l'arrêt.
+    (c) Maintenir deux compteurs séparés ajouterait de la complexité (deux
+        seuils à calibrer, deux fenêtres glissantes, deux conditions
+        d'ouverture) pour un gain marginal. Le principe du single counter
+        est plus lisible et plus facile à raisonner.
+    (d) Le pire cas mixte (utilisateur qui itère ET binaire qui crashe au
+        démarrage) est précisément le scénario où l'arrêt protecteur est
+        souhaitable, pas indésirable.
+
+    Si l'expérience opérationnelle ultérieure montre que le compteur unifié
+    déclenche des faux positifs en pratique, séparer les deux compteurs
+    fera l'objet d'un RFC dédié. Pour l'instant, simplicity wins.
+
+    --- DÉCISION 7 (CLARIFIÉE) — Sémantique retry health check ---
+
+    Le timeout health check (10s) et son éventuel retry s'articulent comme
+    suit, sans confusion possible :
+
+    Tentative 1 :
+    1. state = "starting", spawn binaire
+    2. envoi lastInitRequest sur child.stdin
+    3. armement d'un setTimeout 10s
+    4. si réponse initialize matche AVANT 10s → state = "ready", clearTimeout,
+       drainage lancé. FIN succès.
+    5. si timeout 10s expire SANS réponse matchée → handleHealthCheckTimeout()
+
+    handleHealthCheckTimeout() — UNE seule tentative de retry :
+    1. log avertissement "health check timeout, killing and retrying"
+    2. kill child (SIGTERM puis SIGKILL après 1s)
+    3. attendre on "close"
+    4. recordRestart()  // compte comme restart côté circuit breaker
+    5. si isCircuitOpen() → process.exit(1)
+    6. sinon → state = "restarting", startChild() (qui repasse en starting,
+       relance le health check avec un nouveau timeout 10s)
+
+    Si le SECOND health check timeout → handleHealthCheckTimeout() est
+    rappelée → recordRestart() encore → tôt ou tard, isCircuitOpen() trip →
+    process.exit. Il n'y a donc pas de retry infini : la sémantique
+    "retry une fois" est implicitement encadrée par le circuit breaker.
+
+    Avantage de cette articulation : un seul mécanisme de comptage (le
+    circuit breaker) couvre à la fois les crashes spontanés et les health
+    check timeouts. Pas de compteur dédié, pas de logique en doublon.
+
+    --- DÉCISION 8 — Mise à jour de la règle mcp_reconnect ---
+
+    Rationale : si le proxy est résilient, les appels MCP côté agent ne devraient
+    plus échouer avec "Not connected". La règle doit refléter ce nouveau contrat :
+    elle devient un filet de sécurité de dernier recours, pas un workflow attendu.
+
+    Texte exact proposé pour la règle mcp_reconnect dans shared-rules.yml :
+
+    ```
+    mcp_reconnect:
+      description: >
+        Le proxy MCP (company/plugins/mcp-proxy.mjs) gère de manière transparente
+        les restarts du binaire serveur déclenchés par cargo build ou
+        reload_config(). Les messages MCP envoyés pendant un restart sont
+        bufferisés et rejoués après health check, donc les appels doivent
+        normalement réussir sans intervention de l'agent (le seul délai
+        observable est le temps de re-handshake, typiquement 1 à 5 secondes).
+
+        Si malgré tout un appel MCP échoue avec une erreur de connexion
+        (timeout, connection refused, broken pipe, EOF, tool not found), c'est
+        le signe d'un problème plus profond (proxy lui-même cassé, OOM,
+        circuit breaker du proxy ouvert sur restart loop, etc.). NE PAS
+        considérer l'opération comme échouée immédiatement. Procédure :
+        attendre quelques secondes, puis réessayer l'appel. Répéter jusqu'à 3
+        tentatives espacées de quelques secondes. Si après 3 tentatives le
+        serveur ne répond toujours pas, produire un diagnostic-report et
+        escalader à l'utilisateur.
+        Ne jamais abandonner un workflow en cours à cause d'une coupure MCP
+        transitoire.
+    ```
+
+    --- STRUCTURE CIBLE DU PROXY (vue logique) ---
+
+    Variables d'état :
+    - child : ChildProcess | null
+    - state : "starting" | "ready" | "stopping" | "restarting" | "stopped"
+    - lastInitRequest : Buffer | null (raw, pour replay tel quel)
+    - lastInitRequestId : string | number | null (extrait via parser NDJSON)
+    - pendingWrites : Buffer[] (FIFO, drainé après health check)
+    - stdinDecoder : StringDecoder (UTF-8, persistant entre chunks stdin)
+    - stdoutDecoder : StringDecoder (UTF-8, persistant entre chunks stdout)
+    - stdinAccum : string (accumulateur ligne pour parser NDJSON côté stdin)
+    - stdoutAccum : string (accumulateur ligne pour parser NDJSON côté stdout)
+    - stdoutRawBuffer : Buffer[] (chunks raw bufferisés pendant {starting,
+      restarting}, vidés à la transition vers ready)
+    - stdinPaused : boolean (true si process.stdin est en pause backpressure)
+    - watchDebounce : Timeout | null
+    - healthCheckTimer : Timeout | null
+    - restartTimestamps : number[] (circuit breaker, partagé restart
+      volontaires et crashes — cf. DÉCISION 6 pour l'arbitrage)
+
+    Composants logiques :
+    - feedAndExtract(decoder, accumRef, chunk) : alimente le StringDecoder,
+      split sur newline, retourne les lignes complètes et met à jour accum
+    - captureInitIdIfMatch(line) : parse JSON, si method==="initialize" capture id
+    - isInitResponse(line, id) : parse JSON, vérifie match d'id
+    - flushStdoutBufferExcludingInitResponse(initLine) : reconcatene
+      stdoutRawBuffer, retire la ligne initLine + "\\n", écrit sur stdout
+    - startChild() : reset stdinPaused (cf. DÉCISION 2/6) + spawn + setup
+      handlers + envoie initialize (en restart) + arme health check
+    - drainPendingWrites() : async, vide FIFO en respectant drain events
+    - restartChild() : recordRestart + circuit breaker check + state → stopping → kill
+    - watchBinary() : watch + debounce 4s + stabilisation par taille
+    - onStdinData(chunk) : parser NDJSON + routing direct/buffer + backpressure
+    - onChildStdoutData(chunk) : parser NDJSON + transit transparent (ready)
+      OR full buffering + interception réponse initialize (starting/restarting)
+    - onChildExit(code, signal) : consulte state + circuit breaker
+    - handleHealthCheckTimeout() : kill + recordRestart + respawn ou exit
+    - recordRestart() + isCircuitOpen() : circuit breaker
+
+    --- INTERACTIONS AVEC reload_config (orchestrateur Rust) ---
+
+    reload_config() côté Rust ne tue PAS le binaire — il recharge la config en
+    mémoire. Il ne devrait donc PAS provoquer de perte de connexion en théorie.
+    Le diagnostic-report mentionne cependant une perte effective après
+    reload_config. Hypothèse : reload_config a été appelé juste après un cargo
+    build, et c'est le restart binaire qui a fait perdre la session, pas le
+    reload_config en soi.
+
+    Avec le présent fix, les deux scénarios sont couverts :
+    - cargo build → watcher déclenche restart proxy → buffer + health check → OK
+    - reload_config() seul → pas de restart binaire → aucun impact connexion
+
+    Si on découvre a posteriori que reload_config() provoque malgré tout une
+    rupture (ex. le watcher Rust touche aux schémas en cours d'utilisation et
+    rend le serveur transitoirement instable), un RFC complémentaire ciblera la
+    PISTE B du diagnostic-report (modifier le contrat MCP côté Rust).
+
+    --- TESTS / PROCÉDURE DE VALIDATION (TRANCHÉ) ---
+
+    Acceptance criterion (g) du task-request : un test reproductible doit valider
+    le comportement. Décision : **Option Test 1 (test d'intégration scripté)**.
+
+    Justification du choix : (a) reproductibilité — un script s'exécute à
+    l'identique sur tous les environnements, contrairement à une procédure
+    manuelle qui dépend de l'opérateur, (b) intégrable en CI ultérieurement
+    (l'Implementer-CI validation RFC cc1beef6 prévoit d'élargir les checks
+    automatisés), (c) capture des régressions silencieuses qu'une procédure
+    manuelle peut rater.
+
+    Spécification du test scripté :
+
+    Emplacement : company/scripts/test-mcp-proxy-restart.sh
+    Type : script bash exécutable.
+    Dépendances : node, jq (optionnel pour parsing JSON pretty), un binaire
+    de test compilé (ex. companyos-yaml-validator déjà compilé).
+
+    Scénario nominal exécuté :
+    1. Setup : créer un répertoire temporaire de travail, copier le binaire
+       cible (ex. companyos-yaml-validator) dans ce répertoire.
+    2. Spawn du proxy en mode standalone :
+       `node company/plugins/mcp-proxy.mjs <tmpdir>/binary` avec stdin/stdout
+       captés via pipes nommés ou file descriptors.
+    3. Envoyer une requête initialize JSON-RPC sur stdin du proxy ; attendre
+       et vérifier la réponse initialize sur stdout (timeout 5s).
+    4. Envoyer une requête tools/list ; ne pas attendre sa réponse
+       immédiatement.
+    5. Pendant l'attente (50ms après envoi), simuler un restart binaire :
+       `touch <tmpdir>/binary` (ou réécrire avec le même contenu pour
+       déclencher le watcher).
+    6. Attendre la réponse tools/list. Critère : doit arriver dans les 10s
+       (couvre debounce 4s + restart + re-handshake). Si timeout → FAIL.
+    7. Vérifier que la réponse contient bien le champ result attendu.
+    8. Boucler 5 fois (touch binaire + nouvelle requête tools/list +
+       vérification réponse) pour valider l'absence de drift.
+    9. Cleanup : kill proxy, supprimer tmpdir.
+
+    Critère de succès : exit code 0, toutes les requêtes (initialize + 6x
+    tools/list) ont reçu leur réponse correctement.
+
+    Scénario circuit breaker (test supplémentaire) :
+    1. Compiler un faux binaire qui exite immédiatement avec code 1.
+    2. Spawn proxy avec ce faux binaire.
+    3. Vérifier qu'après ~3 crashes en < 30s, le proxy exite (et non boucle).
+    4. Critère de succès : le proxy exite dans les 15s, exit code != 0.
+
+    Le script doit logger en clair chaque étape ("step 1: spawning proxy...
+    OK", "step 5: touching binary... OK", "step 6: waiting tools/list
+    response... received in 3.2s OK") pour faciliter le debug en cas
+    d'échec. Sortie en mode TAP-like (`ok 1 - initialize replied`, `not ok 2
+    - tools/list timeout`) est un plus mais pas requis.
+
+  impact: >
+    Surface de modification :
+    - company/plugins/mcp-proxy.mjs : refactor du fichier, environ +200 lignes
+      (passage de 149 à ~350 lignes en incluant le parser NDJSON, le circuit
+      breaker, et la gestion backpressure). Pas de changement d'interface
+      publique (toujours invoqué via node mcp-proxy.mjs <binaire>), pas de
+      changement d'arguments CLI, pas de changement d'environnement requis.
+    - company/config/shared-rules.yml : mise à jour du texte de la règle
+      mcp_reconnect (zone protégée — write permit requis).
+    - company/scripts/test-mcp-proxy-restart.sh : nouveau script de test
+      (création ; pas en zone protégée a priori, à confirmer par l'Implementer
+      dans son plan).
+
+    Comportement observable :
+    - Cas nominal (pas de restart) : strictement identique au comportement
+      actuel. State reste "ready", pendingWrites vide, écriture directe vers
+      child.stdin, pas de buffer impliqué. Le parser NDJSON ajoute un coût
+      négligeable (un concat de string + split par chunk, qui sont déjà
+      effectués en interne par Node pour le décodage UTF-8).
+    - Cas restart (cargo build) : les messages en vol sont préservés au lieu
+      d'être perdus. Le délai observable côté agent passe de "déconnexion
+      permanente" à "1-5 secondes de latence transparente". Backpressure
+      naturelle si beaucoup de messages s'accumulent.
+    - Cas crash unique : le proxy respawn automatiquement (nouveau
+      comportement, plus tolérant), l'agent voit une latence mais pas une
+      déconnexion.
+    - Cas crash répété (binaire cassé) : circuit breaker ouvre après 3
+      crashes en 30s, proxy exite, opencode constate la déconnexion. C'est
+      un signal fort vers l'utilisateur que le binaire est cassé,
+      contrairement à une boucle silencieuse.
+
+    Aucune compatibilité descendante à préserver : le proxy est invoqué par
+    opencode.json avec une signature simple, et le protocole MCP JSON-RPC reste
+    inchangé. Les binaires Rust ne sont pas modifiés.
+
+    Risques résiduels :
+    - Le buffer pendingWrites n'est pas persisté. Si le proxy lui-même crashe
+      (pas le child, le proxy node), les messages bufferisés sont perdus. Ce
+      cas est jugé acceptable car un crash du proxy implique de toute façon
+      une reconnexion opencode complète.
+    - Le parser NDJSON suppose que les messages MCP en stdio sont strictement
+      newline-delimited. Si un binaire envoie un message JSON sans newline
+      final (non-conforme), le proxy le bufferisera indéfiniment dans
+      stdoutAccum. Mitigation : limite de taille sur stdoutAccum (ex. 1 MB) —
+      au-delà, log warning et flush brut. À spécifier dans le plan.
+    - Si la réponse initialize du re-handshake n'arrive jamais (binaire
+      cassé), le timeout 10s + circuit breaker garantit qu'on n'attend pas
+      indéfiniment.
+    - L'angle mort de la cause 6 (retry côté opencode) reste non couvert. Si
+      le proxy lui-même est cassé (circuit breaker tripé), l'utilisateur
+      doit resume manuellement.
+    - Backpressure : si opencode n'honore pas correctement le pause sur son
+      pipe stdin (peu probable mais possible avec certaines versions), le
+      kernel buffer pipe (typiquement 64 KB sous Linux) se remplira et
+      opencode se bloquera en write. C'est l'effet voulu (vraie
+      backpressure), mais cela peut surprendre. Documenté ici.
+
+  rollback_plan: >
+    Rollback en trois étapes indépendantes :
+
+    1. mcp-proxy.mjs : restaurer la version actuelle (149 lignes) via
+       `git checkout HEAD~ -- company/plugins/mcp-proxy.mjs`. Comme le contrat
+       d'invocation est inchangé, le rollback est immédiat et sans effet de
+       bord sur opencode.json.
+
+    2. shared-rules.yml : restaurer la version actuelle de la règle
+       mcp_reconnect. Le rollback est purement textuel, pas de migration de
+       données.
+
+    3. test-mcp-proxy-restart.sh : supprimer le fichier ajouté. Aucun autre
+       script ne dépend de lui.
+
+    Le rollback laisse le système dans son état actuel (bug présent mais
+    contourné par la règle mcp_reconnect existante). Aucun artefact créé par
+    ce RFC ne nécessite de cleanup.
+
+  affected_files:
+    - "company/plugins/mcp-proxy.mjs"
+    - "company/config/shared-rules.yml"
+    - "company/scripts/test-mcp-proxy-restart.sh"

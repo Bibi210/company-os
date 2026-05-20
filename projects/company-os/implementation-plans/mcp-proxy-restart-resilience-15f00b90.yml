@@ -1,0 +1,434 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 15f00b90-2201-427e-bd73-c076648e121d
+  title: "Implementation plan : proxy MCP résilient aux restarts (RFC d9399863)"
+  author: implementer
+  created_at: "2026-05-20"
+  description: >
+    Plan d'implémentation du RFC d9399863 (proxy MCP résilient aux restarts).
+    Exécute les 8 décisions techniques tranchées dans le RFC (parser NDJSON,
+    machine à états, buffer FIFO avec backpressure pause/resume, health check
+    actif, debounce étendu, drainage avec drain event, circuit breaker, mise
+    à jour règle mcp_reconnect), sans rouvrir aucune décision architecturale.
+    Le plan est conçu autour d'une contrainte forte : le proxy modifié est
+    celui qui sert la session opencode courante. Les écritures de fichier ne
+    cassent rien tant qu'opencode n'est pas redémarré — le test du nouveau
+    proxy est donc exécuté en sous-processus contre une instance standalone,
+    pas en remplaçant le proxy actif. L'activation réelle a lieu au prochain
+    démarrage opencode. Le plan respecte strictement la séquence
+    write_permit_full_sequence (sealing DB → écriture → commit → consume →
+    build/test → reload).
+  tags:
+    - mcp
+    - proxy
+    - resilience
+    - hot-reload
+    - implementation
+    - write-permit
+  related:
+    - id: d9399863-254e-42f5-a485-ea019ce56a93
+      kind: rfc
+      relationship: derived-from
+    - id: ea91b13b-fab3-4c04-951d-d8377d63707d
+      kind: task-request
+      relationship: derived-from
+
+spec:
+  steps:
+    - description: >
+        Étape 0 (préalable — pas une écriture, juste un check) : vérifier que
+        le write permit 2dc7d39c-32e0-4738-a19a-8adff4cd6f2d est actif et
+        couvre bien les trois paths attendus (company/plugins/mcp-proxy.mjs,
+        company/config/shared-rules.yml, company/scripts/test-mcp-proxy-restart.sh)
+        via check_write_permit(persona="implementer", path=...). Si le permit
+        n'est plus actif (par ex. session interrompue, permit expiré), stopper
+        et escalader au PM avant toute écriture. Vérifier aussi que la DB
+        d'orchestrator a bien été scellée (commit "chore: seal write permit
+        d9399863" présent dans git log) — si pas scellée, scellement immédiat
+        AVANT toute modification de fichier protégé (cf. règle
+        write_permit_full_sequence point 2). Cette étape garantit qu'on
+        respecte la séquence canonique.
+      files: []
+
+    - description: >
+        Étape 1 : créer company/scripts/test-mcp-proxy-restart.sh.
+        Le répertoire company/scripts/ existe déjà (check préalable confirmé).
+        Le script est un bash exécutable conforme à la spec "Spécification du
+        test scripté" de la DÉCISION TESTS du RFC. Structure :
+        (a) Préambule : `set -euo pipefail`, définitions de variables (TMPDIR
+            via mktemp, PROXY=company/plugins/mcp-proxy.mjs, binaire cible =
+            target/debug/companyos-yaml-validator, qui est plus léger et plus
+            rapide que l'orchestrator pour un test).
+        (b) Pré-check : vérifier que node est dispo et que le binaire cible
+            existe (si absent, faire cargo build -p companyos-yaml-validator
+            une fois ; sinon, on assume qu'il a été buildé en amont par la
+            CI/Implementer).
+        (c) Fonction helper send_jsonrpc(method, params, id) qui produit une
+            ligne NDJSON sur stdout, à piper dans le proxy.
+        (d) Fonction helper read_response_with_timeout(timeout_seconds,
+            expected_id) qui lit ligne par ligne stdout du proxy jusqu'à
+            trouver une réponse au id donné, ou échoue après timeout.
+            Implémentée via `read -r -t <timeout>` dans une boucle, en
+            parsant la ligne JSON avec une recherche grep `"id":<id>`
+            (simple, sans dépendance jq dure ; jq utilisé si présent pour
+            pretty-print en mode debug, optionnel).
+        (e) Test 1 : "scénario nominal restart". Spawn le proxy en
+            sous-processus avec stdin/stdout pipés via FIFO (mkfifo) ou via
+            file descriptors bash 3<> ; envoyer initialize, attendre
+            réponse (timeout 5s) ; envoyer tools/list (id=2), 50ms après
+            faire `touch $TARGET_BINARY` pour déclencher le watcher, attendre
+            réponse tools/list (timeout 15s — couvre debounce 4s + restart
+            + re-handshake + marge) ; vérifier que la réponse contient le
+            champ "result". Boucler 5 fois en variant l'id (2,3,4,5,6).
+            Critère : toutes les 5 réponses arrivent dans le délai.
+        (f) Test 2 : "scénario circuit breaker". Créer un faux binaire
+            crashant (script bash one-liner `#!/bin/bash; exit 1` chmod +x
+            dans $TMPDIR/fake-bin) ; spawn le proxy contre ce faux binaire ;
+            vérifier que le proxy exite (non-zero code) dans les 15s ;
+            critère : process exit code != 0 ET temps écoulé < 15s.
+        (g) Cleanup : kill proxy si encore vivant, rm -rf $TMPDIR.
+        (h) Sortie TAP-like : `ok 1 - initialize replied`, `ok 2 -
+            tools/list survived restart (run 1)`, ..., `ok 7 - circuit
+            breaker tripped on crash loop`. Exit code 0 si tous les tests
+            passent, 1 sinon.
+
+        Note d'implémentation : la communication bidirectionnelle bash <→
+        sous-processus est délicate avec des FIFO. L'approche la plus simple
+        et robuste est d'écrire un petit wrapper node.js dans le test
+        (test-mcp-proxy-restart.sh peut générer un fichier .mjs temporaire
+        ou inline via heredoc) qui spawn le proxy via child_process.spawn,
+        gère stdin/stdout proprement (parser NDJSON ligne à ligne sur
+        stdout), et exporte le verdict TAP. Le script bash reste l'entry
+        point et appelle ce wrapper node. Cette approche est explicitement
+        autorisée par le RFC ("Spécification du test scripté" mentionne
+        node comme dépendance). Choix final laissé à l'écriture mais le
+        wrapper node est recommandé pour la fiabilité du parsing JSON-RPC.
+
+        L'écriture de ce fichier consomme le write permit (path couvert).
+      files:
+        - company/scripts/test-mcp-proxy-restart.sh
+
+    - description: >
+        Étape 2 : réécrire company/plugins/mcp-proxy.mjs (le proxy actuel
+        passe de 149 lignes à ~350 lignes selon estimation RFC). Le
+        refactoring applique les 7 décisions techniques (0 à 7) du RFC dans
+        un seul fichier coordonné. Structure cible (vue logique conforme à
+        la section STRUCTURE CIBLE DU PROXY du RFC) :
+
+        (a) Imports : ajouter `import { StringDecoder } from "node:string_decoder"`.
+        (b) Constantes : HIGH_WATER=256, LOW_WATER=64, RESTART_WINDOW_MS=30000,
+            MAX_RESTARTS_IN_WINDOW=3, HEALTH_CHECK_TIMEOUT_MS=10000,
+            WATCH_DEBOUNCE_MS=4000, STABILITY_RECHECK_MS=200, STDOUT_ACCUM_LIMIT=1048576
+            (1 MB cap sur stdoutAccum pour mitiger l'angle mort framing
+            non-conforme, cf. risques résiduels du RFC).
+        (c) Variables d'état (cf. RFC section STRUCTURE CIBLE) : child,
+            state (init "starting"), lastInitRequest (Buffer raw),
+            lastInitRequestId (string|number|null), pendingWrites ([]),
+            stdinDecoder/stdoutDecoder (deux StringDecoder distincts),
+            stdinAccum/stdoutAccum (deux strings distincts),
+            stdoutRawBuffer ([]), stdinPaused (false), watchDebounce,
+            healthCheckTimer, restartTimestamps ([]).
+        (d) Helpers parser NDJSON :
+            - feedAndExtract(decoder, accumRef, chunk) cf. DÉCISION 0
+            - captureInitIdIfMatch(line) : try JSON.parse, si
+              msg.method==="initialize" → lastInitRequestId = msg.id ;
+              note : lastInitRequest reste capturé au niveau du chunk raw
+              dans onStdinData pour pouvoir le replay tel quel (le RFC
+              spécifie "Buffer raw, pour replay tel quel").
+            - isInitResponse(line, expectedId) cf. DÉCISION 3
+        (e) Helpers stdout flush :
+            - flushStdoutBufferExcludingInitResponse(initLine) cf.
+              DÉCISION 0 (mécanique de splice textuel). Implémentation par
+              concat-decode-replace-encode est suffisante ; ne pas
+              sur-optimiser.
+        (f) Circuit breaker : recordRestart() + isCircuitOpen() cf.
+            DÉCISION 6 (compteur unifié).
+        (g) startChild() cf. DÉCISIONS 1, 2, 3, 6 :
+            - réinit anti-deadlock : if stdinPaused → process.stdin.resume(),
+              stdinPaused=false (cf. DÉCISION 2 anti-deadlock)
+            - state = "starting"
+            - child = spawn(...) avec stdio ["pipe","pipe","inherit"]
+            - vider stdoutAccum et reset stdoutRawBuffer (nouveau child,
+              nouveau flux)
+            - attacher child.stdout "data" handler = onChildStdoutData
+            - attacher child.on("error", ...) et child.on("exit", ...)
+              (handler exit = onChildExit)
+            - si lastInitRequest non-null (cas restart) → write
+              lastInitRequest sur child.stdin et armer healthCheckTimer =
+              setTimeout(handleHealthCheckTimeout, HEALTH_CHECK_TIMEOUT_MS)
+            - sinon (premier démarrage) : ne pas armer le timer ; le
+              health check ne se déclenchera qu'après réception du premier
+              initialize venant d'opencode (lastInitRequest sera capturé
+              dans onStdinData et le timer sera armé au moment du forward
+              vers le child)
+        (h) restartChild() cf. DÉCISIONS 1, 6 :
+            - recordRestart()
+            - si isCircuitOpen() → log + process.exit(1)
+            - state = "stopping" ; child.kill("SIGTERM") ; setTimeout
+              SIGKILL après 1s si encore vivant
+            - dans child.on("close") (attaché dans startChild via
+              child.once("close", ...)) → state = "restarting" puis
+              appel startChild()
+        (i) onChildExit(code, signal) cf. DÉCISIONS 1, 6 :
+            - si state ∈ {stopping, restarting} : return (attendu)
+            - sinon : recordRestart() ; si isCircuitOpen() → log +
+              process.exit(code ?? 1) ; sinon log warning + state =
+              "restarting" + startChild()
+        (j) onStdinData(chunk) cf. DÉCISIONS 0, 2, 5 (version
+            consolidée finale) :
+            - feedAndExtract sur stdinDecoder + stdinAccum → lignes
+            - pour chaque ligne : captureInitIdIfMatch ; ET si la ligne
+              contient method="initialize", capturer lastInitRequest =
+              Buffer.from(line + "\n", "utf8") (replay-ready, et arme
+              healthCheckTimer si state === "starting" pour le premier
+              démarrage)
+            - voie rapide vs bufferisée selon (state==="ready" &&
+              pendingWrites.length===0 && child.stdin.writable)
+            - backpressure : write retourne false → pause stdin + once
+              drain → resume
+            - voie bufferisée : push + check HIGH_WATER → pause stdin
+        (k) onChildStdoutData(chunk) cf. DÉCISIONS 0, 3 :
+            - feedAndExtract sur stdoutDecoder + stdoutAccum → lignes
+            - cap stdoutAccum > STDOUT_ACCUM_LIMIT : log warning + reset
+              (mitigation framing non-conforme)
+            - si state === "ready" : process.stdout.write(chunk) ;
+              return (les lignes scannées sont juste pour rester aligné,
+              pas pour intercepter)
+            - sinon (state ∈ {starting, restarting}) :
+              stdoutRawBuffer.push(chunk) ; pour chaque ligne, check
+              isInitResponse(line, lastInitRequestId) → si match :
+                * state = "ready"
+                * clearTimeout(healthCheckTimer)
+                * flushStdoutBufferExcludingInitResponse(line)
+                * drainPendingWrites() (fire-and-forget async)
+                * stdoutRawBuffer = []
+                * break / return
+        (l) drainPendingWrites() async cf. DÉCISION 5 :
+            - while pendingWrites.length > 0 : shift + write ; si !ok
+              await drain ; si stdinPaused && length < LOW_WATER → resume
+            - final resume si stdinPaused encore true à la fin
+        (m) handleHealthCheckTimeout() cf. DÉCISION 7 :
+            - log warning "health check timeout"
+            - if (child) child.kill("SIGTERM") ; setTimeout SIGKILL 1s
+            - écouter child.once("close", () => { recordRestart() ; si
+              isCircuitOpen() → process.exit(1) ; sinon state =
+              "restarting" → startChild() })
+            - note : le circuit breaker fait office de garde-fou contre
+              les retries infinis, cf. RFC DÉCISION 7 dernière phrase
+        (n) watchBinary() cf. DÉCISION 4 :
+            - watch + debounce 4s + stabilisation par taille (deux stats
+              à 200ms, si tailles égales → restart, sinon re-débounce)
+        (o) process.stdin "end" handler : inchangé sur le principe (kill
+            child + exit 0 après 1s), mais doit gérer state correctement
+            (state = "stopping" avant kill, pour que onChildExit ne
+            déclenche pas le circuit breaker).
+        (p) Main : ensureBinary() (inchangé) + startChild() + watchBinary().
+
+        Le commit s'arrête après cette étape ET l'étape 1 ET l'étape 3
+        (les trois fichiers couverts par le permit sont écrits ensemble,
+        un seul commit, cf. règle write_permit_full_sequence point 4).
+
+        Précision sur ordre des écritures dans le commit : pour la lisibilité,
+        écrire dans l'ordre 1 (script test) → 2 (proxy) → 3 (shared-rules),
+        mais le commit englobe les trois.
+      files:
+        - company/plugins/mcp-proxy.mjs
+
+    - description: >
+        Étape 3 : mettre à jour company/config/shared-rules.yml — règle
+        mcp_reconnect (zone protégée, couverte par le permit).
+        Remplacer le texte actuel de la règle `mcp_reconnect.description`
+        par le texte exact spécifié dans la DÉCISION 8 du RFC, à savoir
+        (texte complet à copier sans paraphrase) :
+
+        "Le proxy MCP (company/plugins/mcp-proxy.mjs) gère de manière
+        transparente les restarts du binaire serveur déclenchés par cargo
+        build ou reload_config(). Les messages MCP envoyés pendant un
+        restart sont bufferisés et rejoués après health check, donc les
+        appels doivent normalement réussir sans intervention de l'agent
+        (le seul délai observable est le temps de re-handshake,
+        typiquement 1 à 5 secondes).
+
+        Si malgré tout un appel MCP échoue avec une erreur de connexion
+        (timeout, connection refused, broken pipe, EOF, tool not found),
+        c'est le signe d'un problème plus profond (proxy lui-même cassé,
+        OOM, circuit breaker du proxy ouvert sur restart loop, etc.). NE
+        PAS considérer l'opération comme échouée immédiatement. Procédure :
+        attendre quelques secondes, puis réessayer l'appel. Répéter jusqu'à
+        3 tentatives espacées de quelques secondes. Si après 3 tentatives
+        le serveur ne répond toujours pas, produire un diagnostic-report
+        et escalader à l'utilisateur. Ne jamais abandonner un workflow en
+        cours à cause d'une coupure MCP transitoire."
+
+        Aucune autre règle de shared-rules.yml n'est modifiée. La structure
+        YAML, l'indentation, l'ordre des clés et tous les autres champs
+        métadonnée (id, author, etc.) restent identiques. Validation : appel
+        validate_file sur le fichier après écriture (yaml-validator MCP).
+      files:
+        - company/config/shared-rules.yml
+
+    - description: >
+        Étape 4 : exécuter le test du nouveau proxy en sous-processus,
+        SANS toucher au proxy actif de la session courante. Procédure :
+        (a) chmod +x company/scripts/test-mcp-proxy-restart.sh (si pas
+            déjà exécutable après l'écriture initiale).
+        (b) S'assurer que target/debug/companyos-yaml-validator est
+            compilé. Si absent : cargo build -p companyos-yaml-validator
+            (sans --target-dir, comme imposé par la règle hotreload_last,
+            mais ici on n'attend pas de hot-reload car on n'a pas encore
+            consommé le permit ni reload_config — on veut juste un
+            binaire dispo pour le test).
+        (c) Lancer ./company/scripts/test-mcp-proxy-restart.sh. Le script
+            spawn le proxy MODIFIÉ en sous-processus, avec son propre
+            stdin/stdout — l'instance qui sert la session opencode
+            courante (chargée au démarrage de la session) n'est pas
+            affectée.
+        (d) Critère de succès : exit code 0, sortie TAP avec tous les
+            checks `ok`. Critère d'échec : exit code non-zero ou au
+            moins un `not ok`.
+
+        Cas d'échec :
+        - Si le test échoue : NE PAS commiter / consommer le permit.
+          Produire un diagnostic-report (projects/company-os/diagnostic-reports/...)
+          décrivant le symptôme observé (logs du proxy de test, sortie
+          TAP, ligne précise qui échoue). Revenir au PM avec le diagnostic.
+          Le PM décidera de relancer l'Implementer pour fix, ou
+          d'escalader à l'Architect si le RFC est insuffisant.
+        - Si le test passe : continuer Étape 5.
+      files: []
+
+    - description: >
+        Étape 5 : commit + consommer le write permit. Conformément à la
+        règle write_permit_full_sequence points 4-5 :
+        (a) git add company/plugins/mcp-proxy.mjs
+            company/config/shared-rules.yml
+            company/scripts/test-mcp-proxy-restart.sh
+            projects/company-os/implementation-plans/mcp-proxy-restart-resilience-15f00b90.yml
+        (b) git status pour vérifier qu'AUCUN autre fichier n'est staged
+            (notamment company/data/orchestrator.db doit déjà avoir été
+            scellée dans un commit précédent, séparé — cf. Étape 0).
+        (c) git commit avec message :
+            "feat(proxy): make MCP proxy resilient to binary restarts (RFC d9399863)"
+            corps : référencer RFC d9399863, task-request ea91b13b,
+            implementation-plan 15f00b90, lister les 7 décisions
+            techniques appliquées en bullet points courts.
+        (d) Si le commit est rejeté par les hooks defense-in-depth :
+            corriger le problème signalé (probablement un schema mismatch
+            ou un naming) et re-commiter. NE PAS amender, créer un commit
+            additionnel (cf. règle git globale "ne pas amender un commit
+            rejeté").
+        (e) Après commit réussi : consume_write_permit(
+              permit_id="2dc7d39c-32e0-4738-a19a-8adff4cd6f2d",
+              persona="implementer").
+        (f) Vérifier consume_write_permit retourne success. Si erreur
+            "already consumed" ou "expired" : diagnostiquer (probablement
+            une consommation accidentelle antérieure), produire un
+            diagnostic-report, revenir au PM.
+
+        Ordre non-négociable : COMMIT d'abord, CONSUME ensuite. Un permit
+        consommé avant le commit rend le commit impossible (hook rejet),
+        cf. règle write_permit_full_sequence.
+      files: []
+
+    - description: >
+        Étape 6 : validation post-consume — cargo build + cargo test +
+        validate_file shared-rules. Conformément à la règle
+        hotreload_last :
+        (a) cargo build (à la racine du repo, SANS --target-dir, pour
+            déclencher le hot-reload des MCP servers). Note importante :
+            ce build peut déclencher un restart du binaire orchestrateur
+            via le watcher du proxy actuel (encore l'ancien). Le proxy
+            actuel n'est pas résilient (c'est précisément le bug qu'on
+            fixe) → risque de perte de connexion MCP transitoire pendant
+            cette étape. Si une perte de connexion survient, appliquer la
+            règle mcp_reconnect (encore l'ancienne version active dans la
+            session) : attendre, réessayer jusqu'à 3 fois. Si vraiment
+            cassé, l'utilisateur doit resume opencode et reprendra à
+            l'Étape 7 (validation + reload).
+            Critère : cargo build retourne exit code 0, aucune erreur de
+            compilation.
+        (b) cargo test (à la racine). Critère : 0 failed. Même remarque
+            sur le risque de perte MCP transitoire ; ce n'est PAS bloquant
+            pour le test cargo lui-même (cargo test ne dépend pas de MCP).
+        (c) Appel MCP validate_file sur company/config/shared-rules.yml
+            pour confirmer que le YAML reste schema-conforme après
+            modification de la règle mcp_reconnect. Critère : validation OK.
+        (d) Si l'une des trois validations échoue : produire un
+            diagnostic-report, revenir au PM. Le permit a déjà été
+            consommé à l'étape 5, donc il faudra un nouveau permit pour
+            corriger les fichiers protégés (RFC complémentaire si
+            nécessaire — cas peu probable, à voir avec le PM).
+      files: []
+
+    - description: >
+        Étape 7 : reload_config(), EN DERNIER, uniquement si Étape 6 est
+        verte intégralement. Conformément à la règle hotreload_last :
+        toutes les conditions préalables sont remplies (permit consommé,
+        cargo build vert, cargo test vert, validate_file vert).
+
+        Précision importante sur l'effet de reload_config dans CE workflow
+        spécifique : reload_config recharge la config orchestrateur côté
+        Rust. Cela NE recharge PAS le proxy mcp-proxy.mjs en lui-même,
+        car le proxy node est lancé une seule fois par opencode au
+        démarrage de session et n'est PAS rechargé par reload_config.
+        Conséquence : le NOUVEAU code du proxy ne sera réellement actif
+        qu'au prochain démarrage opencode (au prochain "resume"
+        utilisateur). Pendant la session courante, c'est encore l'ANCIEN
+        proxy qui sert les MCP calls.
+
+        Cela ne pose pas de problème fonctionnel : le commit est fait, le
+        code est sur disque, et la prochaine session opencode chargera la
+        nouvelle version. Ce qu'il faut comprendre est que l'absence de
+        régression dans la session courante ne suffit PAS à prouver le
+        succès du fix — c'est l'Étape 4 (test scripté en sous-processus
+        contre le nouveau proxy) qui apporte cette preuve. L'Étape 7 est
+        donc un appel défensif (reload_config systématique en fin de
+        workflow), pas une étape d'activation.
+
+        Critère : reload_config retourne success.
+
+        Note : si la connexion MCP a été perdue pendant l'Étape 6 (cargo
+        build) et n'a pas été rétablie par les retries, l'utilisateur
+        doit resume opencode AVANT cette Étape 7 — auquel cas la nouvelle
+        version du proxy sera active et reload_config s'exécutera dans
+        un contexte sain.
+      files: []
+
+    - description: >
+        Étape 8 : note pour le PM. Communiquer (via agent-message ou en
+        retour direct) :
+        - L'implémentation est complète et committée.
+        - Le test scripté (Étape 4) a passé sur la nouvelle version du
+          proxy.
+        - La nouvelle version du proxy NE sera active qu'au prochain
+          démarrage opencode (resume utilisateur). Pendant la session
+          courante post-implémentation, c'est encore l'ancien proxy qui
+          sert les MCP calls, ce qui est attendu et sans danger.
+        - Recommandation : suggérer à l'utilisateur de redémarrer
+          opencode quand il le souhaite pour activer la nouvelle version.
+          Pas d'urgence — l'ancien proxy continue à fonctionner avec ses
+          limites connues.
+        - Si l'Étape 6 (cargo build) a déclenché une perte de connexion
+          MCP transitoire et nécessité un resume opencode en cours de
+          route, le mentionner explicitement dans la note (utile pour le
+          diagnostic futur).
+        - Aucune lesson-learned n'est créée par l'Implementer à cette
+          étape (cf. consigne PM : "Pas de lesson, c'est le PM en fin de
+          cycle").
+      files: []
+
+  dependencies:
+    - "Le binaire target/debug/companyos-yaml-validator doit être compilé pour exécuter le test scripté de l'Étape 4. Si absent, cargo build -p companyos-yaml-validator est inclus dans le pré-check du script de test."
+    - "node (>= 18) disponible dans le PATH — déjà requis pour le proxy lui-même, donc dépendance implicite."
+    - "Write permit 2dc7d39c-32e0-4738-a19a-8adff4cd6f2d actif au moment de l'écriture des fichiers couverts. La DB orchestrator doit être scellée AVANT toute modification de fichier protégé (cf. Étape 0)."
+    - "Approbation préalable de ce plan par l'Architect (review round) avant d'entrer en PHASE 2 d'exécution."
+
+  risks:
+    - "Risque 1 — Perte MCP transitoire pendant l'Étape 6 (cargo build). L'ancien proxy n'est pas résilient ; le cargo build de l'Étape 6 va précisément déclencher le bug qu'on fixe. Mitigation : retries selon règle mcp_reconnect en vigueur ; si vraiment cassé, l'utilisateur resume opencode et la nouvelle version du proxy devient active immédiatement, court-circuitant le problème pour la suite du workflow."
+    - "Risque 2 — Bug dans le nouveau proxy détecté seulement après resume opencode. Le test scripté de l'Étape 4 couvre le scénario nominal restart + circuit breaker, mais ne couvre pas tous les edge cases (charge réelle, messages MCP très volumineux, plusieurs MCP servers en parallèle). Mitigation : la couverture par test reste un sous-ensemble du périmètre réel ; en cas d'incident post-déploiement, produire un diagnostic-report et un RFC complémentaire ciblé."
+    - "Risque 3 — Incompatibilité subtile avec opencode (ex. opencode n'honore pas la backpressure stdin). Documenté comme risque résiduel dans le RFC (section impact). Mitigation : si symptôme observé (opencode bloqué en write), produire diagnostic-report et envisager un fallback (drop avec log au lieu de pause stdin) via RFC complémentaire."
+    - "Risque 4 — Framing non-conforme (binaire qui envoie un JSON sans newline final, ce qui ne devrait pas arriver avec rmcp mais théoriquement possible). Mitigation : cap STDOUT_ACCUM_LIMIT (1 MB) avec log warning et reset, intégré dès l'Étape 2."
+    - "Risque 5 — Le commit est rejeté par les hooks defense-in-depth (schema, naming, ou règle non anticipée). Mitigation : suivre la procédure standard (re-commit additionnel après fix, pas d'amend, cf. règle git globale)."
+    - "Risque 6 — Permit consommé prématurément ou ordre des étapes 5/6/7 inversé. Mitigation : la règle write_permit_full_sequence est explicite sur l'ordre (commit → consume → build/test → reload). Le plan rappelle l'ordre à chaque étape concernée."
+    - "Risque 7 — Le script de test de l'Étape 4 est lui-même buggy (faux positif ou faux négatif). Mitigation : sortie TAP-like détaillée, logs explicites à chaque step ; en cas de doute, relire le script avant de valider. Le script doit être suffisamment simple pour être auditable visuellement."

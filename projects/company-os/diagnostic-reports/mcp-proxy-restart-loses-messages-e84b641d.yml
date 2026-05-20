@@ -1,0 +1,116 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: e84b641d-1266-473e-b93c-cd709aa14ac9
+  title: "Le proxy MCP perd la connexion silencieusement après cargo build / reload_config"
+  author: pm
+  created_at: "2026-05-20"
+  project: company-os
+  description: >
+    Pendant l'implémentation du RFC roadmap (a49801aa), la connexion MCP côté
+    opencode est devenue inutilisable après l'étape cargo build + reload_config,
+    et n'a pas pu être rétablie dans la session (3 tentatives espacées). La règle
+    mcp_reconnect prévoit ce cas, mais l'utilisateur a demandé de fixer le problème
+    structurellement plutôt que de subir des resume manuels à chaque incident.
+  tags:
+    - mcp
+    - proxy
+    - hot-reload
+    - watcher
+    - incident
+    - reconnect
+  related:
+    - id: a49801aa-911e-45d7-95a3-b21d6ea2bd2d
+      kind: rfc
+      relationship: related
+    - id: 0ab64171-7ea8-4423-ae5d-8d741a798429
+      kind: implementation-plan
+      relationship: related
+
+spec:
+  symptom: >
+    Après que l'Implementer a exécuté son implementation-plan (cargo build qui
+    recompile companyos-orchestrator-server et companyos-yaml-validator, puis
+    reload_config()), toute tentative d'appel MCP depuis la session PM retourne
+    "Not connected". Trois tentatives espacées (5s, 10s, 15s) ont échoué.
+    La règle mcp_reconnect impose d'escalader à l'utilisateur après 3 tentatives,
+    ce qui a effectivement été fait. L'utilisateur a confirmé qu'il devait
+    quitter et resume la session opencode pour rétablir la connexion, et a
+    demandé un fix structurel.
+
+  root_cause: >
+    Le proxy MCP (company/plugins/mcp-proxy.mjs) gère bien le redémarrage du
+    binaire enfant quand cargo build le réécrit sur disque (file watcher sur
+    le binaire, debounce 1.5s, kill + respawn + replay de la requête
+    initialize). Mais plusieurs trous dans ce design provoquent des pertes de
+    connexion silencieuses :
+
+    1. PERTE DE MESSAGES PENDANT LE RESTART. Le handler `process.stdin.on("data")`
+       écrit toujours dans `child?.stdin.write(chunk)`. Si child est null (entre
+       kill et nouveau spawn) ou en train de mourir, les chunks sont jetés
+       silencieusement (optional chaining `?.` masque l'erreur, et le write
+       sur un stream en cours de fermeture est juste perdu). Pendant la
+       fenêtre kill → spawn → re-handshake (1 à 4 secondes), TOUS les messages
+       opencode → child sont perdus, dont les appels MCP en cours.
+
+    2. ABSENCE DE BUFFER. Aucun buffer ne mémorise les messages reçus pendant
+       le restart pour les rejouer ensuite. Seule la requête initialize est
+       mémorisée (lastInitRequest), pas les requêtes suivantes.
+
+    3. RACE CONDITION SUR child.on("exit"). Si le child sort sans que
+       restarting=true ait été positionné à temps (cas peu probable mais
+       possible si le kill arrive d'une autre source), le proxy s'auto-suicide
+       via process.exit(code ?? 1).
+
+    4. PAS DE HEALTH CHECK ACTIF APRÈS RESTART. Le proxy considère le child
+       comme "prêt" dès que startChild() retourne, alors que le binaire Rust
+       met du temps à charger sa config, son index, ses schémas (plusieurs
+       centaines de ms). Les messages bufferisés (si on en ajoute) seraient
+       écrits trop tôt.
+
+    5. DEBOUNCE WATCHER POTENTIELLEMENT TROP COURT. Le debounce de 1.5s sur
+       le watch du binaire peut se déclencher au milieu d'un cargo build
+       multi-étape (link incrémental, write final). Si le binaire change deux
+       fois en 2 secondes, on a deux restarts en cascade.
+
+    6. ABSENCE DE RECONNECT CÔTÉ CLIENT. Côté opencode, quand le tool MCP
+       retourne "Not connected", aucun retry transparent n'est tenté.
+       L'erreur est remontée brute au LLM qui doit gérer manuellement via
+       sleep + retry (règle mcp_reconnect), ce qui est fragile.
+
+  resolution: >
+    Statut : en cours d'investigation. La résolution structurelle passe par
+    un RFC à rédiger par l'Architect. Pistes identifiées :
+
+    PISTE A (proxy mcp-proxy.mjs) — la plus directe :
+    - Buffer FIFO des messages stdin pendant restart. Remplacer le write
+      direct par : si child existe et stdin writable → write ; sinon →
+      pendingWrites.push(chunk).
+    - Après spawn + re-handshake, drainer pendingWrites vers child.stdin
+      dans l'ordre.
+    - Health check actif avant de drainer : envoyer un ping JSON-RPC
+      (ex. method "ping" ou tools/list court) et attendre la réponse avant
+      de considérer le child prêt.
+    - Debounce du watcher étendu à 3-5 secondes pour absorber un cargo
+      build multi-étape.
+    - Fixer la race condition exit/restarting via un état explicite
+      ("running" | "restarting" | "stopped") au lieu d'un booléen.
+
+    PISTE B (orchestrateur Rust) — complémentaire :
+    - reload_config() pourrait retourner un sentinel "binary will restart"
+      au lieu de juste un OK, pour que le client sache qu'il doit attendre.
+    - Alternative : NE PAS faire de hot-reload côté Rust, mais déplacer
+      toute la logique d'auto-reload dans le proxy (qui kill et respawn
+      proprement). Moins de magie côté binaire.
+
+    PISTE C (opencode) — hors de notre contrôle direct :
+    - Demander à opencode upstream un mécanisme de retry transparent sur
+      "Not connected" avec backoff. C'est une dépendance externe, on ne
+      peut pas la résoudre nous-mêmes.
+
+    Recommandation : commencer par PISTE A. C'est self-contained
+    (modification d'un seul fichier mcp-proxy.mjs), testable, et résout
+    les causes 1, 2, 3, 4, 5 d'un coup. Si après PISTE A le problème
+    persiste, envisager PISTE B.
+
+  status: investigating

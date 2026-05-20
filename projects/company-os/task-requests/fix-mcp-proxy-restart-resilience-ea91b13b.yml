@@ -1,0 +1,75 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: ea91b13b-fab3-4c04-951d-d8377d63707d
+  title: "Rendre le proxy MCP résilient aux restarts (cargo build / reload_config)"
+  author: pm
+  created_at: "2026-05-20"
+  project: company-os
+  description: >
+    Le proxy MCP (company/plugins/mcp-proxy.mjs) perd silencieusement la
+    connexion quand le binaire Rust est recompilé (cargo build) ou que
+    reload_config est appelé. L'utilisateur doit quitter et resume opencode
+    manuellement à chaque incident. Ce task-request vise à fixer le proxy
+    pour qu'il survive aux restarts sans intervention utilisateur. Le
+    diagnostic-report e84b641d détaille les 6 causes identifiées.
+  tags:
+    - mcp
+    - proxy
+    - resilience
+    - hot-reload
+    - dx
+    - urgent
+  related:
+    - id: e84b641d-1266-473e-b93c-cd709aa14ac9
+      kind: diagnostic-report
+      relationship: derived-from
+
+spec:
+  acceptance_criteria:
+    - >
+      Après un cargo build qui réécrit le binaire MCP (orchestrator ou
+      yaml-validator), la session opencode en cours peut continuer à
+      appeler les tools MCP sans interruption visible côté utilisateur
+      (le seul délai acceptable est le temps de redémarrage du binaire,
+      typiquement < 2 secondes).
+    - >
+      Les messages MCP envoyés pendant la fenêtre de restart sont mis en
+      file d'attente côté proxy, et rejoués après le re-handshake. Aucun
+      message n'est perdu silencieusement.
+    - >
+      Le proxy effectue un health check actif après spawn (ping JSON-RPC
+      ou équivalent) avant de drainer la file de messages bufferisés.
+      Cela garantit que le binaire Rust est vraiment prêt (config chargée,
+      schémas chargés, index ouvert).
+    - >
+      Le debounce du watcher de binaire est calibré pour absorber un
+      cargo build multi-étape sans déclencher plusieurs restarts en
+      cascade. Une valeur explicite et justifiée doit être choisie
+      (suggéré : 3-5 secondes, mais c'est une décision technique).
+    - >
+      La race condition sur child.on("exit") vs flag `restarting` est
+      résolue. Le proxy ne s'auto-suicide plus quand le child sort à
+      cause d'un restart en cours.
+    - >
+      reload_config (côté orchestrateur Rust) reste fonctionnel et ne
+      déclenche pas de perte de connexion. Si une modification du contrat
+      MCP est nécessaire (ex. signal "binary restarting"), c'est tranché
+      dans le RFC.
+    - >
+      Un test (ou une procédure de test reproductible) valide que :
+      (a) un cargo build pendant qu'un appel MCP est en vol ne perd pas
+      la réponse ; (b) reload_config retourne proprement sans casser la
+      session ; (c) 5 restarts en série n'introduisent pas de drift.
+    - >
+      La règle mcp_reconnect dans shared-rules.yml est mise à jour pour
+      refléter la nouvelle réalité (si le fix est complet, la règle peut
+      devenir une mesure défensive de dernier recours plutôt qu'un
+      workflow attendu).
+    - >
+      Comme la modification touche company/plugins/mcp-proxy.mjs (zone
+      protégée potentielle) et possiblement shared-rules.yml, l'Architect
+      détermine si un RFC est requis. Vu la nature systémique (proxy MCP
+      = pièce critique du runtime), un RFC est probable.
+  priority: high
+  status: backlog

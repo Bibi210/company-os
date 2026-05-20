@@ -233,15 +233,24 @@ spec:
         Ne jamais écrire le token dans un fichier ni le partager avec un autre agent.
     mcp_reconnect:
       description: >
-        Le serveur MCP peut redémarrer à tout moment pour deux raisons :
-        (a) un appel explicite à reload_config(),
-        (b) un cargo build qui recompile le binaire MCP (le watcher détecte le changement et relance le serveur).
-        Quand un appel MCP échoue avec une erreur de connexion (timeout, connection refused,
-        broken pipe, EOF, ou tool not found), NE PAS considérer l'opération comme échouée.
-        Procédure : attendre quelques secondes, puis réessayer l'appel. Répéter jusqu'à 3 tentatives
-        espacées de quelques secondes. Si après 3 tentatives le serveur ne répond toujours pas,
-        signaler le problème dans un diagnostic-report et escalader à l'utilisateur.
-        Ne jamais abandonner un workflow en cours à cause d'une coupure MCP transitoire.
+        Le proxy MCP (company/plugins/mcp-proxy.mjs) gère de manière transparente
+        les restarts du binaire serveur déclenchés par cargo build ou
+        reload_config(). Les messages MCP envoyés pendant un restart sont
+        bufferisés et rejoués après health check, donc les appels doivent
+        normalement réussir sans intervention de l'agent (le seul délai
+        observable est le temps de re-handshake, typiquement 1 à 5 secondes).
+
+        Si malgré tout un appel MCP échoue avec une erreur de connexion
+        (timeout, connection refused, broken pipe, EOF, tool not found), c'est
+        le signe d'un problème plus profond (proxy lui-même cassé, OOM,
+        circuit breaker du proxy ouvert sur restart loop, etc.). NE PAS
+        considérer l'opération comme échouée immédiatement. Procédure :
+        attendre quelques secondes, puis réessayer l'appel. Répéter jusqu'à 3
+        tentatives espacées de quelques secondes. Si après 3 tentatives le
+        serveur ne répond toujours pas, produire un diagnostic-report et
+        escalader à l'utilisateur.
+        Ne jamais abandonner un workflow en cours à cause d'une coupure MCP
+        transitoire.
     continuous_improvement:
       description: >
         Chaque agent doit être consciencieux et proactif dans l'amélioration des processus.
