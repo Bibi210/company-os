@@ -59,4 +59,4 @@ spec:
       Si c'est un RFC, il suit le cycle draft -> review -> approved ->
       write permit -> implemented.
   priority: medium
-  status: backlog
+  status: done

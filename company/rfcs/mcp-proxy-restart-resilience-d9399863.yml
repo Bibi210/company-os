@@ -32,8 +32,9 @@ metadata:
       relationship: related
 
 spec:
-  status: approved
+  status: implemented
   approved_at: "2026-05-20T10:15:43.134587077+00:00"
+  implemented_at: "2026-05-20"
   motivation: >
     Le proxy MCP actuel (company/plugins/mcp-proxy.mjs, 149 lignes) gère le
     redémarrage du binaire Rust quand cargo build le réécrit, mais cinq trous

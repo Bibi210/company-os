@@ -1,0 +1,119 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 3f507271-70ba-49ac-9a08-eeb833fb6063
+  title: "Ajouter un kind d'artifact dans CompanyOS nécessite TOUJOURS de toucher au code Rust"
+  author: pm
+  created_at: "2026-05-20"
+  description: >
+    Un RFC qui introduit un nouveau kind (ex. roadmap) doit explicitement
+    prévoir des modifications dans crates/config/src/types.rs : variante de
+    l'enum ArtifactKind, branches as_str/FromStr, matrice access_level, et
+    tests d'exhaustivité. L'enum est fermé et le validator rejette les kinds
+    inconnus. Ne PAS le mentionner dans le RFC = bug bloquant en review
+    Implementer. Cette leçon documente le pattern pour qu'il soit anticipé
+    dans les futurs RFC ajoutant un kind.
+  tags:
+    - artifact-kind
+    - rust
+    - schema
+    - rfc-pattern
+    - companyos-internals
+  related:
+    - id: a49801aa-911e-45d7-95a3-b21d6ea2bd2d
+      kind: rfc
+      relationship: related
+
+spec:
+  context: >
+    Le RFC roadmap (a49801aa) a affirmé en première version "AUCUN CHANGEMENT
+    DE CODE RUST". L'Implementer a voté request_changes en signalant que
+    l'enum ArtifactKind dans crates/config/src/types.rs est fermé, et que
+    deux mécanismes Rust bloquent l'introduction d'un kind sans modification
+    de code :
+
+    1. validator.rs parse le champ kind via kind_str.parse::<ArtifactKind>()
+    et rejette tout kind inconnu avec ValidationError::UnknownKind.
+
+    2. schema_registry.rs découvre les schémas en lisant
+    company/schemas/*.schema.json et IGNORE silencieusement tout schéma dont
+    le stem ne parse pas en ArtifactKind. Conséquence : poser le fichier
+    roadmap.schema.json sans étendre l'enum revient à ne pas le poser du
+    tout pour le validator.
+
+    Le RFC v2 a intégré ces modifications dans une section dédiée "5. CODE
+    RUST" qui liste précisément : nouvelle variante, branches as_str et
+    FromStr, 3 branches d'access_level (Pm, Architect, Implementer ;
+    Ceo/Myself/All couverts par fallback), tests unitaires + test
+    d'intégration. Le compilateur garantit l'exhaustivité du match
+    access_level, donc oublier une branche échoue à la compilation, pas en
+    runtime.
+
+  insight: >
+    Le système est conçu pour que toute extension du catalogue d'artifacts
+    soit une opération CO-COORDONNÉE entre la config (schéma JSON + entrée
+    catalogue + règle file_placement) ET le code Rust (enum + matrice
+    access_level). Aucun des deux pans ne fonctionne sans l'autre :
+
+    - Schéma JSON sans variante enum → schema_registry l'ignore.
+    - Variante enum sans schéma JSON → validator parse OK mais ne sait pas
+      valider le contenu (cas peu probable, mais incohérent).
+    - Catalogue shared-rules à jour sans enum → les agents lisent une doc
+      qui n'est pas refletée par le validator (dérive).
+
+    Cette double-source-de-vérité est volontaire dans le design actuel :
+    elle force chaque ajout à passer par un RFC global qui touche aux
+    deux zones protégées (company/ et crates/). C'est un garde-fou utile
+    contre les ajouts de kinds non documentés ou non typés. Mais ça signifie
+    que tout RFC ajoutant un kind DOIT être conscient des deux pans dès la
+    rédaction.
+
+    Pattern récurrent à reconnaître : si un RFC contient des phrases du
+    type "le nouveau kind X sera reconnu via auto-découverte du schéma",
+    c'est un drapeau rouge. L'auto-découverte existe (chargement des
+    schémas depuis le disque), mais elle ne suffit PAS pour les nouveaux
+    kinds, elle ne traite que la re-découverte des kinds déjà déclarés.
+
+  recommendation: >
+    Pour tout RFC futur qui introduit un nouveau kind d'artifact :
+
+    (1) Lister explicitement dans spec.proposal une section "CODE RUST" qui
+    décrit les modifications de crates/config/src/types.rs :
+    - Variante à ajouter à enum ArtifactKind (préciser le nom CamelCase)
+    - Branche dans impl ArtifactKind { fn as_str(...) }
+    - Branche dans impl FromStr for ArtifactKind
+    - Branches dans la matrice access_level pour chaque persona qui a un
+      access_level différent du fallback Read (typiquement le persona
+      auteur a Write, les autres Read)
+    - Mises à jour des tests unitaires (test_artifact_kind_parse_valid,
+      test_artifact_kind_display_roundtrip, et un test dédié sur
+      access_level pour le nouveau kind)
+    - Mise à jour du test d'intégration test_access_matrix_no_panics dans
+      tests/integration/edge_cases.rs
+
+    (2) Ajouter ces fichiers à spec.affected_files :
+    - crates/config/src/types.rs
+    - tests/integration/edge_cases.rs
+
+    (3) Marquer dans spec.impact que le RFC relève de la catégorie
+    ModifyAccessMatrix (cf. EscalationCategory dans
+    crates/config/src/types.rs). Vérifier dans
+    company/config/review-protocol.yml si modify-access-matrix figure dans
+    ceo_cannot_approve_alone (c'est le cas actuellement) : conséquence,
+    quorum CEO + au moins un autre approbateur requis.
+
+    (4) Étendre le rollback_plan pour couvrir les modifications Rust en
+    plus des modifications config. Ordre recommandé : config d'abord, code
+    Rust ensuite (un binaire qui connaît un kind dont le catalogue ne parle
+    plus est moins bruyant qu'un catalogue qui mentionne un kind dont le
+    binaire ne sait rien).
+
+    (5) Anti-pattern à éviter : écrire "aucun changement de code Rust" ou
+    "auto-découverte du schéma suffira" sans avoir vérifié l'enum et le
+    validator. Si tu n'es pas sûr, lis crates/config/src/types.rs avant de
+    rédiger.
+
+    Note pour l'Architect : cette lesson devrait être incluse dans le
+    lookup mémoire systématique avant de rédiger un RFC qui parle de
+    nouveau kind. Le lookup sur "nouveau kind artifact schema" la fera
+    remonter.

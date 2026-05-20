@@ -72,4 +72,4 @@ spec:
       détermine si un RFC est requis. Vu la nature systémique (proxy MCP
       = pièce critique du runtime), un RFC est probable.
   priority: high
-  status: backlog
+  status: done

@@ -1,0 +1,477 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 3cd72740-1424-46ac-8ee6-96f714f3fa94
+  title: "Outillage MCP de restitution des roadmaps (list_roadmaps + summarize_roadmap)"
+  author: architect
+  created_at: "2026-05-20"
+  status: approved
+  approved_at: "2026-05-20T14:06:18.847394204+00:00"
+  description: >
+    Donne suite au RFC a49801aa (introduction du kind roadmap) en livrant l'outillage
+    de restitution qui permet au PM de répondre vite à "où en sont mes sujets ?" sans
+    parcourir manuellement company/roadmaps/. Le RFC ajoute deux tools MCP côté
+    orchestrator : list_roadmaps() qui liste les roadmaps indexées (avec filtre
+    optionnel sur status et domain), et summarize_roadmap(target) qui agrège l'état
+    d'une roadmap en groupant ses items par timeframe et par status, en mettant en
+    évidence les items blocked, et en remontant le narrative. Le contrat est défini
+    ici, l'implementation-plan exécutera. Le RFC touche des zones protégées Rust
+    (crates/mcp-servers/orchestrator/, crates/orchestrator/) et nécessite donc
+    approbation CEO et write permit.
+  tags:
+    - roadmap
+    - tooling
+    - mcp
+    - orchestrator
+    - pm
+    - restitution
+    - meta
+  related:
+    - id: 8ce26e7f-4b18-49ca-aa9d-674eec5ec0bb
+      kind: task-request
+      relationship: derived-from
+    - id: a49801aa-911e-45d7-95a3-b21d6ea2bd2d
+      kind: rfc
+      relationship: related
+    - id: 3f507271-70ba-49ac-9a08-eeb833fb6063
+      kind: lesson-learned
+      relationship: related
+    - id: c5413270-1634-4e44-9540-e205fb523043
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  motivation: >
+    Le RFC a49801aa a livré le format formel `roadmap` : un artifact global qui
+    organise un domaine en items typés (project / rfc / external), avec trois
+    dimensions (temporelle, causale, narrative). Le PM peut désormais créer et
+    maintenir des roadmaps. Mais la consommation reste manuelle : pour répondre à
+    l'utilisateur "où en sont mes sujets ?", le PM doit aujourd'hui :
+    (1) connaître l'existence des roadmaps actives sans aucun mécanisme de listage,
+    (2) ouvrir chaque YAML un par un avec get(id) ou Read,
+    (3) reconstituer mentalement le regroupement par timeframe et par status,
+    (4) repérer manuellement les items blocked,
+    (5) extraire le narrative et le présenter.
+
+    Ce flow est lent, coûteux en tokens et fragile. Il devient ingérable dès que
+    plusieurs roadmaps coexistent (système, projets métier), et il contredit
+    explicitement le sixième acceptance criterion du task-request 8ce26e7f :
+    "restitution claire en quelques secondes". L'outillage existant (search, get,
+    related) reste atomique : il sert à trouver et lire UN artifact, pas à agréger
+    et restituer.
+
+    Le besoin est donc un mécanisme programmatique qui :
+    - liste les roadmaps indexées (filtrables par status et domain) sans parcours
+      manuel du filesystem ni du résultat d'un search() exigeant un terme FTS ;
+    - prend une roadmap (par domain ou par id) et restitue son état en une seule
+      requête : narrative + items regroupés par timeframe et par status, items
+      blocked mis en évidence ;
+    - reste apatride (lit la vérité depuis l'index + les YAML, conformément à la
+      décision "pas d'auto-synchronisation" du RFC parent).
+
+    Le PM est lui-même un agent qui consomme des tools MCP. Placer cet outillage
+    sous forme de tools MCP est cohérent avec l'écosystème : c'est le même canal
+    que search/get/related, c'est exposé à tous les agents (utile aussi pour
+    l'Architect qui consomme la roadmap pour cadrer ses design-docs, cf. RFC
+    a49801aa section 4.b), et ça profite de l'index déjà alimenté par le plugin
+    defense-in-depth.
+
+  proposal: >
+    Quatre changements coordonnés. Aucun changement à la config YAML
+    (shared-rules, personas, review-protocol) : seul le code Rust de l'orchestrator
+    est touché.
+
+    === 1. NOUVEAU TOOL MCP : list_roadmaps ===
+
+    Contrat fonctionnel :
+      Nom MCP        : list_roadmaps
+      Paramètres :
+        - status  : Optional<String> — filtre par spec.status (valeurs : "active",
+                    "archived"). Si absent → renvoie toutes les roadmaps indexées.
+        - domain  : Optional<String> — filtre par spec.domain (correspondance exacte
+                    sur la string kebab-case). Si absent → toutes les roadmaps.
+      Retour (JSON) :
+        {
+          "roadmaps": [
+            {
+              "id": "<uuid>",
+              "title": "<metadata.title>",
+              "domain": "<spec.domain>",
+              "status": "active" | "archived",
+              "items_count": <usize>,
+              "blocked_count": <usize>,
+              "in_progress_count": <usize>,
+              "file_path": "<chemin relatif>"
+            },
+            ...
+          ],
+          "count": <usize>
+        }
+
+    Sémantique : c'est un listing léger. Pas le narrative complet, pas les items
+    détaillés — juste de quoi répondre à "quelles roadmaps existent et lesquelles
+    nécessitent mon attention en premier ?". Les compteurs blocked_count et
+    in_progress_count sont calculés à la volée en parsant le YAML de chaque
+    roadmap indexée. La liste est triée : status=active d'abord (les actives
+    d'abord puisque c'est ce qui intéresse au retour d'absence), puis par
+    blocked_count décroissant, puis par title alphabétique.
+
+    Cas où aucune roadmap ne correspond : retour `{ "roadmaps": [], "count": 0 }`,
+    pas d'erreur (c'est légitime, ex. : un projet qui n'a pas encore de roadmap).
+
+    === 2. NOUVEAU TOOL MCP : summarize_roadmap ===
+
+    Contrat fonctionnel :
+      Nom MCP        : summarize_roadmap
+      Paramètres (exactement UN des deux doit être fourni) :
+        - id      : Optional<String> — metadata.id de la roadmap (UUID).
+        - domain  : Optional<String> — spec.domain de la roadmap. Si plusieurs
+                    roadmaps partagent ce domain, on choisit celle avec
+                    status=active ; s'il y en a plusieurs actives ou aucune,
+                    on retourne une erreur claire qui demande de préciser par id.
+      Retour (JSON) :
+        {
+          "roadmap": {
+            "id": "<uuid>",
+            "title": "<metadata.title>",
+            "domain": "<spec.domain>",
+            "status": "active" | "archived",
+            "narrative": "<spec.narrative complet>"
+          },
+          "summary": {
+            "items_total": <usize>,
+            "blocked_count": <usize>,
+            "by_status": {
+              "planned": <usize>, "in_progress": <usize>, "done": <usize>,
+              "blocked": <usize>, "cancelled": <usize>
+            },
+            "by_timeframe": {
+              "past": <usize>, "present": <usize>, "future": <usize>
+            }
+          },
+          "blocked_items": [   // mis en évidence en tête
+            {
+              "key": "<spec.items[].key>",
+              "title": "<spec.items[].title>",
+              "ref": { ... },           // contenu typé (project / rfc / external)
+              "timeframe": "...",
+              "target_date": "..." | null,
+              "depends_on": [...] | [],
+              "rationale": "..." | null
+            }, ...
+          ],
+          "items_by_timeframe": {
+            "past":    [ <item>, ... ],
+            "present": [ <item>, ... ],
+            "future":  [ <item>, ... ]
+          },
+          "items_by_status": {
+            "planned":     [ <item>, ... ],
+            "in_progress": [ <item>, ... ],
+            "done":        [ <item>, ... ],
+            "blocked":     [ <item>, ... ],
+            "cancelled":   [ <item>, ... ]
+          }
+        }
+
+      Chaque <item> est l'objet item original (key, title, ref, timeframe, status,
+      target_date, depends_on, rationale) tel qu'il figure dans le YAML. On ne
+      ré-écrit pas la structure : on la transmet telle quelle, juste regroupée.
+
+    Sémantique : le tool produit deux vues redondantes (par timeframe ET par
+    status) car le RFC parent les déclare cohabitantes ; c'est au consommateur
+    (le PM) de choisir laquelle il restitue à l'utilisateur. La duplication des
+    items dans les deux groupements est volontaire et assumée : la sortie est
+    optimisée pour la lecture immédiate, pas pour la place sur disque.
+
+    Les blocked_items sont remontés EN PLUS d'apparaître dans
+    items_by_status.blocked. Cette redondance est explicite : ils sont les
+    points d'attention prioritaires et doivent être trouvables par le PM même
+    s'il consulte la vue "par timeframe".
+
+    Cas où la roadmap est introuvable : erreur claire avec contexte et fix
+    (utiliser list_roadmaps pour voir ce qui existe). Cas où la roadmap est
+    indexée mais le fichier YAML est illisible / corrompu : erreur diagnostic
+    qui pointe le file_path.
+
+    === 3. EXTENSION DU MOTEUR (crates/orchestrator/src/engine.rs et db.rs) ===
+
+    Trois ajouts dans `OrchestratorEngine` :
+
+    3.a. Nouvelle méthode `list_by_kind` dans db.rs (ou réutilisable plus
+         largement) :
+
+         pub fn list_by_kind(&self, kind: &str)
+             -> Result<Vec<IndexedArtifact>, OrchestratorError>;
+
+         Requête SQL simple :
+           SELECT id, kind, title, description, tags, file_path, indexed_at
+             FROM artifacts
+            WHERE kind = ?1
+            ORDER BY title
+
+         Pourquoi pas réutiliser `search_artifacts` ? Parce que search_artifacts
+         exige un terme FTS (`artifacts_fts MATCH ?1`). Pour lister TOUTES les
+         roadmaps sans terme de recherche, il faut une requête non-FTS sur la
+         table de base. Cette méthode est utilitaire et peut servir au-delà du
+         use case roadmap (ex. : à terme, lister tous les RFCs en draft, etc.) ;
+         on la garde générique.
+
+    3.b. Nouvelle méthode `list_roadmaps` dans engine.rs :
+
+         pub fn list_roadmaps(
+             &self,
+             root: &str,
+             status_filter: Option<&str>,
+             domain_filter: Option<&str>,
+         ) -> Result<Vec<RoadmapListEntry>, OrchestratorError>;
+
+         Algorithme :
+           1. Appeler db.list_by_kind("roadmap").
+           2. Pour chaque IndexedArtifact retourné : lire le fichier YAML
+              (read_to_string(root + "/" + file_path)) et parser en
+              serde_yaml::Value.
+           3. Extraire spec.status, spec.domain, et compter spec.items par
+              status. Skipper (avec un log warn) toute roadmap dont le YAML
+              ne parse pas ou n'a pas la forme attendue — un fichier corrompu
+              ne doit pas casser le listing entier.
+           4. Filtrer par status_filter et domain_filter si fournis.
+           5. Trier : actives d'abord (active < archived), puis blocked_count
+              décroissant, puis title alphabétique.
+           6. Retourner.
+
+         Où vivent les types RoadmapListEntry et RoadmapSummary :
+         crates/orchestrator/src/types.rs (ou un nouveau module
+         `roadmap_summary.rs` dans la même crate si la taille le justifie ;
+         décision laissée à l'implementation-plan, c'est de la cuisine
+         d'organisation, pas une décision structurelle).
+
+    3.c. Nouvelle méthode `summarize_roadmap` dans engine.rs :
+
+         pub fn summarize_roadmap(
+             &self,
+             root: &str,
+             selector: RoadmapSelector,
+         ) -> Result<RoadmapSummary, OrchestratorError>;
+
+         Où RoadmapSelector est :
+           pub enum RoadmapSelector {
+               ById(String),
+               ByDomain(String),
+           }
+
+         Algorithme :
+           1. Résoudre la roadmap :
+              - ById(id)     → db.get_artifact(id) ; si kind != "roadmap" → erreur typée.
+              - ByDomain(d)  → db.list_by_kind("roadmap"), parser chacune, ne garder
+                               que celles dont spec.domain == d ET spec.status ==
+                               "active" ; si exactement 1 → ok ; sinon erreur
+                               "ambiguous domain / not found".
+           2. Lire le YAML complet de la roadmap résolue.
+           3. Parser spec.narrative, spec.domain, spec.status, spec.items.
+           4. Construire la sortie typée RoadmapSummary :
+              - blocked_items = items où status == "blocked"
+              - items_by_timeframe = HashMap<"past"|"present"|"future", Vec<Item>>
+              - items_by_status    = HashMap<status, Vec<Item>>
+              - summary.by_status / by_timeframe = compteurs
+           5. Retourner.
+
+         RoadmapSummary se sérialise en JSON via serde (déjà la norme du moteur).
+
+    === 4. EXPOSITION MCP (crates/mcp-servers/orchestrator/src/main.rs) ===
+
+    Deux nouvelles entrées de tool_router sur le pattern existant
+    (Parameters<...> + ok/err Diagnostic) :
+
+    4.a. Params :
+         #[derive(Deserialize, schemars::JsonSchema)]
+         struct ListRoadmapsParams {
+             #[schemars(description = "Optional: filter by status ('active' or 'archived')")]
+             status: Option<String>,
+             #[schemars(description = "Optional: filter by domain (exact match on kebab-case)")]
+             domain: Option<String>,
+         }
+
+         #[derive(Deserialize, schemars::JsonSchema)]
+         struct SummarizeRoadmapParams {
+             #[schemars(description = "metadata.id of the roadmap (UUID). Mutually exclusive with 'domain'.")]
+             id: Option<String>,
+             #[schemars(description = "spec.domain of the roadmap. Mutually exclusive with 'id'. If multiple active roadmaps share this domain, returns an error.")]
+             domain: Option<String>,
+         }
+
+    4.b. Tools :
+         #[tool(description = "List indexed roadmaps. Returns lightweight entries (id, title, domain, status, items_count, blocked_count, in_progress_count). Filterable by status and/or domain. Use this BEFORE summarize_roadmap to discover what exists.")]
+         async fn list_roadmaps(...) { ... }
+
+         #[tool(description = "Summarize a roadmap's state by id or by domain. Returns narrative + items grouped by timeframe AND by status, with blocked items highlighted. Read-only, no state change.")]
+         async fn summarize_roadmap(...) { ... }
+
+         Validation côté tool : summarize_roadmap doit recevoir exactement UN des
+         deux paramètres id/domain ; si les deux sont fournis ou aucun → err()
+         avec Diagnostic clair.
+
+    === 5. PAS DE CHANGEMENT DE PERSONA, PAS DE CHANGEMENT DE SHARED-RULES ===
+
+    Lister/restituer une roadmap n'ajoute aucune capacité produces/consumes
+    nouvelle : c'est une opération de LECTURE sur des artifacts déjà déclarés
+    par le RFC parent (PM produit roadmap, Architect/Implementer/CEO la lisent
+    via Read sur ArtifactKind::Roadmap). L'access_level reste inchangé, les
+    tools ne déclenchent aucun write. Pas de changement de la matrice
+    access_level, pas de nouvelle entrée dans review-protocol (les tools sont
+    une infrastructure, pas un kind d'artifact).
+
+    === 6. PAS DE CHANGEMENT DE L'ENUM ArtifactKind NI DU SCHÉMA roadmap ===
+
+    Le RFC a49801aa a déjà ajouté la variante Roadmap (cf. lesson 3f507271).
+    Aucune autre extension du catalogue n'est nécessaire ici. Le présent RFC
+    NE TOUCHE PAS crates/config/src/types.rs.
+
+    === 7. TESTS ===
+
+    Conformément à la lesson c5413270, l'infra runtime exige des tests
+    scriptés. Mais ici nous ne touchons pas à un composant runtime critique
+    type proxy / watcher : les nouveaux tools sont des fonctions read-only
+    appelées à la demande, dans le même service MCP que search/get/related.
+    Le périmètre de test est donc analogue à celui des tools existants —
+    couvert par des tests unitaires Rust sur l'engine et un test d'intégration
+    qui exerce le routage MCP.
+
+    Plan de tests imposé par ce RFC (l'implementation-plan détaillera l'ordre) :
+
+    7.a. Tests unitaires `crates/orchestrator/src/engine.rs` (et/ou un module
+         dédié `roadmap_summary_tests`) :
+         - test_list_by_kind_returns_only_matching_kind (db-level)
+         - test_list_by_kind_empty_when_no_match
+         - test_list_roadmaps_filters_by_status
+         - test_list_roadmaps_filters_by_domain
+         - test_list_roadmaps_sorts_active_first_then_blocked_desc
+         - test_list_roadmaps_skips_corrupt_yaml_with_warning
+         - test_summarize_by_id_basic_grouping
+         - test_summarize_by_domain_picks_unique_active
+         - test_summarize_by_domain_ambiguous_returns_error
+         - test_summarize_blocked_items_appear_in_blocked_list_and_in_by_status
+         - test_summarize_not_found_returns_typed_error
+         - test_summarize_id_points_to_non_roadmap_kind_returns_error
+
+         Utiliser db.open_in_memory() (déjà supporté, cf. db.rs ligne 83).
+         Pour le YAML, créer des roadmaps fixtures dans un tmpdir et pointer le
+         `root` du moteur dessus. Pas de mock du filesystem nécessaire.
+
+    7.b. Test d'intégration côté serveur MCP (sous tests/ de la crate
+         crates/mcp-servers/orchestrator/ si une infra de test in-process
+         existe ; sinon, test unitaire qui valide la sérialisation
+         RoadmapSummary → JSON sans passer par MCP). L'objectif est de
+         vérifier la forme du JSON retourné, pas de tester rmcp lui-même.
+
+    7.c. Validation manuelle bout-en-bout par le PM après merge : créer une
+         roadmap "companyos-system" minimale avec 3 items dont 1 blocked, puis
+         appeler list_roadmaps() puis summarize_roadmap(domain="companyos-system")
+         et vérifier que la restitution est lisible et synthétique. Acceptance
+         criterion 6 du task-request couvert.
+
+    Cette approche reste cohérente avec la lesson c5413270 : pas d'infra
+    runtime sensible ici (pas de hot-reload, pas de protocole externe au-delà
+    de MCP déjà testé), donc test scripté non obligatoire. Si la suite (rare)
+    révèle des bugs, on capitalisera en lesson dérivée.
+
+  impact: >
+    ZONES PROTÉGÉES TOUCHÉES (write permit requis après approbation) :
+    - crates/orchestrator/src/db.rs        : nouvelle méthode list_by_kind.
+    - crates/orchestrator/src/engine.rs    : nouvelles méthodes list_roadmaps
+      et summarize_roadmap.
+    - crates/orchestrator/src/types.rs     : nouveaux types RoadmapListEntry,
+      RoadmapSummary, RoadmapSelector (ou nouveau module roadmap_summary.rs ;
+      cf. proposal 3.b).
+    - crates/orchestrator/src/lib.rs       : re-exports des nouveaux types
+      publics si nécessaire pour les consommateurs (le binaire MCP).
+    - crates/mcp-servers/orchestrator/src/main.rs : nouveaux Params structs et
+      nouveaux #[tool] list_roadmaps / summarize_roadmap.
+
+    AUCUNE ZONE PROTÉGÉE CONFIG TOUCHÉE :
+    - shared-rules.yml, personas/*.yml, review-protocol.yml, schemas/* : aucun
+      changement. Pas de nouveau kind, pas de nouveau persona, pas de nouvelle
+      règle.
+
+    AUCUN ARTIFACT EXISTANT N'EST INVALIDÉ : ajout pur d'outils, aucun
+    changement de format ni de matrice access_level.
+
+    CATÉGORIE D'ESCALADE : ce RFC ne touche pas la matrice access_level
+    (ArtifactKind n'est pas étendu, aucune branche access_level ajoutée),
+    ne modifie pas la persona CEO, n'introduit pas de breaking schema change,
+    ne supprime pas de persona. Aucune des quatre catégories de
+    `ceo_cannot_approve_alone` n'est concernée. L'approbation CEO seule suffit
+    en théorie, mais ce RFC reste soumis au protocole standard `rfc: [all]`
+    (PM + Architect + Implementer + CEO) pour préserver la pluralité
+    d'analyse.
+
+    IMPACT COMPORTEMENTAL :
+    - Le PM gagne une boucle d'usage : "demande utilisateur → list_roadmaps()
+      → summarize_roadmap() → restitution". L'ensemble doit tenir en quelques
+      secondes (acceptance criterion 6).
+    - L'Architect peut lui aussi consommer summarize_roadmap() pour situer
+      ses design-docs dans le narrative stratégique (cohérent avec RFC parent
+      section 4.b).
+    - Aucun impact pour Implementer et CEO ; ils peuvent utiliser les tools
+      mais ce n'est pas leur use case principal.
+
+    RISQUES IDENTIFIÉS :
+    - Risque 1 : COÛT DE PARSE. list_roadmaps lit et parse tous les YAML de
+      roadmap à chaque appel pour compter blocked/in_progress. Mitigation :
+      le nombre de roadmaps reste petit (1 à 10 attendues à moyen terme).
+      Pas de cache pour éviter une cohérence trompeuse — les YAML sont la
+      vérité, cohérent avec la décision "pas d'auto-synchronisation" du RFC
+      parent. Si plus tard le volume explose, un RFC ultérieur pourra
+      introduire un cache invalidé par le watcher.
+    - Risque 2 : ROADMAP CORROMPUE. Un YAML mal formé pourrait casser
+      l'agrégation. Mitigation : list_roadmaps skippe avec warning (cf.
+      proposal 3.b étape 3) ; summarize_roadmap remonte une erreur typée
+      qui pointe le file_path (le PM peut alors aller corriger).
+    - Risque 3 : DOMAIN AMBIGU. Si deux roadmaps actives partagent le même
+      domain, summarize_roadmap(domain=...) ne peut pas trancher. Mitigation :
+      erreur explicite qui demande de préciser par id. Pas de fallback
+      silencieux (anti-pattern : ferait perdre la trace de la duplication).
+    - Risque 4 : DÉRIVE DE FORME. La sortie summarize_roadmap est riche
+      (deux vues redondantes + blocked_items en tête). Si les besoins du PM
+      évoluent, on devra revoir la forme. C'est accepté ; les agents
+      consomment du JSON, pas un format binaire — un changement de forme
+      est une release minor, pas un breaking change.
+
+  rollback_plan: >
+    Rollback réversible par git revert sur le commit qui matérialise ce RFC.
+    Procédure manuelle équivalente, dans un ordre qui maintient la
+    compilation à chaque étape :
+
+    1. CODE MCP : retirer les #[tool] list_roadmaps et summarize_roadmap et les
+       structs Params associées dans crates/mcp-servers/orchestrator/src/main.rs.
+    2. CODE ENGINE : retirer les méthodes pub fn list_roadmaps et
+       summarize_roadmap dans crates/orchestrator/src/engine.rs.
+    3. CODE DB : retirer la méthode pub fn list_by_kind dans
+       crates/orchestrator/src/db.rs.
+    4. CODE TYPES : retirer RoadmapListEntry, RoadmapSummary, RoadmapSelector
+       (ou supprimer le module dédié) dans crates/orchestrator/src/types.rs et
+       les re-exports dans lib.rs.
+    5. TESTS : retirer les tests unitaires et d'intégration ajoutés en
+       section 7 de la proposal.
+    6. BUILD : `cargo check -p companyos-orchestrator
+       -p companyos-orchestrator-mcp` doit passer ; `cargo test` complet doit
+       passer.
+
+    PAS DE DONNÉES À MIGRER NI À PURGER : ces tools ne créent aucune donnée
+    persistée (pas d'écriture en DB, pas d'écriture YAML). Les roadmaps
+    elles-mêmes restent intactes ; seule l'API MCP perd les deux tools.
+
+    DÉPENDANCES SORTANTES : si après merge le PM commence à scripter ses
+    restitutions sur list_roadmaps / summarize_roadmap, un rollback les
+    casserait. Pas de risque côté agents (les agents lisent les instructions
+    persona courantes, qui ne mentionneront pas ces tools en dur dans ce
+    RFC — c'est volontaire pour limiter le couplage). Si un RFC ultérieur
+    documente officiellement les tools dans les personas, son rollback_plan
+    devra explicitement les retirer.
+
+  affected_files:
+    - crates/orchestrator/src/db.rs
+    - crates/orchestrator/src/engine.rs
+    - crates/orchestrator/src/types.rs
+    - crates/orchestrator/src/lib.rs
+    - crates/mcp-servers/orchestrator/src/main.rs

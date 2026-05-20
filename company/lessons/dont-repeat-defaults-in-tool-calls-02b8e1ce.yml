@@ -1,0 +1,88 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 02b8e1ce-184d-4b3f-8c46-357dfa828791
+  title: "Ne pas répéter les valeurs par défaut des paramètres dans les appels de tools"
+  author: pm
+  created_at: "2026-05-20"
+  description: >
+    Plusieurs agents (dont le PM dans cette session) passent systématiquement
+    des paramètres optionnels avec leur valeur par défaut (ex. limit=10 sur
+    search() alors que le défaut est déjà 10). C'est du cargo cult : ça donne
+    l'illusion d'un arbitrage conscient sans en être un. Règle : ne passer un
+    paramètre optionnel QUE quand on dévie consciemment du défaut.
+  tags:
+    - tools
+    - cargo-cult
+    - defaults
+    - clarity
+    - search
+    - hygiene
+
+spec:
+  context: >
+    L'utilisateur a observé que le PM passe systématiquement limit=10 sur ses
+    appels search() de l'orchestrateur MCP. Or limit=10 est exactement la
+    valeur par défaut documentée dans la signature du tool. Le PM le faisait
+    par mimétisme avec un exemple vu dans le contexte initial, sans s'être
+    posé la question.
+
+    Conséquences observées :
+    1. Bruit visuel dans les appels (paramètre qui n'apporte rien).
+    2. Faux signal : un lecteur de la session (humain ou autre agent) peut
+       croire que la valeur 10 résulte d'un arbitrage spécifique, alors que
+       c'est juste un copier-coller du défaut.
+    3. Dilution du sens des cas où l'on DEVRAIT passer limit explicitement
+       (ex. limit=50 pour un audit large, limit=3 pour ne garder que le top).
+       Si limit=10 est partout, l'œil ne distingue plus les déviations
+       intentionnelles du bruit.
+
+    Cas symétriques observables ailleurs : passer kind=null explicitement
+    quand le défaut est null, passer un boolean à sa valeur par défaut,
+    spécifier un format quand le format par défaut convient.
+
+  insight: >
+    Un paramètre optionnel passé à sa valeur par défaut n'est pas neutre :
+    il pollue le code/log de la session et masque les décisions réelles.
+    La règle hygiénique est simple : un paramètre apparaît dans l'appel
+    UNIQUEMENT si sa valeur diffère du défaut documenté.
+
+    Cette règle a un corollaire qui force à la rigueur : avant de passer un
+    paramètre, vérifier le défaut. Si on le passe quand même, on a une
+    raison consciente. Si on ne sait pas quel est le défaut, on n'a pas le
+    droit de le préciser (parce qu'on ne sait pas ce qu'on confirme ou
+    écarte).
+
+    Au-delà du cosmétique, c'est une question de signal/bruit dans la
+    mémoire collective : chaque appel de tool dans une session est un
+    petit acte de communication. Multiplier les paramètres redondants
+    diminue l'information par caractère.
+
+  recommendation: >
+    Règle opérationnelle pour tous les agents :
+
+    (1) Avant chaque appel de tool, identifier mentalement quels paramètres
+    sont VRAIMENT nécessaires (différents du défaut documenté).
+
+    (2) Pour les autres, ne pas les passer.
+
+    (3) Si on ignore le défaut d'un paramètre, vérifier la documentation du
+    tool avant de décider de le passer ou non. Ne pas passer "par sécurité"
+    sans savoir.
+
+    (4) Exemple concret search() de l'orchestrateur :
+    - search(query="x") → équivalent à limit=10, kind=null. Ne PAS écrire
+      explicitement ces deux paramètres.
+    - search(query="x", limit=50) → cas légitime, on dévie consciemment.
+    - search(query="x", kind="lesson-learned") → cas légitime, on filtre.
+    - search(query="x", kind="lesson-learned", limit=10) → limit=10 est
+      redondant, à retirer.
+
+    (5) Étendre à tout tool : Glob, Grep, Read offset/limit, Edit
+    replaceAll, etc. Pas d'auto-renseignement de paramètres optionnels à
+    leur valeur par défaut.
+
+    Cette pratique réduit le bruit dans la session et fait ressortir les
+    décisions intentionnelles. Si elle est suivie systématiquement, voir
+    un paramètre passé devient une information : "l'agent a délibérément
+    voulu une valeur différente du défaut".

@@ -1,0 +1,179 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: c5413270-1634-4e44-9540-e205fb523043
+  title: "Un test scripté révèle des bugs que les pseudo-codes de RFC ne capturent pas"
+  author: pm
+  created_at: "2026-05-20"
+  description: >
+    Pendant l'implémentation du RFC MCP proxy resilience (d9399863), le test
+    scripté de l'Étape 4 a révélé 3 bugs réels que ni le RFC ni le plan
+    n'avaient anticipés (deadlock initialize premier startup, swallowing de la
+    réponse initialize au premier startup, notification initialized non
+    rejouée après restart). Sans ce test, les bugs seraient passés inaperçus
+    et auraient cassé la session opencode au prochain redémarrage. Cette
+    lesson capture deux apprentissages : la valeur d'un test scripté
+    obligatoire pour les infrastructures critiques, et le fait qu'un protocole
+    réel (MCP, JSON-RPC) a toujours plus d'invariants que ce qu'un design
+    document peut exhaustivement énumérer.
+  tags:
+    - mcp
+    - proxy
+    - tests
+    - infrastructure
+    - design-vs-reality
+    - lessons-from-implementation
+  related:
+    - id: d9399863-254e-42f5-a485-ea019ce56a93
+      kind: rfc
+      relationship: related
+    - id: e84b641d-1266-473e-b93c-cd709aa14ac9
+      kind: diagnostic-report
+      relationship: related
+
+spec:
+  context: >
+    Le RFC d9399863 introduisait un refactor important du proxy MCP
+    (mcp-proxy.mjs, passage de 149 à 568 lignes). Trois rounds de review ont
+    permis de produire un design exhaustif sur le papier : machine à états,
+    parser NDJSON, buffer FIFO avec backpressure, health check actif, circuit
+    breaker, debounce calibré. L'Implementer a confirmé la faisabilité au
+    round 3. Le plan d'implémentation incluait un test scripté
+    (test-mcp-proxy-restart.sh) obligatoire à l'Étape 4, avant tout commit.
+
+    Pendant l'exécution, le test a échoué initialement. L'Implementer a
+    découvert 3 bugs que la chaîne RFC -> plan -> review n'avait pas vus :
+
+    1. DEADLOCK PREMIER STARTUP. Le RFC stipulait que `state === "starting"`
+    bufferise tous les messages stdin sauf initialize (au moment du
+    re-handshake). Mais au premier démarrage, l'initialize venant d'opencode
+    était aussi bufferisée parce que le check ne distinguait pas "premier
+    startup" de "re-handshake". Résultat : le child ne recevait jamais
+    l'initialize, donc jamais de réponse, donc jamais de transition vers ready.
+    Fix : flag chunkContainsInitialize forçant l'envoi direct quand on est
+    en starting ET qu'on voit un initialize.
+
+    2. SWALLOWING DE LA RÉPONSE INITIALIZE. Symétriquement, la fonction
+    flushStdoutBufferExcludingInitResponse était appliquée même au premier
+    startup, alors que opencode attend explicitement cette réponse pour
+    finaliser son propre handshake. Fix : flag isFirstStartup qui forwarde la
+    réponse en intégralité au premier démarrage, et la swallow uniquement aux
+    re-handshakes ultérieurs.
+
+    3. NOTIFICATION INITIALIZED NON REJOUÉE. Le protocole MCP exige la
+    séquence : initialize -> response initialize -> notifications/initialized
+    -> requests. Le RFC ne mentionnait que le replay de initialize, pas de la
+    notification initialized qui suit. Sans elle, le serveur Rust crashait au
+    premier tools/list après restart avec l'erreur "expect initialized
+    notification, but received: ListToolsRequest". Fix : capture de
+    lastInitializedNotification dans onStdinData, replay après transition
+    vers ready.
+
+    Ces trois bugs partagent un même schéma : ils naissent à l'intersection
+    entre un design correct au niveau abstrait (la machine à états) et les
+    invariants concrets d'un protocole réel (MCP/JSON-RPC) qui imposent des
+    séquences d'échange spécifiques.
+
+  insight: >
+    Deux apprentissages distincts mais liés.
+
+    APPRENTISSAGE 1 - UN PSEUDO-CODE DE RFC NE PEUT PAS ÉPUISER LES INVARIANTS
+    D'UN PROTOCOLE EXTERNE.
+
+    Le RFC d9399863 a traversé 3 rounds de review avec 11 findings techniques
+    bloquants au total, tous résolus. Le design final était plus solide que la
+    moyenne. Et pourtant, 3 bugs sont apparus à l'implémentation, tous liés à
+    des invariants du protocole MCP que ni l'Architect, ni l'Implementer
+    reviewer, ni le PM, n'avaient explicitement modélisés. Pourquoi ?
+
+    Parce que le pseudo-code se concentre sur la MÉCANIQUE INTERNE (machine
+    à états, buffer, drainage, circuit breaker), pas sur le PROTOCOLE EXTERNE
+    (séquence des messages, distinction handshake initial vs re-handshake,
+    notifications de cycle de vie). Les invariants protocolaires sont
+    souvent implicites dans la documentation upstream ou apparaissent
+    seulement à l'exécution sous forme d'erreurs. Un design correct au niveau
+    "comment je gère mon état" peut être incomplet au niveau "qu'attend mon
+    interlocuteur de moi".
+
+    Conséquence : pour toute infrastructure qui interfacie un protocole
+    externe (MCP, LSP, HTTP frameworks, sockets), même un design exhaustivement
+    reviewé doit être considéré comme HYPOTHÉTIQUE jusqu'à validation par
+    exécution. Le test scripté n'est pas une formalité, c'est la confrontation
+    du design au protocole réel.
+
+    APPRENTISSAGE 2 - LE TEST SCRIPTÉ OBLIGATOIRE EST UN INVESTISSEMENT
+    EXTRÊMEMENT RENTABLE.
+
+    L'Architect avait initialement proposé deux options pour valider
+    l'acceptance criterion (g) : test scripté ou procédure manuelle. Le PM a
+    explicitement demandé que le RFC tranche pour le scripté. Sans ce
+    arbitrage, l'Implementer aurait pu choisir la procédure manuelle
+    (plus simple à rédiger), et les 3 bugs auraient été détectés par
+    l'utilisateur en production, avec une session opencode cassée et un
+    diagnostic-report à produire à froid.
+
+    Le test a coûté ~80 lignes de bash + driver Node embarqué. Il a sauvé un
+    cycle d'incident + diagnostic + correction qui aurait coûté plusieurs
+    heures et frustré l'utilisateur. ROI manifeste.
+
+    Critère pour rendre un test scripté OBLIGATOIRE dans un RFC : dès qu'on
+    touche à de l'infrastructure runtime (proxy, serveur, agent toujours
+    actif, watcher, hot-reload), un test scripté est non négociable. La
+    "procédure manuelle" est acceptable seulement pour des artifacts de
+    développement (ex. un script utilisé à la demande), pas pour de
+    l'infrastructure dont la stabilité est critique.
+
+  recommendation: >
+    Trois pratiques à adopter pour les prochains RFC touchant à de
+    l'infrastructure runtime.
+
+    PRATIQUE 1 - MODÉLISER LE PROTOCOLE EXTERNE COMME PREMIÈRE CLASSE.
+
+    Avant le pseudo-code de machine à états, rédiger une section "PROTOCOLE
+    EXTERNE" qui énumère :
+    - Les séquences de messages attendues (ex: pour MCP : initialize ->
+      response -> initialized -> requests)
+    - Les invariants côté pair (que l'interlocuteur attend de nous)
+    - Les notifications cycle de vie qui doivent être conservées/rejouées
+    - Les messages "one-shot" vs "persistants" du point de vue de la session
+
+    Cette section sert de checklist explicite pendant la review. Si elle
+    manque ou est incomplète, c'est un finding au sens des acceptance
+    criteria du task-request (car elle compromet l'utilisabilité du RFC pour
+    l'Implementer).
+
+    PRATIQUE 2 - LE PM IMPOSE LES TESTS SCRIPTÉS POUR L'INFRA RUNTIME.
+
+    Quand un task-request touche à un composant runtime critique (proxy,
+    serveur toujours actif, plugin de hot-reload), le PM ajoute
+    systématiquement un acceptance criterion qui exige un test scripté
+    reproductible, pas une procédure manuelle. Si l'Architect propose deux
+    options dans le RFC, le PM tranche en review pour le scripté.
+
+    Critère pratique pour identifier "infra runtime critique" :
+    - Composant qui tourne en permanence (proxy MCP, watcher, daemon)
+    - Composant dont une défaillance casse la session d'agents en cours
+    - Composant qui interfacie un protocole externe avec des invariants
+      stricts
+    Si au moins 2 critères sur 3 sont remplis, test scripté obligatoire.
+
+    PRATIQUE 3 - L'IMPLEMENTER REMONTE EXPLICITEMENT LES BUGS DÉTECTÉS HORS
+    PLAN.
+
+    Quand un test révèle des bugs qui n'étaient pas anticipés par le RFC ou
+    le plan, l'Implementer doit les documenter dans sa remontée au PM (pas
+    seulement les corriger en silence). Ces bugs sont des données précieuses
+    pour deux raisons :
+    (a) ils alimentent les lessons learned (comme celle-ci)
+    (b) ils révèlent les angles morts du processus design + review pour les
+        prochains RFC similaires.
+
+    Format minimal : un bug = un paragraphe (symptôme + cause + fix), placé
+    dans la section "Bugs découverts" de la remontée. C'est ce qu'a fait
+    l'Implementer dans le cycle d9399863 et c'est devenu directement utilisable
+    pour cette lesson.
+
+    Note de portée : ces pratiques s'appliquent aux RFC touchant l'INFRA
+    RUNTIME. Pour les RFC purement structurels (schémas, personas, règles
+    shared-rules), les pseudo-codes textuels suffisent — c'est leur exécution
+    qui est triviale (édition de YAML), pas leur design.

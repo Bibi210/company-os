@@ -1,0 +1,846 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 7e92e0a7-5d57-4668-9aff-0f2cfedce75d
+  title: "Implementation plan : outillage MCP list_roadmaps + summarize_roadmap"
+  author: implementer
+  created_at: "2026-05-20"
+  description: >
+    Plan d'implémentation détaillé du RFC 3cd72740 (outillage MCP de restitution
+    des roadmaps). Exécute les quatre changements coordonnés tranchés par le RFC :
+    nouvelle méthode db.list_by_kind, nouveau module roadmap_summary dans la crate
+    orchestrator (types + logique d'agrégation), deux méthodes engine
+    (list_roadmaps, summarize_roadmap), et deux #[tool] MCP côté binaire
+    companyos-orchestrator-mcp. Ce plan tranche les trois points laissés ouverts
+    par le RFC (organisation des types, typage concret des items, variants
+    OrchestratorError) et orchestre l'exécution dans l'ordre exigé par
+    write_permit_full_sequence. Aucune décision structurelle additionnelle n'est
+    prise ici — le contrat fonctionnel et la sémantique restent ceux figés par
+    le RFC.
+  tags:
+    - roadmap
+    - tooling
+    - mcp
+    - orchestrator
+    - implementation
+    - rust
+  related:
+    - id: 3cd72740-1424-46ac-8ee6-96f714f3fa94
+      kind: rfc
+      relationship: derived-from
+    - id: 8ce26e7f-4b18-49ca-aa9d-674eec5ec0bb
+      kind: task-request
+      relationship: derived-from
+    - id: a49801aa-911e-45d7-95a3-b21d6ea2bd2d
+      kind: rfc
+      relationship: related
+    - id: c5413270-1634-4e44-9540-e205fb523043
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  steps:
+    - description: >
+        Étape 0 : décisions d'implémentation tranchées par l'Implementer (les
+        trois points laissés ouverts par le RFC). Cette étape n'écrit pas de
+        code, elle fige les conventions pour les étapes suivantes.
+
+        (a) Organisation des types — DÉCISION : nouveau module
+            crates/orchestrator/src/roadmap_summary.rs. Justification : on
+            introduit 3 types métier (RoadmapListEntry, RoadmapSummary,
+            RoadmapSelector) + un type item (RoadmapItem, RoadmapItemRef) +
+            la logique d'agrégation (parsing YAML → struct, regroupement par
+            timeframe / status, calcul des compteurs). Mettre tout cela dans
+            types.rs (déjà 321 lignes, généraliste sur les newtypes et les
+            enums DB) dilue la cohésion. Un module dédié rapproche les types
+            des helpers qui les construisent et reste re-exporté via lib.rs.
+            types.rs reste réservé aux primitives partagées (newtypes,
+            statuts DB, ReviewRound, WritePermit).
+
+        (b) Typage concret des items — DÉCISION : struct typé RoadmapItem avec
+            serde, plutôt que serde_yaml::Value opaque. Le schéma JSON de la
+            roadmap est figé (company/schemas/roadmap.schema.json, validé en
+            amont par le validator) ; un typage explicite donne :
+              * une sortie JSON propre et stable côté MCP (clés ordonnées,
+                pas de drift de représentation entre tag yaml et tag json),
+              * des erreurs de parse précises pointant le champ fautif quand
+                un YAML est corrompu,
+              * une protection contre les dérives silencieuses si le schéma
+                évolue (le typage refusera l'ancien format au build).
+            Structure retenue :
+              pub struct RoadmapItem {
+                  pub key: String,
+                  pub title: String,
+                  pub ref_: RoadmapItemRef,  // sérialisé en "ref" via #[serde(rename = "ref")]
+                  pub timeframe: String,     // "past" | "present" | "future"
+                  pub status: String,        // "planned" | "in_progress" | "done" | "blocked" | "cancelled"
+                  pub target_date: Option<String>,
+                  pub depends_on: Option<Vec<String>>,
+                  pub rationale: Option<String>,
+              }
+              #[serde(tag = "type", rename_all = "snake_case")]
+              pub enum RoadmapItemRef {
+                  Project { project_slug: String },
+                  Rfc { id: String },
+                  External { label: String },
+              }
+            On garde timeframe et status en String côté struct (au lieu de
+            les ré-encoder en enum Rust) parce qu'ils sont utilisés comme
+            CLÉS de HashMap dans la sortie JSON ; rester sur String évite un
+            aller-retour enum → string sans valeur ajoutée fonctionnelle.
+
+        (c) Variants OrchestratorError à ajouter — DÉCISION : quatre nouveaux
+            variants explicites, plutôt que de réutiliser ArtifactNotFound /
+            ValidationFailed génériques :
+              * RoadmapNotFound { selector: String }
+                  → utilisé par summarize_roadmap quand ni ById ni ByDomain
+                  ne résout. Le champ selector contient soit "id=<uuid>"
+                  soit "domain=<slug>" pour traçabilité.
+              * RoadmapAmbiguousDomain { domain: String, candidate_ids: Vec<String> }
+                  → utilisé quand ByDomain trouve zéro roadmap active OU
+                  plus d'une roadmap active sur ce domain (cf. RFC section
+                  4.b "validation côté tool"). Le message d'erreur liste les
+                  ids candidats pour aider le PM à préciser.
+              * RoadmapParseFailed { path: String, reason: String }
+                  → utilisé par summarize_roadmap quand le YAML résolu est
+                  illisible / mal formé / ne respecte pas la structure
+                  attendue. Le path est le file_path absolu pour pointer
+                  rapidement le fichier fautif (cf. RFC section 4.b cas
+                  "indexée mais YAML corrompu"). list_roadmaps ne lève PAS
+                  cette erreur (skip + warn, cf. étape 3 ci-dessous), elle
+                  est exclusive à summarize_roadmap.
+              * RoadmapKindMismatch { id: String, actual_kind: String }
+                  → utilisé par summarize_roadmap quand ById(id) résout
+                  vers un artifact dont kind != "roadmap". Réutiliser
+                  ArtifactNotFound serait trompeur (l'artifact existe, c'est
+                  juste pas une roadmap) ; un variant dédié est plus
+                  diagnostique.
+            Ces variants sont ajoutés à enum OrchestratorError dans
+            crates/orchestrator/src/error.rs avec leurs #[error("...")]
+            respectifs (cf. étape 2 ci-dessous pour la rédaction exacte).
+
+        Aucun fichier écrit à cette étape ; elle sert de spécification
+        partagée avec l'Architect en review.
+      files: []
+
+    - description: >
+        Étape 1 : ajouter la méthode db.list_by_kind dans
+        crates/orchestrator/src/db.rs.
+
+        (a) Signature publique (sous `// --- Artifact Index ---`, à côté de
+            search_artifacts et get_artifact) :
+              pub fn list_by_kind(&self, kind: &str)
+                  -> Result<Vec<IndexedArtifact>, OrchestratorError>
+
+        (b) Requête SQL non-FTS sur la table artifacts (cf. RFC section 3.a) :
+              SELECT id, kind, title, description, tags, file_path, indexed_at
+                FROM artifacts
+               WHERE kind = ?1
+               ORDER BY title
+
+            On réutilise le row helper ArtifactFullRow déjà défini (lignes
+            617-625 de db.rs) qui mappe exactement ces colonnes. Le parsing
+            des tags depuis JSON suit le même pattern que get_artifact
+            (serde_json::from_str(&row.tags).unwrap_or_default()).
+
+        (c) Tests unitaires dans le module `tests` en bas de db.rs (suite des
+            tests existants, après test_upsert_and_search ligne 837) :
+              * test_list_by_kind_returns_only_matching_kind
+                  - upsert deux artifacts kind="roadmap" + un kind="rfc"
+                  - assert list_by_kind("roadmap").len() == 2 et que les ids
+                    sont ceux des deux roadmaps
+              * test_list_by_kind_empty_when_no_match
+                  - DB vide (ou ne contenant que des kinds autres)
+                  - assert list_by_kind("roadmap").is_empty()
+
+            Ces deux tests couvrent (RFC section 7.a) :
+              "test_list_by_kind_returns_only_matching_kind"
+              "test_list_by_kind_empty_when_no_match"
+      files:
+        - crates/orchestrator/src/db.rs
+
+    - description: >
+        Étape 2 : étendre crates/orchestrator/src/error.rs avec les quatre
+        nouveaux variants tranchés à l'étape 0 (c).
+
+        Ajout au bloc enum OrchestratorError, après InvalidEnumValue (ligne 48) :
+
+          #[error("Roadmap not found: {selector}")]
+          RoadmapNotFound { selector: String },
+
+          #[error("Ambiguous roadmap domain '{domain}' (matches {} candidates: {})",
+                  candidate_ids.len(),
+                  candidate_ids.join(", "))]
+          RoadmapAmbiguousDomain {
+              domain: String,
+              candidate_ids: Vec<String>,
+          },
+
+          #[error("Failed to parse roadmap YAML at '{path}': {reason}")]
+          RoadmapParseFailed { path: String, reason: String },
+
+          #[error("Artifact '{id}' exists but is not a roadmap (actual kind: '{actual_kind}')")]
+          RoadmapKindMismatch { id: String, actual_kind: String },
+
+        Aucun test direct sur ce fichier (les variants sont exercés via les
+        tests de l'engine en étapes 4 et 5).
+      files:
+        - crates/orchestrator/src/error.rs
+
+    - description: >
+        Étape 3 : créer le nouveau module
+        crates/orchestrator/src/roadmap_summary.rs avec les types métier et
+        les helpers de parsing / regroupement.
+
+        Contenu du module (rédigé en pseudo-code Rust ; la version finale
+        respectera rustfmt et les conventions du crate) :
+
+          use std::collections::BTreeMap;
+          use serde::{Deserialize, Serialize};
+
+          /// Sélecteur de roadmap : par id (UUID) ou par domain (kebab-case).
+          /// Construit côté tool MCP à partir des paramètres mutuellement exclusifs.
+          #[derive(Debug, Clone)]
+          pub enum RoadmapSelector {
+              ById(String),
+              ByDomain(String),
+          }
+
+          /// Item d'une roadmap, typé depuis le YAML.
+          #[derive(Debug, Clone, Serialize, Deserialize)]
+          pub struct RoadmapItem {
+              pub key: String,
+              pub title: String,
+              #[serde(rename = "ref")]
+              pub ref_: RoadmapItemRef,
+              pub timeframe: String,
+              pub status: String,
+              #[serde(default, skip_serializing_if = "Option::is_none")]
+              pub target_date: Option<String>,
+              #[serde(default, skip_serializing_if = "Option::is_none")]
+              pub depends_on: Option<Vec<String>>,
+              #[serde(default, skip_serializing_if = "Option::is_none")]
+              pub rationale: Option<String>,
+          }
+
+          #[derive(Debug, Clone, Serialize, Deserialize)]
+          #[serde(tag = "type", rename_all = "snake_case")]
+          pub enum RoadmapItemRef {
+              Project { project_slug: String },
+              Rfc { id: String },
+              External { label: String },
+          }
+
+          /// Entrée légère renvoyée par list_roadmaps.
+          #[derive(Debug, Clone, Serialize)]
+          pub struct RoadmapListEntry {
+              pub id: String,
+              pub title: String,
+              pub domain: String,
+              pub status: String,        // "active" | "archived"
+              pub items_count: usize,
+              pub blocked_count: usize,
+              pub in_progress_count: usize,
+              pub file_path: String,
+          }
+
+          /// Sortie complète de summarize_roadmap.
+          #[derive(Debug, Clone, Serialize)]
+          pub struct RoadmapSummary {
+              pub roadmap: RoadmapHeader,
+              pub summary: RoadmapCounters,
+              pub blocked_items: Vec<RoadmapItem>,
+              pub items_by_timeframe: BTreeMap<String, Vec<RoadmapItem>>,
+              pub items_by_status: BTreeMap<String, Vec<RoadmapItem>>,
+          }
+
+          #[derive(Debug, Clone, Serialize)]
+          pub struct RoadmapHeader {
+              pub id: String,
+              pub title: String,
+              pub domain: String,
+              pub status: String,
+              pub narrative: String,
+          }
+
+          #[derive(Debug, Clone, Serialize, Default)]
+          pub struct RoadmapCounters {
+              pub items_total: usize,
+              pub blocked_count: usize,
+              pub by_status: BTreeMap<String, usize>,
+              pub by_timeframe: BTreeMap<String, usize>,
+          }
+
+          /// Structure intermédiaire pour parser le YAML brut d'une roadmap.
+          /// N'est PAS pub : c'est un détail d'implémentation. Le module
+          /// expose seulement RoadmapItem / RoadmapSummary / RoadmapListEntry.
+          #[derive(Debug, Deserialize)]
+          struct RoadmapYaml {
+              metadata: RoadmapYamlMetadata,
+              spec: RoadmapYamlSpec,
+          }
+          #[derive(Debug, Deserialize)]
+          struct RoadmapYamlMetadata {
+              id: String,
+              title: String,
+          }
+          #[derive(Debug, Deserialize)]
+          struct RoadmapYamlSpec {
+              domain: String,
+              status: String,
+              narrative: String,
+              items: Vec<RoadmapItem>,
+          }
+
+          /// Parse un YAML de roadmap en structure typée.
+          /// Public uniquement à l'intérieur du crate (pub(crate)).
+          pub(crate) fn parse_roadmap_yaml(content: &str)
+              -> Result<RoadmapYaml, serde_yaml::Error>;
+
+          /// Compte les items par status (utilisé par list_roadmaps pour les
+          /// compteurs légers, et par summarize_roadmap pour by_status).
+          pub(crate) fn count_by_status(items: &[RoadmapItem])
+              -> BTreeMap<String, usize>;
+
+          /// Compte les items par timeframe.
+          pub(crate) fn count_by_timeframe(items: &[RoadmapItem])
+              -> BTreeMap<String, usize>;
+
+          /// Regroupe les items par clé (status OU timeframe). Conserve
+          /// l'ordre d'apparition dans le YAML à l'intérieur de chaque groupe.
+          pub(crate) fn group_items_by<F>(items: &[RoadmapItem], key: F)
+              -> BTreeMap<String, Vec<RoadmapItem>>
+          where
+              F: Fn(&RoadmapItem) -> String;
+
+        Choix de structures :
+          * BTreeMap plutôt que HashMap pour la sortie JSON : ordre déterministe
+            des clés, ce qui facilite les tests et l'expérience PM (les sorties
+            sont stables d'un appel à l'autre).
+          * Les groupages contiennent TOUS les statuts / timeframes même quand
+            vides (clés zero-init). Justification : la sortie JSON est ainsi
+            self-describing — le consommateur n'a pas à deviner quels statuts
+            existent.
+
+        Pas de tests dans ce module à cette étape ; les types sont testés
+        indirectement via les tests engine (étapes 4 et 5).
+
+        Mise à jour de crates/orchestrator/src/lib.rs : ajouter
+            pub mod roadmap_summary;
+            pub use roadmap_summary::{
+                RoadmapItem, RoadmapItemRef, RoadmapListEntry, RoadmapSelector,
+                RoadmapSummary,
+            };
+        Les types internes (RoadmapHeader, RoadmapCounters) sont aussi
+        re-exportés pour que le binaire MCP puisse les sérialiser sans
+        passer par RoadmapSummary opaque.
+
+        À ajouter au pub use :
+            pub use roadmap_summary::{RoadmapHeader, RoadmapCounters};
+      files:
+        - crates/orchestrator/src/roadmap_summary.rs
+        - crates/orchestrator/src/lib.rs
+
+    - description: >
+        Étape 4 : implémenter engine.list_roadmaps dans
+        crates/orchestrator/src/engine.rs.
+
+        (a) Signature publique (ajoutée après related(), avant reindex_all,
+            section "// --- Artifact Index Operations ---") :
+              pub fn list_roadmaps(
+                  &self,
+                  root: &str,
+                  status_filter: Option<&str>,
+                  domain_filter: Option<&str>,
+              ) -> Result<Vec<RoadmapListEntry>, OrchestratorError>
+
+        (b) Algorithme (cf. RFC section 3.b étapes 1 à 6) :
+              1. self.db.list_by_kind(ROADMAP_KIND) → Vec<IndexedArtifact>.
+                 ROADMAP_KIND est une constante locale du module engine.rs :
+                   const ROADMAP_KIND: &str = "roadmap";
+              2. Pour chaque IndexedArtifact :
+                 - read_to_string(format!("{root}/{}", artifact.file_path)).
+                   En cas d'IO error : tracing::warn!(...) et skip (NE PAS
+                   propager — un fichier illisible ne doit pas casser le
+                   listing entier, cf. RFC section 3.b risque 2).
+                 - parse_roadmap_yaml(&content). En cas d'erreur de parse :
+                   même traitement (warn + skip).
+                 - construire RoadmapListEntry à partir du résultat :
+                     id          = parsed.metadata.id
+                     title       = parsed.metadata.title
+                     domain      = parsed.spec.domain
+                     status      = parsed.spec.status
+                     items_count = parsed.spec.items.len()
+                     blocked_count    = items.filter status=="blocked".count()
+                     in_progress_count= items.filter status=="in_progress".count()
+                     file_path   = artifact.file_path (chemin relatif depuis root)
+              3. Filtrer :
+                 - si Some(s) = status_filter → conserver entry où entry.status == s
+                 - si Some(d) = domain_filter → conserver entry où entry.domain == d
+              4. Trier (Vec::sort_by) selon trois clés successives :
+                 - clé 1 : status "active" avant "archived" (Ordering::Less si
+                   a == "active" && b != "active")
+                 - clé 2 : blocked_count DÉCROISSANT (b.cmp(&a))
+                 - clé 3 : title CROISSANT (a.cmp(&b), Unicode lexicographique)
+              5. Retourner.
+
+        (c) Tests unitaires (ajoutés dans le module `tests` de engine.rs,
+            après les tests existants). Chaque test :
+              - crée un tmpdir avec tempfile::tempdir() (dépendance déjà
+                disponible dans le workspace),
+              - écrit un ou plusieurs YAML de roadmap fixture dans
+                <tmpdir>/company/roadmaps/<id>.yml,
+              - construit un OrchestratorEngine via setup_engine() puis
+                indexe les fixtures via engine.index_artifact(),
+              - appelle list_roadmaps(tmpdir, ...) et asserte la sortie.
+
+            Tests à écrire :
+              * test_list_roadmaps_filters_by_status
+                  - 1 roadmap status=active + 1 roadmap status=archived
+                  - assert list_roadmaps(_, Some("active"), None).len() == 1
+                  - assert list_roadmaps(_, Some("archived"), None).len() == 1
+              * test_list_roadmaps_filters_by_domain
+                  - 2 roadmaps domain="dom-a" + 1 roadmap domain="dom-b"
+                  - assert list_roadmaps(_, None, Some("dom-a")).len() == 2
+              * test_list_roadmaps_sorts_active_first_then_blocked_desc
+                  - roadmap A : active, 0 blocked, title "Alpha"
+                  - roadmap B : active, 2 blocked, title "Beta"
+                  - roadmap C : archived, 5 blocked, title "Gamma"
+                  - sortie attendue : [B, A, C]
+                    (actives d'abord, blocked desc à l'intérieur, archived ensuite)
+              * test_list_roadmaps_skips_corrupt_yaml_with_warning
+                  - indexer un fichier valide + un fichier YAML invalide
+                    (volontairement cassé, ex: "kind: roadmap\nbroken:\n  -\n: x")
+                  - assert list_roadmaps(_, None, None).len() == 1
+                  - le résultat contient bien la roadmap valide
+
+            Ces quatre tests couvrent l'intégralité des cas de listage du RFC
+            section 7.a, sauf test_list_by_kind_* déjà couverts à l'étape 1.
+      files:
+        - crates/orchestrator/src/engine.rs
+
+    - description: >
+        Étape 5 : implémenter engine.summarize_roadmap dans
+        crates/orchestrator/src/engine.rs.
+
+        (a) Signature publique (ajoutée immédiatement après list_roadmaps) :
+              pub fn summarize_roadmap(
+                  &self,
+                  root: &str,
+                  selector: RoadmapSelector,
+              ) -> Result<RoadmapSummary, OrchestratorError>
+
+        (b) Algorithme (cf. RFC section 3.c étapes 1 à 5) :
+
+              1. Résoudre la roadmap → (artifact: IndexedArtifact)
+                 - RoadmapSelector::ById(id) :
+                     match self.db.get_artifact(&id)? {
+                         None => Err(RoadmapNotFound { selector: format!("id={id}") }),
+                         Some(a) if a.kind != ROADMAP_KIND =>
+                             Err(RoadmapKindMismatch { id, actual_kind: a.kind }),
+                         Some(a) => a,
+                     }
+                 - RoadmapSelector::ByDomain(domain) :
+                     entries = self.db.list_by_kind(ROADMAP_KIND)?;
+                     candidates = pour chaque entry, parser YAML, garder ceux
+                                  où spec.domain == domain && spec.status == "active".
+                                  Les YAML invalides sont SKIPÉS (warn + continue).
+                     match candidates.len() {
+                         0 => Err(RoadmapNotFound { selector: format!("domain={domain}") }),
+                         1 => candidate (l'IndexedArtifact correspondant),
+                         _ => Err(RoadmapAmbiguousDomain {
+                                  domain,
+                                  candidate_ids: candidates.iter()
+                                                            .map(|c| c.id.clone())
+                                                            .collect(),
+                              }),
+                     }
+
+              2. Lire le YAML complet :
+                   let full_path = format!("{root}/{}", artifact.file_path);
+                   let content = read_to_string(&full_path)
+                       .map_err(|e| RoadmapParseFailed {
+                           path: full_path.clone(),
+                           reason: format!("io error: {e}"),
+                       })?;
+
+              3. Parser :
+                   let parsed = parse_roadmap_yaml(&content)
+                       .map_err(|e| RoadmapParseFailed {
+                           path: full_path.clone(),
+                           reason: format!("yaml error: {e}"),
+                       })?;
+
+              4. Construire RoadmapSummary :
+                   let items = parsed.spec.items;
+                   let blocked_items: Vec<_> = items.iter()
+                                                    .filter(|i| i.status == "blocked")
+                                                    .cloned()
+                                                    .collect();
+                   let by_status = count_by_status(&items);
+                   let by_timeframe = count_by_timeframe(&items);
+                   let items_by_status = group_items_by(&items, |i| i.status.clone());
+                   let items_by_timeframe = group_items_by(&items, |i| i.timeframe.clone());
+
+                   // Zero-init des clés manquantes pour stabilité de la sortie JSON :
+                   for s in ["planned", "in_progress", "done", "blocked", "cancelled"] {
+                       by_status.entry(s.to_string()).or_insert(0);
+                       items_by_status.entry(s.to_string()).or_insert_with(Vec::new);
+                   }
+                   for t in ["past", "present", "future"] {
+                       by_timeframe.entry(t.to_string()).or_insert(0);
+                       items_by_timeframe.entry(t.to_string()).or_insert_with(Vec::new);
+                   }
+
+                   RoadmapSummary {
+                       roadmap: RoadmapHeader {
+                           id: parsed.metadata.id,
+                           title: parsed.metadata.title,
+                           domain: parsed.spec.domain,
+                           status: parsed.spec.status,
+                           narrative: parsed.spec.narrative,
+                       },
+                       summary: RoadmapCounters {
+                           items_total: items.len(),
+                           blocked_count: blocked_items.len(),
+                           by_status,
+                           by_timeframe,
+                       },
+                       blocked_items,
+                       items_by_timeframe,
+                       items_by_status,
+                   }
+
+              5. Retourner Ok(...).
+
+        (c) Tests unitaires (suite du module `tests` de engine.rs) :
+              * test_summarize_by_id_basic_grouping
+                  - 1 roadmap avec 4 items : 2 status=done timeframe=past,
+                    1 status=in_progress timeframe=present, 1 status=blocked
+                    timeframe=future
+                  - assert summary.items_total == 4
+                  - assert summary.by_status == {done:2, in_progress:1, blocked:1,
+                                                  planned:0, cancelled:0}
+                  - assert items_by_timeframe["past"].len() == 2
+                  - assert items_by_status["done"].len() == 2
+              * test_summarize_by_domain_picks_unique_active
+                  - 1 roadmap domain="d", status=active + 1 même domain
+                    status=archived
+                  - summarize_roadmap(_, ByDomain("d")) doit retourner l'active
+              * test_summarize_by_domain_ambiguous_returns_error
+                  - 2 roadmaps domain="d", status=active
+                  - assert matches!(result, Err(RoadmapAmbiguousDomain { .. }))
+                  - assert candidate_ids.len() == 2
+              * test_summarize_blocked_items_appear_in_blocked_list_and_in_by_status
+                  - 1 roadmap avec 2 items blocked + 1 done
+                  - assert blocked_items.len() == 2
+                  - assert items_by_status["blocked"].len() == 2
+                  - assert items_by_status["done"].len() == 1
+                  - les clés des items blocked sont les mêmes dans les deux listes
+              * test_summarize_not_found_returns_typed_error
+                  - DB vide
+                  - assert matches!(summarize_roadmap(_, ById("absent")),
+                                    Err(RoadmapNotFound { .. }))
+                  - assert matches!(summarize_roadmap(_, ByDomain("absent")),
+                                    Err(RoadmapNotFound { .. }))
+              * test_summarize_id_points_to_non_roadmap_kind_returns_error
+                  - indexer un RFC (kind="rfc") avec un id donné
+                  - assert matches!(summarize_roadmap(_, ById(rfc_id)),
+                                    Err(RoadmapKindMismatch { .. }))
+
+            Ces six tests couvrent les six tests summarize listés au RFC
+            section 7.a.
+      files:
+        - crates/orchestrator/src/engine.rs
+
+    - description: >
+        Étape 6 : exposer les deux nouveaux #[tool] dans
+        crates/mcp-servers/orchestrator/src/main.rs (cf. RFC section 4).
+
+        (a) Ajout du use pour les nouveaux types (dans le bloc use du haut
+            de main.rs, à côté de l'import companyos_orchestrator existant) :
+              use companyos_orchestrator::{
+                  ArtifactPath, Finding, OrchestratorDb, OrchestratorEngine, PathPattern,
+                  ReviewVerdict, RfcUpdateResult,
+                  RoadmapSelector,
+              };
+
+        (b) Nouvelles structs Params (ajoutées dans la section "Artifact
+            Index params", après IndexArtifactParams) :
+
+              #[derive(Deserialize, schemars::JsonSchema)]
+              struct ListRoadmapsParams {
+                  #[schemars(description = "Optional: filter by status ('active' or 'archived')")]
+                  status: Option<String>,
+                  #[schemars(description = "Optional: filter by domain (exact match on kebab-case)")]
+                  domain: Option<String>,
+              }
+
+              #[derive(Deserialize, schemars::JsonSchema)]
+              struct SummarizeRoadmapParams {
+                  #[schemars(description = "metadata.id of the roadmap (UUID). Mutually exclusive with 'domain'.")]
+                  id: Option<String>,
+                  #[schemars(description = "spec.domain of the roadmap. Mutually exclusive with 'id'. If multiple active roadmaps share this domain, returns an error.")]
+                  domain: Option<String>,
+              }
+
+        (c) Implémentation des deux tools dans `impl OrchestratorServer`,
+            après reindex_all (à la fin de la section "Artifact Index tools").
+            On suit strictement le pattern existant (Parameters<...>, lock
+            engine, ok/err Diagnostic) :
+
+              #[tool(description = "List indexed roadmaps. Returns lightweight entries (id, title, domain, status, items_count, blocked_count, in_progress_count). Filterable by status and/or domain. Use this BEFORE summarize_roadmap to discover what exists.")]
+              async fn list_roadmaps(
+                  &self,
+                  params: Parameters<ListRoadmapsParams>,
+              ) -> Result<CallToolResult, McpError> {
+                  let params = params.0;
+                  // Validation côté tool : si status fourni, il doit être "active" ou "archived".
+                  if let Some(ref s) = params.status
+                      && s != "active" && s != "archived"
+                  {
+                      return err(Diagnostic::error(C, "Invalid status filter")
+                          .with_context(format!("list_roadmaps(status={s})"))
+                          .with_reason("status must be 'active' or 'archived'")
+                          .with_fix("Omit status to list all roadmaps, or pass 'active' / 'archived'")
+                          .to_string());
+                  }
+                  let engine = self.engine.lock().await;
+                  match engine.list_roadmaps(
+                      &self.root_path,
+                      params.status.as_deref(),
+                      params.domain.as_deref(),
+                  ) {
+                      Ok(entries) => ok(serde_json::to_string_pretty(&serde_json::json!({
+                          "roadmaps": entries,
+                          "count": entries.len(),
+                      })).unwrap_or_default()),
+                      Err(e) => err(Diagnostic::error(C, "Failed to list roadmaps")
+                          .with_context("list_roadmaps")
+                          .with_reason(format!("{e}"))
+                          .with_fix("Verify the roadmap index is healthy (try reindex_all)")
+                          .to_string()),
+                  }
+              }
+
+              #[tool(description = "Summarize a roadmap's state by id or by domain. Returns narrative + items grouped by timeframe AND by status, with blocked items highlighted. Read-only, no state change.")]
+              async fn summarize_roadmap(
+                  &self,
+                  params: Parameters<SummarizeRoadmapParams>,
+              ) -> Result<CallToolResult, McpError> {
+                  let params = params.0;
+                  // Validation : exactement UN des deux paramètres doit être fourni
+                  let selector = match (params.id, params.domain) {
+                      (Some(id), None) => RoadmapSelector::ById(id),
+                      (None, Some(domain)) => RoadmapSelector::ByDomain(domain),
+                      (Some(_), Some(_)) => {
+                          return err(Diagnostic::error(C, "Ambiguous selector")
+                              .with_context("summarize_roadmap")
+                              .with_reason("Provide exactly ONE of 'id' or 'domain', not both")
+                              .with_fix("Drop one of the two parameters")
+                              .to_string());
+                      }
+                      (None, None) => {
+                          return err(Diagnostic::error(C, "Missing selector")
+                              .with_context("summarize_roadmap")
+                              .with_reason("Provide exactly ONE of 'id' or 'domain'")
+                              .with_fix("Call list_roadmaps first to find the id or domain")
+                              .to_string());
+                      }
+                  };
+                  let engine = self.engine.lock().await;
+                  match engine.summarize_roadmap(&self.root_path, selector) {
+                      Ok(summary) => ok(serde_json::to_string_pretty(&summary).unwrap_or_default()),
+                      Err(e) => err(Diagnostic::error(C, "Failed to summarize roadmap")
+                          .with_context("summarize_roadmap")
+                          .with_reason(format!("{e}"))
+                          .with_fix("Use list_roadmaps to see what exists. If a YAML is corrupt, the error message points to the file.")
+                          .to_string()),
+                  }
+              }
+
+        (d) Test d'intégration côté serveur MCP (cf. RFC section 7.b).
+            Décision : pas d'infra de test in-process MCP existante dans
+            le workspace (cf. main.rs : tout passe par stdio + rmcp). On
+            opte donc pour la deuxième option du RFC : un test unitaire
+            qui valide la sérialisation RoadmapSummary → JSON, placé
+            dans crates/orchestrator/src/roadmap_summary.rs (au plus
+            près des structures testées, pas dans main.rs qui est un
+            binaire). Test :
+              * test_roadmap_summary_serializes_to_expected_json_shape
+                  - construit une RoadmapSummary minimaliste à la main
+                  - sérialise via serde_json::to_value
+                  - assert que les clés top-level présentes : "roadmap",
+                    "summary", "blocked_items", "items_by_timeframe",
+                    "items_by_status"
+                  - assert que roadmap contient bien id/title/domain/status/narrative
+                  - assert que summary contient items_total / blocked_count /
+                    by_status / by_timeframe
+                  - assert que items_by_status contient les 5 clés statut
+                    (zero-init) et items_by_timeframe les 3 clés timeframe
+            Ce test couvre l'objectif explicite du RFC section 7.b :
+            "vérifier la forme du JSON retourné, pas de tester rmcp
+            lui-même".
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+        - crates/orchestrator/src/roadmap_summary.rs
+
+    - description: >
+        Étape 7 : exécution de la séquence write_permit_full_sequence dans
+        l'ordre opérationnel obligatoire (cf. rules.write_permit_full_sequence
+        de la persona implementer).
+
+        Note préalable : le write permit 09678038-2c86-44d7-b90a-f421c6f0eaff
+        a déjà été émis par le CEO et couvre exactement les 5 fichiers cibles
+        (crates/orchestrator/src/{db,engine,types,lib}.rs +
+        crates/mcp-servers/orchestrator/src/main.rs). Le nouveau fichier
+        crates/orchestrator/src/roadmap_summary.rs n'est PAS dans la liste
+        explicite des paths du permit ; il faudra le vérifier au moment de
+        l'exécution. Voir risques 5 et 6 ci-dessous.
+
+        Ordre concret d'exécution (à appliquer une fois ce plan approuvé par
+        l'Architect) :
+
+        (a) Sceller la DB orchestrator AVANT toute modification de fichier
+            protégé. Le grant_write_permit a déjà modifié
+            company/data/orchestrator.db (insertion dans la table
+            write_permits). Cette modification doit être committée avant
+            l'écriture des fichiers Rust pour respecter l'ordre exigé par
+            write_permit_full_sequence étape 2 :
+              git add -f company/data/orchestrator.db
+              git commit -m "chore: seal write permit 09678038 for roadmap-tooling RFC"
+
+        (b) Écrire / modifier les fichiers Rust (étapes 1 à 6 du présent plan,
+            dans n'importe quel ordre puisqu'elles sont co-commitées) :
+              - crates/orchestrator/src/db.rs           (étape 1)
+              - crates/orchestrator/src/error.rs        (étape 2 — pas dans le
+                permit ; voir risque 5)
+              - crates/orchestrator/src/roadmap_summary.rs  (étape 3 — fichier
+                NOUVEAU, voir risque 6)
+              - crates/orchestrator/src/lib.rs          (étapes 3)
+              - crates/orchestrator/src/engine.rs       (étapes 4 et 5)
+              - crates/mcp-servers/orchestrator/src/main.rs (étape 6)
+              - crates/orchestrator/src/types.rs        (rien — confirmé à
+                l'étape 0, on n'y touche pas finalement)
+
+            Note : l'inclusion de error.rs et roadmap_summary.rs (et la
+            NON-inclusion de types.rs) diverge du périmètre nominal du permit
+            tel que mentionné dans la consigne. Avant d'écrire, l'Implementer
+            doit appeler check_write_permit(persona="implementer", path=...)
+            sur chacun des 7 fichiers concernés pour vérifier la couverture
+            effective. Si check_write_permit retourne false pour error.rs
+            ou roadmap_summary.rs, REMONTER au PM avant de continuer (le
+            permit doit être ré-émis avec le scope complet). NE PAS écrire
+            sur un fichier non couvert.
+
+        (c) Après écritures, committer l'ensemble :
+              git add crates/orchestrator/src/db.rs \
+                      crates/orchestrator/src/error.rs \
+                      crates/orchestrator/src/roadmap_summary.rs \
+                      crates/orchestrator/src/lib.rs \
+                      crates/orchestrator/src/engine.rs \
+                      crates/mcp-servers/orchestrator/src/main.rs
+              git commit -m "feat(orchestrator): add list_roadmaps and summarize_roadmap MCP tools"
+
+        (d) Consommer le permit APRÈS le commit (jamais avant) :
+              consume_write_permit(
+                  persona="implementer",
+                  permit_id="09678038-2c86-44d7-b90a-f421c6f0eaff"
+              )
+
+        (e) Build et test :
+              cargo build       # SANS --target-dir : déclenche le hot-reload
+                                # du binaire MCP de l'orchestrator
+              cargo test        # suite complète, doit passer 0 failed
+            En cas d'échec build ou test : produire un diagnostic-report et
+            STOPPER la séquence (ne pas appeler reload_config). Investiguer
+            puis re-exécuter le build/test après correction.
+
+        (f) reload_config() EN TOUT DERNIER, uniquement si build + test sont
+            verts. Cette étape garantit que l'orchestrator MCP servant la
+            session courante prenne en compte le code rechargé. Le hot-reload
+            via cargo build étape (e) suffit normalement, mais reload_config
+            est explicitement listé dans write_permit_full_sequence.
+      files:
+        - company/data/orchestrator.db
+        - crates/orchestrator/src/db.rs
+        - crates/orchestrator/src/error.rs
+        - crates/orchestrator/src/roadmap_summary.rs
+        - crates/orchestrator/src/lib.rs
+        - crates/orchestrator/src/engine.rs
+        - crates/mcp-servers/orchestrator/src/main.rs
+
+    - description: >
+        Étape 8 : validation manuelle bout-en-bout (cf. RFC section 7.c,
+        acceptance criterion 6 du task-request 8ce26e7f).
+
+        Cette étape n'est PAS de l'exécution automatisée ; c'est un protocole
+        de validation que l'Implementer exécute après le passage au vert de
+        l'étape 7. Objectif : vérifier que la chaîne complète tool MCP →
+        engine → DB → YAML produit la restitution attendue côté PM.
+
+        Protocole :
+          1. Vérifier l'absence de roadmap existante (vérification de
+             cohérence — au moment de la rédaction du plan, ls
+             company/roadmaps/ est vide) :
+                 list_roadmaps()  → attendu : { roadmaps: [], count: 0 }
+
+          2. Créer une roadmap fixture minimale "companyos-system" avec 3
+             items dont 1 blocked. Le fichier est placé dans
+             company/roadmaps/companyos-system-<8chars>.yml.
+             Contenu minimal : kind=roadmap, metadata { id (généré),
+             title, description, tags }, spec { domain="companyos-system",
+             status="active", narrative="...", items: 3 entrées dont une
+             status=blocked et timeframe=present }.
+             Validation : validate_file sur le YAML créé.
+
+          3. Appeler list_roadmaps() puis vérifier :
+                 - count == 1
+                 - roadmaps[0].domain == "companyos-system"
+                 - roadmaps[0].items_count == 3
+                 - roadmaps[0].blocked_count == 1
+                 - roadmaps[0].status == "active"
+
+          4. Appeler summarize_roadmap(domain="companyos-system") puis
+             vérifier :
+                 - roadmap.narrative est bien rendu en clair (pas tronqué)
+                 - summary.items_total == 3, summary.blocked_count == 1
+                 - blocked_items.len() == 1, et son key correspond bien
+                 - items_by_status["blocked"].len() == 1
+                 - items_by_timeframe a bien 3 clés (past/present/future),
+                   même si certaines sont vides
+
+          5. Appeler summarize_roadmap(id="<id-fixture>") et vérifier que
+             le résultat est identique à celui de l'étape 4.
+
+          6. Tester un cas d'erreur :
+                 summarize_roadmap(id="00000000-0000-0000-0000-000000000000")
+                 → attendu : erreur typée RoadmapNotFound (selector="id=00...")
+
+          7. Si l'utilisateur le souhaite, supprimer ou archiver la roadmap
+             fixture (mise à status=archived) et re-tester pour confirmer
+             que list_roadmaps() avec status="archived" la trouve.
+
+        Si une seule de ces vérifications échoue, produire un
+        diagnostic-report qui pointe le symptôme et la commande qui a
+        échoué, puis remonter au PM.
+      files: []
+
+  dependencies:
+    - "RFC 3cd72740-1424-46ac-8ee6-96f714f3fa94 approuvé (statut: approved) — vérifié."
+    - "Write permit 09678038-2c86-44d7-b90a-f421c6f0eaff émis par le CEO. Périmètre nominal : 5 fichiers (db.rs, engine.rs, types.rs, lib.rs, main.rs MCP). Périmètre RÉEL nécessaire après décisions d'implémentation : 6 fichiers (db.rs, error.rs, roadmap_summary.rs, lib.rs, engine.rs, main.rs MCP) — types.rs n'est pas touché ; error.rs et roadmap_summary.rs s'ajoutent. À VÉRIFIER côté permit avant écriture (cf. étape 7.b)."
+    - "Architect doit reviewer ce plan avant exécution (review-protocol)."
+    - "Le kind 'roadmap' doit être supporté côté Rust (enum ArtifactKind::Roadmap) ET côté schéma JSON (company/schemas/roadmap.schema.json). Vérifié : les deux sont en place depuis le RFC a49801aa (cf. types.rs lignes 144, 163, 196, 222, 228, 238)."
+    - "Étapes 1 à 6 sont co-écrites puis co-committées ; il n'y a pas d'ordre strict entre elles, seule la cohérence finale du commit importe (cargo build doit passer)."
+    - "Étape 7.e (cargo build + test) gate strictement l'étape 7.f (reload_config) ; ne jamais inverser."
+
+  risks:
+    - "Risque 1 : OUBLI DU SCELLAGE DE LA DB. Si l'Implementer modifie les fichiers Rust avant de committer company/data/orchestrator.db, le hook git rejettera le commit final. Mitigation : suivre rigoureusement l'ordre concret de l'étape 7 (a) → (b)."
+    - "Risque 2 : CONSUME_WRITE_PERMIT APPELÉ AVANT LE COMMIT. La règle write_permit_full_sequence est explicite : le commit git précède consume_write_permit. Inverser bloque le commit a posteriori. Mitigation : la séquence est explicitée en étape 7.c puis 7.d."
+    - "Risque 3 : RELOAD_CONFIG APPELÉ AVANT CARGO TEST. Si reload_config recharge un binaire MCP construit sur du code qui ne compile pas / dont les tests échouent, la session MCP peut perdre son contexte. Mitigation : étape 7.f explicitement conditionnée aux verts de 7.e."
+    - "Risque 4 : MATCH NON-EXHAUSTIF SUR ArtifactKind QUELQUE PART. Le code ne fait pas de match sur ArtifactKind::Roadmap à l'extérieur de crates/config (cf. grep effectué pendant le lookup). Risque résiduel faible. Mitigation : le compilateur Rust impose l'exhaustivité ; cargo build de l'étape 7.e révélerait toute branche manquante."
+    - "Risque 5 : PERMIT NE COUVRE PAS error.rs. L'ajout de variants à OrchestratorError est imposé par les décisions de l'étape 0 (c). Si check_write_permit(implementer, 'crates/orchestrator/src/error.rs') retourne None, l'Implementer doit s'arrêter et remonter au PM pour ré-émission du permit. Ne pas tenter de contourner. Mitigation détective : check_write_permit avant écriture, étape 7.b."
+    - "Risque 6 : PERMIT NE COUVRE PAS roadmap_summary.rs (nouveau fichier). Pour les fichiers NOUVEAUX, glob-matching peut quand même couvrir si le permit utilise un préfixe crates/orchestrator/src/ (à vérifier sur le permit réel). Mitigation : check_write_permit avant l'écriture du nouveau fichier ; si non couvert, remonter au PM avant d'écrire."
+    - "Risque 7 : LE SCHÉMA YAML DES ROADMAPS DIVERGE DE LA STRUCTURE RoadmapItem. Si parse_roadmap_yaml échoue sur des YAML valides au regard du schéma JSON (ex: un champ optionnel mal géré), les tests engine échoueront. Mitigation : les fixtures de test couvrent les variantes (items avec et sans target_date / depends_on / rationale, ref de chacun des 3 types project/rfc/external)."
+    - "Risque 8 : INVARIANTS PROTOCOLAIRES MCP NON CAPTURÉS PAR LE PSEUDO-CODE (cf. lesson c5413270). Les nouveaux tools sont des fonctions read-only sans état persistant ; l'analogie avec le proxy MCP ne tient pas (pas de session longue, pas de re-handshake, pas de cycle de vie). Le risque réside surtout dans la sérialisation JSON : le test test_roadmap_summary_serializes_to_expected_json_shape (étape 6.d) est explicitement conçu pour valider la FORME du JSON, ce qu'un consommateur PM verra réellement. Si après merge un appel PM produit une forme inattendue, capitaliser en lesson dérivée."
+    - "Risque 9 : VOLUMÉTRIE FUTURE DES ROADMAPS. À 1-10 roadmaps c'est trivial ; au-delà, parser tous les YAML à chaque list_roadmaps devient coûteux. Mitigation : le RFC accepte ce coût pour rester sans cache (cohérent avec la décision 'pas d'auto-synchronisation' du RFC a49801aa). Pas d'action requise tant que le volume reste petit."
