@@ -6,7 +6,7 @@ use companyos_config::watcher::{self, ConfigChangeKind};
 use companyos_config::{ArtifactKind, CompanyConfig, Diagnostic, PersonaId, constants};
 use companyos_orchestrator::{
     ArtifactPath, Finding, OrchestratorDb, OrchestratorEngine, PathPattern, ReviewVerdict,
-    RfcUpdateResult,
+    RfcUpdateResult, RoadmapSelector,
 };
 use companyos_validation::{ArtifactValidator, SchemaRegistry};
 use rmcp::{
@@ -169,6 +169,28 @@ struct RelatedParams {
 struct IndexArtifactParams {
     #[schemars(description = "Relative path to the YAML artifact file (from project root)")]
     path: String,
+}
+
+// --- Roadmap tools params ---
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct ListRoadmapsParams {
+    #[schemars(description = "Optional: filter by status ('active' or 'archived')")]
+    status: Option<String>,
+    #[schemars(description = "Optional: filter by domain (exact match on kebab-case)")]
+    domain: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct SummarizeRoadmapParams {
+    #[schemars(
+        description = "metadata.id of the roadmap (UUID). Mutually exclusive with 'domain'."
+    )]
+    id: Option<String>,
+    #[schemars(
+        description = "spec.domain of the roadmap. Mutually exclusive with 'id'. If multiple active roadmaps share this domain, returns an error."
+    )]
+    domain: Option<String>,
 }
 
 fn ok(json: String) -> Result<CallToolResult, McpError> {
@@ -562,6 +584,89 @@ impl OrchestratorServer {
                 .with_reason(format!("{e}"))
                 .with_fix(
                     "Check that the company/ directory exists and contains valid YAML artifacts",
+                )
+                .to_string()),
+        }
+    }
+
+    // --- Roadmap tools ---
+
+    #[tool(
+        description = "List indexed roadmaps. Returns lightweight entries (id, title, domain, status, items_count, blocked_count, in_progress_count). Filterable by status and/or domain. Use this BEFORE summarize_roadmap to discover what exists."
+    )]
+    async fn list_roadmaps(
+        &self,
+        params: Parameters<ListRoadmapsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let params = params.0;
+        // Tool-level validation: status must be one of the two allowed values when provided.
+        if let Some(ref s) = params.status
+            && s != "active"
+            && s != "archived"
+        {
+            return err(Diagnostic::error(C, "Invalid status filter")
+                .with_context(format!("list_roadmaps(status={s})"))
+                .with_reason("status must be 'active' or 'archived'")
+                .with_fix("Omit status to list all roadmaps, or pass 'active' / 'archived'")
+                .to_string());
+        }
+        let engine = self.engine.lock().await;
+        match engine.list_roadmaps(
+            &self.root_path,
+            params.status.as_deref(),
+            params.domain.as_deref(),
+        ) {
+            Ok(entries) => {
+                let count = entries.len();
+                ok(serde_json::to_string_pretty(&serde_json::json!({
+                    "roadmaps": entries,
+                    "count": count,
+                }))
+                .unwrap_or_default())
+            }
+            Err(e) => err(Diagnostic::error(C, "Failed to list roadmaps")
+                .with_context("list_roadmaps")
+                .with_reason(format!("{e}"))
+                .with_fix("Verify the roadmap index is healthy (try reindex_all)")
+                .to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Summarize a roadmap's state by id or by domain. Returns narrative + items grouped by timeframe AND by status, with blocked items highlighted. Read-only, no state change."
+    )]
+    async fn summarize_roadmap(
+        &self,
+        params: Parameters<SummarizeRoadmapParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let params = params.0;
+        // Validation: exactly ONE of id/domain must be provided.
+        let selector = match (params.id, params.domain) {
+            (Some(id), None) => RoadmapSelector::ById(id),
+            (None, Some(domain)) => RoadmapSelector::ByDomain(domain),
+            (Some(_), Some(_)) => {
+                return err(Diagnostic::error(C, "Ambiguous selector")
+                    .with_context("summarize_roadmap")
+                    .with_reason("Provide exactly ONE of 'id' or 'domain', not both")
+                    .with_fix("Drop one of the two parameters")
+                    .to_string());
+            }
+            (None, None) => {
+                return err(Diagnostic::error(C, "Missing selector")
+                    .with_context("summarize_roadmap")
+                    .with_reason("Provide exactly ONE of 'id' or 'domain'")
+                    .with_fix("Call list_roadmaps first to find the id or domain")
+                    .to_string());
+            }
+        };
+        let engine = self.engine.lock().await;
+        match engine.summarize_roadmap(&self.root_path, selector) {
+            Ok(summary) => ok(serde_json::to_string_pretty(&summary).unwrap_or_default()),
+            Err(e) => err(Diagnostic::error(C, "Failed to summarize roadmap")
+                .with_context("summarize_roadmap")
+                .with_reason(format!("{e}"))
+                .with_fix(
+                    "Use list_roadmaps to see what exists. If a YAML is corrupt, the error message points to the file.",
                 )
                 .to_string()),
         }

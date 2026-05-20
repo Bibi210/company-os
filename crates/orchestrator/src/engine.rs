@@ -20,7 +20,15 @@ pub enum RfcUpdateResult {
 
 use crate::db::OrchestratorDb;
 use crate::error::OrchestratorError;
+use crate::roadmap_summary::{
+    self, ALL_STATUSES, ALL_TIMEFRAMES, RoadmapCounters, RoadmapHeader, RoadmapListEntry,
+    RoadmapSelector, RoadmapSummary,
+};
 use crate::types::*;
+
+/// Kind discriminator used everywhere the engine needs to scope operations
+/// to roadmap artifacts. Keep in sync with crates/config/src/types.rs.
+const ROADMAP_KIND: &str = "roadmap";
 
 pub struct OrchestratorEngine {
     db: OrchestratorDb,
@@ -378,6 +386,210 @@ impl OrchestratorEngine {
     /// Get all relations for an artifact (bidirectional).
     pub fn related(&self, id: &str) -> Result<Vec<RelationLink>, OrchestratorError> {
         self.db.get_relations(id)
+    }
+
+    // --- Roadmap tools ---
+
+    /// List indexed roadmaps with light-weight per-roadmap counters.
+    /// Filterable by `status` ("active"/"archived") and/or `domain`.
+    ///
+    /// Corrupt or unreadable roadmap YAMLs are skipped with a tracing warn,
+    /// not propagated as errors — a single broken file must not poison the
+    /// listing for the rest.
+    ///
+    /// Output is sorted (active first, then blocked_count desc, then title asc).
+    pub fn list_roadmaps(
+        &self,
+        root: &str,
+        status_filter: Option<&str>,
+        domain_filter: Option<&str>,
+    ) -> Result<Vec<RoadmapListEntry>, OrchestratorError> {
+        let indexed = self.db.list_by_kind(ROADMAP_KIND)?;
+
+        let mut entries: Vec<RoadmapListEntry> = Vec::new();
+        for artifact in indexed {
+            let full_path = format!("{root}/{}", artifact.file_path);
+            let content = match std::fs::read_to_string(&full_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "[companyos-orchestrator] WARN: skipping unreadable roadmap '{full_path}': {e}"
+                    );
+                    continue;
+                }
+            };
+            let parsed = match roadmap_summary::parse_roadmap_yaml(&content) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "[companyos-orchestrator] WARN: skipping unparseable roadmap '{full_path}': {e}"
+                    );
+                    continue;
+                }
+            };
+
+            let items = &parsed.spec.items;
+            let blocked_count = items.iter().filter(|i| i.status == "blocked").count();
+            let in_progress_count = items.iter().filter(|i| i.status == "in_progress").count();
+
+            entries.push(RoadmapListEntry {
+                id: parsed.metadata.id,
+                title: parsed.metadata.title,
+                domain: parsed.spec.domain,
+                status: parsed.spec.status,
+                items_count: items.len(),
+                blocked_count,
+                in_progress_count,
+                file_path: artifact.file_path,
+            });
+        }
+
+        // Apply filters
+        if let Some(s) = status_filter {
+            entries.retain(|e| e.status == s);
+        }
+        if let Some(d) = domain_filter {
+            entries.retain(|e| e.domain == d);
+        }
+
+        // Sort: active first, then blocked_count desc, then title asc.
+        entries.sort_by(|a, b| {
+            let a_active = a.status == "active";
+            let b_active = b.status == "active";
+            b_active
+                .cmp(&a_active)
+                .then_with(|| b.blocked_count.cmp(&a.blocked_count))
+                .then_with(|| a.title.cmp(&b.title))
+        });
+
+        Ok(entries)
+    }
+
+    /// Summarize a roadmap by id or domain. Returns a structured view with
+    /// narrative + items grouped by both timeframe and status, with blocked
+    /// items highlighted.
+    pub fn summarize_roadmap(
+        &self,
+        root: &str,
+        selector: RoadmapSelector,
+    ) -> Result<RoadmapSummary, OrchestratorError> {
+        // 1. Resolve the indexed artifact for the requested roadmap.
+        let artifact = match selector {
+            RoadmapSelector::ById(id) => match self.db.get_artifact(&id)? {
+                None => {
+                    return Err(OrchestratorError::RoadmapNotFound {
+                        selector: format!("id={id}"),
+                    });
+                }
+                Some(a) if a.kind != ROADMAP_KIND => {
+                    return Err(OrchestratorError::RoadmapKindMismatch {
+                        id,
+                        actual_kind: a.kind,
+                    });
+                }
+                Some(a) => a,
+            },
+            RoadmapSelector::ByDomain(domain) => {
+                let indexed = self.db.list_by_kind(ROADMAP_KIND)?;
+                let mut candidates: Vec<IndexedArtifact> = Vec::new();
+                for a in indexed {
+                    let full_path = format!("{root}/{}", a.file_path);
+                    let content = match std::fs::read_to_string(&full_path) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!(
+                                "[companyos-orchestrator] WARN: skipping unreadable roadmap during domain resolution '{full_path}': {e}"
+                            );
+                            continue;
+                        }
+                    };
+                    let parsed = match roadmap_summary::parse_roadmap_yaml(&content) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!(
+                                "[companyos-orchestrator] WARN: skipping unparseable roadmap during domain resolution '{full_path}': {e}"
+                            );
+                            continue;
+                        }
+                    };
+                    if parsed.spec.domain == domain && parsed.spec.status == "active" {
+                        candidates.push(a);
+                    }
+                }
+                match candidates.len() {
+                    0 => {
+                        return Err(OrchestratorError::RoadmapNotFound {
+                            selector: format!("domain={domain}"),
+                        });
+                    }
+                    1 => candidates.into_iter().next().unwrap(),
+                    _ => {
+                        return Err(OrchestratorError::RoadmapAmbiguousDomain {
+                            domain,
+                            candidate_ids: candidates.into_iter().map(|a| a.id).collect(),
+                        });
+                    }
+                }
+            }
+        };
+
+        // 2. Read and parse the resolved roadmap YAML.
+        let full_path = format!("{root}/{}", artifact.file_path);
+        let content = std::fs::read_to_string(&full_path).map_err(|e| {
+            OrchestratorError::RoadmapParseFailed {
+                path: full_path.clone(),
+                reason: format!("io error: {e}"),
+            }
+        })?;
+        let parsed = roadmap_summary::parse_roadmap_yaml(&content).map_err(|e| {
+            OrchestratorError::RoadmapParseFailed {
+                path: full_path.clone(),
+                reason: format!("yaml error: {e}"),
+            }
+        })?;
+
+        // 3. Build aggregations.
+        let items = parsed.spec.items;
+        let blocked_items: Vec<_> = items
+            .iter()
+            .filter(|i| i.status == "blocked")
+            .cloned()
+            .collect();
+
+        let mut by_status = roadmap_summary::count_by_status(&items);
+        let mut by_timeframe = roadmap_summary::count_by_timeframe(&items);
+        let mut items_by_status = roadmap_summary::group_items_by(&items, |i| i.status.clone());
+        let mut items_by_timeframe =
+            roadmap_summary::group_items_by(&items, |i| i.timeframe.clone());
+
+        // Zero-init canonical keys so the output JSON shape is stable.
+        for s in ALL_STATUSES {
+            by_status.entry((*s).into()).or_insert(0);
+            items_by_status.entry((*s).into()).or_default();
+        }
+        for t in ALL_TIMEFRAMES {
+            by_timeframe.entry((*t).into()).or_insert(0);
+            items_by_timeframe.entry((*t).into()).or_default();
+        }
+
+        Ok(RoadmapSummary {
+            roadmap: RoadmapHeader {
+                id: parsed.metadata.id,
+                title: parsed.metadata.title,
+                domain: parsed.spec.domain,
+                status: parsed.spec.status,
+                narrative: parsed.spec.narrative,
+            },
+            summary: RoadmapCounters {
+                items_total: items.len(),
+                blocked_count: blocked_items.len(),
+                by_status,
+                by_timeframe,
+            },
+            blocked_items,
+            items_by_timeframe,
+            items_by_status,
+        })
     }
 
     /// Reindex all artifacts under the given directory.
@@ -752,5 +964,450 @@ mod tests {
             vec![],
         );
         assert!(result.is_err());
+    }
+
+    // --- Roadmap tools tests ---
+
+    use crate::OrchestratorError;
+    use crate::roadmap_summary::RoadmapSelector;
+
+    /// Self-cleaning temp root: a unique directory under std::env::temp_dir()
+    /// removed on drop. Avoids pulling `tempfile` into orchestrator's deps.
+    struct RoadmapTestRoot {
+        path: std::path::PathBuf,
+    }
+
+    impl RoadmapTestRoot {
+        fn new() -> Self {
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "companyos-orchestrator-roadmap-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&p).expect("create temp root");
+            std::fs::create_dir_all(p.join("company/roadmaps")).expect("create roadmaps dir");
+            std::fs::create_dir_all(p.join("company/schemas")).expect("create schemas dir");
+            RoadmapTestRoot { path: p }
+        }
+
+        fn root_str(&self) -> &str {
+            self.path.to_str().expect("utf-8 root path")
+        }
+
+        /// Write a roadmap YAML fixture under company/roadmaps/<id>.yml.
+        /// Items are passed as (key, ref_type, ref_value, timeframe, status).
+        fn write_roadmap(
+            &self,
+            id: &str,
+            title: &str,
+            domain: &str,
+            status: &str,
+            items: &[(&str, &str, &str, &str, &str)],
+        ) -> String {
+            let items_yaml: String = items
+                .iter()
+                .map(|(key, rtype, rval, tf, st)| {
+                    let ref_block = match *rtype {
+                        "project" => format!("    ref:\n      type: project\n      project_slug: {rval}"),
+                        "rfc" => format!("    ref:\n      type: rfc\n      id: {rval}"),
+                        _ => format!("    ref:\n      type: external\n      label: \"{rval}\""),
+                    };
+                    format!(
+                        "  - key: {key}\n    title: \"Item {key}\"\n{ref_block}\n    timeframe: {tf}\n    status: {st}\n"
+                    )
+                })
+                .collect();
+
+            let mut content = String::new();
+            content.push_str("api_version: companyos/v1\n");
+            content.push_str("kind: roadmap\n");
+            content.push_str("metadata:\n");
+            content.push_str(&format!("  id: {id}\n"));
+            content.push_str(&format!("  title: \"{title}\"\n"));
+            content.push_str("  author: pm\n");
+            content.push_str("  created_at: \"2026-05-20\"\n");
+            content.push_str("  description: \"fixture\"\n");
+            content.push_str("  tags: [test]\n");
+            content.push_str("spec:\n");
+            content.push_str(&format!("  domain: {domain}\n"));
+            content.push_str(&format!("  status: {status}\n"));
+            content.push_str(&format!("  narrative: \"Narrative for {title}\"\n"));
+            content.push_str("  items:\n");
+            content.push_str(&items_yaml);
+            let rel_path = format!("company/roadmaps/{id}.yml");
+            let abs = self.path.join(&rel_path);
+            std::fs::write(&abs, &content).expect("write roadmap");
+            rel_path
+        }
+
+        /// Write a raw file (used for corrupt fixtures and non-roadmap kinds).
+        fn write_raw(&self, rel_path: &str, content: &str) {
+            let abs = self.path.join(rel_path);
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            std::fs::write(&abs, content).expect("write raw");
+        }
+    }
+
+    impl Drop for RoadmapTestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Index a roadmap directly via db.upsert_artifact, bypassing schema
+    /// validation. We want full control over the YAML (including malformed
+    /// fixtures) without depending on a populated schema registry.
+    fn index_roadmap_directly(
+        engine: &OrchestratorEngine,
+        root: &RoadmapTestRoot,
+        id: &str,
+        file_path: &str,
+    ) {
+        let artifact = crate::IndexedArtifact {
+            id: id.into(),
+            kind: "roadmap".into(),
+            title: format!("title-{id}"),
+            description: String::new(),
+            tags: vec![],
+            file_path: file_path.into(),
+            indexed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let content = std::fs::read_to_string(root.path.join(file_path)).unwrap_or_default();
+        engine
+            .db
+            .upsert_artifact(&artifact, &content, &[])
+            .expect("upsert");
+    }
+
+    fn index_artifact_with_kind(
+        engine: &OrchestratorEngine,
+        id: &str,
+        kind: &str,
+        file_path: &str,
+    ) {
+        let artifact = crate::IndexedArtifact {
+            id: id.into(),
+            kind: kind.into(),
+            title: format!("title-{id}"),
+            description: String::new(),
+            tags: vec![],
+            file_path: file_path.into(),
+            indexed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        engine
+            .db
+            .upsert_artifact(&artifact, "", &[])
+            .expect("upsert");
+    }
+
+    // --- list_roadmaps tests ---
+
+    #[test]
+    fn test_list_roadmaps_filters_by_status() {
+        let root = RoadmapTestRoot::new();
+        let engine = setup_engine();
+
+        let id_a = "11111111-1111-1111-1111-111111111111";
+        let id_b = "22222222-2222-2222-2222-222222222222";
+        let p_a = root.write_roadmap(id_a, "Active one", "dom-a", "active", &[]);
+        let p_b = root.write_roadmap(id_b, "Archived one", "dom-b", "archived", &[]);
+        index_roadmap_directly(&engine, &root, id_a, &p_a);
+        index_roadmap_directly(&engine, &root, id_b, &p_b);
+
+        let active = engine
+            .list_roadmaps(root.root_str(), Some("active"), None)
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, id_a);
+
+        let archived = engine
+            .list_roadmaps(root.root_str(), Some("archived"), None)
+            .unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, id_b);
+
+        let all = engine.list_roadmaps(root.root_str(), None, None).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_list_roadmaps_filters_by_domain() {
+        let root = RoadmapTestRoot::new();
+        let engine = setup_engine();
+
+        let ids = [
+            ("33333333-3333-3333-3333-333333333333", "dom-a"),
+            ("44444444-4444-4444-4444-444444444444", "dom-a"),
+            ("55555555-5555-5555-5555-555555555555", "dom-b"),
+        ];
+        for (i, (id, dom)) in ids.iter().enumerate() {
+            let p = root.write_roadmap(id, &format!("R{i}"), dom, "active", &[]);
+            index_roadmap_directly(&engine, &root, id, &p);
+        }
+
+        let dom_a = engine
+            .list_roadmaps(root.root_str(), None, Some("dom-a"))
+            .unwrap();
+        assert_eq!(dom_a.len(), 2);
+        assert!(dom_a.iter().all(|e| e.domain == "dom-a"));
+
+        let dom_b = engine
+            .list_roadmaps(root.root_str(), None, Some("dom-b"))
+            .unwrap();
+        assert_eq!(dom_b.len(), 1);
+    }
+
+    #[test]
+    fn test_list_roadmaps_sorts_active_first_then_blocked_desc() {
+        let root = RoadmapTestRoot::new();
+        let engine = setup_engine();
+
+        let id_a = "aaaaaaaa-1111-1111-1111-111111111111";
+        let id_b = "bbbbbbbb-2222-2222-2222-222222222222";
+        let id_c = "cccccccc-3333-3333-3333-333333333333";
+
+        // A: active, 0 blocked, title "Alpha"
+        let p_a = root.write_roadmap(id_a, "Alpha", "d", "active", &[]);
+        // B: active, 2 blocked, title "Beta"
+        let p_b = root.write_roadmap(
+            id_b,
+            "Beta",
+            "d",
+            "active",
+            &[
+                ("b1", "external", "x", "present", "blocked"),
+                ("b2", "external", "x", "present", "blocked"),
+                ("b3", "external", "x", "past", "done"),
+            ],
+        );
+        // C: archived, 5 blocked, title "Gamma"
+        let p_c = root.write_roadmap(
+            id_c,
+            "Gamma",
+            "d",
+            "archived",
+            &[
+                ("c1", "external", "x", "past", "blocked"),
+                ("c2", "external", "x", "past", "blocked"),
+                ("c3", "external", "x", "past", "blocked"),
+                ("c4", "external", "x", "past", "blocked"),
+                ("c5", "external", "x", "past", "blocked"),
+            ],
+        );
+        index_roadmap_directly(&engine, &root, id_a, &p_a);
+        index_roadmap_directly(&engine, &root, id_b, &p_b);
+        index_roadmap_directly(&engine, &root, id_c, &p_c);
+
+        let entries = engine.list_roadmaps(root.root_str(), None, None).unwrap();
+        assert_eq!(entries.len(), 3);
+        // Expected order: B (active, 2 blocked), A (active, 0 blocked), C (archived)
+        assert_eq!(
+            entries[0].id, id_b,
+            "B should be first (active + most blocked)"
+        );
+        assert_eq!(
+            entries[1].id, id_a,
+            "A should be second (active, 0 blocked)"
+        );
+        assert_eq!(entries[2].id, id_c, "C should be last (archived)");
+    }
+
+    #[test]
+    fn test_list_roadmaps_skips_corrupt_yaml_with_warning() {
+        let root = RoadmapTestRoot::new();
+        let engine = setup_engine();
+
+        let id_good = "66666666-6666-6666-6666-666666666666";
+        let id_bad = "77777777-7777-7777-7777-777777777777";
+
+        let p_good = root.write_roadmap(id_good, "Good", "d", "active", &[]);
+        // Malformed YAML: missing required fields
+        let p_bad = format!("company/roadmaps/{id_bad}.yml");
+        root.write_raw(
+            &p_bad,
+            "api_version: companyos/v1\nkind: roadmap\nbroken: :\n  - x: [",
+        );
+        index_roadmap_directly(&engine, &root, id_good, &p_good);
+        index_roadmap_directly(&engine, &root, id_bad, &p_bad);
+
+        let entries = engine.list_roadmaps(root.root_str(), None, None).unwrap();
+        assert_eq!(entries.len(), 1, "corrupt roadmap should be skipped");
+        assert_eq!(entries[0].id, id_good);
+    }
+
+    // --- summarize_roadmap tests ---
+
+    #[test]
+    fn test_summarize_by_id_basic_grouping() {
+        let root = RoadmapTestRoot::new();
+        let engine = setup_engine();
+
+        let id = "88888888-8888-8888-8888-888888888888";
+        let p = root.write_roadmap(
+            id,
+            "Mixed",
+            "d",
+            "active",
+            &[
+                ("i1", "external", "x", "past", "done"),
+                ("i2", "external", "x", "past", "done"),
+                ("i3", "external", "x", "present", "in_progress"),
+                ("i4", "external", "x", "future", "blocked"),
+            ],
+        );
+        index_roadmap_directly(&engine, &root, id, &p);
+
+        let summary = engine
+            .summarize_roadmap(root.root_str(), RoadmapSelector::ById(id.into()))
+            .expect("summarize ok");
+
+        assert_eq!(summary.summary.items_total, 4);
+        assert_eq!(summary.summary.blocked_count, 1);
+
+        // by_status canonical keys present, including zero counts
+        assert_eq!(summary.summary.by_status.get("done"), Some(&2));
+        assert_eq!(summary.summary.by_status.get("in_progress"), Some(&1));
+        assert_eq!(summary.summary.by_status.get("blocked"), Some(&1));
+        assert_eq!(summary.summary.by_status.get("planned"), Some(&0));
+        assert_eq!(summary.summary.by_status.get("cancelled"), Some(&0));
+
+        // by_timeframe
+        assert_eq!(summary.summary.by_timeframe.get("past"), Some(&2));
+        assert_eq!(summary.summary.by_timeframe.get("present"), Some(&1));
+        assert_eq!(summary.summary.by_timeframe.get("future"), Some(&1));
+
+        // grouped items
+        assert_eq!(summary.items_by_timeframe.get("past").unwrap().len(), 2);
+        assert_eq!(summary.items_by_status.get("done").unwrap().len(), 2);
+        assert_eq!(summary.blocked_items.len(), 1);
+        assert_eq!(summary.blocked_items[0].key, "i4");
+    }
+
+    #[test]
+    fn test_summarize_by_domain_picks_unique_active() {
+        let root = RoadmapTestRoot::new();
+        let engine = setup_engine();
+
+        let id_active = "99999999-9999-9999-9999-999999999999";
+        let id_arch = "aaaaaaaa-0000-0000-0000-000000000000";
+        let p_a = root.write_roadmap(id_active, "Active", "shared-dom", "active", &[]);
+        let p_b = root.write_roadmap(id_arch, "Archived", "shared-dom", "archived", &[]);
+        index_roadmap_directly(&engine, &root, id_active, &p_a);
+        index_roadmap_directly(&engine, &root, id_arch, &p_b);
+
+        let summary = engine
+            .summarize_roadmap(
+                root.root_str(),
+                RoadmapSelector::ByDomain("shared-dom".into()),
+            )
+            .expect("should pick the active one");
+        assert_eq!(summary.roadmap.id, id_active);
+    }
+
+    #[test]
+    fn test_summarize_by_domain_ambiguous_returns_error() {
+        let root = RoadmapTestRoot::new();
+        let engine = setup_engine();
+
+        let id1 = "bbbbbbbb-0000-0000-0000-000000000001";
+        let id2 = "bbbbbbbb-0000-0000-0000-000000000002";
+        let p1 = root.write_roadmap(id1, "First", "ambig", "active", &[]);
+        let p2 = root.write_roadmap(id2, "Second", "ambig", "active", &[]);
+        index_roadmap_directly(&engine, &root, id1, &p1);
+        index_roadmap_directly(&engine, &root, id2, &p2);
+
+        let res =
+            engine.summarize_roadmap(root.root_str(), RoadmapSelector::ByDomain("ambig".into()));
+        match res {
+            Err(OrchestratorError::RoadmapAmbiguousDomain {
+                domain,
+                candidate_ids,
+            }) => {
+                assert_eq!(domain, "ambig");
+                assert_eq!(candidate_ids.len(), 2);
+            }
+            other => panic!("expected RoadmapAmbiguousDomain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_summarize_blocked_items_appear_in_blocked_list_and_in_by_status() {
+        let root = RoadmapTestRoot::new();
+        let engine = setup_engine();
+
+        let id = "cccccccc-0000-0000-0000-000000000003";
+        let p = root.write_roadmap(
+            id,
+            "Blockers",
+            "d",
+            "active",
+            &[
+                ("b1", "external", "x", "present", "blocked"),
+                ("b2", "external", "x", "future", "blocked"),
+                ("d1", "external", "x", "past", "done"),
+            ],
+        );
+        index_roadmap_directly(&engine, &root, id, &p);
+
+        let summary = engine
+            .summarize_roadmap(root.root_str(), RoadmapSelector::ById(id.into()))
+            .expect("summarize ok");
+
+        assert_eq!(summary.blocked_items.len(), 2);
+        let by_status_blocked = summary.items_by_status.get("blocked").unwrap();
+        assert_eq!(by_status_blocked.len(), 2);
+
+        let blocked_keys: Vec<_> = summary.blocked_items.iter().map(|i| &i.key).collect();
+        let by_status_keys: Vec<_> = by_status_blocked.iter().map(|i| &i.key).collect();
+        for k in &blocked_keys {
+            assert!(by_status_keys.contains(k));
+        }
+
+        assert_eq!(summary.items_by_status.get("done").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_summarize_not_found_returns_typed_error() {
+        let root = RoadmapTestRoot::new();
+        let engine = setup_engine();
+
+        // ById on empty DB
+        let by_id =
+            engine.summarize_roadmap(root.root_str(), RoadmapSelector::ById("absent-id".into()));
+        assert!(matches!(
+            by_id,
+            Err(OrchestratorError::RoadmapNotFound { .. })
+        ));
+
+        // ByDomain on empty DB
+        let by_dom = engine.summarize_roadmap(
+            root.root_str(),
+            RoadmapSelector::ByDomain("absent-dom".into()),
+        );
+        assert!(matches!(
+            by_dom,
+            Err(OrchestratorError::RoadmapNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn test_summarize_id_points_to_non_roadmap_kind_returns_error() {
+        let root = RoadmapTestRoot::new();
+        let engine = setup_engine();
+
+        let rfc_id = "dddddddd-0000-0000-0000-000000000004";
+        // Index an artifact with kind="rfc"
+        index_artifact_with_kind(&engine, rfc_id, "rfc", "company/rfcs/x.yml");
+
+        let res = engine.summarize_roadmap(root.root_str(), RoadmapSelector::ById(rfc_id.into()));
+        match res {
+            Err(OrchestratorError::RoadmapKindMismatch { id, actual_kind }) => {
+                assert_eq!(id, rfc_id);
+                assert_eq!(actual_kind, "rfc");
+            }
+            other => panic!("expected RoadmapKindMismatch, got {other:?}"),
+        }
     }
 }

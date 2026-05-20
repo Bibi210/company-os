@@ -396,6 +396,48 @@ impl OrchestratorDb {
         Ok(results)
     }
 
+    /// List all indexed artifacts of a given kind, ordered by title.
+    /// Unlike `search_artifacts`, this does NOT require an FTS query term —
+    /// it scans the base `artifacts` table directly. Use it when you need an
+    /// exhaustive listing of artifacts of a specific kind (e.g., all roadmaps).
+    pub fn list_by_kind(&self, kind: &str) -> Result<Vec<IndexedArtifact>, OrchestratorError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, title, description, tags, file_path, indexed_at
+             FROM artifacts
+             WHERE kind = ?1
+             ORDER BY title",
+        )?;
+
+        let rows = stmt
+            .query_map(params![kind], |row| {
+                Ok(ArtifactFullRow {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    title: row.get(2)?,
+                    description: row.get(3)?,
+                    tags: row.get(4)?,
+                    file_path: row.get(5)?,
+                    indexed_at: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut results = Vec::with_capacity(rows.len());
+        for row in rows {
+            let tags: Vec<String> = serde_json::from_str(&row.tags).unwrap_or_default();
+            results.push(IndexedArtifact {
+                id: row.id,
+                kind: row.kind,
+                title: row.title,
+                description: row.description,
+                tags,
+                file_path: row.file_path,
+                indexed_at: row.indexed_at,
+            });
+        }
+        Ok(results)
+    }
+
     pub fn get_artifact(&self, id: &str) -> Result<Option<IndexedArtifact>, OrchestratorError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, title, description, tags, file_path, indexed_at FROM artifacts WHERE id = ?1",
@@ -857,5 +899,45 @@ mod tests {
         assert!(!results.is_empty());
         assert_eq!(results[0].id, "rfc-001");
         assert_eq!(results[0].title, "Implement caching layer");
+    }
+
+    fn make_indexed(id: &str, kind: &str, title: &str) -> IndexedArtifact {
+        IndexedArtifact {
+            id: id.into(),
+            kind: kind.into(),
+            title: title.into(),
+            description: String::new(),
+            tags: vec![],
+            file_path: format!("company/fixtures/{id}.yml"),
+            indexed_at: Utc::now().to_rfc3339(),
+        }
+    }
+
+    #[test]
+    fn test_list_by_kind_returns_only_matching_kind() {
+        let db = setup_db();
+        let r1 = make_indexed("road-001", "roadmap", "Beta Roadmap");
+        let r2 = make_indexed("road-002", "roadmap", "Alpha Roadmap");
+        let other = make_indexed("rfc-001", "rfc", "Some RFC");
+        db.upsert_artifact(&r1, "content", &[]).unwrap();
+        db.upsert_artifact(&r2, "content", &[]).unwrap();
+        db.upsert_artifact(&other, "content", &[]).unwrap();
+
+        let results = db.list_by_kind("roadmap").unwrap();
+        assert_eq!(results.len(), 2);
+        // Ordered by title: "Alpha" < "Beta"
+        assert_eq!(results[0].id, "road-002");
+        assert_eq!(results[1].id, "road-001");
+        assert!(results.iter().all(|a| a.kind == "roadmap"));
+    }
+
+    #[test]
+    fn test_list_by_kind_empty_when_no_match() {
+        let db = setup_db();
+        let rfc = make_indexed("rfc-only", "rfc", "Lonely RFC");
+        db.upsert_artifact(&rfc, "content", &[]).unwrap();
+
+        let results = db.list_by_kind("roadmap").unwrap();
+        assert!(results.is_empty());
     }
 }

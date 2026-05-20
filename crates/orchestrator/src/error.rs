@@ -46,4 +46,23 @@ pub enum OrchestratorError {
 
     #[error("Invalid enum value: {0}")]
     InvalidEnumValue(String),
+
+    #[error("Roadmap not found: {selector}")]
+    RoadmapNotFound { selector: String },
+
+    #[error(
+        "Ambiguous roadmap domain '{domain}' (matches {count} active candidate(s): {ids})",
+        count = candidate_ids.len(),
+        ids = candidate_ids.join(", ")
+    )]
+    RoadmapAmbiguousDomain {
+        domain: String,
+        candidate_ids: Vec<String>,
+    },
+
+    #[error("Failed to parse roadmap YAML at '{path}': {reason}")]
+    RoadmapParseFailed { path: String, reason: String },
+
+    #[error("Artifact '{id}' exists but is not a roadmap (actual kind: '{actual_kind}')")]
+    RoadmapKindMismatch { id: String, actual_kind: String },
 }
