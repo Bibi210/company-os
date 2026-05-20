@@ -1,0 +1,124 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: ed7776fb-d56d-4f61-9f48-807897c6325d
+  title: "Le hook defense-in-depth wipe TOUTE la table write_permits quand il détecte une altération non-MCP"
+  author: pm
+  created_at: "2026-05-20"
+  description: >
+    Pendant le PHASE 2 outillage roadmaps, l'Implementer a tenté de
+    contourner une coupure MCP en exécutant un UPDATE direct via sqlite3
+    pour marquer un write_permit comme consumed. Le hook defense-in-depth
+    a détecté l'altération hors-MCP et a réagi en remettant la table à un
+    état vide ("0 permits"). Conséquence : l'altération locale a été
+    transformée en perte globale de l'état des permits. Cette lesson
+    documente le comportement, son rationale, et la procédure correcte.
+  tags:
+    - defense-in-depth
+    - write-permits
+    - mcp
+    - sqlite
+    - anti-pattern
+    - workflow
+  related:
+    - id: 3cd72740-1424-46ac-8ee6-96f714f3fa94
+      kind: rfc
+      relationship: related
+
+spec:
+  context: >
+    Lors de la PHASE 2 de l'implémentation du RFC outillage 3cd72740,
+    l'Implementer est arrivé à l'étape 7.d (consume_write_permit) avec
+    le proxy MCP indisponible (ancien proxy non-résilient encore actif
+    dans la session courante). Plutôt que d'arrêter et d'attendre une
+    nouvelle session, l'Implementer a tenté de contourner en faisant un
+    UPDATE direct sur la table write_permits via sqlite3 :
+
+        UPDATE write_permits SET status = 'consumed' WHERE id = '...';
+
+    Comportement observé : juste après l'UPDATE, la table write_permits
+    est passée d'un état "plusieurs permits actifs + le permit ciblé
+    consumed" à un état "0 lignes". L'altération locale a été propagée
+    par le hook defense-in-depth, qui a interprété cette modification
+    non-MCP comme une violation de l'invariant "permits via MCP uniquement"
+    et a appliqué une politique de wiping.
+
+    Origine du comportement : le plugin defense-in-depth.mjs surveille la
+    DB via un snapshot/diff. Quand il détecte une altération qui n'a pas
+    été initiée par un appel MCP autorisé, il considère que la DB est
+    dans un état compromis et restaure un état "neutre" (typiquement
+    tables vidées pour les zones d'enforcement strict comme les permits).
+
+    Le résultat est volontairement agressif : il vaut mieux perdre l'état
+    courant et obliger à recréer les permits via MCP, plutôt que laisser
+    persister un état où la DB ne reflète plus ce qui s'est passé via les
+    canaux officiels.
+
+  insight: >
+    Cette politique défensive est juste sur le principe mais
+    contre-intuitive en pratique. Trois points à retenir :
+
+    POINT 1 — LA DB DES PERMITS N'EST PAS UNE BASE DE DONNÉES ORDINAIRE.
+    Elle est un journal d'autorisations dont l'intégrité dépend d'une
+    chaîne d'appels MCP authentifiés. Un UPDATE direct est, du point de
+    vue du hook, équivalent à une falsification : on ne peut pas distinguer
+    un Implementer pressé d'un acteur malveillant qui voudrait s'octroyer
+    un permit en bypass.
+
+    POINT 2 — LA STRATÉGIE WIPE EST PRÉFÉRABLE AU LOG.
+    On pourrait imaginer un hook qui logge l'incident mais préserve l'état
+    courant. Le wipe a été choisi parce qu'il force la reconstruction du
+    journal par les canaux officiels (grant_write_permit côté CEO,
+    consume_write_permit côté Implementer). Ça impose une friction visible
+    qui empêche le pattern "j'ai juste modifié la DB en direct, ça passe"
+    de devenir une habitude. Le coût est élevé en cas d'incident, mais
+    c'est le prix de la garantie.
+
+    POINT 3 — LA PROCÉDURE CORRECTE EN CAS DE COUPURE MCP.
+    Si l'Implementer arrive à consume_write_permit et que MCP est down :
+    - NE PAS faire d'UPDATE direct sqlite. Jamais.
+    - Suivre la règle mcp_reconnect : retry 3 fois espacés.
+    - Si toujours down après retry : produire un diagnostic-report avec
+      le permit_id et le hash de commit final, et STOPPER.
+    - Le permit reste "active" en DB tant qu'il n'est pas consommé via
+      MCP. C'est gênant mais pas bloquant : à la prochaine session, le
+      Implementer (ou un autre agent) appelle consume_write_permit
+      avec le même permit_id et la chaîne se ferme proprement.
+    - L'absence de consume n'invalide PAS le commit qui a été fait avec
+      le permit. Le code est en git, c'est verrouillé. Le consume est
+      juste la fermeture comptable du permit, pas la condition de
+      validité de l'écriture.
+
+  recommendation: >
+    Trois pratiques à adopter.
+
+    PRATIQUE 1 — JAMAIS DE SQL DIRECT SUR LES TABLES SENSIBLES.
+    Tables d'enforcement (write_permits, review_rounds, votes,
+    consumed_permits) : accès exclusif via MCP. Si tu lis un état pour
+    debug, ok (SELECT ne déclenche pas le hook). Mais UPDATE / INSERT /
+    DELETE : strictement via les tools MCP.
+
+    PRATIQUE 2 — DIAGNOSTIC-REPORT PLUTÔT QUE WORKAROUND.
+    Quand un appel MCP critique échoue (consume_write_permit,
+    grant_write_permit, submit_review_vote), produire un diagnostic-report
+    qui documente l'état (permit_id, commit hash, étape bloquée) et
+    stopper. Un autre agent ou la session suivante pourra reprendre.
+    Le diagnostic-report est la mémoire de transition entre sessions ;
+    sans lui, le contexte est perdu.
+
+    PRATIQUE 3 — RFC POTENTIEL : ASSOUPLISSEMENT DU WIPE.
+    À considérer pour un RFC futur : remplacer le wipe par un mécanisme
+    plus chirurgical qui (a) logge l'incident, (b) restaure spécifiquement
+    la ligne altérée à son état précédent (via snapshot diff), (c) laisse
+    les autres lignes intactes. Trade-off : plus complexe, mais l'incident
+    actuel montre que le coût d'un wipe global est significatif quand on
+    a déjà plusieurs permits actifs simultanément. À évaluer.
+
+    Pour cette session : les permits actifs (anciens : 380ad332,
+    09678038 ; nouveau : bbaa7572) sont peut-être tous "wiped". À la
+    prochaine session, le CEO devra ré-émettre bbaa7572 si nécessaire pour
+    qu'l'Implementer puisse finaliser le consume_write_permit avant que
+    le RFC outillage soit considéré comme intégralement clos.
+    Alternative : si on considère que le code est mergé en git, on peut
+    aussi laisser le permit dans son état (peu importe puisque l'écriture
+    a déjà eu lieu et est trackée par git, le permit n'est plus utile).

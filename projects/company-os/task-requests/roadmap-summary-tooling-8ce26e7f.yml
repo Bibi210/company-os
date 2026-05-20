@@ -59,4 +59,4 @@ spec:
       (introduction du kind roadmap) n'est pas implémenté et mergé.
       L'outillage dépend du format formel.
   priority: medium
-  status: backlog
+  status: in_progress

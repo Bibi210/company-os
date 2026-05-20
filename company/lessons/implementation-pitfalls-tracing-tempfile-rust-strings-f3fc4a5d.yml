@@ -1,0 +1,174 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: f3fc4a5d-e9e6-43ef-86e9-49441fa84eaa
+  title: "Trois pièges récurrents à anticiper lors d'extensions de crate Rust"
+  author: pm
+  created_at: "2026-05-20"
+  description: >
+    Pendant l'implémentation du RFC outillage roadmaps (3cd72740),
+    l'Implementer a rencontré trois pièges qui n'étaient pas anticipés par
+    le plan : (1) la crate cible n'avait pas tracing dans ses dépendances
+    alors qu'il voulait logger des warnings, (2) elle n'avait pas tempfile
+    en dev-dep pour les fixtures de test, (3) une continuation de string
+    Rust (\) après newline strippe les espaces d'indentation, corrompant
+    silencieusement les fixtures YAML. Cette lesson capture les trois
+    pour qu'un futur implementation-plan les anticipe.
+  tags:
+    - rust
+    - implementation
+    - dependencies
+    - testing
+    - yaml-fixtures
+    - pitfalls
+  related:
+    - id: 3cd72740-1424-46ac-8ee6-96f714f3fa94
+      kind: rfc
+      relationship: related
+    - id: c5413270-1634-4e44-9540-e205fb523043
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Le plan d'implémentation 7e92e0a7 visait à ajouter list_roadmaps et
+    summarize_roadmap dans crates/orchestrator. Le plan avait été reviewé
+    et approuvé par l'Architect. Les 4 décisions de l'Étape 0 (module
+    dédié, struct typé, variants OrchestratorError) étaient solides.
+    Aucun de ces points n'a posé problème en exécution.
+
+    En revanche, trois pièges techniques sont apparus, sans rapport
+    direct avec le design :
+
+    PIÈGE 1 — TRACING NON DÉCLARÉ COMME DÉPENDANCE
+    L'Implementer voulait `tracing::warn!` pour signaler les YAML
+    corrompus lors du listage. `cargo build` a échoué : la crate
+    companyos-orchestrator (la lib) ne déclare pas tracing dans son
+    Cargo.toml, même si le binaire MCP qui l'embarque utilise
+    tracing_subscriber. Le permit ne couvrait pas Cargo.toml.
+    Workaround : remplacement par `eprintln!`. Fonctionnellement
+    équivalent dans ce contexte.
+
+    PIÈGE 2 — TEMPFILE EN DEV-DEP MANQUANTE
+    Les tests d'engine.list_roadmaps avaient besoin d'un dossier temporaire
+    pour matérialiser les fixtures YAML. La dev-dep `tempfile` est utilisée
+    dans crates/config mais pas dans crates/orchestrator. Le permit ne
+    couvrait pas Cargo.toml. Workaround : struct locale `RoadmapTestRoot`
+    qui crée un dossier dans std::env::temp_dir() avec UUID dans le nom et
+    nettoie en Drop. Comportement équivalent à TempDir, zéro nouvelle
+    dépendance.
+
+    PIÈGE 3 — RUST STRING CONTINUATION COLLAPSE INDENTATION
+    L'Implementer a écrit ses fixtures YAML avec format! et continuations
+    de ligne backslash :
+        format!("api_version: ...\n  kind: ...\n  metadata:\n    id: {id}\n", ...)
+    écrit en plusieurs lignes Rust avec `\` en fin de ligne pour continuer.
+    Or `\` après `\n` dans un littéral string Rust consomme TOUS les
+    whitespaces de la ligne suivante. Conséquence : l'indentation YAML
+    collapse à zéro. Le YAML résultant ressemble à :
+        api_version: ...
+        kind: ...
+        metadata:
+        id: ...
+    Ce qui fait croire à serde_yaml que `id` est un champ top-level et
+    `metadata` un mapping vide. 8 tests échouent sur "missing field id".
+    Fix : remplacement par String::push_str avec \n littéraux et
+    indentation explicite. Bug silencieux mais détecté par les tests.
+
+    Aucun de ces trois pièges n'invalide le RFC ou le plan ; ce sont des
+    surprises d'exécution. Mais ils ajoutent du temps et créent des
+    workarounds qui n'auraient pas été nécessaires si anticipés.
+
+  insight: >
+    Trois apprentissages distincts.
+
+    APPRENTISSAGE 1 — LE PÉRIMÈTRE D'UN PERMIT DOIT INCLURE LES METADATA
+    DE CRATE.
+
+    Quand un RFC ajoute du code Rust dans une crate, le permit doit
+    couvrir non seulement les fichiers .rs modifiés mais aussi Cargo.toml
+    SI les modifications introduisent un besoin de nouvelle dépendance.
+
+    Problème pratique : l'Architect ne connaît pas toujours à l'avance
+    quelles dépendances seront nécessaires. C'est l'Implementer qui le
+    découvre. Et l'Implementer peut alors soit :
+    (a) faire un workaround (eprintln! au lieu de tracing, struct locale
+        au lieu de TempDir) — acceptable si workaround léger,
+    (b) demander une extension du permit — lourd, casse le flow.
+
+    La meilleure pratique : lors de la rédaction du plan, l'Implementer
+    DOIT inventorier les dépendances dont il va avoir besoin et confronter
+    cette liste au Cargo.toml de la crate cible. Si une dépendance manque,
+    elle est ajoutée à affected_files dès le plan, ce qui propage au
+    permit.
+
+    APPRENTISSAGE 2 — UNE STRUCT LOCALE PEUT TOUJOURS REMPLACER TEMPFILE
+    DANS LES TESTS RUST.
+
+    Le pattern RoadmapTestRoot (crée un dossier avec uuid, nettoie en
+    Drop) est trivial et évite une dev-dépendance. Critère pour choisir :
+    - Si la crate utilise déjà tempfile, l'utiliser.
+    - Si la crate ne l'utilise pas et qu'on a un permit léger sur
+      Cargo.toml, l'ajouter.
+    - Sinon, struct locale Drop. Une dizaine de lignes, lisible, zéro
+      dépendance.
+
+    APPRENTISSAGE 3 — FIXTURES YAML : NE JAMAIS UTILISER LA CONTINUATION
+    DE LIGNE RUST DANS UN LITTÉRAL STRING.
+
+    En Rust, dans une string littérale, `\` en fin de ligne consomme la
+    fin de ligne ET tous les whitespaces de début de ligne suivante. C'est
+    une feature de Rust pour écrire des messages longs sans \n parasites.
+    Mais dans un YAML qui dépend de l'indentation, c'est un piège.
+
+    Trois manières d'éviter le piège :
+    (a) String::push_str("\n") avec indentation littérale dans le code.
+        Verbose mais sûr.
+    (b) Macro indoc! (crate indoc) qui gère proprement l'indentation des
+        littéraux multiline.
+    (c) Fichier fixture sur disque (fixtures/test_roadmap.yml) lu par
+        include_str! ou read_to_string. Évite tout problème d'échappement.
+
+    Option (c) recommandée pour les fixtures complexes. Option (a)
+    acceptable pour les fixtures simples. Éviter (b) si la crate n'a pas
+    déjà indoc en dev-dep (revient à l'apprentissage 1).
+
+  recommendation: >
+    Pour les futurs RFC qui ajoutent du code Rust :
+
+    (1) DANS LE PLAN — Section "Dépendances impactées".
+    L'Implementer inventorie les crates qu'il va utiliser et coche celles
+    qui ne sont pas déjà dans le Cargo.toml de la crate cible. Si une
+    nouvelle dépendance est nécessaire :
+    - Choisir entre workaround (struct locale, eprintln!, etc.) si la
+      dépendance est légère ou s'il existe une alternative idiomatique.
+    - Demander l'extension du permit à Cargo.toml si la dépendance est
+      structurellement nécessaire (logging cohérent avec le reste du
+      workspace, tooling de test partagé, etc.).
+    Cette section vit dans l'implementation-plan, juste après les
+    décisions de l'Étape 0.
+
+    (2) DANS LES FIXTURES YAML DE TEST — Pas de continuation backslash.
+    Soit fixture sur disque + include_str!/read_to_string, soit
+    String::push_str avec indentation littérale. Tester la fixture via
+    yaml-validator AVANT d'écrire les assertions de test.
+
+    (3) PATTERN STRUCT LOCALE Drop pour les tempdir, à utiliser quand
+    tempfile n'est pas déjà en dev-dep. Code générique :
+        struct LocalTempDir { path: PathBuf }
+        impl LocalTempDir {
+            fn new(prefix: &str) -> Self {
+                let path = std::env::temp_dir()
+                    .join(format!("{}-{}", prefix, uuid::Uuid::new_v4()));
+                std::fs::create_dir_all(&path).unwrap();
+                Self { path }
+            }
+        }
+        impl Drop for LocalTempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+
+    Ces trois pratiques évitent les workarounds en exécution et
+    rendent les implementation-plans plus prévisibles.

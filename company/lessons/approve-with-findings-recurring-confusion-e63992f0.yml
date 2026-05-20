@@ -1,0 +1,149 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: e63992f0-7317-4d59-b744-1163f14c4f57
+  title: "Le verdict approve+findings revient en boucle malgré la règle review_findings_honesty"
+  author: pm
+  created_at: "2026-05-20"
+  description: >
+    En une seule session, plusieurs agents (Implementer, CEO, Architect) ont
+    voté approve en ajoutant des findings non-correctifs. Chacun a justifié
+    son geste (confirmation factuelle, validation explicite d'arbitrage,
+    matérialisation d'une décision demandée). Tous ces gestes contreviennent
+    à la lettre de review_findings_honesty mais répondent à un besoin réel
+    de traçabilité. Cette lesson capture le pattern et propose un fix
+    procédural au lieu de rappels répétés à la règle.
+  tags:
+    - review
+    - workflow
+    - findings
+    - verdict
+    - rule-friction
+    - process-improvement
+
+spec:
+  context: >
+    La règle review_findings_honesty (shared-rules.yml) est claire :
+    approve = aucun finding. request_changes = findings correctifs.
+    Pas de catégorie intermédiaire ("confirmation", "non bloquant",
+    "informatif"). Un finding sur un approve est défini comme un
+    artifact de review défectueux.
+
+    Dans la session du 2026-05-20, ce pattern défectueux est apparu
+    quatre fois en moins de deux heures :
+
+    1. PM (round 1 RFC roadmap a49801aa) : a voté approve avec des
+    findings de traçabilité ("alignement validé point par point", "risques
+    identifiés", "edge cases couverts"). PM s'auto-corrige avec re-vote
+    findings=[].
+
+    2. Implementer (round 2 RFC roadmap v2) : a voté approve avec des
+    findings de "confirmation factuelle" (numéros de ligne vérifiés, audit
+    grep conduit). Re-vote demandé et exécuté.
+
+    3. CEO (round 2 RFC outillage 3cd72740) : a voté approve avec 6
+    findings de validation stratégique (alignement task-request, lessons
+    intégrées, bonus de design, risques traités, escalade, prochaine
+    étape).
+
+    4. Architect (round 1 plan outillage 7e92e0a7) : a voté approve avec
+    4 findings dont un explicitement "hors-verdict, informel" sur des
+    points d'arbitrage demandés par l'Implementer.
+
+    Tous ces agents ont JUSTIFIÉ leur entorse à la règle par un argument
+    cohérent : il y a des situations où le review-report a une valeur
+    documentaire au-delà du strict verdict binaire. Trois cas distincts
+    apparaissent :
+
+    CAS A — TRAÇABILITÉ DE L'AUDIT : le reviewer a vérifié des points
+    précis (ex. numéros de ligne, alignement avec un task-request) et
+    veut laisser une trace que cette vérification a été conduite. Sans
+    ça, un futur lecteur ne sait pas si l'approve résulte d'un examen
+    sérieux ou d'un rubber-stamp.
+
+    CAS B — ARBITRAGE EXPLICITEMENT DEMANDÉ : un Implementer pose une
+    question au reviewer dans le plan ("est-ce que cette option est OK ?").
+    Le reviewer répond "oui" mais ne RIEN écrire serait moins informatif
+    que de matérialiser la validation.
+
+    CAS C — VALIDATION STRATÉGIQUE CEO : le CEO veut consigner non pas un
+    correctif mais une lecture stratégique (cohérence avec l'esprit du
+    système, intégration des lessons, etc.) au moment du vote, pour
+    documenter le pourquoi de son approbation.
+
+  insight: >
+    La règle review_findings_honesty est juste sur le fond — l'approve doit
+    rester sans ambiguïté quand on parle de correctifs — mais elle est trop
+    étroite : elle confond deux usages distincts du champ findings.
+
+    Usage 1 (correctif) : findings = gaps à corriger. Verdict associé =
+    request_changes. C'est l'usage que la règle nomme.
+
+    Usage 2 (audit trail) : findings = trace de la vérification conduite,
+    réponses aux questions du demandeur, lecture stratégique du verdict.
+    Verdict associé = approve. C'est l'usage qui revient en pratique et qui
+    n'a pas de canal officiel.
+
+    La règle actuelle force soit à supprimer cet audit trail (perte
+    d'information), soit à le mettre quand même (entorse à la règle). Ni
+    l'un ni l'autre n'est satisfaisant. Quatre violations en deux heures
+    indiquent un problème structurel, pas un manque de discipline
+    individuelle.
+
+    Deux options de résolution :
+
+    Option 1 — RAPPEL ET ENFORCEMENT STRICT. On garde la règle telle quelle
+    et on rappelle systématiquement aux agents de ne mettre AUCUN finding
+    sur un approve. L'audit trail va alors dans la remontée informelle au
+    PM (canal hors-artifact) mais pas dans le review-report. Inconvénient :
+    perd la traçabilité dans l'artifact lui-même, qui reste pourtant une
+    pièce officielle du dossier.
+
+    Option 2 — AMENDER LA RÈGLE ET LE SCHÉMA. Introduire un champ
+    notes (séparé de findings) dans review-report.schema.json. notes a une
+    sémantique purement documentaire et est autorisé sur tous les verdicts.
+    findings garde sa sémantique correctif-only. Coût : RFC schéma +
+    amendement règle + migration éventuelle des review-reports existants
+    (négligeable si on dit que les anciens findings sur approve sont
+    interprétables rétroactivement comme notes).
+
+  recommendation: >
+    Action recommandée pour le PM : ouvrir un RFC dédié à la fin de la
+    session courante pour évaluer l'Option 2 (amender la règle + le
+    schéma). Le RFC devra :
+
+    (1) Documenter les 4 cas observés cette session comme preuve du
+    besoin (referencer cette lesson par metadata.related).
+
+    (2) Proposer le champ notes dans review-report.schema.json :
+        - Type : array of strings, optionnel.
+        - Sémantique : observations qui n'imposent pas de modification,
+          mais qui méritent d'être consignées dans l'artifact. Audit trail,
+          validations d'arbitrage, lecture stratégique.
+        - Autorisé sur tous les verdicts (approve ET request_changes).
+
+    (3) Amender la règle review_findings_honesty pour autoriser
+    explicitement notes sur approve, en gardant la prohibition de findings
+    sur approve. La distinction devient nette :
+        - findings = "il y a quelque chose à corriger" → request_changes.
+        - notes = "voici la trace de mon analyse" → indépendant du verdict.
+
+    (4) Préciser que notes n'a PAS le statut bloquant de findings. Un
+    reviewer qui pose une question dans notes n'attend pas qu'elle soit
+    résolue avant merge ; c'est de l'information, pas un blocker.
+
+    En attendant cet amendement, RÈGLE PROVISOIRE pour les agents :
+    - Si tu hésites entre approve+findings et approve-sans-findings,
+      vote approve-sans-findings et mets tes observations dans la
+      remontée au PM (canal hors-artifact). C'est moins traçable mais
+      c'est conforme à la règle actuelle.
+    - Si tes findings sont vraiment des correctifs (gaps qui bloquent le
+      consommateur), vote request_changes. La règle est faite pour ça.
+    - Ne pas essayer de catégoriser tes findings comme "non-bloquants"
+      ou "informels" sur un approve : cette catégorie n'existe pas dans
+      le schéma actuel et l'invoquer est une entorse.
+
+    Cette lesson n'est PAS une critique des agents qui ont enfreint la
+    règle. Leurs justifications sont cohérentes et leurs intentions
+    saines. C'est la règle qui mérite d'évoluer, pas les agents qui
+    méritent un rappel.
