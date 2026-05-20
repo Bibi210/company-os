@@ -39,6 +39,7 @@ artifacts:
     - implementation-plan
     - review-report
     - diagnostic-report
+    - roadmap
 
 review_behavior: >
   Review le code et les tests en vérifiant la conformité avec le design doc.

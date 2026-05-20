@@ -26,6 +26,7 @@ artifacts:
   produces:
     - task-request
     - lesson-learned
+    - roadmap
   consumes:
     - design-doc
     - implementation-plan

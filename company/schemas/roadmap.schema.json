@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://companyos.dev/schemas/roadmap.schema.json",
+  "allOf": [
+    { "$ref": "_base.schema.json" },
+    {
+      "properties": {
+        "kind": { "const": "roadmap" },
+        "metadata": {
+          "properties": {
+            "description": { "type": "string" },
+            "tags": { "type": "array", "items": { "type": "string" } }
+          },
+          "required": ["description", "tags"]
+        },
+        "spec": {
+          "type": "object",
+          "properties": {
+            "domain": {
+              "type": "string",
+              "description": "Domaine couvert par la roadmap (ex: 'companyos-system', 'puissance4-verus', 'product-discovery'). Identifiant kebab-case, libre. Plusieurs roadmaps peuvent partager un domaine si elles couvrent des sous-thèmes distincts, mais c'est rare — privilégier une roadmap par domaine."
+            },
+            "status": {
+              "type": "string",
+              "enum": ["active", "archived"],
+              "description": "active = roadmap vivante, mise à jour au fur et à mesure. archived = roadmap historique, plus mise à jour (ex: roadmap d'un trimestre passé que l'on garde pour mémoire)."
+            },
+            "narrative": {
+              "type": "string",
+              "description": "Récit stratégique de la roadmap : pourquoi ces sujets, pourquoi cet ordre, quel est le fil conducteur. C'est ce qu'on raconte à quelqu'un qui découvre le domaine. Champ libre, plusieurs paragraphes attendus."
+            },
+            "items": {
+              "type": "array",
+              "description": "Éléments tracés par la roadmap. Chaque item référence un artifact (projet, RFC) ou un sujet en exploration, et porte ses dimensions temporelle, causale, narrative.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "key": {
+                    "type": "string",
+                    "description": "Identifiant local de l'item dans la roadmap (kebab-case, unique au sein de spec.items). Sert de cible pour les dépendances (depends_on). Ne pas confondre avec metadata.id — c'est juste un handle local."
+                  },
+                  "title": {
+                    "type": "string",
+                    "description": "Titre lisible de l'item (ex: 'Migrer le schéma project-config', 'Lancer le projet puissance4-verus')."
+                  },
+                  "ref": {
+                    "type": "object",
+                    "description": "Référence vers l'artifact ou le sujet tracé. Trois types supportés : project, rfc, external. Le type discrimine le contenu attendu.",
+                    "oneOf": [
+                      {
+                        "properties": {
+                          "type": { "const": "project" },
+                          "project_slug": {
+                            "type": "string",
+                            "description": "Slug kebab-case du projet (correspond au dossier projects/<slug>/ et au project_name du project-config)."
+                          }
+                        },
+                        "required": ["type", "project_slug"],
+                        "additionalProperties": false
+                      },
+                      {
+                        "properties": {
+                          "type": { "const": "rfc" },
+                          "id": {
+                            "type": "string",
+                            "format": "uuid",
+                            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                            "description": "metadata.id du RFC référencé."
+                          }
+                        },
+                        "required": ["type", "id"],
+                        "additionalProperties": false
+                      },
+                      {
+                        "properties": {
+                          "type": { "const": "external" },
+                          "label": {
+                            "type": "string",
+                            "description": "Label libre pour un sujet pas encore formalisé en projet ou RFC (ex: idée en exploration, dépendance externe). Encourage à formaliser plus tard, mais ne bloque pas le tracking."
+                          }
+                        },
+                        "required": ["type", "label"],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "timeframe": {
+                    "type": "string",
+                    "enum": ["past", "present", "future"],
+                    "description": "Position temporelle grossière de l'item. past = livré, present = en cours, future = planifié. Cette information est redondante avec status mais sert au regroupement visuel (un PM veut séparer 'ce qui est fait' de 'ce qui est devant nous')."
+                  },
+                  "status": {
+                    "type": "string",
+                    "enum": ["planned", "in_progress", "done", "blocked", "cancelled"],
+                    "description": "État opérationnel de l'item dans la roadmap. C'est la VÉRITÉ portée par la roadmap (mise à jour manuellement par le PM). Une roadmap n'auto-synchronise PAS avec les artifacts sources — éviter une magie fragile."
+                  },
+                  "target_date": {
+                    "type": "string",
+                    "description": "Cible temporelle libre : date ISO 8601 (2026-09-15), trimestre (2026-Q3), ou label (\"bientôt\", \"post-launch\"). Optionnel. Format libre pour ne pas forcer une rigueur prématurée."
+                  },
+                  "depends_on": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Liste de `key` d'autres items de la même roadmap dont celui-ci dépend. Permet de tracer la causalité (ne pas démarrer X tant que Y n'est pas done). Optionnel."
+                  },
+                  "rationale": {
+                    "type": "string",
+                    "description": "Pourquoi cet item est dans la roadmap, ou pourquoi à cette position. Complète narrative au niveau global avec une justification par item. Optionnel."
+                  }
+                },
+                "required": ["key", "title", "ref", "timeframe", "status"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": ["domain", "status", "narrative", "items"]
+        }
+      },
+      "required": ["spec"]
+    }
+  ]
+}

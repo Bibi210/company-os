@@ -141,6 +141,7 @@ pub enum ArtifactKind {
     FlowControl,
     ReviewProtocol,
     HumanReviewTriggers,
+    Roadmap,
 }
 
 impl ArtifactKind {
@@ -159,6 +160,7 @@ impl ArtifactKind {
             Self::FlowControl => "flow-control",
             Self::ReviewProtocol => "review-protocol",
             Self::HumanReviewTriggers => "human-review-triggers",
+            Self::Roadmap => "roadmap",
         }
     }
 
@@ -191,6 +193,7 @@ impl FromStr for ArtifactKind {
             "flow-control" => Ok(Self::FlowControl),
             "review-protocol" => Ok(Self::ReviewProtocol),
             "human-review-triggers" => Ok(Self::HumanReviewTriggers),
+            "roadmap" => Ok(Self::Roadmap),
             _ => Err(format!("unknown artifact kind: '{s}'")),
         }
     }
@@ -216,11 +219,13 @@ pub fn access_level(persona: PersonaId, kind: ArtifactKind) -> AccessLevel {
     match (persona, kind) {
         (Pm, TaskRequest) => Write,
         (Pm, LessonLearned) => Write,
+        (Pm, Roadmap) => Write,
         (Pm, _) => Read,
 
         (Architect, DesignDoc) => Write,
         (Architect, Rfc) => Write,
         (Architect, LessonLearned) => Write,
+        (Architect, Roadmap) => Read,
         (Architect, _) => Read,
 
         (Implementer, ImplementationPlan) => Write,
@@ -230,6 +235,7 @@ pub fn access_level(persona: PersonaId, kind: ArtifactKind) -> AccessLevel {
         (Implementer, ReviewProtocol) => Permit,
         (Implementer, HumanReviewTriggers) => Permit,
         (Implementer, Persona) => Permit,
+        (Implementer, Roadmap) => Read,
         (Implementer, _) => Read,
 
         (Myself, _) => Read,
@@ -422,6 +428,7 @@ mod tests {
             "flow-control",
             "review-protocol",
             "human-review-triggers",
+            "roadmap",
         ];
         for input in cases {
             assert!(
@@ -452,6 +459,7 @@ mod tests {
             ArtifactKind::FlowControl,
             ArtifactKind::ReviewProtocol,
             ArtifactKind::HumanReviewTriggers,
+            ArtifactKind::Roadmap,
         ];
         for variant in all_kinds {
             let s = variant.to_string();
@@ -497,6 +505,26 @@ mod tests {
         assert_eq!(
             access_level(PersonaId::Implementer, ArtifactKind::ImplementationPlan),
             AccessLevel::Write
+        );
+    }
+
+    #[test]
+    fn test_access_level_roadmap() {
+        assert_eq!(
+            access_level(PersonaId::Pm, ArtifactKind::Roadmap),
+            AccessLevel::Write
+        );
+        assert_eq!(
+            access_level(PersonaId::Architect, ArtifactKind::Roadmap),
+            AccessLevel::Read
+        );
+        assert_eq!(
+            access_level(PersonaId::Implementer, ArtifactKind::Roadmap),
+            AccessLevel::Read
+        );
+        assert_eq!(
+            access_level(PersonaId::Ceo, ArtifactKind::Roadmap),
+            AccessLevel::Read
         );
     }
 

@@ -222,6 +222,7 @@ fn test_access_matrix_no_panics() {
         ArtifactKind::FlowControl,
         ArtifactKind::ReviewProtocol,
         ArtifactKind::HumanReviewTriggers,
+        ArtifactKind::Roadmap,
     ];
 
     for persona in PersonaId::all() {

@@ -159,6 +159,23 @@ spec:
           suppression de données, modifications de zones protégées.
           Artifact global (vit dans company/config/).
         schema: company/schemas/human-review-triggers.schema.json
+      roadmap:
+        description: >
+          Vue d'ensemble d'un domaine (système, projet métier, thématique stratégique)
+          organisée selon trois dimensions : temporelle (past/present/future, dates
+          ou trimestres), causale (dépendances entre items), narrative (récit du
+          pourquoi).
+          Référence des éléments hétérogènes : projets (via project_slug),
+          RFCs (via id UUID), ou sujets en exploration (type external).
+          Une roadmap est un artifact GLOBAL : elle vit dans company/roadmaps/
+          et porte un `domain` qui identifie son périmètre (ex: 'companyos-system',
+          'puissance4-verus'). Plusieurs roadmaps coexistent, une par domaine.
+          Statut : `active` (vivante, mise à jour) ou `archived` (historique).
+          Produite et maintenue par le PM. Pas d'auto-synchronisation avec les
+          artifacts référencés : le `status` de chaque item est la vérité portée par
+          la roadmap, mise à jour manuellement par le PM. Sert au PM à répondre à
+          "où en sont mes sujets ?".
+        schema: company/schemas/roadmap.schema.json
   rules:
     artifact_id:
       description: >
@@ -194,7 +211,7 @@ spec:
         Kinds projet  : task-request, design-doc, implementation-plan, review-report, diagnostic-report,
                         project-config
         Kinds globaux : lesson-learned, persona, rfc, flow-control, review-protocol,
-                        human-review-triggers, agent-message
+                        human-review-triggers, agent-message, roadmap
         Le project-slug doit être un identifiant kebab-case unique et immuable.
     review_protocol:
       description: >
