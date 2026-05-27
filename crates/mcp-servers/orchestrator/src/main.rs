@@ -171,6 +171,22 @@ struct IndexArtifactParams {
     path: String,
 }
 
+// --- Defense-in-depth coordination params (PILIER A / hook refactor) ---
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct RevertPermitsToSnapshotParams {
+    #[schemars(
+        description = "Snapshot blob obtained from snapshot_permits_state, or null to wipe all permits"
+    )]
+    snapshot: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct IndexNowParams {
+    #[schemars(description = "Relative path (from project root) to the YAML artifact to index")]
+    path: String,
+}
+
 // --- Roadmap tools params ---
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -431,6 +447,69 @@ impl OrchestratorServer {
                 ))
                 .with_reason(format!("{e}"))
                 .with_fix("Verify the permit_id is valid and has not already been consumed")
+                .to_string()),
+        }
+    }
+
+    // --- Defense-in-depth coordination tools (RFC cdbfee72
+    //     PROPOSITION 5 + finding B index_now) ---
+
+    #[tool(
+        description = "Return an opaque blob describing the current state of write_permits. Used by the defense-in-depth hook to detect permit tampering before/after bash commands. Read-only."
+    )]
+    async fn snapshot_permits_state(&self) -> Result<CallToolResult, McpError> {
+        let engine = self.engine.lock().await;
+        match engine.snapshot_permits() {
+            Ok(blob) => ok(serde_json::to_string_pretty(&serde_json::json!({
+                "snapshot": blob,
+            }))
+            .unwrap_or_default()),
+            Err(e) => err(Diagnostic::error(C, "Failed to snapshot write_permits")
+                .with_context("snapshot_permits_state")
+                .with_reason(format!("{e}"))
+                .with_fix("Check database connectivity and DB integrity")
+                .to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Restore the write_permits table to a previous snapshot, removing any permit not present in the snapshot. Used by the defense-in-depth hook to revert tampering detected after a bash command. Pass snapshot=null to wipe all permits (used when the DB did not exist before the bash command). Returns the number of permits deleted."
+    )]
+    async fn revert_permits_to_snapshot(
+        &self,
+        params: Parameters<RevertPermitsToSnapshotParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let params = params.0;
+        let engine = self.engine.lock().await;
+        match engine.restore_permits_from_snapshot(params.snapshot.as_deref()) {
+            Ok(deleted) => ok(serde_json::to_string_pretty(&serde_json::json!({
+                "deleted": deleted,
+            }))
+            .unwrap_or_default()),
+            Err(e) => err(Diagnostic::error(C, "Failed to revert write_permits")
+                .with_context("revert_permits_to_snapshot")
+                .with_reason(format!("{e}"))
+                .with_fix("Check database connectivity and DB integrity")
+                .to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Index a single YAML artifact file immediately, bypassing the file watcher's 500ms debounce. Used by the orchestrator CLI --index mode as a fallback when the server holds the lock (PILIER A) but the file watcher is unavailable, and by tests that need deterministic indexing latency. Idempotent: INSERT OR REPLACE."
+    )]
+    async fn index_now(
+        &self,
+        params: Parameters<IndexNowParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let params = params.0;
+        let engine = self.engine.lock().await;
+        let validator = self.validator.read().await;
+        match engine.index_artifact(&self.root_path, &params.path, &validator) {
+            Ok(artifact) => ok(serde_json::to_string_pretty(&artifact).unwrap_or_default()),
+            Err(e) => err(Diagnostic::error(C, "Failed to index artifact")
+                .with_context(format!("index_now(path={})", params.path))
+                .with_reason(format!("{e}"))
+                .with_fix("Verify the file exists, is a valid YAML artifact, and passes schema validation")
                 .to_string()),
         }
     }
