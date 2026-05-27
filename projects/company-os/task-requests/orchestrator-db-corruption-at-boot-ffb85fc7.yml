@@ -1,0 +1,91 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: ffb85fc7-f5a4-4bfc-b207-1ff955ef77e5
+  title: Investiguer et corriger la corruption de la DB orchestrator au démarrage
+  author: pm
+  created_at: "2026-05-27"
+  project: company-os
+  description: >
+    La base SQLite de l'orchestrator (company/data/orchestrator.db) est
+    corrompue de manière récurrente. Symptôme observé : sqlite3 "PRAGMA
+    integrity_check" remonte des erreurs structurelles graves (rowids
+    out-of-order, doubles références à des pages, btreeInitPage error
+    code 11, pages "never used", invalid page number 218103808). Les
+    appels MCP search() et reindex_all() échouent alors avec "database
+    disk image is malformed". Hypothèse de l'utilisateur, à valider :
+    la corruption se reproduit à chaque démarrage du serveur. La même
+    DB lue hors-ligne (depuis un commit, dans /tmp) est parfaitement
+    saine — la corruption apparaît dès qu'elle est ouverte par le
+    binaire en cours d'exécution. Ce ticket cadre la phase
+    investigation + correctif. L'Architect mène le diagnostic, choisit
+    la stratégie de fix (correctif local ou RFC structurel), et
+    s'assure que la DB reste saine après chaque cycle de
+    démarrage/restart.
+  tags:
+    - orchestrator
+    - sqlite
+    - corruption
+    - persistence
+    - critical-infra
+  related:
+    - id: 95ee5480-d5d4-4d66-88f3-3a3b7e3c1469
+      kind: diagnostic-report
+      relationship: related
+    - id: d9399863-254e-42f5-a485-ea019ce56a93
+      kind: rfc
+      relationship: related
+
+spec:
+  priority: high
+  status: backlog
+  acceptance_criteria:
+    - >
+      Un diagnostic-report est produit avec une root_cause clairement
+      identifiée (pas une hypothèse, une cause vérifiée par
+      reproduction).
+    - >
+      L'hypothèse "la DB est corrompue à chaque start" est confirmée
+      ou infirmée par un protocole reproductible (partir d'une DB
+      saine, démarrer le serveur, mesurer PRAGMA integrity_check
+      avant/après).
+    - >
+      Un correctif est mergé. Si le correctif touche les zones
+      protégées ou change la stratégie de persistence de manière
+      structurelle, il passe par un RFC approuvé par le CEO.
+    - >
+      Après le correctif, démarrer le serveur depuis une DB saine ne
+      la corrompt plus. Vérification : PRAGMA integrity_check retourne
+      "ok" après un cycle complet (start → quelques appels MCP →
+      shutdown propre).
+    - >
+      Après le correctif, un restart du binaire par le proxy résilient
+      (RFC d9399863) en cours d'utilisation ne corrompt pas la DB.
+      Vérification : reproduire le scénario de restart (cargo build
+      pendant que le serveur tourne, ou kill -TERM du binaire) puis
+      PRAGMA integrity_check = "ok".
+    - >
+      Si la stratégie de persistence est revue (journal_mode,
+      checkpoint au shutdown, locking, atomicité du schema migration,
+      détection d'instances concurrentes), le choix retenu est
+      explicité et justifié dans le design-doc.
+    - >
+      Une lesson-learned est produite à la clôture, capitalisant la
+      root cause et la stratégie de prévention.
+
+  investigation_hints: >
+    Pistes non prescriptives à explorer par l'Architect / Implementer.
+    L'Architect arbitre, ne pas s'y enfermer :
+      - Interaction entre le restart du binaire par le proxy résilient
+        (d9399863) et une transaction WAL en cours côté SQLite.
+      - Schema migration au boot non-atomique (ALTER TABLE / CREATE
+        INDEX interrompu si le binaire est tué avant commit).
+      - Deux instances concurrentes du binaire qui ouvrent la même DB
+        en write (un orphelin survivant ?).
+      - Mode WAL mal configuré : pas de checkpoint au shutdown,
+        fichiers -wal/-shm laissés dans un état incohérent entre
+        sessions.
+      - Bug rusqlite / sqlx au shutdown (drop non bloquant, écritures
+        en vol perdues).
+      - Réécriture par defense-in-depth (snapshotPermits / revert)
+        appliquée sur une DB qui a un WAL actif → race.

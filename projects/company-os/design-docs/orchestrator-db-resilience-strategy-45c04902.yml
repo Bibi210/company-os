@@ -1,0 +1,1051 @@
+api_version: companyos/v1
+kind: design-doc
+metadata:
+  id: 45c04902-53f5-43db-981b-80f937233e62
+  title: "Stratégie de résilience persistence orchestrator : writer unique, configuration WAL défensive, graceful shutdown, autorepair au boot"
+  author: architect
+  created_at: "2026-05-27"
+  description: >
+    Design d'architecture qui rend la persistence SQLite de
+    l'orchestrator résiliente aux scénarios de cycle de vie hostile
+    (restart par proxy résilient, kill brutal, ouvertures
+    concurrentes par le hook defense-in-depth). Répond aux
+    acceptance criteria du task-request ffb85fc7 et formalise les
+    décisions architecturales motivées par le diagnostic-report
+    378c387c. Trois piliers complémentaires : un writer unique
+    coordonné par un file lock OS, une configuration SQLite WAL
+    défensive uniformisée sur tous les chemins d'ouverture, et un
+    graceful shutdown avec signal handlers. Un quatrième pilier
+    d'autorepair au boot transforme tout résidu de corruption en un
+    incident court (reconstruction depuis l'index YAML source de
+    vérité) au lieu d'un blocage du système. Pas de détails
+    d'implémentation, pas de chemins de fichiers — c'est le job de
+    l'implementation-plan dérivé de ce design-doc.
+  tags:
+    - orchestrator
+    - sqlite
+    - wal
+    - persistence
+    - concurrency
+    - resilience
+    - design
+    - critical-infra
+  related:
+    - id: ffb85fc7-f5a4-4bfc-b207-1ff955ef77e5
+      kind: task-request
+      relationship: input
+    - id: 378c387c-7e25-4abd-8ccd-5bb7b4d82449
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: related
+    - id: d9399863-254e-42f5-a485-ea019ce56a93
+      kind: rfc
+      relationship: related
+    - id: 95ee5480-d5d4-4d66-88f3-3a3b7e3c1469
+      kind: diagnostic-report
+      relationship: related
+  changelog:
+    - date: "2026-05-27"
+      author: architect
+      description: >
+        Révision iteration 3 suite au round 77c0d9b5 (votes
+        Implementer + PM = request_changes, 2 findings
+        nouveaux : A = AC-bloquant sur race
+        serveur-vs-`--index`-transitoire, B = contradiction
+        interne dans la mitigation file-watcher-en-panne).
+        Trois changements de fond :
+        (1) PILIER A enrichi d'un RETRY BORNÉ côté serveur sur
+        l'acquisition de l'exclusif au boot, pour absorber les
+        `--index` transitoires légitimes en cours (cas
+        autoIndex spawné par defense-in-depth pendant que le
+        serveur redémarre). Sans ce retry, le restart par le
+        proxy résilient peut échouer même sans corruption, ce
+        qui viole l'esprit de l'AC (5) du task-request ffb85fc7.
+        La sémantique : LOCK_EX non bloquant en première tentative,
+        puis polling toutes les ~200ms jusqu'à un timeout dur
+        (recommandation initiale 10s, à calibrer dans
+        l'implementation-plan ; un `--index` légitime prend
+        < 200ms donc 10s = 50x marge). Si le timeout expire, le
+        serveur exite avec un message clair "another writer is
+        holding the lock for too long" — comportement attendu
+        face à une vraie double instance ou un --index zombie.
+        (2) Le protocole de validation est enrichi d'un test
+        (e) dédié au cas serveur-vs-`--index`-transitoire,
+        distinct du test (d) qui restait centré sur le cas
+        serveur-vs-serveur.
+        (3) La mitigation "file watcher en panne" du composant
+        indexation-coordination est REMPLACÉE. La précédente
+        proposition (ORCHESTRATOR_ALLOW_INDEX_WITH_LOCK=1)
+        réintroduisait FACTEUR 1 du diagnostic (deux writers
+        avec connexions SQLite distinctes), contradiction
+        interne. Option (b) du finding B retenue : un nouvel
+        outil MCP `index_now(path)` est exposé par le serveur ;
+        `--index`, quand il détecte le lock exclusif tenu,
+        appelle cet outil au lieu de no-op pur si on souhaite
+        garantir l'indexation immédiate sans attendre le
+        debounce du watcher (cas watcher en panne ET cas où
+        on veut une latence d'indexation déterministe).
+        Rationale du choix (b) plutôt que (a) : (a) crée une
+        dégradation fonctionnelle réelle (un YAML écrit pendant
+        une panne watcher reste invisible à search() jusqu'au
+        prochain redémarrage du serveur, parce que
+        reload_config() ne déclenche PAS de reindex — vérifié
+        dans main.rs:441-458) ; le contrat tacite "tout YAML
+        écrit est searchable dans la seconde" serait cassé.
+        (b) préserve ce contrat sans introduire de second
+        ouvreur, l'indexation passant par le serveur via MCP.
+
+    - date: "2026-05-27"
+      author: architect
+      description: >
+        Révision iteration 2 suite au round bf79526b (vote
+        Implementer = request_changes, 3 findings bloquants de
+        classe a). Trois changements de fond :
+        (1) le composant defense-in-depth-mcp-coordination est
+        étendu pour couvrir hasActivePermit (oublié dans la v1)
+        en plus de snapshotPermits et revertPermitTampering. Un
+        inventaire exhaustif des 4 call sites sqlite3 CLI dans
+        defense-in-depth-core.mjs est désormais énuméré
+        explicitement (L105, L188, L200, L206) ;
+        (2) la sémantique du lock pour --index est tranchée :
+        --index est NO-OP quand le serveur tient l'exclusif
+        (logue un message clair, exit code 0, indexation déléguée
+        au file watcher du serveur). Option (b) du finding 2.
+        Le composant pilier-A-unique-writer-via-file-lock est
+        réécrit en conséquence ;
+        (3) la stratégie d'indexation est explicitée : quand le
+        serveur tourne, il est l'unique indexeur via son file
+        watcher ; --index ne se déclenche en pratique que quand
+        le serveur n'est pas joignable (boot froid, restart
+        proxy en cours, environnement CLI sans serveur). Un
+        nouveau composant indexation-coordination formalise
+        cette règle.
+        Décision tranchée par l'Architect sur le finding 2 :
+        option (b) plutôt que (a). Rationale : (a) "le serveur
+        cède l'exclusif" introduit un protocole de handoff
+        (release → --index acquiert → release → serveur
+        réacquiert) qui est lui-même source de races et de
+        complexité. (b) est cohérent avec la philosophie "un
+        seul writer en vie à la fois" et s'appuie sur un
+        mécanisme déjà nécessaire (le file watcher serveur).
+        Décision sur le finding 3 : pas de modification du
+        comportement de autoIndex() côté hook
+        defense-in-depth — c'est --index lui-même qui détecte
+        et se met en no-op. Le hook continue d'appeler
+        autoIndex() inconditionnellement, ce qui couvre
+        proprement les cas où le serveur n'est pas là.
+
+spec:
+  overview: >
+    Le problème. La DB SQLite de l'orchestrator
+    (company/data/orchestrator.db) se corrompt de manière récurrente
+    et imprévisible. PRAGMA integrity_check remonte des erreurs
+    structurelles graves (rowids out-of-order, btreeInitPage error
+    code 11, pages "never used", invalid page number, doubles
+    références). Les appels MCP search() et reindex_all() échouent
+    alors avec "database disk image is malformed", ce qui bloque le
+    lookup mémoire imposé à tous les agents par shared-rules.yml
+    (règle memory_lookup_before_acting). La même DB lue hors-ligne
+    est saine — la corruption est liée au cycle de vie du binaire,
+    pas à un défaut intrinsèque du contenu. Diagnostic complet :
+    378c387c.
+
+    Les acceptance criteria du task-request ffb85fc7 que ce design
+    doit satisfaire :
+    (1) le diagnostic est produit avec une root cause vérifiée
+        (DONE — diagnostic-report 378c387c) ;
+    (2) un protocole reproductible distingue cas sain et corrompu
+        (DONE — 6 scénarios scriptés dans
+        /tmp/db-corruption-repro/, qui ont infirmé l'hypothèse
+        "corruption à chaque start" et révélé la cause superposée) ;
+    (3) un correctif sera mergé (post-design-doc, post-RFC) ;
+    (4) après correctif, démarrer le serveur depuis une DB saine ne
+        la corrompt pas (cible vérifiée par PRAGMA integrity_check
+        avant et après un cycle complet start → quelques appels →
+        shutdown propre) ;
+    (5) après correctif, un restart du binaire par le proxy
+        résilient (RFC d9399863) ne corrompt pas la DB (cible
+        vérifiée par cargo build + restart watcher en cours
+        d'utilisation) ;
+    (6) la stratégie de persistence revue est explicitée et
+        justifiée (objet du présent design-doc) ;
+    (7) une lesson-learned sera produite à la clôture du
+        task-request.
+
+    Le problème est structurel et touche le contrat de persistence
+    du système : il fait l'objet d'un RFC (cdbfee72) qui sera
+    soumis au CEO pour approbation et nécessitera un write permit
+    pour modifier crates/orchestrator/, crates/mcp-servers/ et
+    company/plugins/defense-in-depth-core.mjs.
+
+    Cap stratégique. Plutôt que de patcher symptomatiquement, le
+    design adopte une posture défensive en profondeur : on suppose
+    que SIGKILL peut survenir n'importe quand (la sémantique du
+    proxy résilient le rend inéluctable), que plusieurs processus
+    voudront lire/écrire la DB en parallèle (defense-in-depth a
+    besoin de vérifier les permits avant chaque bash), et qu'une
+    corruption résiduelle pourra apparaître malgré les protections.
+    Le design choisit donc :
+    - de SUPPRIMER autant que possible la concurrence (PILIER A) ;
+    - de RENDRE TOLÉRANTE la concurrence restante (PILIER B) ;
+    - d'ASSURER la propreté du shutdown (PILIER C) ;
+    - d'AUTORÉPARER toute corruption résiduelle au boot (PILIER D).
+
+    Les quatre piliers sont indissociables — un seul pilier ne
+    suffit pas, et l'ordre A, B, C, D n'est pas un ordre de
+    priorité mais un découpage logique. Le RFC cdbfee72 propose
+    leur implémentation conjointe.
+
+    Hors scope. Ce design ne change PAS le contrat MCP exposé par
+    l'orchestrator (les outils search, get, related, etc. restent
+    inchangés). Il ne change PAS le schéma logique des tables
+    (review_rounds, write_permits, artifacts, artifact_relations,
+    artifacts_fts). Il ne change PAS le format des artifacts YAML
+    sur disque, qui restent la source de vérité (la DB n'est qu'un
+    index opérationnel). Il ne change PAS le protocole de review,
+    de write permit, ou d'authentification.
+
+  components:
+    - name: pilier-A-unique-writer-via-file-lock
+      description: >
+        Mécanisme de coordination inter-process basé sur un file
+        lock POSIX (flock) sur un fichier sentinelle dédié. La
+        sémantique cible est forte : "un seul writer SQLite en vie
+        à la fois sur la DB orchestrator". Cette unicité s'obtient
+        en deux temps.
+
+        (1) Le binaire serveur (mode run_server) acquiert ce lock
+        en mode EXCLUSIF au démarrage et le détient pendant toute
+        sa durée de vie. Il le relâche au shutdown via un Drop
+        guard. En cas de SIGKILL, le kernel libère le lock
+        automatiquement à la mort du processus — c'est précisément
+        l'invariant qui justifie le choix de flock OS plutôt
+        qu'un PID file applicatif.
+
+        Acquisition au boot — RETRY BORNÉ. Pour ne pas échouer
+        face à un `--index` transitoire légitime qui tient
+        l'exclusif au moment du restart serveur (par exemple un
+        autoIndex spawné par defense-in-depth pendant que le
+        proxy résilient redémarre le binaire), le serveur tente
+        l'acquisition en mode non bloquant (LOCK_EX | LOCK_NB),
+        et en cas d'échec EWOULDBLOCK, retry en polling toutes
+        les ~200ms jusqu'à un timeout dur. La recommandation
+        initiale du design est 10s ; la valeur exacte est
+        déléguée à l'implementation-plan, avec deux contraintes :
+        elle doit être largement supérieure à la durée d'un
+        --index nominal (mesuré < 200ms : fork + flock + DDL
+        idempotente + 1 upsert + exit) — un facteur 50 est
+        confortable — et elle doit rester invisible côté UX
+        d'une session opencode (< 30s sinon le restart proxy
+        devient perceptible).
+
+        Si le timeout expire, le serveur exite avec un message
+        explicite ("another writer is holding the lock for more
+        than <N>s, refusing to start"). Comportement attendu face
+        à une vraie double instance, un --index zombie, ou un
+        lock tenu par un processus crashé sur un FS qui ne libère
+        pas correctement (cas dégénéré documenté ci-dessous). Le
+        proxy résilient le constatera, déclenchera son circuit
+        breaker, et l'utilisateur sera notifié.
+
+        Distinction importante : ce retry s'applique UNIQUEMENT
+        côté serveur au boot. `--index` ne retry PAS — sa
+        sémantique no-op-if-server est conservée (LOCK_EX |
+        LOCK_NB → succès = pas de serveur → indexer ; échec
+        EWOULDBLOCK = serveur en vie → no-op + log + exit 0). La
+        symétrie n'a pas lieu : un serveur en vie est l'état
+        stable normal, donc --index qui attendrait n'apporte
+        rien (le file watcher indexera). Inversement, un --index
+        en cours est un état transitoire bref, donc serveur qui
+        attend est justifié.
+
+        (2) Le binaire en mode --index (run_index) NE PREND PAS le
+        lock du tout. À la place, il consulte l'état du lock
+        (par exemple via une tentative non bloquante d'acquérir
+        l'exclusif sans le garder, ou via une introspection
+        platform-specific) :
+          - si AUCUN processus ne tient le lock exclusif →
+            --index acquiert l'exclusif lui-même le temps de son
+            travail (db.migrate() + upsert d'un artifact), puis
+            le relâche. C'est le cas "pas de serveur en vie", par
+            exemple un boot froid juste après que defense-in-depth
+            ait écrit un YAML, ou un appel --index manuel en
+            environnement CLI.
+          - si UN processus tient le lock exclusif (forcément un
+            serveur, par construction) → --index NE TOUCHE PAS la
+            DB. Il logue sur stdout un message normalisé du type
+            "server detected, indexing delegated to file watcher"
+            et exite avec code 0 (succès, parce que l'indexation
+            sera effectivement faite par le file watcher serveur
+            dans la seconde qui suit le write YAML). L'exit 0
+            évite que le caller (autoIndex() côté hook) considère
+            ça comme une erreur à réessayer sur l'autre target
+            release/debug.
+
+        Cette sémantique élimine entièrement le scénario de
+        concurrence write-write entre --index et le serveur,
+        identifié comme FACTEUR 1 par le diagnostic 378c387c.
+        L'indexation reste garantie en steady-state : si le
+        serveur tourne, c'est lui qui indexe (file watcher) ; si
+        le serveur ne tourne pas, c'est --index qui indexe.
+        Aucune fenêtre de "personne n'indexe".
+
+        Décision tranchée (option (b) du finding 2 du round 1) :
+        --index est no-op quand le serveur tient l'exclusif. La
+        décision est documentée dans le metadata.changelog et la
+        section decisions ci-dessous (décision
+        "indexation no-op").
+
+        Justification générale du choix d'un lock OS plutôt qu'un
+        lock applicatif (PID file, sqlite "BEGIN EXCLUSIVE", lock
+        row en DB). Le lock OS survit aux SIGKILL : quand le
+        processus détenteur est tué brutalement, le kernel libère
+        automatiquement le lock, contrairement à un PID file qui
+        peut rester orphelin. Il ne nécessite aucune transaction
+        SQLite, donc reste fonctionnel même si la DB est corrompue.
+        Il est portable (Linux + macOS, lesquels supportent
+        flock(2) nativement).
+
+        Effets de bord positifs. Le hook defense-in-depth, en
+        cessant d'invoquer sqlite3 CLI directement (cf. composant
+        defense-in-depth-mcp-coordination ci-dessous) ET en
+        bénéficiant du no-op de --index, cesse d'être à l'origine
+        des ouvreurs concurrents identifiés par le diagnostic.
+
+        Limites. Si le lock fichier est perdu (NFS, container avec
+        bind mount non posix), le mécanisme dégrade silencieusement
+        vers le comportement actuel (concurrence non coordonnée).
+        Acceptable car CompanyOS tourne sur un FS local
+        (company/data/ vit dans un repo git, donc forcément un FS
+        compatible POSIX flock). Une vérification d'amorçage
+        (acquisition LOCK_SH puis LOCK_EX d'un FD test au boot)
+        peut détecter et logguer un warning explicite si le FS
+        ne supporte pas flock — à arbitrer dans
+        l'implementation-plan.
+
+    - name: pilier-B-sqlite-defensive-config
+      description: >
+        Uniformisation de la configuration SQLite sur TOUS les
+        chemins d'ouverture (serveur, --index, futurs tools). Une
+        séquence de PRAGMA standardisée est appliquée à chaque
+        nouvelle connexion : journal_mode = WAL (conservé), foreign_keys
+        = ON (conservé), busy_timeout, synchronous, et
+        wal_autocheckpoint. Les valeurs précises sont déléguées à
+        l'implementation-plan, mais les contraintes de design sont :
+
+        (a) busy_timeout doit être suffisamment large pour absorber
+        la contention attendue entre serveur et --index (plusieurs
+        secondes), pas immédiat.
+
+        (b) synchronous doit être au moins NORMAL (le défaut est
+        FULL, mais NORMAL est le compromis officiel recommandé en
+        mode WAL — il garde la durabilité de COMMIT au prix d'une
+        fenêtre de perte des dernières transactions en cas de
+        coupure brutale, ce qui est acceptable ici car la DB est
+        un index reconstructible depuis les YAML).
+
+        (c) wal_autocheckpoint doit être explicite (pas hérité du
+        défaut), pour que la lecture du code rende immédiatement
+        compréhensible le comportement de checkpoint.
+
+        Effet attendu. Les conflits transitoires entre ouvreurs
+        cessent d'échouer en SQLITE_BUSY et deviennent des attentes
+        bornées. Les écritures restent durables au sens transaction
+        SQLite. La fenêtre de WAL ne grossit pas indéfiniment.
+
+    - name: pilier-C-graceful-shutdown
+      description: >
+        Le binaire serveur installe des signal handlers SIGTERM et
+        SIGINT au démarrage. À la réception d'un de ces signaux, une
+        séquence ordonnée d'arrêt est déclenchée :
+        (1) arrêt du file watcher (pour cesser de produire des
+            événements reindex_all en cours d'arrêt),
+        (2) attente bornée de la fin des tokio tasks background
+            (notamment reindex_all et les réceptions de file
+            watcher), avec un timeout dur au-delà duquel on accepte
+            de tuer les tasks (option tokio shutdown_timeout),
+        (3) exécution explicite de PRAGMA wal_checkpoint(TRUNCATE) sur
+            la connexion principale, pour réintégrer toutes les
+            frames du -wal dans le .db et le tronquer à zéro,
+        (4) drop de la connexion principale,
+        (5) suppression idéale (mais non garantie) des fichiers
+            -wal/-shm si SQLite ne l'a pas fait (cas standard, le
+            checkpoint TRUNCATE suivi du close de la dernière
+            connexion supprime -wal et -shm).
+
+        SIGKILL reste possible et n'est pas couvert par les
+        handlers — d'où l'existence du PILIER D pour récupérer
+        proprement quand SIGKILL frappe entre deux étapes ci-dessus.
+
+        Migration DDL idempotente sous transaction. SCHEMA_SQL et
+        FTS_SQL sont enveloppés dans une BEGIN IMMEDIATE / COMMIT
+        explicite au open. Si un SIGKILL frappe en cours de DDL,
+        SQLite rollback automatiquement la transaction au prochain
+        open via le WAL recovery, ce qui élimine le risque de
+        schéma FTS5 partiellement matérialisé décrit par le
+        diagnostic 378c387c (facteur 3).
+
+    - name: pilier-D-autorepair-au-boot
+      description: >
+        Au démarrage, AVANT de lancer reindex_all background, le
+        binaire serveur exécute un PRAGMA integrity_check sur la
+        connexion principale. Si le résultat n'est pas "ok", il
+        déclenche une procédure de rebuild :
+
+        (1) la connexion principale est fermée,
+        (2) les fichiers orchestrator.db, orchestrator.db-wal,
+            orchestrator.db-shm sont supprimés,
+        (3) une nouvelle connexion est ouverte sur un .db neuf
+            (qui s'auto-crée via Connection::open),
+        (4) la migration DDL idempotente est rejouée,
+        (5) reindex_all est exécuté SYNCHRONEMENT (pas en
+            background) pour repeupler les tables artifacts/
+            artifact_relations/artifacts_fts depuis les fichiers
+            YAML qui sont la source de vérité (review_rounds et
+            write_permits ne sont PAS dans les YAML, donc seront
+            perdus — voir limites ci-dessous).
+
+        La source de vérité du contenu indexable (artifacts) est
+        sur disque dans les fichiers YAML. La DB n'est qu'un
+        accélérateur de recherche, reconstructible. Cette stratégie
+        rend acceptable une perte de la DB (incident contenu en
+        quelques secondes de rebuild plutôt qu'en blocage
+        utilisateur).
+
+        Limite assumée. Les tables review_rounds et write_permits
+        n'ont pas de source de vérité externe — elles vivent
+        UNIQUEMENT dans la DB. Si une corruption détruit ces
+        tables, le rebuild les perd. Acceptable car :
+        (a) ces tables ont une durée de vie courte (un round dure
+            quelques heures, un permit quelques minutes) ;
+        (b) si on perd un round en cours, l'auteur le relance ;
+        (c) si on perd un permit, le CEO le re-grant après nouvelle
+            approbation RFC ;
+        (d) ces deux pertes sont de toute façon ce qui se produit
+            aujourd'hui quand la corruption frappe — le PILIER D ne
+            dégrade pas la situation, il l'améliore en évitant le
+            blocage complet.
+
+        Un journal d'audit (write trace) pour pouvoir reconstruire
+        les rounds et permits depuis un log externe est laissé hors
+        scope de ce design — c'est un sujet adjacent qui mérite son
+        propre design-doc si on veut traiter la durabilité forte
+        de ces deux tables.
+
+    - name: defense-in-depth-mcp-coordination
+      description: >
+        Le hook defense-in-depth (company/plugins/defense-in-depth-core.mjs)
+        cesse d'invoquer sqlite3 CLI directement sur la DB protégée.
+        Inventaire exhaustif des call sites sqlite3 actuellement
+        présents dans le hook, recensés par grep sur le fichier :
+
+          - L105 : hasActivePermit(rootDir, filePath) — appelé à
+            CHAQUE write/edit YAML en zone protégée (L321) et à
+            CHAQUE commande bash qui touche un fichier en zone
+            protégée (L382). C'est le caller le plus fréquent des
+            trois. Ouvre la DB en lecture pour scanner les
+            write_permits actifs et matcher leurs target_paths
+            contre le chemin écrit.
+
+          - L188 : snapshotPermits(rootDir) — appelé AVANT chaque
+            commande bash (Layer 2 before hook). Ouvre la DB en
+            lecture pour calculer un blob d'état "count +
+            GROUP_CONCAT(id || ':' || status)" de la table
+            write_permits.
+
+          - L200 : revertPermitTampering(rootDir, before) cas
+            "DB n'existait pas avant" — efface toute la table
+            write_permits si la DB est apparue pendant le bash.
+            En pratique très rare mais possible (ex. boot froid
+            simultané).
+
+          - L206 : revertPermitTampering(rootDir, before) cas
+            "DB existait, certains permits sont nouveaux" —
+            supprime les permits ajoutés pendant le bash qui ne
+            sont pas dans le snapshot d'avant. Appelé APRÈS
+            chaque commande bash.
+
+        Refactor cible. Chacun de ces call sites est remplacé par
+        un appel MCP au serveur orchestrator, qui devient l'unique
+        ouvreur de la DB :
+
+          - hasActivePermit → check_write_permit(persona, path).
+            Cet outil MCP est DÉJÀ EXPOSÉ par le serveur
+            (cf. crates/mcp-servers/orchestrator/src/main.rs:392
+            "fn check_write_permit") — pas de nouveau tool à
+            créer, juste un changement de chemin d'appel côté
+            hook. La paramétrisation (persona) sera dérivée de
+            input.agent côté hook ; à arbitrer dans
+            l'implementation-plan.
+
+          - snapshotPermits → snapshot_permits_state (nouveau
+            tool MCP). Retourne le blob opaque
+            "count + GROUP_CONCAT(id:status)" actuellement produit
+            par le sqlite3 inline.
+
+          - revertPermitTampering (les deux cas L200 et L206) →
+            revert_permits_to_snapshot(snapshot_blob) (nouveau
+            tool MCP). Reçoit le blob produit précédemment par
+            snapshot_permits_state et restaure l'état des
+            write_permits à ce blob. La sémantique exacte
+            (delete-new, restore-status) est arrêtée dans
+            l'implementation-plan en cohérence avec le
+            comportement actuel.
+
+        Justification. Le hook viole aujourd'hui sa propre règle
+        L264 ("sqlite3 + .db forbidden") par court-circuit, parce
+        que l'auteur du hook n'avait pas d'alternative MCP
+        complète au moment de l'écrire (check_write_permit existe
+        mais n'a pas été utilisé ; snapshot/revert n'avaient pas
+        d'équivalent). La conséquence inattendue est que ce hook
+        est l'un des trois ouvreurs concurrents identifiés par le
+        diagnostic 378c387c, et en pratique le PLUS FRÉQUENT via
+        hasActivePermit. En passant tous les call sites par MCP,
+        le hook délègue intégralement l'accès à la connexion
+        unique du serveur, ce qui satisfait de facto le PILIER A
+        sur ce chemin.
+
+        Limite. Si le serveur orchestrator est en train de
+        redémarrer au moment où le hook appelle un de ces outils,
+        le proxy résilient (RFC d9399863) bufferise le message et
+        le rejoue. Acceptable car le hook accepte déjà un délai
+        de quelques secondes (il exécute déjà des commandes git
+        en synchrone avant chaque bash).
+
+        Cas non couvert. Si le serveur n'est PAS joignable du
+        tout (binaire absent, proxy lui-même cassé, circuit
+        breaker du proxy ouvert), les appels MCP échouent. La
+        politique de fallback du hook dans ce cas est laissée
+        à l'implementation-plan, avec deux options possibles à
+        arbitrer : (i) bloquer le bash/write en signalant
+        l'incident (posture conservatrice, défense en
+        profondeur), (ii) autoriser le bash/write en logguant
+        l'incident (posture liberale, disponibilité prioritaire).
+        La recommandation initiale est (i) pour rester cohérent
+        avec la posture défense en profondeur du hook, mais
+        l'arbitrage final dépend de l'expérience opérationnelle
+        observée pendant les restarts.
+
+    - name: indexation-coordination
+      description: >
+        Règle d'unicité de l'indexation, dérivée du finding 3 du
+        round de review iteration 1. À l'état actuel du code,
+        chaque write YAML déclenche DEUX indexations potentielles :
+        (i) autoIndex() côté hook defense-in-depth, qui spawn un
+        subprocess --index immédiatement après le write
+        (defense-in-depth-core.mjs:349) ;
+        (ii) le file watcher tokio du serveur orchestrator, qui
+        détecte la modification du fichier dans projects/ ou
+        company/ et déclenche un reindex_all (main.rs:807-814).
+        C'est une expression directe du FACTEUR 1 du diagnostic :
+        deux ouvreurs concurrents avec connexions SQLite distinctes
+        écrivant sur les mêmes tables.
+
+        Le design pose la règle d'unicité suivante :
+
+          INVARIANT — À tout instant, au plus un processus indexe
+          la DB. Quand le serveur tient le lock exclusif (PILIER
+          A), il est l'unique indexeur via son file watcher.
+          Quand le serveur ne tient pas le lock, --index est
+          l'unique indexeur via son propre acquisition exclusive
+          temporaire.
+
+        Mécanisme d'application. Le mécanisme défini au PILIER A
+        suffit, sans besoin de désactiver autoIndex() côté hook :
+
+          - quand le serveur tourne, autoIndex() spawn --index,
+            qui détecte le lock exclusif tenu par le serveur,
+            logue son no-op, et exite 0. Le file watcher serveur
+            détectera le write YAML (delay debounce 500ms dans
+            spawn_watcher, cf. main.rs:782) et déclenchera son
+            propre index_artifact ou reindex_all. Net : un seul
+            indexeur effectif (le serveur).
+
+          - quand le serveur ne tourne pas, autoIndex() spawn
+            --index, qui ne voit aucun lock exclusif, acquiert
+            l'exclusif lui-même, indexe, relâche. Net : un seul
+            indexeur effectif (--index).
+
+        Décision tranchée (option recommandée par le PM dans le
+        round de review iteration 1, retenue par l'Architect) : on
+        NE désactive PAS autoIndex() côté hook quand un serveur est
+        détecté. Le hook continue d'appeler autoIndex()
+        inconditionnellement après chaque write YAML, et c'est
+        --index lui-même qui détecte et se met en no-op via le
+        lock. Justification : (a) la détection du serveur
+        depuis le hook (en Node.js) serait moins fiable que la
+        détection depuis --index (en Rust) qui peut consulter le
+        flock directement ; (b) cette répartition garde le hook
+        ignorant des détails d'implémentation côté Rust, et
+        garde la responsabilité de la coordination où elle doit
+        être (dans le binaire qui détient la connexion SQLite) ;
+        (c) le coût d'un --index no-op est négligeable (~quelques
+        ms de fork + détection lock + exit).
+
+        Effet observable côté file watcher serveur. Le file
+        watcher devient le chemin d'indexation principal en
+        steady-state. Sa latence (debounce 500ms par défaut, cf.
+        Duration::from_millis(500) dans main.rs:782) reste
+        acceptable pour l'usage du système (un agent qui produit
+        un YAML peut attendre une demi-seconde avant que l'index
+        le voie ; les outils MCP search/get sont eux-mêmes
+        appelés dans des workflows qui ont déjà des latences
+        comparables). Si l'expérience opérationnelle montre que
+        cette latence pose problème, le debounce peut être abaissé
+        sans changement structurel.
+
+        Cas dégénéré — file watcher serveur en panne ou
+        indésirable. Si inotify est épuisé sur le système ou si
+        le watcher tokio est arrêté pour une raison quelconque,
+        le serveur loggue déjà un warning au démarrage
+        (main.rs:819-821 : "File watcher unavailable, manual
+        reload_config still works"). Sans correctif, --index
+        continuerait à no-op à cause du lock exclusif tenu par
+        le serveur, et plus rien n'indexerait automatiquement.
+        Note technique importante : reload_config (main.rs:441)
+        ne déclenche PAS de reindex_all — il ne recharge que la
+        config flow-control en mémoire. Donc le warning
+        "manual reload_config still works" ne sauve pas
+        l'indexation automatique.
+
+        Mitigation retenue (option (b) du finding B round 2) :
+        introduction d'un outil MCP `index_now(path)` exposé par
+        le serveur orchestrator. Quand `--index` détecte le
+        lock exclusif tenu (sémantique no-op du PILIER A), il
+        ne se contente plus de logguer + exit 0 silencieusement.
+        Il appelle d'abord index_now(path) via MCP, qui demande
+        au serveur d'indexer immédiatement le fichier sans
+        passer par le debounce du watcher. Si l'appel réussit,
+        --index logue "delegated to server via index_now" + exit
+        0. Si l'appel échoue (serveur injoignable malgré le lock
+        tenu — cas extrême : le serveur est en vie mais son
+        runtime MCP est cassé), --index logue l'incident en
+        stderr et exite avec code non-zero, ce qui remonte
+        proprement l'échec au caller (autoIndex côté hook).
+
+        Contrat de index_now(path) :
+          - Paramètre : un chemin relatif vers un fichier YAML
+            d'artifact à indexer. Erreur si le chemin n'existe
+            pas ou n'est pas un YAML valide.
+          - Effet : exécute engine.index_artifact(root, path,
+            validator) sur la connexion unique du serveur. Pas
+            de reindex_all complet (économie de coût).
+          - Idempotence : INSERT OR REPLACE côté DB (déjà
+            comportement existant de upsert_artifact dans
+            engine.rs), donc appel répété sur le même fichier
+            est sûr.
+          - Concurrence : protégé par le Mutex tokio de
+            l'engine (déjà présent), donc serialisé avec les
+            autres opérations DB du serveur.
+          - Latence : équivalente à une indexation par le
+            watcher, sans le debounce. < 50ms attendus pour
+            un YAML standard.
+
+        Pourquoi pas l'option (a) "accepter pas d'indexation =
+        limite documentée". Elle créerait une dégradation
+        fonctionnelle réelle : un YAML écrit pendant une panne
+        watcher resterait invisible à search() jusqu'au prochain
+        redémarrage complet du serveur, parce que (i)
+        reload_config() ne déclenche pas de reindex, (ii) le
+        seul moyen actuel de forcer un reindex est l'outil MCP
+        reindex_all qui est intentionnellement coûteux (scan
+        complet) et qu'aucun agent n'appellera spontanément
+        après chaque write YAML. Le contrat tacite "tout YAML
+        écrit est searchable dans la seconde" — qui sous-tend
+        le bon fonctionnement du lookup mémoire imposé par
+        shared-rules — serait cassé. (b) préserve ce contrat
+        sans introduire de second ouvreur de la DB.
+
+        Effet observable. Quand le watcher fonctionne
+        normalement, index_now n'est presque jamais appelé en
+        pratique : --index détecte le lock, mais le watcher
+        indexe naturellement avant que index_now ne devienne
+        nécessaire (debounce 500ms vs --index immédiat — le
+        watcher gagne la course dans la majorité des cas). Mais
+        si le watcher est en panne OU si on veut une latence
+        d'indexation déterministe pour un test, index_now sert
+        de fallback robuste.
+
+    - name: protocole-de-validation
+      description: >
+        Le design exige un test reproductible qui valide les
+        acceptance criteria (4) et (5) du task-request. Le détail
+        du script est délégué à l'implementation-plan, mais le
+        cadre attendu est :
+
+        (a) Test "boot propre" : partir d'une DB saine, démarrer le
+            serveur, faire quelques appels MCP, kill -TERM, vérifier
+            PRAGMA integrity_check = ok et absence de -wal/-shm
+            résiduels.
+
+        (b) Test "restart proxy" : partir d'une DB saine, démarrer
+            le serveur, démarrer une boucle de --index en parallèle,
+            simuler un cargo build (touch du binaire) plusieurs
+            fois, vérifier que la DB reste integrity_check = ok
+            après chaque cycle.
+
+        (c) Test "SIGKILL pendant reindex_all" : démarrer le
+            serveur, le tuer brutalement pendant que reindex_all
+            background tourne, redémarrer, vérifier que le PILIER D
+            détecte la corruption (s'il y en a) et que le serveur
+            redémarre avec une DB saine repeuplée.
+
+        (d) Test "double instance serveur-vs-serveur" : démarrer
+            une première instance serveur, attendre qu'elle
+            tienne l'exclusif, tenter de démarrer une deuxième
+            instance serveur, vérifier que la deuxième attend
+            jusqu'au timeout de retry (recommandé 10s) puis
+            échoue proprement avec un message d'erreur lisible
+            ("another writer is holding the lock for more than
+            <N>s, refusing to start"). La première instance
+            doit rester saine pendant et après le test.
+
+        (e) Test "serveur démarre pendant --index transitoire"
+            (nouveau, finding A round 2). Scénario qui valide
+            l'esprit de l'AC (5) du task-request : un restart
+            par le proxy résilient DOIT réussir même si un
+            --index transitoire tient brièvement l'exclusif.
+            Séquence : (i) partir d'une DB saine, (ii) tuer
+            l'éventuel serveur préexistant, (iii) spawn un
+            --index synthétique qu'on instrumente pour tenir
+            l'exclusif pendant quelques secondes (par exemple
+            un wrapper qui acquiert le lock puis sleep 2s avant
+            de relâcher, simulant un --index lent), (iv)
+            démarrer le serveur en parallèle, (v) vérifier que
+            le serveur retry l'acquisition pendant son timeout
+            (recommandé 10s), finit par acquérir l'exclusif
+            dès que --index relâche, et démarre normalement.
+            Critère de succès : le serveur ne retourne pas
+            d'erreur d'init, integrity_check = ok après
+            startup, le file watcher est actif. La latence
+            d'init mesurée doit être proche du temps de hold
+            du --index synthétique (à quelques centaines de ms
+            près).
+
+        Variante (e') du test (e) : --index synthétique qui
+        tient l'exclusif plus longtemps que le timeout du
+        serveur (par exemple 15s avec un timeout de 10s).
+        Vérifier que le serveur exite proprement avec le
+        message attendu, et que la DB reste saine
+        (integrity_check = ok depuis l'extérieur après que
+        --index ait relâché).
+
+        (f) Test "index_now en fallback watcher" (finding B
+            round 2). Démarrer un serveur, désactiver
+            artificiellement son watcher (par exemple via une
+            variable d'env de test ou un kill ciblé de la
+            tokio task watcher si exposée), écrire un YAML
+            depuis l'extérieur, déclencher autoIndex → --index,
+            vérifier que --index détecte le lock tenu, appelle
+            index_now via MCP, et que le YAML devient
+            searchable via search() côté serveur. Critère de
+            succès : search() retourne le YAML dans la seconde
+            qui suit le write, sans intervention manuelle.
+
+        Critère de succès global : tous les tests retournent
+        integrity_check = ok à la fin, les tests (d) et (e')
+        exitent proprement sans modifier la DB, et les tests
+        (e) et (f) confirment respectivement que le restart
+        proxy reste fiable et que l'indexation reste garantie
+        même en cas de panne watcher.
+
+  decisions:
+    - decision: >
+        Adopter une coordination inter-process explicite via file
+        lock POSIX (flock) plutôt qu'un lock applicatif (PID file,
+        BEGIN EXCLUSIVE SQLite, table de locks).
+      rationale: >
+        Le lock OS est libéré automatiquement par le kernel quand
+        le processus détenteur meurt (y compris SIGKILL), ce qui est
+        exactement le scénario que le diagnostic 378c387c identifie
+        comme racine du problème. Un PID file laissé orphelin par un
+        SIGKILL nécessite une logique de nettoyage de stale lock,
+        elle-même source de races. Un BEGIN EXCLUSIVE SQLite ne
+        protège que les transactions, pas le cycle de vie complet
+        d'un processus, et exige une DB déjà saine pour fonctionner
+        (cercle vicieux quand la DB est corrompue). Un lock OS
+        natif est plus simple, plus robuste, plus testable.
+
+    - decision: >
+        Conserver journal_mode WAL (ne pas basculer vers DELETE ou
+        TRUNCATE journal).
+      rationale: >
+        WAL est le seul mode qui autorise lectures concurrentes
+        pendant qu'un writer écrit, ce qui est un besoin réel du
+        système (un agent qui lit l'index pendant qu'un autre
+        écrit). Basculer vers DELETE simplifie le cycle de vie des
+        fichiers mais sérialise toutes les lectures derrière le
+        writer — incompatible avec les attentes de performance.
+        Le diagnostic identifie WAL comme propice à la concurrence
+        non coordonnée, pas comme défectueux en soi. Les PILIER A,
+        B, C, D adressent les conditions d'usage de WAL plutôt que
+        de remplacer WAL.
+
+    - decision: >
+        Conserver l'invocation du binaire en mode CLI --index par
+        defense-in-depth après chaque write YAML (ne pas la
+        refactorer en appel MCP au serveur principal), MAIS avec
+        sémantique no-op quand le serveur tient l'exclusif.
+      rationale: >
+        Le mode --index reste nécessaire comme chemin d'indexation
+        de secours quand le serveur n'est pas joignable (boot
+        froid, environnement CLI hors-session, restart proxy en
+        cours). Le coupler au serveur via MCP de manière
+        bloquante introduirait une dépendance qui rendrait le
+        hook defense-in-depth inutilisable hors-session.
+        Cependant, l'INVARIANT d'unicité d'indexation (cf.
+        composant indexation-coordination ci-dessus) impose que
+        --index ne touche la DB QUE quand aucun serveur ne la
+        détient. La sémantique retenue (option (b) du finding 2
+        round 1) :
+          - --index sans serveur en vie : acquiert l'exclusif,
+            indexe, relâche. Comportement actuel préservé en
+            mode CLI.
+          - --index avec serveur en vie : no-op, log, exit 0.
+            Le file watcher du serveur fera l'indexation.
+        Cette sémantique élimine la concurrence write-write
+        identifiée par le FACTEUR 1 du diagnostic, sans
+        sacrifier la disponibilité du chemin --index hors
+        serveur. Note de séparation : ce choix est différent du
+        choix concernant snapshotPermits / revertPermitTampering
+        / hasActivePermit, qui eux passent par MCP — la
+        différence vient du fait que ces trois appels sont
+        invoqués dans le contexte d'un hook bash où le serveur
+        est de toute façon présent dans la session opencode (le
+        hook lui-même tourne sous opencode), tandis que --index
+        peut être invoqué dans des contextes où le serveur
+        n'existe pas (par exemple un script de maintenance
+        offline).
+
+    - decision: >
+        Ne PAS désactiver autoIndex() côté hook quand un serveur
+        est détecté. Le hook continue d'appeler autoIndex()
+        inconditionnellement après chaque write YAML.
+      rationale: >
+        Le finding 3 du round de review iteration 1 a soulevé
+        l'option de désactiver autoIndex() côté hook quand le
+        serveur est détecté, en s'appuyant sur le seul file
+        watcher pour indexer. Rejeté pour trois raisons :
+        (a) la détection du serveur en Node.js (côté hook)
+        serait moins fiable que la détection via flock en Rust
+        (côté --index), et dupliquerait la logique de
+        coordination dans deux langages ;
+        (b) la responsabilité de la coordination doit rester
+        dans le composant qui détient la connexion SQLite,
+        pas dans le hook qui doit rester ignorant des détails
+        de persistence ;
+        (c) le coût d'un --index no-op est négligeable
+        (quelques ms de fork + flock read + exit). On préfère
+        cette dépense marginale à un couplage cross-language.
+        Conséquence : l'INVARIANT d'unicité d'indexation est
+        assuré par --index lui-même, pas par le hook.
+
+    - decision: >
+        Implémenter PILIER D (autorepair au boot via reindex_all
+        depuis YAML) plutôt que de tenter une réparation in-place
+        de la DB corrompue (PRAGMA writable_schema, dump+reload, etc).
+      rationale: >
+        La source de vérité réelle vit dans les fichiers YAML sur
+        disque. La DB n'est qu'un index. Une réparation in-place
+        prend plus de temps qu'un rebuild, exige un code de
+        recovery complexe (SQLite ne garantit pas qu'un dump
+        d'une DB malformée est récupérable), et ne traite qu'une
+        sous-classe des cas (certaines corruptions sont
+        irrécupérables sans .recover). Un rebuild complet est
+        simple, déterministe, et idempotent. La perte assumée des
+        tables review_rounds et write_permits est jugée acceptable
+        en regard du bénéfice (cf. limite documentée du PILIER D).
+
+    - decision: >
+        Refactorer en outils MCP les QUATRE call sites sqlite3
+        CLI actuellement présents dans defense-in-depth-core.mjs :
+        hasActivePermit (L105), snapshotPermits (L188),
+        revertPermitTampering nuclear delete (L200) et
+        revertPermitTampering selective delete (L206). AU LIEU DE
+        conserver les sqlite3 inlines.
+      rationale: >
+        Le hook viole déjà sa propre règle L264 (sqlite3 + .db
+        forbidden) en court-circuitant. Passer tous les call sites
+        par MCP rend le contrat cohérent (tout accès DB passe par
+        le serveur unique) ET supprime un ouvreur concurrent
+        identifié par le diagnostic, en particulier hasActivePermit
+        qui est le call site le plus fréquent (un appel par write
+        en zone protégée ET un appel par bash sur fichier protégé).
+        L'inventaire des 4 call sites a été établi par grep
+        exhaustif sur le hook (finding 1 du round iteration 1
+        nous a permis de combler l'oubli sur hasActivePermit dans
+        la v1 du design). Pour hasActivePermit, l'outil MCP cible
+        check_write_permit existe DÉJÀ côté serveur (main.rs:392),
+        donc le refactor est purement côté hook. Pour
+        snapshotPermits et revertPermitTampering, deux nouveaux
+        outils MCP sont introduits (snapshot_permits_state,
+        revert_permits_to_snapshot). La latence ajoutée est
+        négligeable (un appel MCP local prend moins de 10ms en
+        steady-state, moins de 5s pendant un restart proxy
+        buffer-replay). Le hook tolère déjà cette latence
+        puisqu'il exécute des commandes git en synchrone avant
+        chaque bash.
+
+    - decision: >
+        Envelopper SCHEMA_SQL et FTS_SQL dans une transaction
+        explicite (BEGIN IMMEDIATE / COMMIT) au open.
+      rationale: >
+        Le diagnostic 378c387c (facteur 3) identifie le risque que
+        SIGKILL pendant la sous-séquence de création FTS5 laisse
+        un schéma partiellement matérialisé invisible aux IF NOT
+        EXISTS ultérieurs. Une transaction explicite garantit que
+        soit l'ensemble du schéma est en place soit rien (rollback
+        au prochain open via WAL recovery). Coût négligeable (une
+        BEGIN et un COMMIT ajoutés à chaque open).
+
+    - decision: >
+        Le serveur retry l'acquisition du lock exclusif au boot
+        avec un timeout borné (recommandation initiale 10s)
+        pour absorber les --index transitoires légitimes.
+      rationale: >
+        Le finding A du round de review iteration 2 a identifié
+        que la sémantique no-op de --index, combinée à une
+        acquisition non bloquante du serveur au boot, créait
+        une race : un --index spawn par defense-in-depth pendant
+        que le proxy résilient redémarre le binaire peut tenir
+        l'exclusif au moment où le nouveau serveur démarre. Sans
+        retry, le serveur exite, le proxy considère son restart
+        comme un échec, l'utilisateur subit une déconnexion MCP.
+        C'est une violation de l'esprit de l'AC (5) du
+        task-request ffb85fc7 ("après le correctif, un restart
+        du binaire par le proxy résilient ne corrompt pas la
+        DB" — implicitement le restart doit RÉUSSIR, pas
+        seulement éviter la corruption). Le retry borné côté
+        serveur (polling ~200ms jusqu'à un timeout dur de l'ordre
+        de 10s) absorbe les --index transitoires (durée nominale
+        < 200ms) sans rendre le serveur tolérant à une vraie
+        double instance (qui tient le lock indéfiniment). Le
+        timeout dur garantit qu'on n'attend pas éternellement
+        face à un --index zombie. La symétrie côté --index n'est
+        PAS appliquée : un --index qui rencontre un serveur en
+        vie reste en no-op pur (le watcher indexe, pas besoin
+        d'attendre).
+
+    - decision: >
+        Introduire un outil MCP index_now(path) pour permettre
+        une indexation immédiate déléguée au serveur quand
+        --index détecte le lock exclusif.
+      rationale: >
+        Le finding B du round 2 a identifié une contradiction
+        interne de la révision iteration 2 : la mitigation
+        "ORCHESTRATOR_ALLOW_INDEX_WITH_LOCK=1 autorise --index
+        à écrire malgré le lock serveur" réintroduisait
+        littéralement le FACTEUR 1 du diagnostic (deux writers
+        concurrents avec connexions SQLite distinctes). Deux
+        options propres ont été envisagées :
+        (a) Accepter "watcher en panne = pas d'indexation auto"
+            comme limite documentée. Rejeté pour deux raisons :
+            (i) ce serait une dégradation fonctionnelle réelle
+            sur un cas dégénéré qui peut survenir (inotify
+            épuisé) ; (ii) reload_config() ne déclenche PAS de
+            reindex_all (vérifié dans main.rs:441-458), donc
+            il n'existe aucun moyen léger de combler la panne
+            watcher en cours de session — seul un redémarrage
+            complet du serveur restaure l'indexation, ce qui
+            casse le contrat tacite "tout YAML écrit est
+            searchable dans la seconde" sur lequel s'appuie
+            le lookup mémoire imposé par shared-rules.
+        (b) Exposer un outil MCP index_now(path) côté serveur.
+            --index, quand il détecte le lock tenu, appelle
+            index_now au lieu de no-op pur. L'indexation passe
+            par la connexion unique du serveur, donc INVARIANT
+            d'unicité préservé. Cohérent avec le reste du
+            design (tous les accès DB passent par le serveur).
+            Coût : un outil MCP de plus, sémantique évidente
+            (engine.index_artifact sous Mutex tokio).
+        Option (b) retenue. C'est aussi la recommandation du
+        PM dans le retour du round 2. Le contrat de index_now
+        est documenté dans le composant indexation-coordination.
+
+    - decision: >
+        --index acquiert l'exclusif lui-même quand aucun serveur
+        ne tient le lock, et est NO-OP quand un serveur tient le
+        lock. Pas de protocole de handoff serveur/--index.
+      rationale: >
+        Le finding 2 du round de review iteration 1 a identifié
+        que le design v1 disait "--index prend le lock partagé",
+        ce qui était incohérent puisque --index écrit
+        effectivement dans la DB (db.migrate + upsert). Deux
+        options envisagées :
+        (a) le serveur cède temporairement l'exclusif quand un
+            --index arrive : nécessite un protocole de handoff
+            (release exclusif → --index acquiert → --index
+            relâche → serveur réacquiert) qui est lui-même
+            source de races (qui réacquiert en premier si
+            plusieurs --index attendent ? que fait le serveur
+            pendant qu'il n'a plus le lock ?). Complexité
+            disproportionnée par rapport au gain.
+        (b) --index est no-op si un serveur détient l'exclusif,
+            indexation déléguée au file watcher du serveur :
+            simple, sans état partagé, sans race. Préservation
+            de la disponibilité hors-serveur (boot froid, CLI
+            offline). Latence supplémentaire négligeable
+            (debounce file watcher 500ms vs --index immédiat).
+        Option (b) retenue. C'est aussi l'option recommandée par
+        le PM dans le retour du round. La sémantique exacte
+        ("no-op + log + exit 0") est documentée dans le composant
+        pilier-A-unique-writer-via-file-lock et l'invariant
+        d'unicité d'indexation est documenté dans le composant
+        indexation-coordination.
+
+    - decision: >
+        Ne pas adopter sqlx ni sea-orm en remplacement de rusqlite.
+      rationale: >
+        Hors scope de ce design. Le diagnostic n'incrimine pas
+        rusqlite ; il incrimine l'absence de coordination et de
+        graceful shutdown. Changer de driver introduirait un risque
+        de régression majeur sans bénéfice direct sur la cause
+        racine. Si une migration vers un driver async-native devient
+        souhaitable un jour (par exemple pour profiter de runtime
+        tokio bout-en-bout), elle fera l'objet d'un design-doc
+        séparé.
+
+  open_questions:
+    - >
+      Faut-il rendre le PILIER D (autorepair au boot) configurable
+      (opt-in/opt-out) via flow-control.yml ou shared-rules.yml ?
+      Avantage : un opérateur peut préférer un crash explicite à
+      une perte silencieuse des rounds/permits. Inconvénient :
+      configuration supplémentaire à comprendre. À trancher dans
+      l'implementation-plan.
+    - >
+      Quelle est la bonne valeur de busy_timeout (PILIER B) ?
+      Trop court (< 500ms) ne couvre pas un checkpoint long. Trop
+      long (> 30s) bloque le hook defense-in-depth de manière
+      désagréable. À calibrer empiriquement dans
+      l'implementation-plan, avec une valeur initiale conservatrice
+      autour de 5s et une révision possible après mise en
+      production.
+    - >
+      Le file lock du PILIER A doit-il être dans company/data/
+      (à côté de la DB) ou ailleurs (par exemple /tmp ou
+      $XDG_RUNTIME_DIR) ? Avantage proximité : un opérateur qui
+      cherche pourquoi le serveur ne démarre pas trouve le lock
+      facilement. Inconvénient proximité : c'est une zone
+      protégée par defense-in-depth, ce qui peut créer des
+      interactions inattendues. À trancher dans
+      l'implementation-plan en lien avec la définition des
+      protected zones.
+    - >
+      Le test (d) "double instance" doit-il bloquer la deuxième
+      instance ou la faire attendre que la première sorte ?
+      Bloquer est plus simple, attendre est plus convivial
+      pour les workflows opérateur (par exemple cargo build qui
+      respawn). Recommandation initiale : bloquer avec message
+      clair, mais à reconsidérer si l'expérience opérationnelle
+      montre une friction.
+    - >
+      Le journal d'audit des écritures sur review_rounds et
+      write_permits (pour reconstruction post-rebuild) est laissé
+      hors scope. Faut-il l'ouvrir comme task-request distinct
+      maintenant ou attendre un premier retour d'expérience post-
+      RFC cdbfee72 ? Recommandation : attendre, car le PILIER D
+      adresse déjà la majorité des cas pratiques et la perte
+      assumée est documentée.

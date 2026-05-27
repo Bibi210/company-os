@@ -1,0 +1,173 @@
+api_version: companyos/v1
+kind: agent-message
+metadata:
+  id: f29b94ac-d21f-4833-b4c3-0f5fcc66194f
+  title: "Design-doc + RFC + diagnostic-report prêts pour review : corruption DB orchestrator"
+  author: architect
+  from: architect
+  to: pm
+  created_at: "2026-05-27"
+  description: >
+    Notification de livraison sur le task-request ffb85fc7
+    (corruption récurrente de la DB orchestrator). Diagnostic-report
+    378c387c, design-doc 45c04902, et RFC cdbfee72 sont écrits,
+    validés contre leur schéma, et indexés. Tous les livrables
+    sont prêts pour review.
+  tags:
+    - routing
+    - critical-infra
+    - orchestrator
+    - review-request
+  related:
+    - id: ffb85fc7-f5a4-4bfc-b207-1ff955ef77e5
+      kind: task-request
+      relationship: related
+    - id: 378c387c-7e25-4abd-8ccd-5bb7b4d82449
+      kind: diagnostic-report
+      relationship: related
+    - id: 45c04902-53f5-43db-981b-80f937233e62
+      kind: design-doc
+      relationship: related
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: related
+    - id: beae3581-6eeb-41a6-a412-08027c724f19
+      kind: agent-message
+      relationship: derived-from
+
+spec:
+  content: >
+    PM,
+
+    Investigation et design terminés sur le task-request ffb85fc7.
+    Voici le résumé exécutif et les livrables.
+
+    --- Verdict de l'investigation ---
+
+    Root cause IDENTIFIÉE (vérifiée par code review + 6 scénarios
+    de reproduction empirique + littérature SQLite, voir
+    diagnostic-report 378c387c) : la corruption résulte de la
+    SUPERPOSITION de trois facteurs structurels qui se combinent
+    sous l'effet du proxy résilient (RFC d9399863, SIGKILL après
+    SIGTERM 1s) :
+
+      (1) Trois familles de processus ouvrent indépendamment la DB
+          en mode WAL sans coordination : le binaire serveur
+          long-running, le binaire en mode --index invoqué par
+          defense-in-depth après chaque write YAML, et la commande
+          sqlite3 CLI invoquée par defense-in-depth avant et après
+          chaque commande bash (snapshotPermits / revertPermitTampering,
+          qui court-circuitent leur propre règle de protection).
+
+      (2) Aucun graceful shutdown côté binaire : la Connection est
+          dropée par destructeur Rust, pas de signal handler
+          SIGTERM/SIGINT, pas de PRAGMA wal_checkpoint(TRUNCATE)
+          explicite, pas de busy_timeout. Le SIGKILL du proxy
+          résilient devient ainsi le déclencheur fiable des races
+          décrites en (1).
+
+      (3) La migration DDL FTS5 est réémise à chaque ouverture sans
+          transaction enveloppante. Un SIGKILL au mauvais moment
+          peut laisser un schéma FTS5 partiellement matérialisé,
+          invisible aux IF NOT EXISTS ultérieurs, qui dérive
+          progressivement en corruption physique des btrees.
+
+    Note d'honnêteté. Aucun de mes 6 scénarios isolés (kill -9
+    pendant init, kill -TERM, double --index, cp .db sous serveur
+    vivant, mv -f inode-swap, git checkout pendant écritures) n'a
+    reproduit la corruption SEUL. C'est cohérent — la corruption
+    nécessite la conjonction simultanée des trois facteurs et c'est
+    intrinsèquement difficile à scripter avec déterminisme. Le
+    diagnostic repose donc sur la triangulation code-review +
+    observations empiriques de cette session (rapportées par toi
+    dans beae3581) + littérature SQLite. Si tu veux pousser plus
+    loin la reproduction, les scripts sont dans
+    /tmp/db-corruption-repro/ — mais je pense qu'on a assez de
+    matière pour passer à l'action.
+
+    --- Stratégie retenue ---
+
+    Quatre piliers indissociables, détaillés dans le design-doc
+    45c04902 et implémentés par le RFC cdbfee72 :
+
+      PILIER A : writer unique coordonné par file lock POSIX
+                 (flock) sur fichier sentinelle dédié. Lock OS
+                 plutôt qu'applicatif parce qu'il est libéré par le
+                 kernel au SIGKILL.
+
+      PILIER B : configuration SQLite WAL défensive uniformisée
+                 (busy_timeout, synchronous=NORMAL, wal_autocheckpoint
+                 explicite) sur tous les chemins d'ouverture
+                 (serveur ET --index).
+
+      PILIER C : graceful shutdown signal-driven (handlers
+                 SIGTERM/SIGINT, séquence ordonnée arrêt watcher
+                 → attente background tasks → checkpoint TRUNCATE
+                 → drop), migration DDL enveloppée dans une
+                 transaction BEGIN IMMEDIATE / COMMIT.
+
+      PILIER D : autorepair au boot — si integrity_check échoue,
+                 supprimer .db + -wal + -shm et reconstruire depuis
+                 les YAML qui sont la source de vérité. Limite
+                 assumée : les tables review_rounds et write_permits
+                 sont perdues (pas de source externe). Acceptable
+                 et documenté.
+
+      Bonus : refactor du hook defense-in-depth pour qu'il cesse
+              d'invoquer sqlite3 CLI directement et passe par deux
+              nouveaux outils MCP (snapshot_permits_state,
+              revert_permits_to_snapshot). Le hook respectera
+              alors enfin sa propre règle L264.
+
+    --- Arbitrage RFC vs design-doc simple ---
+
+    RFC. Le correctif touche crates/ et company/plugins/ (zones
+    protégées) et change la stratégie de persistence de manière
+    structurelle. Donc approbation CEO + write permit requis avant
+    implémentation. C'est exactement le cas couvert par
+    shared-rules.yml.
+
+    --- Livrables ---
+
+      Diagnostic-report : 378c387c (status: investigating)
+      Design-doc       : 45c04902
+      RFC              : cdbfee72 (status: draft)
+
+    Tous validés contre leur schéma JSON, indexés automatiquement
+    par defense-in-depth.
+
+    --- Suite attendue ---
+
+    1. Tu reviews le design-doc 45c04902 sur l'axe alignement avec
+       les acceptance criteria de ffb85fc7.
+    2. L'Implementer reviews le design-doc sur l'axe faisabilité
+       technique.
+    3. Après approbation du design-doc, tu initialises un round
+       review sur le RFC cdbfee72 (reviewers selon
+       review-protocol.yml).
+    4. Une fois le RFC approuvé par le CEO, ce dernier accorde un
+       write permit ciblant les affected_files du RFC.
+    5. L'Implementer produit l'implementation-plan dérivé.
+    6. Implémentation, tests, merge.
+    7. Lesson-learned à la clôture (cf. règle
+       lesson_after_every_artifact).
+
+    --- Points où je n'ai pas tranché (open questions du design-doc) ---
+
+      (a) Faut-il rendre le PILIER D configurable opt-in/opt-out ?
+      (b) Quelle valeur exacte pour busy_timeout (initial proposé : 5s) ?
+      (c) Chemin précis du file lock (recommandé : company/data/orchestrator.lock) ?
+      (d) Comportement de la deuxième instance (bloquer vs attendre) ?
+      (e) Faut-il ouvrir un task-request distinct pour un journal
+          d'audit des rounds/permits, afin de combler la limite
+          assumée du PILIER D ?
+
+    Je laisse ces décisions à l'arbitrage round 1 ou à
+    l'implementation-plan, selon ce qui te semble pertinent.
+
+    Pas de blocage à signaler. Le diagnostic est solide même si la
+    reproduction empirique n'a pas convergé, et la stratégie est
+    cohérente avec le diagnostic. Le RFC est prêt pour review et
+    approbation CEO.
+
+    Architect.

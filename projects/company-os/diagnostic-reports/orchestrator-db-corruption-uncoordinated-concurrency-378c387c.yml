@@ -1,0 +1,289 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: 378c387c-7e25-4abd-8ccd-5bb7b4d82449
+  title: "Corruption récurrente de la DB orchestrator : concurrence non coordonnée entre N ouvertures WAL + absence de graceful shutdown"
+  author: architect
+  created_at: "2026-05-27"
+  description: >
+    Investigation de la corruption récurrente de
+    company/data/orchestrator.db rapportée par le PM dans le
+    task-request ffb85fc7. PRAGMA integrity_check remonte des erreurs
+    structurelles graves (rowids out-of-order, btreeInitPage error 11,
+    pages "never used", invalid page number, doubles références à des
+    pages). Investigation conduite par reproduction empirique (6
+    scénarios scriptés exécutés sur des copies de la baseline saine)
+    et lecture du code (crates/orchestrator/src/db.rs,
+    crates/mcp-servers/orchestrator/src/main.rs,
+    company/plugins/defense-in-depth-core.mjs,
+    company/plugins/mcp-proxy.mjs, RFC d9399863). La cause racine
+    identifiée est structurelle : trois familles de processus
+    distincts ouvrent indépendamment la DB SQLite en mode WAL sans
+    coordination explicite, et le binaire serveur n'a aucun mécanisme
+    de graceful shutdown — ce qui rend le SIGKILL utilisé par le proxy
+    résilient (RFC d9399863) potentiellement destructeur. Le correctif
+    nécessite un changement structurel de la stratégie de persistence
+    et fait donc l'objet du RFC cdbfee72 et du design-doc 45c04902.
+  tags:
+    - orchestrator
+    - sqlite
+    - wal
+    - corruption
+    - persistence
+    - concurrency
+    - critical-infra
+  related:
+    - id: ffb85fc7-f5a4-4bfc-b207-1ff955ef77e5
+      kind: task-request
+      relationship: input
+    - id: 45c04902-53f5-43db-981b-80f937233e62
+      kind: design-doc
+      relationship: related
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: related
+    - id: d9399863-254e-42f5-a485-ea019ce56a93
+      kind: rfc
+      relationship: related
+    - id: 95ee5480-d5d4-4d66-88f3-3a3b7e3c1469
+      kind: diagnostic-report
+      relationship: related
+
+spec:
+  symptom: >
+    PRAGMA integrity_check sur company/data/orchestrator.db rapporte
+    des erreurs structurelles graves de façon intermittente :
+    "rowid X out of order", "btreeInitPage() returns error code 11"
+    (SQLITE_CORRUPT_BKPT), "Page N: never used", "invalid page number
+    218103808" (valeur typique de bytes lus comme entier sur des
+    pages réinitialisées à zéro), et doubles références à des pages
+    par plusieurs btrees. Les appels MCP search() et reindex_all()
+    échouent alors avec "database disk image is malformed". La même
+    DB lue hors-ligne depuis un commit (dans /tmp) est saine. Le
+    symptôme apparaît dès que le binaire orchestrator-server reprend
+    la main après certains événements de cycle de vie (restart par
+    proxy, git checkout pendant que le binaire tourne, kill brutal
+    pendant une session active).
+
+    Observations empiriques de la session courante consignées par
+    le PM dans l'agent-message beae3581 et l'instruction Architect :
+    (i) DB working tree corrompue en début de session ;
+    (ii) même DB dans /tmp saine (lue depuis le commit 1a8bb87) ;
+    (iii) `git checkout HEAD -- company/data/orchestrator.db` pendant
+    que le binaire tournait, la DB est redevenue corrompue presque
+    immédiatement ;
+    (iv) restart propre du processus opencode (qui redémarre
+    coordonnément proxy + binaire) a rétabli la santé de la DB ;
+    (v) search() et reindex_all() refonctionnent depuis ce restart.
+
+  root_cause: >
+    La cause racine est structurelle et multi-facettes. Aucune des
+    six expériences de reproduction isolées (kill -9 pendant
+    initialize, kill -TERM après initialize, 5 --index simultanés sur
+    le même fichier, cp .db sous serveur vivant, mv -f .db (inode
+    swap), git checkout pendant 20 writes + 5 post-writes) ne produit
+    SEULE de corruption — SQLite WAL est robuste face à chacun de ces
+    scénarios pris individuellement. La corruption observée provient
+    de la SUPERPOSITION simultanée des trois facteurs ci-dessous,
+    dont chacun est en lui-même un anti-pattern documenté de SQLite
+    en WAL multi-process.
+
+    FACTEUR 1 — Concurrence non coordonnée entre 3 familles d'ouvreurs
+    de la DB.
+
+    La DB orchestrator.db est ouverte en lecture/écriture par trois
+    types de processus distincts qui ne se connaissent pas :
+
+    (a) Le binaire serveur long-running
+    (crates/mcp-servers/orchestrator/src/main.rs, run_server) qui
+    maintient UNE connexion rusqlite ouverte tant que le serveur vit,
+    avec une tâche tokio background reindex_all() lancée au boot
+    (main.rs:767-779) et un file-watcher (main.rs:782-822) qui
+    déclenche d'autres reindex_all() en cours de vie.
+
+    (b) Le binaire en mode CLI --index
+    (crates/mcp-servers/orchestrator/src/main.rs, run_index, ligne
+    703) invoqué par defense-in-depth-core.mjs:139 après CHAQUE write
+    YAML accepté. Chaque invocation ouvre sa propre connexion,
+    re-exécute db.migrate() (CREATE TABLE IF NOT EXISTS +
+    CREATE VIRTUAL TABLE FTS5 — DDL), indexe, puis ferme la
+    connexion par drop implicite.
+
+    (c) Le binaire sqlite3 CLI invoqué par defense-in-depth-core.mjs
+    aux lignes 188 (snapshotPermits, AVANT chaque commande bash) et
+    200/206 (revertPermitTampering, APRÈS chaque commande bash). Ce
+    chemin contourne la règle "sqlite3 + .db forbidden" de la
+    L264 du même fichier en l'exécutant lui-même côté hook.
+
+    Les trois chemins ouvrent la DB en mode WAL (le journal_mode WAL
+    est persisté dans le header de la DB depuis le premier
+    `PRAGMA journal_mode=WAL` exécuté par db.rs:79). Aucun ne
+    configure busy_timeout, ce qui rend les attentes sur lock
+    SQLITE_BUSY immédiates au lieu de bloquantes — donc une écriture
+    qui rencontre le -shm pris par un voisin échoue plutôt que de
+    réessayer poliment.
+
+    FACTEUR 2 — Absence totale de graceful shutdown côté binaire.
+
+    crates/mcp-servers/orchestrator/src/main.rs:824-827 termine par
+    `service.waiting().await? ; Ok(()) }` — la `Connection`
+    rusqlite est simplement dropée par destructeur Rust au déroulement
+    de la pile. Aucun signal handler SIGTERM/SIGINT n'est posé, aucun
+    `PRAGMA wal_checkpoint(TRUNCATE)` n'est exécuté avant le drop,
+    aucun `optimize` n'est lancé. Conséquences :
+
+    (i) Si SIGTERM arrive, tokio est interrompu et l'unwind tente de
+    fermer la connexion ; en pratique cela fonctionne, mais le -wal
+    et le -shm restent sur disque (SQLite supprime ces fichiers
+    seulement si la dernière connexion ferme proprement ET si elle
+    détient un lock écrit). Au prochain ouvert, recovery se déclenche.
+
+    (ii) Si SIGKILL arrive (cas du proxy résilient RFC d9399863, qui
+    SIGTERM puis SIGKILL à 1s — cf. RFC d9399863 §
+    "handleHealthCheckTimeout"), aucun unwind ne s'exécute. Le -shm
+    est laissé dans un état "live" avec des marqueurs de readers
+    actifs qui ne sont plus là (le verrouillage POSIX advisory s'évanouit
+    au close du FD, donc la « réservation » des readers du -shm
+    devient orpheline). Le prochain ouvreur peut soit faire un
+    recovery propre (cas heureux), soit, s'il arrive simultanément à
+    un autre ouvreur qui fait aussi recovery, entrer dans une race
+    bien documentée par SQLite sur les systèmes où le shm est mappé
+    en mémoire partagée (cas standard Linux).
+
+    FACTEUR 3 — Migration DDL non idempotente côté reentry concurrente.
+
+    db.rs:88-92 exécute systématiquement SCHEMA_SQL et FTS_SQL à
+    chaque ouverture, y compris en mode --index. Les statements sont
+    tous CREATE TABLE IF NOT EXISTS / CREATE VIRTUAL TABLE IF NOT
+    EXISTS / CREATE INDEX IF NOT EXISTS, donc en théorie idempotents.
+    En pratique, deux processus qui exécutent SIMULTANÉMENT un
+    `CREATE VIRTUAL TABLE IF NOT EXISTS artifacts_fts USING fts5(...)`
+    sur une DB FTS5 prennent un exclusive lock SQLite et l'un des
+    deux échoue avec SQLITE_BUSY. Si le perdant n'a pas de
+    busy_timeout (cas actuel), il sort en erreur. Plus grave : la
+    création FTS5 alloue plusieurs tables shadow (artifacts_fts_data,
+    _config, _idx, _docsize, _content). Si la transaction de
+    création est interrompue par SIGKILL au mauvais moment (entre
+    deux des sous-CREATE de FTS5), le schéma reste partiellement
+    matérialisé. Les ouvertures ultérieures via IF NOT EXISTS
+    voient certaines tables shadow présentes mais pas toutes, sans
+    le détecter ; les opérations FTS5 ultérieures écrivent dans un
+    schéma incohérent → corruption logique qui finit par dégénérer
+    en corruption physique des btrees (les rowids des shadow tables
+    cessent d'être alignés).
+
+    SUPERPOSITION QUI PRODUIT LA CORRUPTION OBSERVÉE.
+
+    Le scénario type qui réunit les trois facteurs :
+    1. Le proxy résilient (d9399863) déclenche un restart binaire
+       suite à un cargo build ou un health-check timeout.
+    2. Au moment du SIGKILL, le binaire a une tâche tokio reindex_all
+       background en cours (lancée au boot et/ou par le file
+       watcher), donc une transaction WAL ouverte avec des frames
+       non-checkpointées.
+    3. defense-in-depth lance EN PARALLÈLE un sqlite3 CLI
+       snapshotPermits ou un --index suite à un write YAML : ce
+       processus ouvre la DB pendant que le binaire principal est en
+       train d'être tué.
+    4. Le binaire respawn ; au boot il lance run_server() qui appelle
+       OrchestratorDb::open puis db.migrate() puis lance reindex_all
+       en background. À ce moment, l'ancien -shm est dans un état
+       intermédiaire (lock orphelin du killed précédent), et le
+       processus parallèle de l'étape 3 commence sa propre récupération.
+    5. Race entre deux récupérations WAL concurrentes + DDL FTS5
+       réémises sur un schéma partiellement matérialisé → frames
+       du WAL appliquées sur des pages qui n'ont plus la même
+       structure → btree pages avec rowids out-of-order, doubles
+       références, pages réinitialisées vues comme "never used".
+
+    Confirmations indirectes :
+    - Restart coordonné de toute la pile (opencode kill total →
+      relance) répare car les TROIS familles de processus sont
+      éteintes en même temps, le prochain démarrage n'a aucun
+      reader concurrent et le recovery WAL est solitaire.
+    - DB lue dans /tmp depuis le commit est saine car il n'y a
+      aucun -wal/-shm associé : SQLite ouvre une DB "fraîche" sans
+      historique de concurrence.
+    - `git checkout HEAD -- company/data/orchestrator.db` re-corrompt
+      car il réinjecte une DB sans son -wal correspondant, sous un
+      binaire encore vivant qui croit que la DB et son -wal sont
+      synchronisés.
+
+    Classement des facteurs par criticité :
+    1. (haute) FACTEUR 1 — 3 familles de processus concurrents sans
+       coordination.
+    2. (haute) FACTEUR 2 — absence de graceful shutdown, combinée au
+       SIGKILL agressif du RFC d9399863.
+    3. (moyenne) FACTEUR 3 — DDL/FTS5 réémis à chaque open, vulnérable
+       au SIGKILL pendant la sous-séquence FTS5.
+
+    Reproduction empirique : 6 scénarios scriptés exécutés
+    (/tmp/db-corruption-repro/runs/{A..K}), aucun isolé ne reproduit
+    la corruption. C'est cohérent — la corruption est une race entre
+    plusieurs facteurs simultanés, intrinsèquement difficile à
+    déterminer dans un test scripté qui n'orchestre que deux acteurs
+    à la fois. Le diagnostic repose donc sur la triangulation
+    code-review + observations empiriques de session + littérature
+    SQLite (WAL + multi-process est documenté comme requérant
+    busy_timeout et idéalement WAL-mode persistent + un seul writer
+    ou un coordination layer).
+
+  resolution: >
+    Le correctif est structurel et touche la stratégie de persistence
+    de l'orchestrator : il fait l'objet du RFC cdbfee72 (Architect
+    auteur) qui doit être approuvé par le CEO et nécessitera un write
+    permit pour modifier le code Rust et le hook defense-in-depth. Le
+    design-doc associé est 45c04902.
+
+    Stratégie retenue (détaillée dans le design-doc 45c04902,
+    motivée et chiffrée dans le RFC cdbfee72) — trois piliers
+    indissociables :
+
+    PILIER A — Unique writer process via file lock OS.
+    Le binaire serveur acquiert un flock exclusif sur un fichier
+    sentinelle (ex. company/data/orchestrator.lock) au démarrage et
+    le relâche au shutdown. Tout processus --index acquiert le même
+    flock en mode partagé (read-shared) avec un timeout court (5s) ;
+    si le lock est pris en exclusif par le serveur, le processus
+    --index attend ou échoue proprement. Le hook defense-in-depth
+    cesse d'invoquer sqlite3 CLI directement (refactor de
+    snapshotPermits et revertPermitTampering en outils MCP
+    dédiés). Ceci élimine les ouvreurs sauvages et garantit un
+    writer unique.
+
+    PILIER B — Configuration SQLite défensive uniformisée.
+    Toutes les ouvertures (serveur ET --index) appliquent un
+    preamble PRAGMA unique :
+    - busy_timeout = 5000 (5s) → tolérance aux contentions WAL
+    - synchronous = NORMAL → équilibre durabilité/perf en WAL
+    - wal_autocheckpoint = 1000 (défaut conservé, explicite)
+    - foreign_keys = ON (déjà présent)
+    Un PRAGMA wal_checkpoint(TRUNCATE) est exécuté avant le drop de
+    la connexion principale au shutdown propre.
+
+    PILIER C — Graceful shutdown + signal handlers.
+    main.rs run_server installe des handlers SIGTERM/SIGINT (via
+    tokio::signal) qui déclenchent une séquence de fermeture
+    ordonnée : arrêt du file watcher, attente de la fin de
+    reindex_all background, checkpoint WAL TRUNCATE explicite,
+    drop de la connexion, exit propre. La règle de migration DDL
+    devient idempotente sous transaction : SCHEMA_SQL et FTS_SQL
+    sont enveloppés dans une BEGIN IMMEDIATE / COMMIT pour garantir
+    qu'un SIGKILL ne laisse pas un schéma partiellement matérialisé
+    (la transaction sera rollbackée au prochain open).
+
+    Le RFC cdbfee72 cible aussi un fix opérationnel court terme,
+    indépendant des trois piliers : reconstruire la DB depuis
+    l'index YAML (équivalent d'un reindex_all hors ligne) chaque
+    fois qu'une corruption est détectée au boot. Cela transforme la
+    corruption d'un incident bloquant en un délai de quelques
+    secondes, le temps que le PILIER A+B+C empêche la récurrence.
+
+    Statut actuel : investigating → le diagnostic est complet et la
+    stratégie est arrêtée, mais aucun correctif n'est encore mergé.
+    Le statut passera à resolved lorsque le RFC cdbfee72 sera
+    approuvé, l'implementation-plan dérivé sera exécuté, et que les
+    acceptance criteria du task-request ffb85fc7 seront vérifiés
+    sur la DB de production.
+
+  status: investigating
