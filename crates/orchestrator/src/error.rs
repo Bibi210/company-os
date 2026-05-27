@@ -65,4 +65,12 @@ pub enum OrchestratorError {
 
     #[error("Artifact '{id}' exists but is not a roadmap (actual kind: '{actual_kind}')")]
     RoadmapKindMismatch { id: String, actual_kind: String },
+
+    #[error(
+        "Failed to acquire DB lock on '{path}' after {timeout_ms}ms — another writer is holding it"
+    )]
+    LockBusy { path: String, timeout_ms: u64 },
+
+    #[error("Database integrity check failed: {details}")]
+    IntegrityFailure { details: String },
 }

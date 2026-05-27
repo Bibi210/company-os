@@ -14,3 +14,4 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 glob = { workspace = true }
+fs2 = "0.4"
