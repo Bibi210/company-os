@@ -95,6 +95,25 @@ function run(cmd, cwd) {
   }
 }
 
+// Helper that wraps a SQL statement with the same defensive PRAGMA preamble
+// used by the Rust binary (busy_timeout=5000, synchronous=NORMAL), so that
+// concurrent accesses between the server and the hook don't immediately
+// fail with SQLITE_BUSY but wait up to 5s for the lock. This is an
+// imperfect mitigation: the hook still opens its own sqlite3 connection,
+// which violates the "single writer" invariant of PILIER A. The proper
+// fix is to refactor these call sites into MCP tool calls (RFC cdbfee72
+// PROPOSITION 5), but the orchestrator MCP transport is stdio-only and
+// the opencode plugin context does not expose an MCP client. An amendment
+// of the RFC documenting this constraint is part of plan étape 10.0.
+function runSqliteWithTimeout(dbPath, sql, cwd) {
+  // .timeout is a sqlite3 CLI dot-command equivalent to PRAGMA busy_timeout.
+  // It must precede the SQL statement on the same command line.
+  return run(
+    `sqlite3 "${dbPath}" ".timeout 5000" "${sql}"`,
+    cwd,
+  );
+}
+
 function hasActivePermit(rootDir, filePath) {
   const dbPath = resolve(rootDir, _zones.db_path);
   if (!existsSync(dbPath)) return false;
@@ -102,7 +121,7 @@ function hasActivePermit(rootDir, filePath) {
   const rel = relative(rootDir, resolve(rootDir, filePath));
 
   const query = `SELECT target_paths FROM write_permits WHERE status = 'active'`;
-  const result = run(`sqlite3 "${dbPath}" "${query}"`, rootDir);
+  const result = runSqliteWithTimeout(dbPath, query, rootDir);
   if (!result) return false;
 
   for (const line of result.split("\n")) {
@@ -184,8 +203,14 @@ function revertFile(rootDir, filePath) {
 function snapshotPermits(rootDir) {
   const dbPath = resolve(rootDir, _zones.db_path);
   if (!existsSync(dbPath)) return null;
-  // Hash of all permits: count + ids + statuses
-  return run(`sqlite3 "${dbPath}" "SELECT COUNT(*), GROUP_CONCAT(id || ':' || status) FROM write_permits"`, rootDir);
+  // Hash of all permits: count + ids + statuses.
+  // .timeout 5000 mitigates SQLITE_BUSY contention with the server (see
+  // runSqliteWithTimeout comment).
+  return runSqliteWithTimeout(
+    dbPath,
+    "SELECT COUNT(*), GROUP_CONCAT(id || ':' || status) FROM write_permits",
+    rootDir,
+  );
 }
 
 function revertPermitTampering(rootDir, before) {
@@ -197,13 +222,17 @@ function revertPermitTampering(rootDir, before) {
   // Nuclear option: delete any permits not in the before snapshot
   if (before === null) {
     // DB didn't exist before, now it does — wipe permits
-    run(`sqlite3 "${dbPath}" "DELETE FROM write_permits"`, rootDir);
+    runSqliteWithTimeout(dbPath, "DELETE FROM write_permits", rootDir);
   } else {
     // Extract IDs from before snapshot and delete anything new
     const beforeIds = (before.split(",").map(s => s.split(":")[0]).filter(Boolean));
     const placeholders = beforeIds.map(id => `'${id}'`).join(",");
     if (placeholders) {
-      run(`sqlite3 "${dbPath}" "DELETE FROM write_permits WHERE id NOT IN (${placeholders})"`, rootDir);
+      runSqliteWithTimeout(
+        dbPath,
+        `DELETE FROM write_permits WHERE id NOT IN (${placeholders})`,
+        rootDir,
+      );
     }
   }
   return true;

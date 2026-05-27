@@ -3,3 +3,4 @@ target/
 *.db*
 .companyos/
 Cargo.lock
+company/data/orchestrator.lock
