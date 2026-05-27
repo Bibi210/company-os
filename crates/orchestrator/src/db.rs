@@ -69,6 +69,27 @@ CREATE VIRTUAL TABLE IF NOT EXISTS artifacts_fts USING fts5(
 );
 ";
 
+/// Defensive PRAGMA preamble applied at every open.
+///
+/// Rationale (cf. design-doc 45c04902 PILIER B):
+/// - journal_mode=WAL: required for concurrent reads + single writer.
+/// - foreign_keys=ON: enforce referential integrity (we don't rely on it
+///   in practice yet, but kept for safety).
+/// - busy_timeout=5000: tolerate contention between server + --index up
+///   to 5s, avoid immediate SQLITE_BUSY failures.
+/// - synchronous=NORMAL: WAL-recommended trade-off, durability preserved
+///   per-COMMIT, small window of last-tx loss on crash is acceptable
+///   (DB is reconstructible from YAML via PILIER D).
+/// - wal_autocheckpoint=1000: explicit (default is 1000 too) so a reader
+///   of the code immediately sees the checkpoint frequency.
+const DEFENSIVE_PRAGMAS: &str = "\
+PRAGMA journal_mode=WAL;\
+PRAGMA foreign_keys=ON;\
+PRAGMA busy_timeout=5000;\
+PRAGMA synchronous=NORMAL;\
+PRAGMA wal_autocheckpoint=1000;\
+";
+
 pub struct OrchestratorDb {
     conn: Connection,
 }
@@ -76,18 +97,63 @@ pub struct OrchestratorDb {
 impl OrchestratorDb {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OrchestratorError> {
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        conn.execute_batch(DEFENSIVE_PRAGMAS)?;
         Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> Result<Self, OrchestratorError> {
         let conn = Connection::open_in_memory()?;
+        // In-memory DBs return "memory" for journal_mode but accept all
+        // other PRAGMAs harmlessly. Apply the same preamble for uniformity.
+        conn.execute_batch(DEFENSIVE_PRAGMAS)?;
         Ok(Self { conn })
     }
 
+    /// Apply the schema migration inside a single BEGIN IMMEDIATE/COMMIT
+    /// transaction. Rationale (cf. design-doc 45c04902 PILIER C and
+    /// diagnostic 378c387c factor 3): if SIGKILL strikes mid-DDL, SQLite
+    /// will rollback the partial transaction on the next open via WAL
+    /// recovery, eliminating the FTS5 partially-materialized schema risk.
     pub fn migrate(&self) -> Result<(), OrchestratorError> {
-        self.conn.execute_batch(SCHEMA_SQL)?;
-        self.conn.execute_batch(FTS_SQL)?;
+        let migration_sql = format!("BEGIN IMMEDIATE;{SCHEMA_SQL}{FTS_SQL}COMMIT;");
+        self.conn.execute_batch(&migration_sql)?;
+        Ok(())
+    }
+
+    /// Run `PRAGMA integrity_check` and return true if the result is
+    /// exactly "ok". Used by the boot autorepair (PILIER D) to detect
+    /// corruption before serving requests.
+    ///
+    /// Logs the corruption details to stderr when the result is not "ok"
+    /// (best-effort logging, no error propagation on log failure).
+    pub fn integrity_check(&self) -> Result<bool, OrchestratorError> {
+        let mut stmt = self.conn.prepare("PRAGMA integrity_check;")?;
+        let rows: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // SQLite returns a single row "ok" when healthy, otherwise one or
+        // more rows describing the corruption.
+        let is_ok = rows.len() == 1 && rows[0] == "ok";
+        if !is_ok {
+            eprintln!(
+                "[companyos:orchestrator] integrity_check failed with {} row(s):",
+                rows.len()
+            );
+            for row in &rows {
+                eprintln!("  - {row}");
+            }
+        }
+        Ok(is_ok)
+    }
+
+    /// Execute `PRAGMA wal_checkpoint(TRUNCATE)` to flush all WAL frames
+    /// into the main DB file and truncate the WAL to zero. Used by the
+    /// graceful shutdown sequence (PILIER C) to leave the DB in a clean
+    /// state without -wal/-shm residuals.
+    pub fn checkpoint_truncate(&self) -> Result<(), OrchestratorError> {
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
     }
 
@@ -677,6 +743,53 @@ mod tests {
         let db = OrchestratorDb::open(":memory:").unwrap();
         db.migrate().unwrap();
         db
+    }
+
+    // --- PILIER B / PILIER C / PILIER D : defensive PRAGMAs, transactional
+    //     migrate, and integrity_check / checkpoint_truncate helpers.
+
+    #[test]
+    fn test_integrity_check_passes_on_fresh_db() {
+        let db = setup_db();
+        let ok = db.integrity_check().unwrap();
+        assert!(ok, "integrity_check should return true on a fresh DB");
+    }
+
+    #[test]
+    fn test_migrate_is_idempotent() {
+        // The wrapping transaction must still allow multiple calls
+        // (each call wraps SCHEMA_SQL + FTS_SQL in a fresh BEGIN/COMMIT,
+        // and all CREATE statements are IF NOT EXISTS).
+        let db = OrchestratorDb::open(":memory:").unwrap();
+        db.migrate().unwrap();
+        db.migrate().unwrap();
+        let ok = db.integrity_check().unwrap();
+        assert!(ok);
+    }
+
+    #[test]
+    fn test_checkpoint_truncate_noop_on_memory_db() {
+        // In-memory DBs have no WAL but the PRAGMA must still succeed.
+        let db = setup_db();
+        db.checkpoint_truncate().unwrap();
+    }
+
+    #[test]
+    fn test_defensive_pragmas_applied() {
+        // Validate that busy_timeout and synchronous are at expected values.
+        let db = setup_db();
+        let busy_timeout: i64 = db
+            .conn
+            .query_row("PRAGMA busy_timeout;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy_timeout, 5000);
+
+        // synchronous=NORMAL is encoded as 1.
+        let synchronous: i64 = db
+            .conn
+            .query_row("PRAGMA synchronous;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 1, "synchronous should be NORMAL (1)");
     }
 
     fn make_round(id: Uuid) -> ReviewRound {
