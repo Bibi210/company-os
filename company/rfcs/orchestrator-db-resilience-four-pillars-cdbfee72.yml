@@ -56,6 +56,137 @@ metadata:
       relationship: related
   changelog:
     - date: "2026-05-27"
+      author: implementer
+      description: >
+        Révision iteration 5 — AMENDEMENT POST-IMPLÉMENTATION par
+        l'Implementer. Engagé par étape 10.0 de l'implementation-plan
+        d1dcdc4e. Reconnaît empiriquement deux contraintes
+        techniques découvertes pendant l'exécution du plan, et
+        reformule les passages concernés sans changer la finalité
+        des piliers ni la cible d'élimination de la concurrence
+        non coordonnée du FACTEUR 1 du diagnostic 378c387c.
+
+        AMENDEMENT 1 — Comportement de `--index` quand le lock
+        exclusif est tenu par un serveur (PROPOSITION 1 étape 3
+        sous-cas 1, 2, 3).
+
+        VERSION ITERATION 3-4 (NON RÉALISABLE) : --index, quand il
+        détecte EWOULDBLOCK sur le flock, appelle le tool MCP
+        index_now via le serveur orchestrator pour déléguer
+        l'indexation, avec trois sous-cas (succès, erreur métier,
+        MCP injoignable).
+
+        VERSION ITERATION 5 (RÉELLE) : --index, quand il détecte
+        EWOULDBLOCK sur le flock, logue sur stdout
+        "Server detected via flock, indexing of <path> delegated to
+        file watcher" et exit 0. Pas d'appel MCP. Le file watcher
+        du serveur indexera le YAML modifié dans la seconde grâce
+        à son debounce de 500ms. Cf. crates/mcp-servers/orchestrator/src/main.rs
+        fn run_index (commit 3f60aaa).
+
+        IMPOSSIBILITÉ TECHNIQUE. L'outil index_now reste exposé
+        côté serveur (commit 8ab0eeb), mais --index ne peut pas
+        l'appeler car le transport MCP du serveur orchestrator
+        est stdio uniquement (cf. crates/mcp-servers/orchestrator/src/main.rs
+        ligne `let (stdin, stdout) = rmcp::transport::io::stdio()`),
+        ce qui exclut toute connexion cross-process depuis un
+        autre binaire Rust. index_now reste accessible aux
+        appelants secondaires : agents au sein d'une session
+        opencode, tests futurs qui spawnent leur propre client
+        MCP, scripts CI qui auraient leur propre transport.
+
+        IMPACT SUR LE CONTRAT FONCTIONNEL. Aucun. Le contrat
+        tacite "tout YAML écrit est searchable dans la seconde"
+        reste tenu via le file watcher serveur (debounce 500ms).
+        L'invariant d'unicité d'indexation est strictement
+        préservé : quand le serveur tient le lock, c'est lui
+        l'unique indexeur (file watcher) ; quand il ne le tient
+        pas, --index prend le relais avec son propre lock exclusif.
+        Aucune fenêtre de double-indexation possible.
+
+        AMENDEMENT 2 — Refactor des call sites sqlite3 du hook
+        defense-in-depth (PROPOSITION 5, call sites 1 à 4).
+
+        VERSION ITERATION 3-4 (NON RÉALISABLE) : les quatre call
+        sites sqlite3 inline du hook (hasActivePermit L105,
+        snapshotPermits L188, revertPermitTampering nuclear L200,
+        revertPermitTampering selective L206) sont refactorés en
+        appels MCP vers check_write_permit (existant) et
+        snapshot_permits_state / revert_permits_to_snapshot
+        (nouveaux). Le hook ne touche plus directement la DB.
+
+        VERSION ITERATION 5 (RÉELLE) : les quatre call sites
+        sqlite3 inline sont CONSERVÉS, mais wrappés dans un
+        helper runSqliteWithTimeout qui prepend
+        '.timeout 5000' (équivalent CLI du PRAGMA busy_timeout
+        appliqué par le binaire Rust en PILIER B) avant chaque
+        invocation sqlite3. Concrètement : les concurrences brèves
+        entre le serveur et le hook n'échouent plus immédiatement
+        en SQLITE_BUSY mais attendent jusqu'à 5s la libération
+        du lock SQLite interne. Cf. company/plugins/defense-in-depth-core.mjs
+        fn runSqliteWithTimeout (commit f01cc68). Les outils MCP
+        snapshot_permits_state, revert_permits_to_snapshot
+        restent EXPOSÉS côté serveur (commit 8ab0eeb) pour des
+        appelants futurs.
+
+        IMPOSSIBILITÉ TECHNIQUE. Le hook defense-in-depth tourne
+        dans le runtime opencode, qui injecte un contexte
+        {project, client, $, directory, worktree} où `client` est
+        un client SDK opencode (pour app.log, sessions, etc.),
+        PAS un client MCP. Le hook ne peut donc pas appeler des
+        tools MCP sans une voie de communication supplémentaire
+        (par exemple un socket unix vers le serveur, ou un client
+        MCP injecté par opencode dans les hooks). Ces deux pistes
+        sont hors scope du présent RFC.
+
+        IMPACT SUR L'INVARIANT D'UNICITÉ. Partiel mais matériellement
+        réduit par rapport à l'état pré-RFC :
+        - Les call sites SELECT (hasActivePermit, snapshotPermits)
+          restent multi-ouvreurs en lecture. SQLite WAL accepte
+          plusieurs lecteurs simultanés sans corruption, donc
+          tolérable.
+        - Les call sites DELETE (revertPermitTampering) sont
+          déclenchés UNIQUEMENT quand un tampering est détecté
+          (snapshot avant et après bash ne matchent pas) — chemin
+          rare en pratique.
+        - Tous les call sites héritent désormais du busy_timeout
+          5s qui aligne le hook sur la posture PILIER B du
+          serveur.
+        - Le risque résiduel est inférieur à l'état pré-RFC
+          où aucun busy_timeout n'était posé et où les sqlite3
+          échouaient immédiatement en SQLITE_BUSY pendant les
+          fenêtres de contention.
+
+        AMÉLIORATIONS FUTURES. Un RFC ultérieur pourra :
+        (a) ajouter un transport non-stdio à l'orchestrator
+            (socket unix, TCP local), permettant à --index ET au
+            hook d'appeler les tools MCP cross-process ;
+        (b) demander à opencode d'injecter un client MCP dans le
+            runtime des plugins (upstream change) ;
+        (c) déléguer les opérations de tampering au binaire
+            CLI via un sous-mode dédié (--snapshot-permits,
+            --revert-permits-snapshot) qui ouvre une connexion
+            sqlite3 native avec PRAGMA busy_timeout et flock
+            cooperative (mode lecteur partagé sans bloquer le
+            serveur).
+
+        Aucune de ces voies n'est obligatoire pour atteindre les
+        acceptance criteria du task-request ffb85fc7 : le risque
+        de corruption identifié par le diagnostic 378c387c est
+        attaqué par les PILIERs A (lock OS), B (PRAGMA défensifs
+        appliqués des deux côtés), C (graceful shutdown) et D
+        (autorepair). L'amendement 2 dégrade marginalement la
+        pureté de PILIER A mais ne casse pas la sécurité du
+        système.
+
+        IMPACT SUR LA REVIEW. Cet amendement est soumis à un
+        review round séparé (auteur = implementer, reviewers =
+        pm, architect, ceo) pour valider la reformulation. Si
+        approuvé, le RFC passe en status: implemented à l'étape
+        10.4 du plan d1dcdc4e. Si rejeté : retour à l'Architect
+        pour design d'une voie technique alternative.
+
+    - date: "2026-05-27"
       author: architect
       description: >
         Révision iteration 4 suite au round 0564de3c sur le RFC
