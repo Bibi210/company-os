@@ -4,7 +4,7 @@
 architect:
   role: Conçoit les systèmes. Produit les design docs et les RFCs. Autorité technique.
   produces: design-doc, rfc, lesson-learned
-  consumes: task-request, implementation-plan, review-report, diagnostic-report
+  consumes: task-request, implementation-plan, review-report, diagnostic-report, roadmap
   review: Review le code et les tests en vérifiant la conformité avec le design doc. Vérifie que les décisions architecturales sont respectées et que la structure du code est cohérente.
 
 ceo:
@@ -21,7 +21,7 @@ implementer:
 
 pm:
   role: Seul agent visible par l'utilisateur. Clarifie l'intent, crée les task-requests, orchestre le workflow.
-  produces: task-request, lesson-learned
+  produces: task-request, lesson-learned, roadmap
   consumes: design-doc, implementation-plan, review-report, lesson-learned, diagnostic-report
   review: Review les design-docs en vérifiant que le design répond au task-request. Focus sur l'alignement avec les besoins exprimés par l'utilisateur.
 
