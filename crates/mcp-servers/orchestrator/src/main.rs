@@ -894,7 +894,8 @@ async fn run_server() -> anyhow::Result<()> {
     )?;
     tracing::info!("Acquired exclusive DB lock on {lock_path}");
 
-    let db = OrchestratorDb::open(format!("{db_dir}/{}", constants::DB_FILENAME))?;
+    let db_file = format!("{db_dir}/{}", constants::DB_FILENAME);
+    let db = OrchestratorDb::open(&db_file)?;
     db.migrate()?;
 
     let schemas_dir = format!("{root}/{}", constants::SCHEMAS_DIR);
@@ -902,6 +903,46 @@ async fn run_server() -> anyhow::Result<()> {
     let validator = Arc::new(RwLock::new(ArtifactValidator::new(registry)));
 
     let engine = OrchestratorEngine::new(db, max_iterations);
+
+    // PILIER D — autorepair at boot. If integrity_check reports
+    // corruption, rebuild the DB from the YAML index source of truth.
+    let engine = match engine.integrity_check() {
+        Ok(true) => engine,
+        Ok(false) => {
+            eprintln!(
+                "[companyos:{C}] Database corruption detected at boot — rebuilding from YAML"
+            );
+            let db = engine.into_db_for_rebuild();
+            drop(db);
+            // Remove the corrupted DB + its WAL/SHM siblings. Errors are
+            // logged but not fatal: missing files are fine, real IO
+            // errors are recovered when the new open() succeeds anyway.
+            let _ = std::fs::remove_file(&db_file);
+            let _ = std::fs::remove_file(format!("{db_file}-wal"));
+            let _ = std::fs::remove_file(format!("{db_file}-shm"));
+
+            let new_db = OrchestratorDb::open(&db_file)?;
+            new_db.migrate()?;
+            let new_engine = OrchestratorEngine::new(new_db, max_iterations);
+            // Rebuild synchronously before the server starts serving
+            // requests. read() the validator under its RwLock once.
+            let validator_guard = validator.read().await;
+            let count = new_engine
+                .reindex_all(&root, &validator_guard)
+                .map_err(|e| anyhow::anyhow!("rebuild reindex_all failed: {e}"))?;
+            drop(validator_guard);
+            eprintln!(
+                "[companyos:{C}] Database rebuilt from YAML index — {count} artifacts re-indexed"
+            );
+            new_engine
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "integrity_check failed before any work: {e}"
+            ));
+        }
+    };
+
     let engine = Arc::new(Mutex::new(engine));
 
     let server = OrchestratorServer::new(engine.clone(), validator.clone(), root.clone());
@@ -909,7 +950,7 @@ async fn run_server() -> anyhow::Result<()> {
     let (stdin, stdout) = rmcp::transport::io::stdio();
 
     // Reindex in background after MCP handshake is ready
-    tokio::spawn({
+    let reindex_handle = tokio::spawn({
         let engine = engine.clone();
         let validator = validator.clone();
         let root = root.clone();
@@ -924,13 +965,13 @@ async fn run_server() -> anyhow::Result<()> {
     });
 
     // File watcher: auto-reload config/schemas/artifacts on disk changes
-    match watcher::spawn_watcher(&root, Duration::from_millis(500)) {
+    let watcher_handle_opt = match watcher::spawn_watcher(&root, Duration::from_millis(500)) {
         Ok(mut handle) => {
             let engine = engine.clone();
             let validator = validator.clone();
             let root = root.clone();
             let schemas_dir = schemas_dir.clone();
-            tokio::spawn(async move {
+            let task_handle = tokio::spawn(async move {
                 while let Some(change) = handle.rx.recv().await {
                     match change {
                         ConfigChangeKind::Config => match CompanyConfig::load(&root) {
@@ -960,14 +1001,58 @@ async fn run_server() -> anyhow::Result<()> {
                     }
                 }
             });
+            Some(task_handle)
         }
         Err(e) => {
             tracing::warn!("File watcher unavailable, manual reload_config still works: {e}");
+            None
+        }
+    };
+
+    // PILIER C — graceful shutdown signal-driven. Install SIGTERM and
+    // SIGINT handlers, then race them with the MCP service.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+
+    let service = server.serve((stdin, stdout)).await?;
+
+    tokio::select! {
+        result = service.waiting() => {
+            match result {
+                Ok(_) => tracing::info!("MCP service ended normally"),
+                Err(e) => tracing::warn!("MCP service ended with error: {e}"),
+            }
+        }
+        _ = sigterm.recv() => {
+            tracing::info!("SIGTERM received, initiating graceful shutdown");
+        }
+        _ = sigint.recv() => {
+            tracing::info!("SIGINT received, initiating graceful shutdown");
         }
     }
 
-    let service = server.serve((stdin, stdout)).await?;
-    service.waiting().await?;
+    // Shutdown sequence (PILIER C):
+    // (1) Drop the watcher handle: the notify thread shuts down on FD
+    //     close and the consumer task exits when the channel closes.
+    if let Some(h) = watcher_handle_opt {
+        h.abort();
+    }
+    // (2) Await reindex background with a bounded timeout. If it doesn't
+    //     finish in time, abort and continue (data loss acceptable: a
+    //     reindex is idempotent and will rerun at next boot).
+    if let Err(_e) = tokio::time::timeout(Duration::from_secs(5), reindex_handle).await {
+        tracing::warn!("reindex_all background did not finish in 5s — aborting");
+    }
+    // (3) Explicit WAL checkpoint TRUNCATE on the main connection so the
+    //     DB is left in a clean state without -wal/-shm residuals.
+    {
+        let engine = engine.lock().await;
+        match engine.checkpoint_truncate() {
+            Ok(()) => tracing::info!("PRAGMA wal_checkpoint(TRUNCATE) done at shutdown"),
+            Err(e) => tracing::warn!("Checkpoint TRUNCATE failed at shutdown: {e}"),
+        }
+    }
+    // (4) Drop the engine + lock_guard happens at scope exit.
 
     Ok(())
 }
