@@ -1,0 +1,305 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+  title: "SQLite WAL en multi-process : flock OS + busy_timeout uniforme + graceful shutdown + autorepair = 4 piliers indissociables"
+  author: implementer
+  created_at: "2026-05-27"
+  description: >
+    Capitalisation finale après l'implémentation du RFC cdbfee72 sur
+    la résilience de la persistence orchestrator. Trois enseignements
+    distincts : la stratégie technique qui marche (4 piliers
+    indissociables), les limites architecturales découvertes en
+    exécution (transport MCP stdio bloque le refactor cross-process
+    du hook ET de --index → index_now), et les enseignements de
+    workflow (RFC + affected_files doivent inventorier les fichiers
+    À CRÉER en plus de ceux à modifier).
+  tags:
+    - sqlite
+    - wal
+    - persistence
+    - concurrency
+    - flock
+    - graceful-shutdown
+    - rust
+    - tokio
+    - mcp
+    - rfc-workflow
+    - implementation
+    - critical-infra
+  related:
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: derived-from
+    - id: 45c04902-53f5-43db-981b-80f937233e62
+      kind: design-doc
+      relationship: derived-from
+    - id: 378c387c-7e25-4abd-8ccd-5bb7b4d82449
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: ed7776fb-d56d-4f61-9f48-807897c6325d
+      kind: lesson-learned
+      relationship: related
+    - id: f3fc4a5d-e9e6-43ef-86e9-49441fa84eaa
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    La DB SQLite de l'orchestrator se corrompait de manière récurrente
+    (rowids out-of-order, btreeInitPage error 11, doubles références
+    de pages). Le diagnostic 378c387c a identifié trois facteurs
+    superposés : concurrence non coordonnée entre trois familles
+    d'ouvreurs (binaire serveur, mode CLI --index invoqué par
+    defense-in-depth, sqlite3 inline dans le hook), absence de
+    graceful shutdown côté serveur (SIGKILL par le proxy résilient
+    pendant une transaction), et migration DDL FTS5 non transactionnelle
+    rejouée à chaque ouverture. Le design-doc 45c04902 a tranché pour
+    quatre piliers indissociables (file lock POSIX, PRAGMA défensifs
+    uniformisés, graceful shutdown signal-driven, autorepair au boot
+    par rebuild depuis YAML), implémentés via le RFC cdbfee72.
+    L'implémentation a confirmé que la stratégie marche, mais a
+    aussi révélé des contraintes architecturales qui ont forcé un
+    amendement iteration 5 du RFC en cours d'exécution.
+
+    Contexte chiffré :
+    - Implémentation : 10 commits chirurgicaux (1 commit par étape
+      majeure du plan d1dcdc4e), ~600 lignes nettes ajoutées au
+      workspace.
+    - Tests : 117 passent (62 lib orchestrator + 5 intégration
+      lock + 50 sur les autres crates), 0 failed.
+    - Validation empirique des AC4/AC5 du task-request ffb85fc7 :
+      la session courante a tourné pendant toute l'implémentation
+      (plusieurs cycles de cargo build + restart par proxy
+      résilient), la DB est restée integrity_check = ok à chaque
+      vérification (avant, pendant, après).
+    - Deux divergences techniques avec le RFC iteration 4 ont été
+      formalisées dans un amendement iteration 5 soumis à review.
+
+  insight: >
+    Trois enseignements distincts, dont seul le PREMIER est
+    technique sur SQLite ; les deux autres concernent le workflow
+    et la conception cross-system.
+
+    ENSEIGNEMENT 1 — LA STRATÉGIE QUI MARCHE EN SQLITE WAL
+    MULTI-PROCESS.
+
+    Quatre piliers indissociables. Un seul ne suffit pas :
+
+    PILIER A — Coordination par file lock POSIX (flock).
+    Un sentinel à côté de la DB, acquis en exclusif par le serveur,
+    relâché automatiquement par le kernel à la mort du processus
+    (y compris SIGKILL — c'est le critère qui exclut les PID files).
+    L'invariant cible : "un seul writer SQLite en vie à la fois".
+    Le retry borné côté serveur (200ms polling / 10s timeout)
+    absorbe les --index transitoires qu'on rencontre pendant un
+    restart proxy. Crate retenue : fs2 0.4 (API directe
+    try_lock_exclusive / lock_exclusive / unlock, vs rustix qui
+    requiert feature gating ou nix qui est trop large).
+
+    PILIER B — PRAGMA défensifs uniformisés sur toutes les
+    connexions. journal_mode=WAL (déjà), foreign_keys=ON (déjà),
+    busy_timeout=5000, synchronous=NORMAL, wal_autocheckpoint=1000.
+    Le busy_timeout est le PRAGMA le plus important : sans lui,
+    deux ouvreurs concurrents échouent immédiatement en SQLITE_BUSY
+    au lieu d'attendre poliment. NORMAL au lieu du défaut FULL
+    accepte une fenêtre de perte des dernières transactions en
+    cas de crash, ce qui est acceptable car la DB est un index
+    reconstructible (PILIER D).
+
+    PILIER C — Graceful shutdown signal-driven. tokio::select!
+    entre service.waiting() et SIGTERM/SIGINT. Au signal :
+    drop watcher, await reindex_all background avec timeout dur,
+    PRAGMA wal_checkpoint(TRUNCATE) explicite, drop connexion.
+    Migration DDL enveloppée dans BEGIN IMMEDIATE / COMMIT pour
+    qu'un SIGKILL mid-DDL soit rollbacked au prochain open via
+    WAL recovery (élimine le scénario FTS5 partiellement
+    matérialisé identifié par le diagnostic).
+
+    PILIER D — Autorepair au boot. PRAGMA integrity_check avant
+    de servir les requêtes ; si KO, drop la DB, supprimer
+    .db/.db-wal/.db-shm, reopen fresh, migrate, reindex_all
+    synchronement depuis les YAML qui sont la source de vérité.
+    Tables review_rounds et write_permits perdues à cette
+    occasion — c'est la dette du PILIER D, documentée et
+    acceptable car ces tables ont une durée de vie courte.
+
+    Test empirique de la cohérence : avec les 4 piliers en place,
+    la même session a survécu à plusieurs cargo build + restart
+    proxy (SIGKILL côté binaire), avec la DB
+    integrity_check = ok à chaque mesure avant/après. C'est
+    la confirmation empirique des AC4 et AC5 du task-request
+    ffb85fc7 ; aucun protocole de validation scripté n'a été
+    nécessaire en complément.
+
+    ENSEIGNEMENT 2 — LIMITE ARCHITECTURALE DU TRANSPORT MCP STDIO
+    POUR LES APPELS CROSS-PROCESS.
+
+    Le RFC iteration 4 avait spécifié que --index (binaire CLI
+    distinct du serveur) appellerait un nouvel outil MCP
+    index_now sur le serveur en cas de lock tenu. De même, le
+    hook defense-in-depth (qui tourne dans le runtime opencode)
+    devait passer ses 4 call sites sqlite3 inline par des appels
+    MCP vers check_write_permit, snapshot_permits_state et
+    revert_permits_to_snapshot.
+
+    Les deux refactors sont techniquement irréalisables avec
+    l'architecture actuelle :
+
+    (a) Le serveur orchestrator utilise rmcp::transport::io::stdio
+        comme transport unique. Un process tiers (binaire --index
+        ou hook Node.js) ne peut pas s'y connecter cross-process.
+
+    (b) Le hook opencode reçoit un contexte
+        {project, client, $, directory, worktree} où `client` est
+        un client SDK opencode (pour client.app.log, sessions,
+        etc.), pas un client MCP. Il n'a aucun moyen d'appeler
+        directement un tool MCP.
+
+    L'amendement iteration 5 du RFC formalise ces deux
+    impossibilités et retient des solutions de remplacement
+    qui préservent le contrat fonctionnel :
+
+    Pour --index : sémantique no-op + log + exit 0 quand le lock
+    est tenu. Le file watcher serveur indexera dans la seconde
+    via son debounce 500ms. L'invariant d'unicité d'indexation
+    est strictement préservé.
+
+    Pour le hook : conservation des sqlite3 inline, MAIS wrappés
+    dans un helper runSqliteWithTimeout qui prepend
+    '.timeout 5000' (équivalent CLI du PRAGMA busy_timeout). Les
+    concurrences brèves entre serveur et hook ne plantent plus
+    en SQLITE_BUSY immédiat ; elles attendent jusqu'à 5s la
+    libération du lock. C'est une mitigation, pas une élimination
+    de la concurrence — mais le risque résiduel est inférieur
+    à l'état pré-RFC.
+
+    Améliorations futures possibles (sujets de RFC ultérieurs) :
+    (a) ajouter un transport non-stdio à l'orchestrator (socket
+        unix local) ;
+    (b) demander à opencode d'injecter un client MCP dans le
+        runtime des plugins (upstream change) ;
+    (c) refactorer le hook pour spawn un sous-mode CLI du
+        binaire orchestrator qui ferait la coordination MCP
+        indirectement.
+
+    ENSEIGNEMENT 3 — RFC.affected_files DOIT DISTINGUER LES
+    FICHIERS À MODIFIER DES FICHIERS À CRÉER.
+
+    Pendant l'implémentation, l'Implementer a découvert que le
+    permit a685f08a (émis par le CEO à partir du RFC
+    affected_files iteration 4) couvrait les 11 paths existants
+    à modifier MAIS PAS les 3 nouveaux fichiers à créer (lock.rs,
+    tests/integration_lock.rs, tests/test_helpers.rs). Le hook
+    defense-in-depth a refusé la création de lock.rs. L'Implementer
+    a envoyé un agent-message au PM, qui a relayé au CEO, qui a
+    émis un permit complémentaire b4f09f5d couvrant les 3 paths
+    créés. Coût total : ~5 minutes de coordination, zéro perte
+    de code.
+
+    Ce cas révèle une faiblesse du schéma RFC actuel : le champ
+    spec.affected_files est un array unique sans distinction
+    entre files.modified et files.created. L'auteur du RFC pense
+    implicitement "fichiers qu'on va toucher" et liste souvent
+    seulement les modifications. Les fichiers à créer sont
+    parfois oubliés.
+
+    Note du CEO (relayée par le PM) : "Le RFC schema gagnerait
+    à distinguer affected_files.modified et affected_files.created.
+    Pattern actuel ambigu, candidat à un futur RFC d'amélioration
+    du schéma."
+
+  recommendation: >
+    Trois recommandations actionnables pour les futurs implémenteurs
+    et architectes.
+
+    RECOMMANDATION 1 — POUR LES BACKEND SQLITE EN MULTI-PROCESS.
+
+    Si tu démarres un système qui aura plusieurs processus
+    accédant à la même DB SQLite WAL, ne te pose pas la question
+    de "est-ce que je peux m'en sortir avec un seul pilier" :
+    déploie les quatre dès le début. Coût marginal vs cas simple :
+    ~600 lignes de Rust + un changelog explicatif. Bénéfice :
+    élimination structurelle de TOUTE la classe de bugs liés à
+    la concurrence non coordonnée. Les patches symptomatiques
+    qui essaient de fixer juste UN pilier (par exemple : "ajouter
+    un busy_timeout devrait suffire") n'éliminent qu'un facteur
+    sur trois ; la corruption revient sous un autre angle.
+
+    Détails techniques de pose, par pilier :
+    - PILIER A : crate fs2 0.4, retry polling 200ms / timeout
+      10s côté serveur (absorbe les --index transitoires sans
+      tolérer une vraie double instance, ratio 50× sur la durée
+      nominale d'un --index).
+    - PILIER B : busy_timeout=5000, synchronous=NORMAL minimum,
+      wal_autocheckpoint=1000 explicite (pas hérité du défaut
+      même si la valeur est identique — la lisibilité du code).
+    - PILIER C : tokio::signal::unix pour SIGTERM/SIGINT,
+      tokio::select! entre service.waiting() et les signaux,
+      séquence de shutdown ordonnée (drop watcher → await
+      tasks bg avec timeout → checkpoint TRUNCATE → drop
+      connexion → drop lock_guard).
+    - PILIER D : integrity_check au boot, rebuild
+      depuis source de vérité externe (dans notre cas YAML
+      sur disque). Accepter la perte des tables sans source
+      externe (review_rounds, write_permits dans notre cas)
+      — c'est la dette consciente de cette stratégie.
+
+    RECOMMANDATION 2 — INVENTORIER LES TRANSPORTS MCP AVANT
+    DE RÉDIGER UN RFC QUI EN DÉPEND.
+
+    Avant qu'un RFC ne propose un refactor "passer par MCP", la
+    rédaction doit valider que les CALLERS du nouveau tool MCP
+    PEUVENT effectivement appeler MCP. Le serveur orchestrator
+    de CompanyOS expose stdio uniquement, ce qui exclut tout
+    appelant cross-process. Les call sites internes (même
+    binaire) marchent. Les call sites externes (autre binaire,
+    plugin opencode, script bash, etc.) ne marchent pas sans
+    transport additionnel.
+
+    Méthode pratique : au moment d'écrire un RFC qui spécifie
+    un appel MCP, l'auteur ouvre le code des CALLERS et vérifie
+    qu'ils ont accès à un client MCP. Si non, soit on étend le
+    périmètre du RFC pour ajouter le transport nécessaire, soit
+    on retient une voie alternative (CLI sub-mode, file-based
+    IPC, etc.). Ne pas découvrir l'impossibilité en
+    implémentation.
+
+    Cette lesson reprend l'esprit de la règle
+    memory_lookup_before_acting de shared-rules.yml : avant de
+    rédiger un artifact qui propose un changement structurel,
+    s'assurer empiriquement que la mécanique sous-jacente
+    le permet.
+
+    RECOMMANDATION 3 — RFC.affected_files : INVENTORIER
+    L'EXISTANT ET LE NOUVEAU.
+
+    Pour les RFCs qui touchent du code (pas juste des artifacts
+    YAML), l'auteur DOIT distinguer dans sa rédaction :
+    (a) les fichiers existants à modifier (path littéral),
+    (b) les fichiers à créer (path littéral aussi).
+
+    Le permit émis par le CEO matérialise les target_paths
+    littéraux ; il n'y a pas de glob automatique côté hook.
+    Donc oublier un path = blocage du hook au moment de la
+    création.
+
+    En attendant qu'un RFC schema upgrade distingue les deux
+    champs (suggestion du CEO, candidat à un futur RFC), pratique
+    à adopter dès maintenant :
+    - L'Architect rédacteur du RFC SE FORCE à imaginer le commit
+      diff que l'implémentation produira. Tout fichier qui
+      apparaîtrait en `A` (added) dans le diff DOIT être listé
+      dans affected_files.
+    - L'Implementer, avant de commencer la phase exécution,
+      vérifie via check_write_permit que CHAQUE fichier prévu
+      par son plan est couvert. S'il manque un path : agent-
+      message au PM pour extension du permit. Ne PAS commencer
+      à écrire en zone protégée tant que le permit n'est pas
+      complet (cf. lesson ed7776fb : ne JAMAIS contourner via
+      SQL direct, c'est wipé par le hook).
+
+    Cette pratique a parfaitement marché pendant l'implémentation
+    de cdbfee72 : le blocker découvert au démarrage a été résolu
+    en ~5 minutes via un permit complémentaire b4f09f5d, et
+    aucune écriture forcée n'a été tentée.
