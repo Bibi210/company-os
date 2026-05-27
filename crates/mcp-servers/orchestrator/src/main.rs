@@ -778,12 +778,65 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+// --- PILIER A constants (file-lock coordination, RFC cdbfee72) ---
+const LOCK_FILENAME: &str = "orchestrator.lock";
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+const LOCK_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// CLI mode: index a single artifact file (called by defense-in-depth plugin).
+///
+/// Implements the NO-OP-IF-SERVER semantics tranchée by the
+/// implementation-plan étape 5.2 (option (b) of design-doc finding 2):
+///
+/// - if the file lock is free → acquire it, run the indexing work, release
+///   it. Normal off-server CLI path.
+/// - if the lock is held by another writer (server) → no-op + log + exit 0.
+///   The server's file watcher will pick up the YAML change within ~500ms.
+///
+/// The RFC step 5.2 originally specified an MCP call to `index_now` here,
+/// but this is technically impossible cross-process given the
+/// orchestrator's stdio transport. An amendment of the RFC documenting
+/// this constraint is engagé in étape 10.0 of the plan.
 fn run_index(file_path: &str) -> anyhow::Result<()> {
     let root = std::env::var(constants::ENV_COMPANYOS_ROOT).unwrap_or_else(|_| ".".into());
 
     let db_dir = format!("{root}/{}", constants::DATA_DIR);
     std::fs::create_dir_all(&db_dir)?;
+
+    let lock_path = format!("{db_dir}/{LOCK_FILENAME}");
+
+    // Try to acquire the lock non-blocking. If another writer (server)
+    // holds it, we become a no-op: the watcher will index.
+    let _lock_guard = match companyos_orchestrator::lock::try_acquire_exclusive(
+        std::path::Path::new(&lock_path),
+    ) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            println!(
+                "{}",
+                Diagnostic::info(
+                    C,
+                    format!(
+                        "Server detected via flock, indexing of {file_path} delegated to file watcher"
+                    ),
+                )
+                .with_context(format!("run_index(path={file_path})"))
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            eprintln!(
+                "{}",
+                Diagnostic::warning(C, format!("Lock probe failed for {lock_path}"))
+                    .with_context(format!("run_index(path={file_path})"))
+                    .with_reason(format!("{e}"))
+            );
+            // Lock probe failed for a non-EWOULDBLOCK reason (permissions,
+            // missing parent dir, etc.). Exit non-zero so the caller can
+            // surface the issue.
+            return Err(anyhow::anyhow!("Failed to probe DB lock: {e}"));
+        }
+    };
 
     let db = OrchestratorDb::open(format!("{db_dir}/{}", constants::DB_FILENAME))?;
     db.migrate()?;
@@ -812,6 +865,7 @@ fn run_index(file_path: &str) -> anyhow::Result<()> {
             Ok(())
         }
     }
+    // _lock_guard drops here on the happy path too → lock released.
 }
 
 async fn run_server() -> anyhow::Result<()> {
@@ -827,6 +881,18 @@ async fn run_server() -> anyhow::Result<()> {
 
     let db_dir = format!("{root}/{}", constants::DATA_DIR);
     std::fs::create_dir_all(&db_dir)?;
+
+    // PILIER A — acquire the exclusive lock with bounded retry. Absorbs
+    // transient --index holders during proxy-driven restarts (finding A
+    // round 2 of design-doc 45c04902). On timeout: error propagated up
+    // to main, exit non-zero with the LockBusy message.
+    let lock_path = format!("{db_dir}/{LOCK_FILENAME}");
+    let _lock_guard = companyos_orchestrator::lock::acquire_exclusive_blocking(
+        std::path::Path::new(&lock_path),
+        LOCK_RETRY_INTERVAL,
+        LOCK_RETRY_TIMEOUT,
+    )?;
+    tracing::info!("Acquired exclusive DB lock on {lock_path}");
 
     let db = OrchestratorDb::open(format!("{db_dir}/{}", constants::DB_FILENAME))?;
     db.migrate()?;
