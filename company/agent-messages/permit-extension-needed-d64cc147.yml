@@ -1,0 +1,137 @@
+api_version: companyos/v1
+kind: agent-message
+metadata:
+  id: d64cc147-9f45-4745-bb07-e36a1a687ee8
+  title: "Extension du write permit a685f08a requise (3 nouveaux paths)"
+  author: implementer
+  created_at: "2026-05-27"
+  from: implementer
+  to: pm
+  description: >
+    Pendant le démarrage de la Phase 2 d'implémentation du RFC
+    cdbfee72, l'Implementer a vérifié le périmètre exact du write
+    permit a685f08a-260d-4a6f-8c92-26b8d07ca5b5 via
+    check_write_permit. Trois paths planifiés à l'étape 2 et 9
+    du implementation-plan d1dcdc4e ne sont PAS couverts : le
+    nouveau module crates/orchestrator/src/lock.rs (étape 2.2),
+    et les deux fichiers de tests d'intégration Rust
+    crates/orchestrator/tests/integration_lock.rs +
+    crates/orchestrator/tests/test_helpers.rs (étape 9.1 et 9.2).
+    Le hook defense-in-depth rejettera leur création.
+    L'Implementer demande au PM de relancer le CEO pour étendre
+    le permit avec ces 3 paths.
+  tags:
+    - write-permit
+    - extension-needed
+    - implementation
+    - orchestrator
+  related:
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: related
+    - id: d1dcdc4e-1a33-42c6-8037-1fa3e3eba0a8
+      kind: implementation-plan
+      relationship: related
+
+spec:
+  content: >
+    PM,
+
+    Je commence l'implémentation du RFC cdbfee72 selon le plan
+    d1dcdc4e. Au moment de vérifier le périmètre du write permit
+    a685f08a-260d-4a6f-8c92-26b8d07ca5b5 avant la première
+    écriture en zone protégée, je constate que trois paths
+    planifiés ne sont pas couverts.
+
+    PERMIT ACTUEL — 11 paths, dont 7 dans crates/ déjà existants :
+
+      crates/orchestrator/src/db.rs
+      crates/orchestrator/src/error.rs
+      crates/orchestrator/src/lib.rs
+      crates/orchestrator/src/engine.rs
+      crates/orchestrator/Cargo.toml
+      crates/mcp-servers/orchestrator/src/main.rs
+      crates/mcp-servers/orchestrator/Cargo.toml
+      company/plugins/defense-in-depth-core.mjs
+      company/config/protected-zones.json
+      .gitignore
+      Cargo.lock
+
+    PATHS MANQUANTS — 3 nouveaux fichiers en zone protégée
+    crates/ :
+
+      crates/orchestrator/src/lock.rs
+          (étape 2.2 du plan : nouveau module hébergeant la
+          struct DbLockGuard et les fonctions
+          acquire_exclusive_blocking / try_acquire_exclusive ;
+          dépendance fs2 0.4)
+
+      crates/orchestrator/tests/integration_lock.rs
+          (étape 9.1 : tests d'intégration des scénarios
+          (a) boot propre, (d) double instance,
+          (e) serveur-vs-index-transitoire,
+          (e') zombie timeout, et le no-op de --index)
+
+      crates/orchestrator/tests/test_helpers.rs
+          (étape 9.2 : helpers de test — LocalTempDir Drop guard
+          inspiré de la lesson f3fc4a5d, spawn_server,
+          wait_for_server_ready)
+
+    ORIGINE DE L'OUBLI
+
+    Le RFC cdbfee72 liste les paths AFFECTÉS au sens "fichiers
+    où des changements seront commités". Sa rédaction implicitait
+    que les nouveaux fichiers prévus dans crates/orchestrator/
+    seraient couverts par un glob ou un préfixe — mais le permit
+    materialise ces paths au literal exact, sans glob automatique.
+    Le hook defense-in-depth.hasActivePermit fait du
+    startsWith + match exact (cf. defense-in-depth-core.mjs:111-118),
+    et le serveur côté check_write_permit (db.rs:531
+    path_matches via glob::Pattern) fait pareil. Aucun des paths
+    ci-dessus ne match les target_paths existants.
+
+    Vérification effectuée :
+
+      check_write_permit(persona=implementer,
+                         path=crates/orchestrator/tests/integration_lock.rs)
+      → {"has_permit": false}
+
+      check_write_permit(persona=implementer,
+                         path=crates/orchestrator/src/lock.rs)
+      → {"has_permit": false}
+
+    DEMANDE
+
+    Soit étendre le permit a685f08a en ajoutant ces 3 paths
+    (préférable car le RFC reste l'autorité de réference et
+    on n'éclate pas le suivi en plusieurs permits), soit émettre
+    un nouveau permit complémentaire qui les couvre. La première
+    option est plus propre côté traçabilité ; je laisse au CEO
+    le choix de la forme.
+
+    ALTERNATIVES DE CONTOURNEMENT examinées et écartées :
+
+    (1) Mettre le code de lock dans db.rs (couvert par le
+        permit) au lieu d'un module dédié. ÉCARTÉ : ça pollue
+        db.rs qui est déjà long (943 lignes) et viole la
+        décision (i) de l'étape 0 du plan (module dédié pour
+        la cohésion).
+
+    (2) Mettre les tests d'intégration en tests inline dans
+        db.rs (#[cfg(test)] mod tests existant). ÉCARTÉ : un
+        test d'intégration de lock doit spawn le binaire
+        compilé via std::process::Command — c'est l'idiome
+        d'un test d'intégration externe sous tests/, pas un
+        test unitaire inline dans la lib.
+
+    Je ne progresse pas tant que le permit n'est pas étendu.
+    Je continue en attendant uniquement sur les étapes 1 et 3
+    qui ne touchent que des paths déjà couverts (db.rs +
+    engine.rs). Le bloquant est essentiellement le module lock.rs
+    (étape 2.2) qui conditionne ensuite les étapes 5 (acquisition
+    dans main.rs), 6 (shutdown), 7 (autorepair) et 9 (tests).
+
+    Merci de relayer au CEO. Quand le permit est étendu, je
+    reprends.
+
+    — Implementer
