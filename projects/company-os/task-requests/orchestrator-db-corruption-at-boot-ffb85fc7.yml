@@ -38,7 +38,7 @@ metadata:
 
 spec:
   priority: high
-  status: backlog
+  status: done
   acceptance_criteria:
     - >
       Un diagnostic-report est produit avec une root_cause clairement
