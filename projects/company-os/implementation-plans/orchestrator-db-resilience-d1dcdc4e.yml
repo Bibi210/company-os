@@ -1,0 +1,1107 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: d1dcdc4e-1a33-42c6-8037-1fa3e3eba0a8
+  title: "Implementation plan : résilience DB orchestrator (flock + PRAGMA + graceful shutdown + autorepair + refactor defense-in-depth + index_now)"
+  author: implementer
+  created_at: "2026-05-27"
+  description: >
+    Plan d'implémentation détaillé du RFC cdbfee72 et du design-doc
+    45c04902. Exécute les quatre piliers (file lock POSIX, PRAGMA
+    défensifs, graceful shutdown signal-driven, autorepair au boot)
+    plus le refactor des quatre call sites sqlite3 du hook
+    defense-in-depth vers MCP, plus l'introduction du tool MCP
+    index_now. Tranche les open questions du design-doc et fige les
+    conventions techniques (crate flock, path du sentinel,
+    timeouts, sémantique de fallback). L'ordre des étapes respecte
+    les dépendances : PRAGMA défensifs (PILIER B) en premier car
+    pré-requis de tous les autres opens, transaction DDL (partie
+    de PILIER C) en parallèle car bénéficie aux mêmes ouvertures,
+    nouveaux outils MCP côté serveur AVANT le refactor du hook qui
+    en dépend, file lock (PILIER A) avant graceful shutdown
+    (PILIER C) et autorepair (PILIER D) qui s'appuient dessus,
+    enfin refactor du hook en dernier car il dépend de tous les
+    nouveaux tools MCP. Le write permit a685f08a-260d-4a6f-8c92-26b8d07ca5b5
+    est consommé en fin de séquence, après que tous les commits
+    git en zone protégée soient passés.
+  tags:
+    - orchestrator
+    - sqlite
+    - wal
+    - persistence
+    - concurrency
+    - resilience
+    - file-lock
+    - graceful-shutdown
+    - defense-in-depth
+    - implementation
+    - rust
+  related:
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: derived-from
+    - id: 45c04902-53f5-43db-981b-80f937233e62
+      kind: design-doc
+      relationship: derived-from
+    - id: ffb85fc7-f5a4-4bfc-b207-1ff955ef77e5
+      kind: task-request
+      relationship: derived-from
+    - id: 378c387c-7e25-4abd-8ccd-5bb7b4d82449
+      kind: diagnostic-report
+      relationship: related
+    - id: ed7776fb-d56d-4f61-9f48-807897c6325d
+      kind: lesson-learned
+      relationship: related
+    - id: f3fc4a5d-e9e6-43ef-86e9-49441fa84eaa
+      kind: lesson-learned
+      relationship: related
+  changelog:
+    - date: "2026-05-27"
+      author: implementer
+      description: >
+        Révision iteration 2 suite au round 037833b7 (vote
+        Architect = request_changes, 1 finding (a)). L'Architect
+        accepte la décision technique de l'étape 5.2 (--index ne
+        peut pas appeler index_now via MCP cross-process puisque
+        le transport MCP du serveur orchestrator est stdio, pas
+        socket/HTTP) ET la sémantique de remplacement retenue
+        (no-op + log + exit 0 pour le cas EWOULDBLOCK). MAIS le
+        RFC cdbfee72 en status: approved stipule formellement que
+        --index DOIT appeler index_now via MCP (PROPOSITION 1
+        étape 3 sous-cas 1/2/3). Sans réconciliation, le plan
+        diverge d'un artefact approuvé. Correctif appliqué :
+        ajout d'un sous-point 10.0 en tête de l'étape 10
+        formalisant l'engagement à amender le RFC en iteration 5
+        AVANT que le RFC ne passe en status: implemented à
+        l'étape 10.4. Le moment précis de l'amendement est fixé
+        juste après la validation empirique de l'étape 5.2 (donc
+        avant l'étape 10), pour amender avec la preuve technique
+        en main plutôt que sur la base d'une hypothèse. Aucune
+        autre modification du plan : la décision technique reste
+        intacte, le tool index_now reste exposé côté serveur
+        pour les appelants secondaires.
+
+spec:
+  steps:
+    - description: >
+        Étape 0 — Décisions d'implémentation tranchées par l'Implementer.
+        Cette étape n'écrit pas de code, elle fige les conventions
+        pour les étapes suivantes.
+
+        (a) Choix de la crate flock — DÉCISION : fs2 version 0.4.
+            Justification : API la plus directe et lisible pour
+            notre usage (File::try_lock_exclusive, lock_exclusive,
+            unlock), zéro feature à activer, ~3M downloads
+            mensuels, maintenance stable depuis des années.
+            rustix nécessiterait d'activer la feature "fs" qui
+            tire d'autres modules inutiles, et son API est plus
+            bas niveau (manipulation de fd brut). nix idem trop
+            large. fs2 est focalisée sur ce besoin précis.
+            Dépendance ajoutée uniquement à
+            crates/orchestrator/Cargo.toml (la struct LockGuard
+            sera exposée par companyos-orchestrator et utilisée
+            depuis main.rs sans dep directe).
+
+        (b) Path du fichier sentinel — DÉCISION :
+            company/data/orchestrator.lock, à côté de la DB.
+            Justification : recommandation initiale du design-doc
+            adoptée. Avantage proximité immédiate pour
+            l'opérateur qui debugue. .gitignore couvre déjà *.db*
+            mais pas *.lock — on étend à *.lock pour garder le
+            répertoire propre côté git. Ce fichier reste un
+            simple sentinel : son contenu n'est pas significatif,
+            seul le lock posix qu'il porte l'est.
+
+        (c) Détection du fichier de lock côté defense-in-depth —
+            DÉCISION : ajouter le pattern /\.lock$/ aux
+            VOLATILE_PATTERNS du hook (defense-in-depth-core.mjs
+            ligne 40-42). Le fichier orchestrator.lock vit dans
+            company/data/ qui n'est pas explicitement dans les
+            prefixes protégés (vérifié dans protected-zones.json :
+            seuls company/config/, company/personas/,
+            company/schemas/, company/plugins/, crates/ y sont).
+            La règle VOLATILE_PATTERNS sert exactement à exclure
+            ce type de fichier des checks d'intégrité (déjà
+            utilisée pour .db, .db-shm, .db-wal, .db-journal,
+            .pid). Aucune modification de protected-zones.json
+            n'est donc nécessaire — c'est le hook lui-même qui
+            doit reconnaître .lock comme volatile.
+
+        (d) Timeouts et valeurs — DÉCISION : retenir les
+            recommandations initiales du design-doc/RFC. Les
+            constantes sont déclarées dans une location
+            stable :
+              - LOCK_RETRY_INTERVAL = 200ms
+              - LOCK_RETRY_TIMEOUT  = 10s (soit 50 tentatives)
+              - BUSY_TIMEOUT_MS     = 5000 (PRAGMA)
+              - SHUTDOWN_TIMEOUT    = 5s (attente tasks au shutdown)
+              - WATCHER_DEBOUNCE    = 500ms (déjà existant)
+
+        (e) Sémantique du fallback côté --index quand MCP
+            index_now échoue avec "MCP unavailable" — DÉCISION :
+            implémenter le mode "silent fallback" (log stderr +
+            exit 0) recommandé par le RFC en PROPOSITION 1
+            étape 3 sous-cas 3. Ne pas exposer de flag opt-in
+            pour cette première itération ; si l'expérience
+            opérationnelle montre que l'erreur silencieuse pose
+            problème, on rebasculera vers exit non-zero dans
+            une future révision (peu invasive : une seule ligne
+            du wrapper run_index).
+
+        (f) Sémantique du fallback côté hook quand un appel MCP
+            échoue (check_write_permit, snapshot_permits_state,
+            revert_permits_to_snapshot) — DÉCISION : implémenter
+            la posture conservatrice (i) recommandée par le RFC
+            en fin de PROPOSITION 5 : bloquer le bash/write en
+            signalant l'incident. Concrètement : si l'appel MCP
+            renvoie une erreur réseau/protocole (pas une erreur
+            métier), le hook retourne false pour hasActivePermit
+            (= pas de permit, donc revert), null pour
+            snapshotPermits, false pour revertPermitTampering.
+            Conformément à la philosophie défense en profondeur :
+            on échoue fermé.
+
+        (g) Path du lock côté defense-in-depth pendant le
+            refactor — DÉCISION : `_zones.db_path` reste pointé
+            sur orchestrator.db (utilisé pour le check
+            "bash command references db file" ligne 254). Le
+            fichier .lock est nouveau et n'a pas besoin d'être
+            référencé dans _zones. Le hook ne le touche jamais
+            directement, c'est le binaire serveur/--index qui
+            l'ouvre via fs2.
+
+        (h) Tests d'intégration — DÉCISION : tests dans
+            crates/orchestrator/tests/ (nouveau dossier de tests
+            d'intégration Rust), pas dans des scripts bash
+            externes. Justification : ce sont des tests qui
+            requièrent du contrôle fin sur les flocks et les
+            signaux, qui se prête bien à du Rust pur (std::process::Command
+            pour spawn le binaire, fs2 pour assister le contrôle
+            du lock dans des helpers de test). Les scripts bash
+            externes resteraient pertinents pour des tests
+            end-to-end avec le proxy, mais ceux-ci sortent du
+            scope strict du RFC ; les tests d'intégration Rust
+            couvrent largement les scenarios (a) à (k) + (e),
+            (e'), (f) listés dans les artefacts approuvés.
+
+        (i) Convention de nommage — DÉCISION : la struct du Drop
+            guard s'appelle `DbLockGuard`, vit dans un nouveau
+            module crates/orchestrator/src/lock.rs (réexporté
+            via lib.rs). Les variants d'erreur ajoutés sont
+            `OrchestratorError::LockBusy { timeout_ms: u64 }` et
+            `OrchestratorError::IntegrityFailure { details: String }`.
+
+        (j) Dépendances impactées (cf. lesson f3fc4a5d) —
+            INVENTAIRE :
+              - crates/orchestrator/Cargo.toml : ajouter fs2 = "0.4"
+                en dépendance normale. tracing est déjà absent
+                mais nous logguerons via eprintln! côté lock.rs
+                pour ne pas multiplier les dépendances. Les tests
+                d'intégration utiliseront `tempfile` qui n'est pas
+                en dev-dep — on implémente le pattern LocalTempDir
+                de la lesson f3fc4a5d.
+              - crates/mcp-servers/orchestrator/Cargo.toml : aucune
+                modification nécessaire (notre flock est encapsulé
+                par companyos-orchestrator). Mais ce fichier est
+                quand même dans affected_files par prudence (cf.
+                changelog iteration 4 du RFC) ; on n'y touche que
+                si une dépendance nouvelle se révèle indispensable.
+
+        Aucune décision restant ouverte. Le RFC + design-doc sont
+        suffisamment précis pour que les étapes 1 à 10 ci-dessous
+        soient strictement applicatives.
+      files: []
+
+    - description: >
+        Étape 1 — PILIER B : configuration WAL défensive uniformisée
+        + transaction DDL pour migrate (partie PILIER C).
+
+        (1.1) Modifier crates/orchestrator/src/db.rs :
+              - Ajouter une constante privée `const DEFENSIVE_PRAGMAS: &str`
+                contenant la séquence :
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA foreign_keys=ON;
+                 PRAGMA busy_timeout=5000;
+                 PRAGMA synchronous=NORMAL;
+                 PRAGMA wal_autocheckpoint=1000;"
+              - Modifier `OrchestratorDb::open(path)` pour appeler
+                `conn.execute_batch(DEFENSIVE_PRAGMAS)` au lieu de la
+                séquence actuelle limitée à journal_mode + foreign_keys.
+              - `OrchestratorDb::open_in_memory()` reçoit aussi le
+                preamble (bénéficie aux tests).
+              - Modifier `OrchestratorDb::migrate()` pour exécuter
+                SCHEMA_SQL puis FTS_SQL DANS UNE TRANSACTION ENVELOPPANTE :
+                `self.conn.execute_batch("BEGIN IMMEDIATE; <SCHEMA_SQL>; <FTS_SQL>; COMMIT;")`
+                en une seule chaîne, ce qui garantit rollback automatique
+                si un SIGKILL frappe au milieu (rejoué par WAL recovery
+                au prochain open).
+              - Ajouter une méthode publique `integrity_check(&self) -> Result<bool, OrchestratorError>` :
+                exécute `PRAGMA integrity_check` et retourne true si le
+                résultat est exactement "ok", false sinon. Loggue les
+                détails via eprintln! quand le résultat n'est pas "ok"
+                (utilisé par PILIER D).
+              - Ajouter une méthode publique `checkpoint_truncate(&self) -> Result<(), OrchestratorError>` :
+                exécute `PRAGMA wal_checkpoint(TRUNCATE)`. Utilisée par
+                PILIER C shutdown.
+
+        (1.2) Vérifier que les tests inline existants
+              (`#[cfg(test)] mod tests` au bas de db.rs) continuent
+              de passer après cette modif. Comme open_in_memory est
+              utilisé par setup_db() et n'a pas de fichier WAL réel
+              (in-memory DB), le `journal_mode=WAL` PRAGMA renverra
+              "memory" sans casser. busy_timeout etc. s'appliquent
+              normalement.
+
+        (1.3) Ajouter dans db.rs un test :
+              `#[test] fn test_integrity_check_passes_on_fresh_db()`
+              qui ouvre une DB neuve via open_in_memory + migrate, et
+              vérifie integrity_check() == true.
+
+        (1.4) cargo build && cargo test -p companyos-orchestrator.
+      files:
+        - "crates/orchestrator/src/db.rs"
+
+    - description: >
+        Étape 2 — Ajouter la dépendance fs2 et créer le module de
+        file lock (PILIER A — partie crate orchestrator).
+
+        (2.1) Modifier crates/orchestrator/Cargo.toml :
+              - Ajouter `fs2 = "0.4"` sous [dependencies].
+
+        (2.2) Créer crates/orchestrator/src/lock.rs :
+              - Nouveau module exposant deux fonctions et une struct :
+                * `pub struct DbLockGuard { file: std::fs::File }` :
+                  RAII guard. Quand droppé, l'OS libère le lock
+                  automatiquement (kernel POSIX flock semantics).
+                * `pub fn acquire_exclusive_blocking(path: &Path, retry_interval: Duration, timeout: Duration) -> Result<DbLockGuard, OrchestratorError>` :
+                  ouvre le fichier sentinel (création si absent),
+                  tente `try_lock_exclusive` en boucle avec
+                  `sleep(retry_interval)` entre les essais, jusqu'à
+                  `timeout` total. Retourne `OrchestratorError::LockBusy`
+                  si le timeout expire.
+                * `pub fn try_acquire_exclusive(path: &Path) -> Result<Option<DbLockGuard>, OrchestratorError>` :
+                  tente une fois `try_lock_exclusive` non bloquant.
+                  Retourne Ok(Some(guard)) si succès, Ok(None) si
+                  EWOULDBLOCK, Err pour les autres erreurs (EACCES,
+                  ENOENT, etc.). Utilisé par --index pour détecter
+                  la présence d'un serveur.
+              - Inclure des #[cfg(test)] tests basiques :
+                * test_acquire_then_release : un thread acquiert,
+                  drop, un second thread peut acquérir.
+                * test_try_acquire_when_held : pendant qu'un guard
+                  vit dans le test, try_acquire_exclusive retourne
+                  Ok(None).
+                * test_blocking_acquire_succeeds_after_release : le
+                  thread A acquiert + sleep 300ms + drop, le thread
+                  B lance acquire_blocking avec timeout 2s, succès
+                  attendu en ~300-500ms.
+                * test_blocking_acquire_times_out : thread A
+                  acquiert pour 5s, thread B lance
+                  acquire_blocking avec timeout 500ms, doit retourner
+                  LockBusy.
+
+        (2.3) Modifier crates/orchestrator/src/error.rs :
+              - Ajouter le variant
+                `LockBusy { path: String, timeout_ms: u64 }` avec
+                message "Failed to acquire DB lock on '{path}' after
+                {timeout_ms}ms — another writer is holding it".
+              - Ajouter le variant
+                `IntegrityFailure { details: String }` avec message
+                "Database integrity check failed: {details}". (Pas
+                strictement nécessaire dans cette étape mais
+                préparé pour PILIER D.)
+
+        (2.4) Modifier crates/orchestrator/src/lib.rs :
+              - Ajouter `pub mod lock;`
+              - Ajouter `pub use lock::DbLockGuard;`
+
+        (2.5) cargo build -p companyos-orchestrator &&
+              cargo test -p companyos-orchestrator.
+              Les 4 tests de lock.rs doivent passer. Vérifier
+              get_diagnostics côté LSP : aucune erreur, aucun warning.
+      files:
+        - "crates/orchestrator/Cargo.toml"
+        - "crates/orchestrator/src/lock.rs"
+        - "crates/orchestrator/src/error.rs"
+        - "crates/orchestrator/src/lib.rs"
+
+    - description: >
+        Étape 3 — PILIER D : autorepair au boot (méthodes côté
+        crate orchestrator).
+
+        Cette étape prépare les méthodes nécessaires AU NIVEAU CRATE,
+        mais le câblage côté binaire (séquence boot avec choix
+        nominal vs rebuild) est l'étape 5 (main.rs).
+
+        (3.1) Modifier crates/orchestrator/src/db.rs :
+              - Pas de nouvelle méthode publique nécessaire : on a
+                déjà `integrity_check()` (étape 1) et `delete_all_artifacts()`
+                existant. Le rebuild se fait au niveau du binaire
+                (drop la connexion, supprimer les fichiers, rouvrir,
+                migrer, reindex). Donc l'étape 3 est principalement
+                conceptuelle : valider qu'aucune nouvelle méthode
+                publique n'est requise côté db.rs au-delà de ce qui
+                a été ajouté en étape 1.
+
+        (3.2) Modifier crates/orchestrator/src/engine.rs si nécessaire :
+              - Pas de modification structurelle requise. reindex_all
+                existe déjà (ligne 596) et accepte un sync execution
+                via engine.reindex_all(root, validator). C'est
+                exactement ce dont PILIER D a besoin pour repeupler
+                la DB après rebuild.
+              - On ajoute juste une méthode helper
+                `pub fn snapshot_permits(&self) -> Result<String, OrchestratorError>`
+                qui exécute la même requête que le hook actuel
+                (SELECT COUNT(*), GROUP_CONCAT(id || ':' || status)
+                FROM write_permits) et retourne le blob string.
+              - On ajoute aussi
+                `pub fn restore_permits_from_snapshot(&self, snapshot: Option<String>) -> Result<usize, OrchestratorError>`
+                qui :
+                * Si snapshot is None → DELETE FROM write_permits
+                  (nuclear), retourne le nombre de lignes supprimées.
+                * Sinon → parse le blob "count|id1:status1,id2:status2,…"
+                  pour récupérer les IDs présents, puis exécute
+                  DELETE FROM write_permits WHERE id NOT IN (…).
+                  Retourne le nombre de lignes supprimées.
+              - Ces deux méthodes vivent sur OrchestratorEngine
+                (pour rester cohérent avec les autres méthodes
+                publiques sur permits : grant_permit, check_permit,
+                consume_permit).
+
+        (3.3) Ajouter dans engine.rs des tests :
+              - test_snapshot_permits_format : crée 2 permits actifs
+                + 1 consumed, appelle snapshot_permits, vérifie le
+                format (COUNT|id1:active,id2:active,id3:consumed).
+              - test_restore_permits_nuclear : crée 2 permits,
+                restore_permits_from_snapshot(None), vérifie que la
+                table est vide.
+              - test_restore_permits_selective : crée 3 permits,
+                snapshot, crée un 4ème, restore, vérifie que seuls
+                les 3 d'origine restent.
+
+        (3.4) cargo build && cargo test -p companyos-orchestrator.
+      files:
+        - "crates/orchestrator/src/engine.rs"
+
+    - description: >
+        Étape 4 — Nouveaux tools MCP côté serveur :
+        snapshot_permits_state, revert_permits_to_snapshot,
+        index_now. (Préalable indispensable au refactor du hook
+        en étape 8.)
+
+        Ces trois tools s'ajoutent à l'impl OrchestratorServer dans
+        crates/mcp-servers/orchestrator/src/main.rs. Les deux
+        premiers wrapent les méthodes ajoutées en étape 3.3 ; le
+        troisième wrap engine.index_artifact existant.
+
+        (4.1) Définir trois nouvelles structs de paramètres,
+              à côté des autres ParamsXxx existantes :
+              - `struct SnapshotPermitsStateParams { }` (pas de
+                paramètres ; à confirmer avec rmcp si une struct
+                vide est acceptée ; sinon utiliser unit).
+              - `struct RevertPermitsToSnapshotParams { snapshot: Option<String> }`.
+              - `struct IndexNowParams { path: String }`.
+
+        (4.2) Implémenter les trois #[tool] sur OrchestratorServer :
+
+              snapshot_permits_state :
+                description = "Return an opaque blob representing
+                the current state of write_permits. Used by
+                defense-in-depth hook to detect tampering."
+                Pas de validation persona/token : c'est une lecture,
+                accessible à tout caller.
+                Body : engine.lock().await.snapshot_permits()
+                → ok(format!("{{\"snapshot\":\"{}\"}}", blob))
+                ou format JSON équivalent.
+
+              revert_permits_to_snapshot :
+                description = "Restore the write_permits table to a
+                previous snapshot. Removes permits not present in
+                the snapshot. Used by defense-in-depth hook to
+                revert tampering. Pass null snapshot to wipe all
+                permits."
+                Body : engine.lock().await.restore_permits_from_snapshot(params.snapshot)
+                → retourne le count de permits supprimés.
+
+              index_now :
+                description = "Index a single YAML artifact file
+                immediately, bypassing the file watcher debounce.
+                Used by --index when it detects the server holds
+                the lock."
+                Body : reconstruit le ArtifactValidator depuis
+                self.validator (déjà chargé), appelle
+                engine.index_artifact(&self.root_path, &params.path, &validator).
+                Retourne l'IndexedArtifact en JSON pretty.
+
+        (4.3) Vérification get_diagnostics : aucune erreur, aucun
+              warning. Le `tool_router` macro doit reconnaître les
+              trois nouvelles méthodes automatiquement (vérifier que
+              `#[tool_router]` les pick correctement).
+
+        (4.4) cargo build -p companyos-orchestrator-server (ce qui
+              déclenche aussi la dépendance orchestrator et donc
+              recompile fs2 + nouveau module lock.rs).
+              Pas de hot-reload ici : le binaire n'est pas encore
+              démarré côté serveur, les tools ne sont visibles
+              qu'au prochain restart du serveur, donc cargo build
+              suffit pour la vérification.
+
+        (4.5) Tests : il n'y a pas de tests intégrés pour ces tools
+              au niveau crate orchestrator-server (le pattern dans
+              ce repo est de tester engine.rs et db.rs au niveau
+              crate, et de tester l'intégration MCP via les tests
+              d'intégration de l'étape 9). Donc validation par
+              cargo build et inspection LSP uniquement à ce stade.
+      files:
+        - "crates/mcp-servers/orchestrator/src/main.rs"
+
+    - description: >
+        Étape 5 — PILIER A (côté serveur) : acquisition du file lock
+        au boot avec retry borné.
+
+        (5.1) Modifier crates/mcp-servers/orchestrator/src/main.rs,
+              dans run_server() :
+              - Définir des constantes locales :
+                * LOCK_RETRY_INTERVAL = Duration::from_millis(200)
+                * LOCK_RETRY_TIMEOUT = Duration::from_secs(10)
+              - Calculer le path du sentinel :
+                let lock_path = format!("{db_dir}/orchestrator.lock");
+              - JUSTE AVANT l'ouverture de la DB
+                (`OrchestratorDb::open(format!(...))` à la ligne ~752),
+                acquérir le lock :
+                let _lock_guard = companyos_orchestrator::lock::acquire_exclusive_blocking(
+                    Path::new(&lock_path),
+                    LOCK_RETRY_INTERVAL,
+                    LOCK_RETRY_TIMEOUT,
+                )?;
+              - Le `_lock_guard` reste vivant pour toute la durée
+                de run_server (drop en sortie de fonction = libération
+                du lock).
+              - Si l'acquisition retourne LockBusy, le `?` propage
+                l'erreur jusqu'à `main()`, qui exite avec un message
+                lisible. Le format du message doit inclure le timeout
+                et le path, ex. "Failed to acquire DB lock on
+                'company/data/orchestrator.lock' after 10000ms —
+                another writer is holding it. Refusing to start."
+
+        (5.2) Modifier run_index() (ligne ~703) :
+              - Calculer le même lock_path.
+              - Tenter `try_acquire_exclusive(Path::new(&lock_path))` :
+                * Ok(Some(guard)) → AUCUN serveur en vie. Garder
+                  le guard local pendant tout le travail de
+                  run_index, exécuter db.migrate +
+                  engine.index_artifact, et exit 0 à la fin (drop
+                  du guard libère le lock).
+                * Ok(None) → un serveur tient le lock. APPELER
+                  index_now via MCP. NB : run_index est un mode
+                  CLI synchrone (pas dans tokio), il n'a pas
+                  accès au transport MCP. STRATÉGIE :
+                  - Spawn un client MCP en tokio runtime ad-hoc
+                    qui se connecte via stdio à... non, ce n'est
+                    pas possible depuis un process séparé.
+                  - ALTERNATIVE PRAGMATIQUE : utiliser le proxy
+                    déjà tournant. Mais run_index n'a pas accès
+                    au proxy directement.
+                  - DÉCISION RÉVISÉE : implémenter le fallback
+                    de PROPOSITION 1 étape 3 sous-cas 3 directement :
+                    le run_index log "server detected via flock,
+                    skipping index (server file watcher will index)"
+                    sur stdout et exit 0. C'est de facto le
+                    comportement no-op pur du design-doc avant le
+                    finding B. Le file watcher serveur indexera
+                    dans la seconde.
+
+                  Mais le finding B impose index_now ! Donc on
+                  doit trouver un chemin pour appeler MCP depuis
+                  run_index. SOLUTION : run_index utilise
+                  reqwest ou un client MCP minimal pour se
+                  connecter au transport du serveur. PROBLÈME :
+                  le serveur orchestrator MCP tourne en stdio,
+                  pas en HTTP/socket. On ne peut pas s'y
+                  connecter depuis un autre process.
+
+                  ARBITRAGE FINAL : pour cette première
+                  implémentation, on adopte la sémantique "no-op
+                  pur + exit 0" pour le cas EWOULDBLOCK côté
+                  --index, en logguant clairement la délégation
+                  au file watcher. C'est UN ÉCART avec la
+                  PROPOSITION 1 étape 3 du RFC (qui spécifie
+                  index_now via MCP), mais c'est techniquement
+                  impossible avec l'architecture stdio MCP
+                  actuelle. Justification documentée à l'étape 0
+                  des risques. L'outil index_now reste exposé
+                  côté serveur (pour appelants secondaires
+                  comme des tests ou futurs agents), mais
+                  --index ne l'appelle pas ; il se contente de
+                  no-op. Le contrat "tout YAML est searchable
+                  dans la seconde" reste satisfait via le file
+                  watcher debounce 500ms.
+                * Err(e) → log stderr + exit non-zero (cas
+                  dégénéré ENOENT/EACCES).
+
+        (5.3) cargo build -p companyos-orchestrator-server.
+              get_diagnostics doit être propre.
+
+        (5.4) Pas de test d'intégration à ce stade pour le lock
+              côté serveur : les tests de l'étape 9 couvriront le
+              cas (e) (serveur démarre pendant --index transitoire)
+              et (e') (--index zombie + timeout).
+      files:
+        - "crates/mcp-servers/orchestrator/src/main.rs"
+
+    - description: >
+        Étape 6 — PILIER C : graceful shutdown signal-driven.
+
+        (6.1) Modifier crates/mcp-servers/orchestrator/src/main.rs,
+              dans run_server() :
+              - Garder une `JoinHandle` de la tokio task reindex_all
+                background (actuellement on drop le résultat de
+                tokio::spawn). On la nomme `reindex_handle`.
+              - Garder une `JoinHandle` aussi pour la tokio task
+                qui consomme le file watcher.
+              - Garder le `FileWatcherHandle` directement (au lieu
+                de juste le drop quand le scope sort).
+              - Installer un signal handler tokio AVANT le
+                `service.waiting().await?` :
+
+                use tokio::signal::unix::{signal, SignalKind};
+
+                let mut sigterm = signal(SignalKind::terminate())?;
+                let mut sigint  = signal(SignalKind::interrupt())?;
+
+                tokio::select! {
+                    _ = service.waiting() => {
+                        tracing::info!("MCP service ended normally");
+                    }
+                    _ = sigterm.recv() => {
+                        tracing::info!("SIGTERM received, initiating graceful shutdown");
+                    }
+                    _ = sigint.recv() => {
+                        tracing::info!("SIGINT received, initiating graceful shutdown");
+                    }
+                }
+
+                // Shutdown sequence
+                // (1) drop watcher handle → notify stops, watcher task exits on channel close
+                drop(watcher_handle);
+                // (2) await reindex_handle with timeout
+                let _ = tokio::time::timeout(Duration::from_secs(5), reindex_handle).await;
+                // (3) checkpoint TRUNCATE
+                let engine_guard = engine.lock().await;
+                if let Err(e) = engine_guard.checkpoint_truncate_via_db() {
+                    tracing::warn!("Checkpoint failed at shutdown: {e}");
+                } else {
+                    tracing::info!("Checkpoint TRUNCATE done at shutdown");
+                }
+                // (4) drop guard + drop lock_guard happens implicitly on scope exit
+
+              NOTE : engine.checkpoint_truncate_via_db() est une méthode
+              à ajouter sur OrchestratorEngine qui délègue à
+              self.db.checkpoint_truncate(). Cela évite d'exposer
+              self.db en mut publique.
+
+        (6.2) Ajouter la méthode déléguée dans engine.rs :
+              ```
+              pub fn checkpoint_truncate(&self) -> Result<(), OrchestratorError> {
+                  self.db.checkpoint_truncate()
+              }
+              ```
+              (Le nom de la méthode côté engine peut être identique à
+              celui de db.rs, le compilateur lève le bon scope.)
+
+        (6.3) cargo build && get_diagnostics. Vérifier que tokio::signal::unix
+              est bien disponible (tokio "full" inclut "signal").
+
+        (6.4) Test manuel léger : lancer un binaire orchestrator-server,
+              envoyer SIGTERM, vérifier dans les logs la séquence
+              "SIGTERM received → Checkpoint done". Pas de test
+              automatisé à ce stade (couvert par les tests d'intégration
+              de l'étape 9).
+      files:
+        - "crates/mcp-servers/orchestrator/src/main.rs"
+        - "crates/orchestrator/src/engine.rs"
+
+    - description: >
+        Étape 7 — PILIER D : autorepair au boot (câblage main.rs).
+
+        (7.1) Modifier crates/mcp-servers/orchestrator/src/main.rs,
+              dans run_server() :
+              - APRÈS l'acquisition du file lock (étape 5) et APRÈS
+                l'ouverture de la DB + db.migrate() (existant), mais
+                AVANT le spawn des tasks background (reindex_all et
+                watcher) :
+
+                if !db.integrity_check()? {
+                    eprintln!(
+                        "[orchestrator] Database corruption detected — \
+                         rebuilding from YAML index source of truth"
+                    );
+                    drop(db);
+                    let db_file = format!("{db_dir}/{}", constants::DB_FILENAME);
+                    let _ = std::fs::remove_file(&db_file);
+                    let _ = std::fs::remove_file(format!("{db_file}-wal"));
+                    let _ = std::fs::remove_file(format!("{db_file}-shm"));
+                    db = OrchestratorDb::open(&db_file)?;
+                    db.migrate()?;
+                    // Reindex synchronously (not background) here :
+                    // we need a temporary engine + validator since the
+                    // real ones haven't been built yet at this point in
+                    // run_server. Solution : delay this rebuild until
+                    // AFTER the engine and validator are built (just
+                    // before the tokio::spawn), so we have everything
+                    // we need.
+                }
+
+              EN PRATIQUE : pour éviter de manipuler engine et
+              validator deux fois, on déplace ce check JUSTE APRÈS
+              la construction de `validator` et `engine` (ligne ~760)
+              mais AVANT le `Arc::new(Mutex::new(...))` qui les
+              wrappe. Le rebuild se fait alors :
+
+                let engine_inner = OrchestratorEngine::new(db, max_iterations);
+                if !engine_inner.integrity_check()? {
+                    eprintln!("[orchestrator] Database corruption detected ...");
+                    let db = engine_inner.into_db_for_rebuild();
+                    drop(db);
+                    // delete files
+                    let new_db = OrchestratorDb::open(&db_file)?;
+                    new_db.migrate()?;
+                    let mut engine_inner = OrchestratorEngine::new(new_db, max_iterations);
+                    let count = engine_inner.reindex_all(&root, &validator)
+                        .map_err(|e| anyhow::anyhow!("Rebuild reindex failed: {e}"))?;
+                    eprintln!("[orchestrator] Rebuilt index with {count} artifacts");
+                    engine_inner
+                } else {
+                    engine_inner
+                }
+
+              Pour cela, ajouter sur OrchestratorEngine :
+                pub fn integrity_check(&self) -> Result<bool, OrchestratorError> {
+                    self.db.integrity_check()
+                }
+                pub fn into_db_for_rebuild(self) -> OrchestratorDb {
+                    self.db
+                }
+
+              Le into_db_for_rebuild est un escape hatch pour le
+              rebuild ; il n'est exposé que côté binaire, à
+              utiliser uniquement par run_server.
+
+        (7.2) cargo build && get_diagnostics.
+
+        (7.3) Test inline dans engine.rs ou db.rs :
+              - test_integrity_check_detects_corruption : créer un
+                fichier .db corrompu (overwrite avec des bytes
+                aléatoires à un offset spécifique simulant une
+                page corrompue), open + integrity_check, attendre
+                false. Délicat à faire en pur in-memory ; on
+                délègue ce test au protocole d'intégration de
+                l'étape 9 (test (c) du RFC).
+      files:
+        - "crates/mcp-servers/orchestrator/src/main.rs"
+        - "crates/orchestrator/src/engine.rs"
+
+    - description: >
+        Étape 8 — Refactor du hook defense-in-depth : sqlite3 CLI →
+        outils MCP. (Dernière étape sur le code source car elle
+        dépend des trois nouveaux tools MCP de l'étape 4.)
+
+        Le hook est en JavaScript Node.js (defense-in-depth-core.mjs).
+        Il s'exécute sous le runtime opencode qui dispose d'un client
+        MCP injecté implicitement (les outils MCP sont accessibles
+        comme fonctions globales ou via un namespace selon la version
+        d'opencode). Le pattern d'appel exact dépend de l'API
+        opencode-hook ; je l'apprendrai en lisant le hook existant
+        et le code de mcp-proxy.mjs.
+
+        (8.1) Lecture exploratoire du hook (defense-in-depth.mjs
+              wrapper + defense-in-depth-core.mjs) ET de
+              mcp-proxy.mjs pour comprendre comment appeler un
+              tool MCP depuis le runtime du hook. Si l'API
+              opencode-hook expose `mcp.call("tool_name", args)`
+              ou équivalent, on l'utilise.
+
+              Si l'API n'expose PAS d'appel MCP synchrone depuis
+              le hook (cas probable : le hook tourne en before/after
+              callbacks et bloquer sur un appel async serait coûteux),
+              il faudra réécrire en async. Le hook actuel est déjà
+              async (les handlers retournent des Promise), donc
+              c'est compatible.
+
+              SI ABSOLUMENT IMPOSSIBLE d'appeler MCP depuis le
+              hook : on garde sqlite3 inline pour cette première
+              itération et on documente cela dans la lesson finale
+              + crée un agent-message au PM. Mais c'est un
+              fallback pessimiste ; la première analyse devrait
+              révéler une voie.
+
+        (8.2) Modifier company/plugins/defense-in-depth-core.mjs :
+              - `hasActivePermit(rootDir, filePath)` : remplacer
+                l'invocation `run(`sqlite3 ${dbPath} "${query}"`, rootDir)`
+                par un appel MCP `check_write_permit(persona,
+                filePath)`. La persona provient de input.agent qui
+                est dispo dans le contexte du hook. Si l'appel MCP
+                échoue (erreur réseau, timeout), retourner false
+                (= pas de permit, pas de write) conformément à
+                la décision 0.f.
+
+              - `snapshotPermits(rootDir)` : remplacer par
+                `snapshot_permits_state()`. Erreur MCP → null.
+
+              - `revertPermitTampering(rootDir, before)` : les deux
+                branches (L200 nuclear, L206 selective) fusionnent
+                en un seul appel `revert_permits_to_snapshot(before)`.
+                Le serveur arbitre en interne :
+                * before === null → null param → serveur fait DELETE.
+                * before !== null → serveur fait DELETE WHERE NOT IN.
+                La fonction du hook retourne true si revert a eu
+                lieu, false sinon.
+
+        (8.3) Ajouter le pattern .lock aux VOLATILE_PATTERNS du
+              hook (cf. décision 0.c). Ligne 40-42 :
+              `const VOLATILE_PATTERNS = [/\.db$/, /\.db-shm$/, /\.db-wal$/, /\.db-journal$/, /\.lock$/, /\.pid$/];`
+              C'est déjà couvert par le pattern `/\.lock$/` existant !
+              Vérification : grep `\.lock` dans le fichier. Si
+              déjà présent, étape 8.3 est no-op (juste validation).
+
+        (8.4) Mettre à jour .gitignore : ajouter `*.lock` ou
+              `company/data/orchestrator.lock` à la liste. Convention
+              minimale : `*.lock`. Cela exclut aussi Cargo.lock ?
+              ATTENTION : Cargo.lock est DÉJÀ ignoré par
+              `Cargo.lock` (cf. .gitignore ligne 5). Mais ajouter
+              `*.lock` exclurait potentiellement d'autres fichiers
+              .lock futurs sans qu'on s'en rende compte. Choix
+              spécifique : ajouter `company/data/orchestrator.lock`
+              en ligne explicite. Plus précis, moins de surprise.
+
+        (8.5) Pas de modification de company/config/protected-zones.json
+              nécessaire (cf. décision 0.c) : le hook reconnaît
+              orchestrator.lock comme volatile via le pattern
+              déjà existant. Mais le fichier reste dans
+              affected_files par prudence (au cas où une
+              modification s'avère nécessaire en cours
+              d'implémentation).
+
+        (8.6) Vérifier le hook syntaxiquement avec node :
+              `node --check company/plugins/defense-in-depth-core.mjs`
+      files:
+        - "company/plugins/defense-in-depth-core.mjs"
+        - ".gitignore"
+
+    - description: >
+        Étape 9 — Tests d'intégration Rust (tests (a) à (k), (e),
+        (e'), (f) du protocole).
+
+        (9.1) Créer crates/orchestrator/tests/integration_lock.rs :
+              tests Rust qui spawn le binaire compilé et vérifient
+              le comportement du flock. Utiliser
+              `std::process::Command` pour spawn, `fs2` directement
+              pour assister depuis le test, `tempfile`-like via
+              le pattern LocalTempDir (cf. lesson f3fc4a5d).
+
+              Tests à implémenter dans ce fichier :
+              - test_a_boot_propre : spawn server avec une DB
+                vide, attendre que MCP réponde, envoyer SIGTERM,
+                vérifier integrity_check via sqlite3 hors ligne =
+                ok, absence de -wal/-shm résiduels.
+                NOTE : nécessite que le binaire soit compilé en
+                debug, donc `cargo build` avant exécution.
+
+              - test_d_double_instance_serveur : spawn server #1,
+                attendre qu'il tienne le lock, spawn server #2,
+                vérifier qu'il sort en erreur avec exit code
+                non-zero ET un message "Failed to acquire DB lock
+                ... after 10000ms" sur stderr.
+                Le test prend ~12s à cause du timeout (10s
+                d'attente + marge).
+
+              - test_e_serveur_pendant_index_transitoire :
+                * Acquérir manuellement le lock depuis le test
+                  (via fs2 directement) pendant 1 seconde dans un
+                  thread bg.
+                * Spawn server.
+                * Vérifier que le server démarre en ~1-1.5s
+                  (attendant la release du lock), et que MCP
+                  répond.
+
+              - test_e_prime_zombie_timeout :
+                * Acquérir le lock depuis le test pour 12 secondes.
+                * Spawn server.
+                * Vérifier que server exite avec code non-zero
+                  après ~10s avec le message LockBusy.
+
+              - test_f_index_now_via_mcp : à reporter ou skipper
+                — comme on a décidé que --index NE déléguerait
+                PAS à index_now via MCP en pratique (étape 5.2
+                arbitrage), ce test devient un test du tool MCP
+                index_now appelé directement (par un client MCP
+                de test) plutôt qu'un test de --index. Marqué
+                comme TODO si on ne peut pas écrire le client
+                MCP de test trivialement. Le tool est testé par
+                inspection visuelle au minimum.
+
+              - test_index_no_op_when_server_holds_lock : spawn
+                server, lancer `binaire --index path/to/yaml`,
+                vérifier que --index sort en 0 avec un log
+                "server detected".
+
+        (9.2) Helper module test_helpers.rs dans tests/ :
+              - struct LocalTempDir { path: PathBuf } avec
+                impl Drop qui rm -rf. (Cf. lesson f3fc4a5d.)
+              - fn spawn_server(root: &Path) -> std::process::Child
+                qui définit COMPANYOS_ROOT et spawn
+                `./target/debug/companyos-orchestrator-server`.
+              - fn wait_for_server_ready(child: &mut Child,
+                timeout: Duration) qui attend que MCP réponde
+                (heuristique : grep stderr pour "Indexed ...
+                artifact(s) on startup" ou attendre 2s).
+
+        (9.3) cargo test -p companyos-orchestrator --test integration_lock.
+              Tous les tests doivent passer. Si test_e' prend 10s
+              il marque le test comme `#[ignore]` par défaut et
+              n'est lancé qu'en --ignored, à arbitrer.
+
+        (9.4) Logger les résultats dans un fichier
+              /tmp/integration-results.txt pour préparer le rapport
+              final.
+      files:
+        - "crates/orchestrator/tests/integration_lock.rs"
+        - "crates/orchestrator/tests/test_helpers.rs"
+
+    - description: >
+        Étape 10 — Réconciliation RFC, validation finale, boucle
+        du workflow write_permit, et clôture.
+
+        (10.0) Amendement du RFC cdbfee72 en iteration 5 —
+               réconciliation avec la décision technique de
+               l'étape 5.2.
+
+               MOTIF. Le RFC en status: approved stipule en
+               PROPOSITION 1 étape 3 que `--index`, lorsqu'il
+               rencontre EWOULDBLOCK, appelle index_now via MCP
+               avec trois sous-cas (succès, erreur métier, MCP
+               injoignable). L'étape 5.2 du présent plan a
+               établi techniquement que cet appel est impossible
+               cross-process : le serveur orchestrator MCP
+               écoute uniquement sur stdio (cf.
+               main.rs:764 `let (stdin, stdout) = rmcp::transport::io::stdio()`),
+               donc un process séparé `--index` ne peut pas s'y
+               connecter. La sémantique retenue à la place est
+               celle pré-finding B : "no-op + log + exit 0",
+               l'indexation étant déléguée au file watcher du
+               serveur (debounce 500ms, le contrat tacite "tout
+               YAML searchable dans la seconde" reste tenu).
+
+               MOMENT DE L'AMENDEMENT. Juste APRÈS la validation
+               empirique de l'étape 5.2 (étape 5 complète,
+               cargo build + cargo test verts sur le comportement
+               --index no-op-if-server), et AVANT le passage du
+               RFC en status: implemented à l'étape 10.4. Faire
+               l'amendement avec la preuve technique en main
+               (path d'ouverture du transport stdio, ligne
+               main.rs:764) plutôt que sur une hypothèse a
+               priori.
+
+               CONTENU DE L'AMENDEMENT. Édition de
+               company/rfcs/orchestrator-db-resilience-four-pillars-cdbfee72.yml
+               via une iteration 5 ajoutée au metadata.changelog
+               qui :
+               (a) reconnaît l'impossibilité technique côté
+                   --index d'appeler index_now via MCP
+                   (transport stdio orchestrator) ;
+               (b) reformule le comportement du cas EWOULDBLOCK
+                   en PROPOSITION 1 étape 3 en :
+                   "--index logue 'server detected via flock,
+                   indexing delegated to server file watcher'
+                   sur stdout et exit 0. Le file watcher
+                   serveur indexera dans la seconde via le
+                   debounce de 500ms." ;
+               (c) précise que le tool MCP index_now reste
+                   exposé côté serveur pour les appelants
+                   secondaires (tests d'intégration MCP,
+                   agents async futurs qui souhaitent forcer
+                   une indexation déterministe, scripts CI) ;
+               (d) ne change RIEN aux autres propositions
+                   (PILIERs A, B, C, D, autres call sites du
+                   refactor defense-in-depth).
+
+               PROCÉDURE. Le RFC cdbfee72 vit dans
+               company/rfcs/, zone protégée company/rfcs/ pas
+               explicitement listée mais le fichier est un
+               artefact YAML. Vérification du périmètre du
+               permit a685f08a : le RFC lui-même n'est pas
+               dans affected_files (seuls les paths qu'il
+               modifie le sont). Or éditer le RFC est une
+               modification du contenu de l'artefact RFC,
+               différent de modifier les paths qu'il
+               référence. Le hook defense-in-depth applique
+               sa logique de protected zones par path
+               (cf. defense-in-depth-core.mjs ligne 320
+               isInProtectedZone) ; company/rfcs/ n'est pas
+               dans les prefixes (vérifié dans
+               protected-zones.json : seuls company/config/,
+               company/personas/, company/schemas/,
+               company/plugins/, crates/). Donc l'édition est
+               libre, pas besoin d'extension du permit.
+
+               REVIEW DE L'AMENDEMENT. Comme c'est un
+               amendement formel d'un RFC déjà approuvé qui
+               affecte la sémantique d'une proposition,
+               initier un nouveau review round (auteur =
+               implementer, reviewers = pm, architect, ceo).
+               Vote attendu : approve (la divergence
+               technique est documentée et la sémantique de
+               remplacement préserve le contrat fonctionnel).
+               Si le CEO refuse, escalade : retour à
+               l'Architect pour design d'une solution
+               alternative (par exemple introduire un canal
+               de communication non-stdio entre --index et
+               le serveur — ipc unix socket, fichier de file
+               de tâches, etc.). Mais ce n'est pas le chemin
+               optimiste attendu.
+
+        (10.1) Avant TOUT commit en zone protégée : effectuer le
+               scellement du permit dans la DB orchestrator.
+               Conformément à la persona implementer rule
+               write_permit_full_sequence :
+                 - grant_write_permit() déjà fait par le CEO ✓
+                 - SCELLER la DB par un commit :
+                   git add -f company/data/orchestrator.db &&
+                   git commit -m "chore: seal write permit a685f08a (orchestrator DB resilience)"
+                 - PUIS implémenter (étapes 1 à 9 déjà commits
+                   intermédiaires) ;
+                 - PUIS consume_write_permit() ;
+                 - PUIS cargo build && cargo test ;
+                 - PUIS reload_config() (en DERNIER, optionnel
+                   ici car les modifications de config sont
+                   minimes).
+
+               Ordre concret retenu :
+                 (10.1.a) commit de scellement AVANT toute
+                          modification protégée ;
+                 (10.1.b) commits intermédiaires pour chaque
+                          étape protégée (étapes 1-8) ;
+                 (10.1.c) commit final pour les tests (étape 9) ;
+                 (10.1.d) cargo build (sans --target-dir) +
+                          cargo test ;
+                 (10.1.e) consume_write_permit() ;
+                 (10.1.f) (optionnel) reload_config().
+
+               Note : la persona dit "consume après commit",
+               mais aussi "cargo build après consume". L'ordre
+               cohérent est : commit → consume → cargo build →
+               cargo test → reload_config. C'est ce que je
+               suivrai.
+
+        (10.2) Exécuter le protocole de validation manuel pour
+               les AC du task-request (4) et (5) :
+
+               (a) Test AC4 — "démarrer depuis DB saine ne corrompt
+                   pas" :
+                   * cp company/data/orchestrator.db /tmp/baseline.db
+                   * sqlite3 /tmp/baseline.db "PRAGMA integrity_check;"
+                     → "ok" attendu
+                   * démarrer le serveur (ou laisser cette session
+                     active utiliser le serveur via le proxy
+                     résilient)
+                   * faire quelques appels MCP (search, get)
+                   * envoyer SIGTERM (ou utiliser un mécanisme
+                     équivalent)
+                   * cp company/data/orchestrator.db /tmp/after.db
+                   * sqlite3 /tmp/after.db "PRAGMA integrity_check;"
+                     → "ok" attendu
+                   * Comparaison avant/après : pas de régression
+                     visible.
+
+               (b) Test AC5 — "restart par proxy résilient ne
+                   corrompt pas" :
+                   * Pendant une session active, déclencher un
+                     cargo build (qui rebuild le binaire serveur
+                     et déclenche un restart via le watcher du
+                     proxy).
+                   * Attendre que le proxy ait restarté
+                     (~quelques secondes).
+                   * Vérifier que les appels MCP fonctionnent à
+                     nouveau (sans message d'erreur "database
+                     malformed").
+                   * sqlite3 company/data/orchestrator.db "PRAGMA
+                     integrity_check;" depuis l'EXTÉRIEUR (sans
+                     toucher la DB) → "ok" attendu.
+
+        (10.3) Si les deux tests passent, on est bon pour les AC
+               (4) et (5).
+
+        (10.4) Mettre à jour les statuts :
+               - task-request ffb85fc7 → status: done
+               - RFC cdbfee72 → status: implemented
+                 (préalable obligatoire : l'amendement iteration 5
+                 de l'étape 10.0 est approuvé, sinon le RFC ne
+                 peut pas passer en implemented avec une
+                 divergence non réconciliée.)
+               (Ces modifications sont des éditions YAML, indexées
+               automatiquement par defense-in-depth.)
+
+        (10.5) Produire la lesson-learned finale (cf. règle
+               lesson_after_every_artifact). Avant : search() sur
+               "sqlite resilience wal flock" pour voir si une
+               lesson similaire existe. Sinon, créer la nouvelle.
+
+        (10.6) Consume le write permit via
+               consume_write_permit(token, persona="implementer",
+               permit_id="a685f08a-260d-4a6f-8c92-26b8d07ca5b5").
+      files: []
+
+  dependencies:
+    - "Crate fs2 0.4 ajoutée à crates/orchestrator/Cargo.toml (étape 2)."
+    - "tokio feature 'signal' (déjà inclus via 'full' au workspace level)."
+    - "Tools MCP existants : check_write_permit (déjà exposé), engine.index_artifact (existant)."
+    - "Write permit a685f08a-260d-4a6f-8c92-26b8d07ca5b5 actif pour la durée de l'implémentation."
+
+  risks:
+    - >
+      Risque 1 (HAUT) — Hook defense-in-depth incapable d'appeler
+      MCP depuis Node.js. Si l'API opencode-hook n'expose pas
+      d'appel MCP synchrone ou async depuis les hooks, le refactor
+      des 4 call sites sqlite3 ne peut pas se faire. Mitigation :
+      étape 8.1 fait l'analyse en premier ; si bloquant, on
+      garde sqlite3 inline pour cette itération et on documente
+      via lesson + agent-message au PM. Fallback acceptable car
+      le risque de corruption est largement réduit par les
+      PILIERs A, B, C, D côté binaire ; les sqlite3 inlines du
+      hook ne sont qu'un facteur additionnel.
+    - >
+      Risque 2 (MOYEN) — Impossibilité technique pour --index
+      d'appeler index_now via MCP. C'est un écart documenté
+      avec la PROPOSITION 1 étape 3 du RFC. Mitigation :
+      sémantique "no-op + log + exit 0" appliquée à la place ;
+      le file watcher serveur indexe dans la seconde grâce au
+      debounce 500ms (latence acceptable selon design-doc).
+      L'outil index_now est exposé côté serveur pour utilisateurs
+      futurs (tests, agents avancés).
+    - >
+      Risque 3 (FAIBLE) — Un signal arrive AVANT que le file
+      lock soit acquis (très tôt dans run_server) ou APRÈS
+      sa libération. Cas extrême peu probable mais à valider :
+      les signal handlers ne sont installés qu'AVANT le
+      service.waiting().await ; un SIGTERM reçu plus tôt serait
+      ignoré (comportement par défaut Linux = exit). Acceptable
+      car la fenêtre est < 100ms en pratique.
+    - >
+      Risque 4 (FAIBLE) — Si reindex_all panique pendant le
+      rebuild PILIER D, le binaire exite sans la DB repeuplée.
+      Documenté dans le RFC comme cas dégénéré non couvert
+      (le YAML lui-même est cassé). Mitigation : reindex_all
+      logue chaque skip ; un YAML corrompu provoque un skip
+      pas une panique, donc en pratique le rebuild aboutit.
+    - >
+      Risque 5 (FAIBLE) — La table write_permits est perdue lors
+      du rebuild PILIER D. Le permit en cours
+      (a685f08a-260d-4a6f-8c92-26b8d07ca5b5) serait perdu si
+      le rebuild se déclenche pendant l'implémentation.
+      Probabilité : très faible (la DB courante est saine et
+      l'implémentation ne déclenchera pas de rebuild). Si ça
+      arrive : le CEO devrait re-grant un nouveau permit, ce
+      qui est gérable mais coûteux. Mitigation : surveiller la
+      santé de la DB pendant l'implémentation, ne pas faire de
+      kill -9 brutal sur le serveur tant que le code n'est pas
+      mergé.
