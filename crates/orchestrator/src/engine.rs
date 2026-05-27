@@ -317,6 +317,44 @@ impl OrchestratorEngine {
         self.db.consume_permit(permit_id)
     }
 
+    /// Opaque blob describing the current state of `write_permits`.
+    /// Backs the MCP tool `snapshot_permits_state` used by the
+    /// defense-in-depth hook to detect tampering.
+    pub fn snapshot_permits(&self) -> Result<String, OrchestratorError> {
+        self.db.snapshot_permits()
+    }
+
+    /// Restore `write_permits` to a previous snapshot. `None` wipes all
+    /// rows (nuclear). Backs the MCP tool `revert_permits_to_snapshot`.
+    /// Returns the number of permits deleted.
+    pub fn restore_permits_from_snapshot(
+        &self,
+        snapshot: Option<&str>,
+    ) -> Result<usize, OrchestratorError> {
+        self.db.restore_permits_from_snapshot(snapshot)
+    }
+
+    /// Database integrity check, used by the autorepair sequence at
+    /// server boot (PILIER D). Returns true iff `PRAGMA integrity_check`
+    /// returns exactly "ok".
+    pub fn integrity_check(&self) -> Result<bool, OrchestratorError> {
+        self.db.integrity_check()
+    }
+
+    /// Execute `PRAGMA wal_checkpoint(TRUNCATE)`. Used by the graceful
+    /// shutdown sequence (PILIER C) to flush WAL frames before exit.
+    pub fn checkpoint_truncate(&self) -> Result<(), OrchestratorError> {
+        self.db.checkpoint_truncate()
+    }
+
+    /// Tear down the engine and return ownership of the inner DB
+    /// connection. Used by the boot autorepair (PILIER D) when
+    /// integrity_check fails: the caller drops the DB, removes the files,
+    /// reopens fresh, and rebuilds.
+    pub fn into_db_for_rebuild(self) -> OrchestratorDb {
+        self.db
+    }
+
     // --- Artifact Index Operations ---
 
     /// Index a single artifact file. Reads YAML, validates, extracts metadata, upserts into index.

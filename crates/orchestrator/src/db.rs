@@ -340,6 +340,87 @@ impl OrchestratorDb {
         Ok(())
     }
 
+    /// Compute an opaque blob describing the current state of
+    /// `write_permits`. Format mirrors the legacy sqlite3 inline call in
+    /// `defense-in-depth-core.mjs:188`:
+    ///
+    /// ```text
+    /// "<count>|<id1>:<status1>,<id2>:<status2>,..."
+    /// ```
+    ///
+    /// When the table is empty the blob is `"0|"`. The blob is consumed
+    /// later by [`Self::restore_permits_from_snapshot`] to detect
+    /// tampering and revert if necessary.
+    pub fn snapshot_permits(&self) -> Result<String, OrchestratorError> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM write_permits", [], |r| r.get(0))?;
+
+        // Concatenate id:status pairs in a stable order (ORDER BY id) so
+        // two consecutive snapshots of the same state are byte-identical.
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id || ':' || status FROM write_permits ORDER BY id")?;
+        let pairs: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(format!("{}|{}", count, pairs.join(",")))
+    }
+
+    /// Restore the `write_permits` table to a previous snapshot,
+    /// removing any permit not present in the snapshot.
+    ///
+    /// - `None` (nuclear): wipe all permits. Used when the DB did not
+    ///   exist before the guarded bash command but exists now.
+    /// - `Some(blob)` (selective): keep only the ids found in the blob.
+    ///
+    /// Returns the number of rows deleted.
+    pub fn restore_permits_from_snapshot(
+        &self,
+        snapshot: Option<&str>,
+    ) -> Result<usize, OrchestratorError> {
+        let snapshot = match snapshot {
+            None => {
+                // Nuclear: wipe everything.
+                let n = self.conn.execute("DELETE FROM write_permits", [])?;
+                return Ok(n);
+            }
+            Some(s) => s,
+        };
+
+        // Parse "<count>|<id1>:<status1>,<id2>:<status2>,..."
+        // Only the ids matter for the selective delete; statuses are
+        // informational (kept in the blob to detect intra-permit
+        // tampering, but not enforced here — the wipe-vs-keep contract
+        // is at row granularity).
+        let pair_segment = snapshot.split_once('|').map(|(_, rest)| rest).unwrap_or("");
+        let ids: Vec<&str> = if pair_segment.is_empty() {
+            Vec::new()
+        } else {
+            pair_segment
+                .split(',')
+                .filter_map(|pair| pair.split(':').next())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+
+        if ids.is_empty() {
+            // Snapshot says "nothing was there" — wipe whatever is here.
+            let n = self.conn.execute("DELETE FROM write_permits", [])?;
+            return Ok(n);
+        }
+
+        // Build "DELETE FROM write_permits WHERE id NOT IN (?, ?, …)"
+        // with the right number of placeholders.
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!("DELETE FROM write_permits WHERE id NOT IN ({placeholders})");
+        let params_vec: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let n = self.conn.execute(&sql, params_vec.as_slice())?;
+        Ok(n)
+    }
+
     // --- Artifact Index ---
 
     pub fn upsert_artifact(
@@ -985,6 +1066,100 @@ mod tests {
         let db = setup_db();
         let result = db.consume_permit(Uuid::new_v4());
         assert!(result.is_err());
+    }
+
+    // --- Snapshot / Restore permits (backing the defense-in-depth hook
+    //     refactor via MCP, step 4 of the implementation-plan) ---
+
+    #[test]
+    fn test_snapshot_permits_empty() {
+        let db = setup_db();
+        let blob = db.snapshot_permits().unwrap();
+        assert_eq!(blob, "0|");
+    }
+
+    #[test]
+    fn test_snapshot_permits_format() {
+        let db = setup_db();
+        let p1 = make_permit(
+            Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            vec!["company/src/"],
+        );
+        let p2 = make_permit(
+            Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+            vec!["company/docs/"],
+        );
+        db.create_permit(&p1).unwrap();
+        db.create_permit(&p2).unwrap();
+
+        let blob = db.snapshot_permits().unwrap();
+        // Ordered by id, two pairs id:status separated by ','.
+        assert_eq!(
+            blob,
+            "2|11111111-1111-1111-1111-111111111111:active,\
+             22222222-2222-2222-2222-222222222222:active"
+        );
+    }
+
+    #[test]
+    fn test_restore_permits_nuclear() {
+        let db = setup_db();
+        let p1 = make_permit(Uuid::new_v4(), vec!["a"]);
+        let p2 = make_permit(Uuid::new_v4(), vec!["b"]);
+        db.create_permit(&p1).unwrap();
+        db.create_permit(&p2).unwrap();
+
+        let deleted = db.restore_permits_from_snapshot(None).unwrap();
+        assert_eq!(deleted, 2);
+
+        let blob = db.snapshot_permits().unwrap();
+        assert_eq!(blob, "0|");
+    }
+
+    #[test]
+    fn test_restore_permits_selective_drops_only_new() {
+        let db = setup_db();
+        let p1 = make_permit(
+            Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap(),
+            vec!["a"],
+        );
+        let p2 = make_permit(
+            Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap(),
+            vec!["b"],
+        );
+        db.create_permit(&p1).unwrap();
+        db.create_permit(&p2).unwrap();
+
+        // Snapshot at this point ("good state" with p1+p2).
+        let snapshot = db.snapshot_permits().unwrap();
+
+        // Tampering: a third permit appears.
+        let p3 = make_permit(
+            Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap(),
+            vec!["c"],
+        );
+        db.create_permit(&p3).unwrap();
+
+        // Revert to the snapshot.
+        let deleted = db.restore_permits_from_snapshot(Some(&snapshot)).unwrap();
+        assert_eq!(deleted, 1, "only p3 should be removed");
+
+        // Verify p1 + p2 remain.
+        let after = db.snapshot_permits().unwrap();
+        assert_eq!(after, snapshot);
+    }
+
+    #[test]
+    fn test_restore_permits_empty_snapshot_wipes_table() {
+        // If the snapshot encodes "table was empty" ("0|"), restoring
+        // should wipe whatever is in the table now.
+        let db = setup_db();
+        let p1 = make_permit(Uuid::new_v4(), vec!["a"]);
+        db.create_permit(&p1).unwrap();
+
+        let deleted = db.restore_permits_from_snapshot(Some("0|")).unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(db.snapshot_permits().unwrap(), "0|");
     }
 
     // --- Artifact Index ---
