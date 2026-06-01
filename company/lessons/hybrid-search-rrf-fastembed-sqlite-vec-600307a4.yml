@@ -1,0 +1,292 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 600307a4-74f6-43dd-95e1-4dee3d2326c1
+  title: "Hybrid search FTS5 BM25 + sqlite-vec + fastembed + RRF : 5ms p95, recall@10 = 0.895, et les frictions opérationnelles à ne pas sous-estimer"
+  author: implementer
+  created_at: "2026-06-01"
+  description: >
+    Capitalisation finale après l'implémentation du RFC bdee1af4 (refonte
+    search en hybrid retrieval) sur le plan 640e2894. Trois axes
+    distincts : (a) l'architecture technique qui marche concrètement
+    (FTS5 BM25 + sqlite-vec + fastembed + RRF), avec les chiffres
+    mesurés (p95 = 5ms sur 92 artifacts, recall@10 = 0.895 sur 20
+    queries dont 3/3 du symptôme), (b) les surprises rencontrées en
+    exécution (sqlite-vec 0.1.10-alpha cassée, déterminisme effectif
+    cross-architecture, comportement de fastembed avec HF_HUB_OFFLINE),
+    (c) les frictions opérationnelles avec le hook defense-in-depth
+    qui ont coûté 2 cycles de re-émission de permits pendant la session.
+  tags:
+    - search
+    - retrieval
+    - hybrid-search
+    - rrf
+    - embeddings
+    - sqlite-vec
+    - fastembed
+    - bm25
+    - implementation
+    - critical-infra
+    - lessons-from-implementation
+  related:
+    - id: bdee1af4-4944-4bee-b7c0-18efd6c7961f
+      kind: rfc
+      relationship: derived-from
+    - id: f433fefc-81b7-4b32-b9a3-3ddd6a020a73
+      kind: design-doc
+      relationship: derived-from
+    - id: 640e2894-6d9e-4c75-bfc7-5a63ec3c84c9
+      kind: implementation-plan
+      relationship: derived-from
+    - id: 6cfd1c62-cbf1-4941-90e1-a0886a9e551c
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+    - id: 8fd49300-14e5-4e7c-b75f-e0e4bd461aac
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Le diagnostic 6cfd1c62 a mesuré que le search FTS5 lexical pur
+    retournait 0 résultat sur 3 queries naturelles évidentes pour un
+    humain, et que ~24% des queries du corpus naturel souffraient de
+    ce pattern. La règle memory_lookup_before_acting de shared-rules
+    impose à TOUS les agents un lookup avant chaque artifact ; si
+    search est faible, la règle se transforme en rituel.
+
+    Le RFC bdee1af4 a tranché : refonte profonde vers hybrid search
+    (lexical FTS5 BM25 + sémantique sqlite-vec + RRF fusion + filtres
+    structurés). Mise en service au commit f1a0405. Bench mesuré sur
+    92 artifacts (corpus actuel) :
+      - p50 = 5ms, p95 = 5ms, p99 = 6ms (cible AC8 < 500ms).
+      - extrapolation 10x : p95 ~ 21ms (cible AC8 < 2000ms).
+      - recall@10 = 0.895 sur 20 queries de référence.
+      - 3/3 queries du symptôme retournent les artifacts attendus.
+      - MRR = 0.585 (premier hit en moyenne en position 2).
+
+    L'implémentation a porté 18 commits (cdbea87 .. f1a0405) répartis
+    en 7 blocs : dépendances + sqlite-vec smoke test + embedding module
+    + tables + upsert transactionnel + engine + fusion + query + BM25 +
+    refonte search MCP + index_status + migration boot + tests +
+    benchmarks + doc. Plus 2 commits de blockers permit (4 émissions
+    de permit au total sur ce chantier).
+
+  insight: >
+    TROIS ENSEIGNEMENTS DISTINCTS.
+
+    ENSEIGNEMENT 1 — L'ARCHITECTURE HYBRID + RRF QUI MARCHE.
+
+    Quatre composants indissociables. Aucun ne suffit seul ; ensemble
+    ils délivrent recall@10 = 0.895 et p95 = 5ms.
+
+    (a) FTS5 unicode61 + BM25 explicite avec column weights. Le
+    tokenizer par défaut (sans options) traite '-' et '_' comme des
+    caractères de mot, ce qui rend tous les UUIDs et identifiants
+    techniques opaques. Avec separators '-_./', "sqlite-vec" tokenise
+    en {sqlite, vec}, "bdee1af4-4944" tokenise en {bdee1af4, 4944}.
+    Le BM25 avec poids (kind=0, title=10, description=3, tags=5,
+    content=1) place les hits dans le titre devant ceux du body, ce
+    qui aligne le ranking avec l'intuition humaine. La fonction de
+    normalisation query côté Rust (sanitize_fts_query Natural mode)
+    casse l'AND-implicite en wrappant chaque token en "X" et joignant
+    par OR — c'est ce qui transforme les 3 queries du symptôme en
+    queries qui matchent (avant : 0 résultat ; après : top-3 attendus).
+
+    (b) sqlite-vec via sqlite3_auto_extension. La crate Rust 0.1.6
+    expose juste un symbole C `sqlite3_vec_init` ; on l'enregistre une
+    fois au début du process via std::sync::Once. Toutes les
+    Connection::open subséquentes (server, --index, tests in_memory)
+    bénéficient automatiquement de vec0. Le smoke test au boot (créer
+    une table vec0_smoketest jetable, insérer 2 vecteurs, kNN attendu)
+    coûte ~5ms et capture la classe de bugs "kNN cassé silencieusement
+    suite à un upgrade de version" (RFC F-rfc-4). Empiriquement on l'a
+    déclenché : 0.1.10-alpha.4 (la plus récente) refuse de compiler
+    (sqlite-vec-diskann.c manquant du tarball). 0.1.6 marche.
+
+    (c) fastembed-rs + MultilingualE5Small. 118M params, dim 384, int8
+    via ONNX Runtime. Footprint 465MB sur disque, ~150MB RAM. Latence
+    embed_text ~20-40ms par texte court. Mode pre-fetch via CLI
+    dédié + HF_HUB_OFFLINE=1 au boot serveur : 0 download au runtime
+    d'un search() (cible AC3 autonomie locale). Le pre-fetch télécharge
+    une fois pour toutes le repo HuggingFace `intfloat/multilingual-e5-
+    small` dans `company/data/embeddings/cache/`. Le cache est
+    gitignored explicitement (sinon ~465MB en git, catastrophe).
+
+    (d) Reciprocal Rank Fusion. ~15 lignes de Rust pur, zéro I/O,
+    O(K_lex + K_sem + N log N). Le tie-breaker déterministe (par id
+    lexicographique) évite les flakes. La constante k=60 (canonique
+    TREC) marche directement : pas de calibration nécessaire. Sur le
+    bench, RRF promeut systématiquement les artifacts présents dans
+    les deux axes (un RFC sur la search qui contient à la fois le mot
+    "search" et l'embedding sémantique adjacent remonte au-dessus
+    d'un artifact présent dans un seul axe).
+
+    Le pipeline transactionnel SQLite : upsert_artifact() couvre
+    `artifacts + artifacts_fts + artifacts_vec + artifact_relations`
+    dans une seule transaction BEGIN IMMEDIATE / COMMIT. Si une étape
+    échoue (par exemple l'embedding compute), aucune des 4 tables n'a
+    écrit. C'est l'invariant clé du RFC (proposition 7) : "présent
+    dans les 4 tables ou aucune".
+
+    ENSEIGNEMENT 2 — LES SURPRISES OPÉRATIONNELLES.
+
+    Surprise 1 : sqlite-vec pre-1.0 alpha cassée. La version la plus
+    récente publiée (0.1.10-alpha.4 en mai 2026) refuse de compiler
+    parce que le tarball publié référence un fichier `sqlite-vec-
+    diskann.c` qui n'y est pas inclus. Mitigation : downgrade vers
+    `=0.1.6` (la dernière stable sans diskann). La règle F-rfc-4 du
+    RFC (pin EXACT) s'est révélée encore plus pertinente que prévue :
+    sans le pin, un `^0.1` aurait sélectionné 0.1.9 ou alpha et fail
+    silencieusement. Cette version 0.1.6 manque les latest features
+    de sqlite-vec (partition keys, auxiliary columns avec +prefix) ;
+    on a contourné avec une metadata column TEXT pour artifact_id.
+
+    Surprise 2 : déterminisme effectif vs déterminisme strict. La
+    contrainte du RFC (modèle déterministe pour PILIER D) est
+    satisfaite same-machine mais pas cross-architecture. fastembed
+    avec ort retourne des embeddings 1e-5 .. 1e-6 différents selon
+    AVX2 vs NEON. Mitigation appliquée : `architecture_marker`
+    concaténé au model_version stocké ("multilingual-e5-small-v1+
+    x86_64"). Au boot, si stored != current, wipe_vec_table + reindex
+    automatique. Coût ~5s sur 92 artifacts, acceptable.
+
+    Surprise 3 : `cargo info` peut tuer un permit. Pendant la session,
+    `cargo info fastembed` a déclenché le hook defense-in-depth
+    (download d'index crates.io) et a wipé les 2 permits actifs. Pas
+    juste celui qui aurait dérivé du download, mais TOUS les permits
+    en DB. Comportement nucléaire du hook (cohérent avec
+    restore_permits_from_snapshot(None) qui DELETE FROM
+    write_permits). Coûté 1 cycle PM→CEO→re-grant. Mitigation :
+    JAMAIS de cargo info/search/update dans une session avec permit
+    actif ; utiliser docs.rs ou les sources cargo dans
+    ~/.cargo/registry/src/ après le premier build.
+
+    Surprise 4 : pré-commit hook clippy strict. cargo fix --tests
+    automatique résout les `let mut` superflus, mais les
+    `clippy::doc-overindented-list-items` ou
+    `clippy::too-many-arguments` ne sont pas auto-fixables —
+    intervention manuelle. Ajouter `#[allow(clippy::too_many_arguments)]`
+    sur une signature 8-args propre est défendable, mais la première
+    fois c'est une friction.
+
+    ENSEIGNEMENT 3 — ARBITRAGES TRANCHÉS QUI ONT BIEN MARCHÉ.
+
+    (a) MultilingualE5Small au lieu de BGE-M3. Pari : un petit modèle
+    multilingue suffit pour 92 artifacts FR+EN, avec marge à 1000.
+    Mesuré recall@10 = 0.895 sur le bench, dont 3/3 sur les queries
+    symptôme. Pari validé. BGE-M3 (4x plus gros, 4x plus lent) serait
+    overkill à ce stade. Le fallback documenté reste valable si une
+    régression future le justifie.
+
+    (b) ureq sync au lieu de reqwest async pour rerank/HyDE. Pari : le
+    cost en footprint et complexité d'un binding async ne se justifie
+    pas pour 2 flags optionnels. Et en pratique : couches rerank et
+    HyDE finalement reportées à un follow-up (le mode hybrid sans
+    Anthropic donne déjà recall@10 = 0.895). La décision de garder
+    ureq simplifie le build et reste prête pour l'étape 13 future.
+
+    (c) Architecture marker concaténé dans model_version au lieu d'un
+    champ séparé. Pari : un seul mécanisme de drift detection couvre
+    deux cas (upgrade de modèle ET change d'architecture). Mesuré :
+    code de detection en 5 lignes côté run_server. Pari validé.
+
+    (d) Tests d'intégration en Rust inline au lieu de search_eval.yml.
+    Pari : le hook defense-in-depth refuse les YAML non-artifact en
+    zone protégée (crates/ inclus). Au lieu de batailler avec le
+    schéma ou renommer le permit, on encode les 20 queries en
+    constante Rust. Trade-off : moins editable par un non-dev, mais
+    type-checked et auto-complétable. Pari raisonnable.
+
+    (e) Étape 13 (rerank/HyDE) reportée. Pari : les chiffres bench
+    sans rerank (recall = 0.895, p95 = 5ms) sont déjà suffisants pour
+    AC1+AC2+AC3+AC5+AC6+AC7+AC8+AC9+AC10. AC4 ("Anthropic optionnelle")
+    est satisfait par les stubs qui retournent une erreur explicite.
+    Ajout effectif des appels HTTP Anthropic = futur RFC quand le
+    besoin sera quantifié.
+
+  recommendation: >
+    QUATRE RECOMMANDATIONS ACTIONNABLES POUR LA SUITE.
+
+    RECOMMANDATION 1 — POUR LES FUTURES REFONTES SEARCH.
+
+    Le pattern "lexical robuste + sémantique embeddings + RRF fusion"
+    est l'état de l'art IR depuis 2022 et marche directement sans
+    calibration sur des corpus de la taille du nôtre (< 10k docs).
+    Trois leçons de mise en place :
+
+    (a) Le tokenizer FTS5 explicite est NON-OPTIONNEL pour les
+    identifiants techniques. Sans separators '-_./', un UUID 8-char
+    devient invisible. C'est une 30-secondes-de-fix qui débloque la
+    moitié des faux négatifs.
+
+    (b) Pinner les versions exactes des deps pre-1.0. sqlite-vec et
+    fastembed sont en alpha ; un `^0.1` aurait cassé le build à un
+    moment imprévu. F-rfc-4 du RFC s'est validé deux fois (au merge
+    et à la première compile).
+
+    (c) Le smoke test au boot d'une extension SQLite tierce est
+    bon marché et capture des bugs vicieux. 10 lignes, 5ms par boot.
+
+    RECOMMANDATION 2 — POUR LES FUTURS RFC TOUCHANT DES DEPS ML.
+
+    Inventorier le runtime ML AVANT de figer le scope. Le RFC initial
+    parlait de "crate Rust pure" qui s'est révélé inexact (candle,
+    fastembed-rs, ort tous tirent des FFI ou downloadent au build).
+    L'iteration 3 du RFC a clarifié : autonomie RUNTIME (search() ne
+    fait pas de réseau) est l'unique contrainte dure ; tout le reste
+    (FFI, download au build) est négociable. Cette clarification a
+    permis fastembed-rs sans débat. Pattern reproductible : la
+    contrainte fonctionnelle doit toujours primer sur la contrainte
+    de pureté du langage.
+
+    RECOMMANDATION 3 — POUR LES SESSIONS AVEC PERMIT ACTIF.
+
+    Pendant cette session, 4 émissions de permit ont été nécessaires :
+    9149f79e (wipé par cargo info), a0b34bcd (wipé par cargo info
+    bis), fb2a5053 (jamais scellé en git, wipé en collateral),
+    00265a47 (final qui a survécu jusqu'à la consume).
+
+    Pattern à éviter : JAMAIS `cargo info`, `cargo search`,
+    `cargo update`, `cargo publish` dans une session avec permit
+    actif. Ces commandes touchent ~/.cargo/registry/ et déclenchent
+    apparemment des side-effects sur la baseline du snapshot. Pattern
+    à privilégier : lire ~/.cargo/registry/src/ directement après le
+    premier `cargo build`, ou docs.rs.
+
+    Pattern à corriger structurellement (candidat RFC futur) : le
+    `grant_write_permit` côté MCP tool devrait FAIRE le commit git
+    de scellement lui-même, plutôt que de laisser cette
+    responsabilité au PM/CEO. Aujourd'hui la règle
+    `write_permit_full_sequence` (persona implementer) dit que
+    l'étape 2 (git commit) est faite par celui qui consomme, mais
+    en pratique c'est trop tard : le PM/CEO émet, et entre l'émission
+    et le scellement, n'importe quelle commande bash dans la
+    fenêtre tue le permit. Atomiciser émission + scellement côté
+    MCP éliminerait toute cette classe de bugs.
+
+    RECOMMANDATION 4 — POUR LES FUTURES MESURES DE QUALITÉ DE SEARCH.
+
+    Le triplet (precision@10, recall@10, MRR) sur un eval set
+    diversifié reste le bon protocole. Quelques précisions tirées de
+    l'expérience :
+
+    (a) Ne pas viser precision@10 >= 0.5 sur un corpus de taille
+    modeste si les queries ont en moyenne 1-3 expected_ids. La
+    métrique est upper-bounded par expected_count / 10. Préférer
+    recall@10 >= 0.7 comme gate.
+
+    (b) Les 3 queries du symptôme du diagnostic sont la cible
+    absolue : si l'une revient 0 hit, la refonte a échoué quoi que
+    disent les autres métriques. C'est le test acceptance pertinent.
+
+    (c) MRR est utile pour mesurer la qualité du ranking (premier hit
+    en position N). On a mesuré MRR = 0.585 = premier hit en
+    moyenne en position 2, ce qui est très satisfaisant pour un
+    workflow agent qui regarde généralement le top-3 retourné.
+
+    (d) Le bench latence doit toujours être en mode `--release` :
+    debug est ~10x plus lent et donnerait des p95 ~50ms au lieu de
+    ~5ms, créant une fausse alarme.

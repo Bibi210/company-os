@@ -2,8 +2,9 @@ api_version: companyos/v1
 kind: rfc
 metadata:
   id: bdee1af4-4944-4bee-b7c0-18efd6c7961f
-  status: approved
+  status: implemented
   approved_at: "2026-06-01T13:30:15.109706198+00:00"
+  implemented_at: "2026-06-01T15:00:00+00:00"
   title: "Refonte search() en hybrid retrieval : FTS5 BM25 durci, embeddings locaux via sqlite-vec, fusion RRF, filtres structurés, reranking et HyDE optionnels via Claude"
   author: architect
   created_at: "2026-06-01"

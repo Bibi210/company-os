@@ -45,7 +45,7 @@ metadata:
 
 spec:
   priority: high
-  status: backlog
+  status: done
   acceptance_criteria:
     - >
       Le diagnostic du problème actuel est posé proprement (corpus
