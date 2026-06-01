@@ -6,22 +6,99 @@ metadata:
   author: implementer
   created_at: "2026-06-01"
   project: company-os
+  changelog:
+    - date: "2026-06-01"
+      author: implementer
+      description: >
+        Révision iteration 2 suite au round e785a3e9 (vote Architect
+        request_changes avec 5 findings, 3 bloquants + 2 non bloquants).
+
+        F-plan-1 BLOQUANT (types.rs absent du permit a0b34bcd). RÉSOLU
+        EN AMONT par PM + CEO via émission d'un permit complémentaire
+        fb2a5053-3a29-4ba5-a125-f0b23cdbcf4b ciblant
+        crates/orchestrator/src/types.rs, scellé en git par le PM avant
+        relance. L'Implementer reflète ce permit complémentaire dans la
+        description du plan, la section dependencies, et l'étape 21 qui
+        consomme désormais les DEUX permits.
+
+        F-plan-2 BLOQUANT (AC 8 partiel, p95 < 2s à corpus 10x non
+        couvert). Ajout d'une étape 18-bis dédiée à la validation du
+        comportement à corpus 10x. Approche retenue : génération
+        synthétique d'un corpus de 756 artifacts (84 actuels * 9 copies
+        avec UUIDs distincts et perturbations de contenu pour éviter la
+        dégénérescence de l'index), benchmark des mêmes 20 queries de
+        référence, vérification p95 < 2s. Approche fallback documentée
+        au cas où la génération est lourde : extrapolation théorique par
+        composant (embedding query O(1) constant, k-NN brute force O(N)
+        linéaire, FTS5 BM25 O(matches) acceptable, RRF négligeable).
+
+        F-plan-3 BLOQUANT (étape 21 confuse). Réécriture complète.
+        Suppression de la confusion entre scellement initial (DÉJÀ
+        FAIT par le PM en commits 5919adb pour a0b34bcd et celui pour
+        fb2a5053) et commits finaux post-implémentation. Ordre corrigé
+        en cohérence avec lesson 8fd49300 (write → commit → consume
+        non-négociable, Layer 2 defense-in-depth vérifie status=active
+        au moment du commit). Suppression de la phrase fautive sur
+        `git add company/data/orchestrator.db` : .gitignore contient
+        `*.db*` donc cet add est no-op sans `-f`, et de toute façon
+        l'état consumed du permit n'a pas vocation à être persisté en
+        git (la DB reste volatile, c'est volontaire).
+
+        F-plan-4 NON BLOQUANT (ureq vs reqwest). Arbitrage documenté
+        explicitement à l'étape 13 et dans la section risks. Le RFC
+        proposition 5 ne mentionne pas un binding HTTP précis ; le
+        design-doc non plus. Le choix ureq dans le plan est défendable
+        sur trois critères : (a) synchrone par défaut, ce qui s'aligne
+        avec le runtime fastembed (synchrone) et évite spawn_blocking
+        sur le tokio runtime, (b) footprint plus léger (~150KB vs
+        ~2MB pour reqwest avec ses features TLS + tokio), (c) zero
+        feature flags à gérer (reqwest exige features `json` + `rustls`
+        ou équivalent). Inconvénient : pas d'API async native, donc
+        l'engine.search qui orchestre rerank/HyDE doit envelopper
+        l'appel dans tokio::task::spawn_blocking pour ne pas bloquer
+        le runtime. Décision maintenue : ureq pour la première
+        itération. Si une seconde itération du système devient
+        async-first transverse, switch vers reqwest envisageable.
+
+        F-plan-5 NON BLOQUANT (checklist call sites
+        OrchestratorEngine::new). Ajoutée à l'étape 7. Quatre call
+        sites identifiés empiriquement par grep :
+          - crates/mcp-servers/orchestrator/src/main.rs:848 (run_index)
+          - crates/mcp-servers/orchestrator/src/main.rs:905 (run_server
+            initial engine pre-autorepair check)
+          - crates/mcp-servers/orchestrator/src/main.rs:926 (run_server
+            rebuild engine post-autorepair)
+          - crates/orchestrator/src/engine.rs:796 (test setup_engine)
+        Tous doivent être mis à jour pour passer l'Arc<Embedder>.
+
+        Aucune autre modification structurelle. Les 24 étapes
+        d'origine sont conservées ; seules les étapes 7 et 21 sont
+        réécrites, et une étape 18-bis est insérée entre 18 et 19
+        (la numérotation des étapes 19-24 est décalée de +1, désormais
+        25 étapes au total). Les décisions techniques tranchées à
+        l'étape 1 (modèle E5Small, runtime fastembed-rs, sqlite-vec
+        pin, etc.) restent inchangées.
+
   description: >
     Plan d'implémentation dérivé du design-doc f433fefc et du RFC bdee1af4
-    (approuvé, write permit a0b34bcd actif). Tranche les deux incertitudes
+    (approuvé). Deux write permits actifs couvrant l'ensemble du scope :
+    a0b34bcd-2af6-407a-b5a6-a264d28b3c7d (15 paths originaux) et
+    fb2a5053-3a29-4ba5-a125-f0b23cdbcf4b (types.rs, ajouté en réponse au
+    finding F-plan-1 de l'iteration 1). Tranche les deux incertitudes
     structurelles laissées ouvertes par l'Architect en cohérence avec les
     contraintes du RFC (autonomie runtime DURE, footprint < 1GB, latence
     p95 < 100ms par embedding, déterminisme effectif > 0.9999 cosine
-    similarity sur la même machine). Décompose le chantier en 24 étapes
-    ordonnées, regroupées en sept blocs cohérents (pré-requis et
-    dépendances, lexical durci, sémantique, fusion et API, observabilité,
-    tests et benchmark, clôture). Chaque étape liste les fichiers
-    impactés (tous couverts par les 15 target_paths du permit a0b34bcd),
-    sa dépendance amont, et son critère de validation. Le plan ne remet
-    pas en cause les décisions architecturales tranchées par les
-    iterations 2 et 3 du RFC et du design-doc. Si un trou de permit est
-    découvert en cours d'exécution (par exemple un nouveau fichier non
-    listé), l'Implementer s'arrête et demande extension via
+    similarity sur la même machine). Décompose le chantier en 25 étapes
+    ordonnées (24 d'origine + étape 18-bis pour la validation à corpus
+    10x ajoutée en iteration 2), regroupées en sept blocs cohérents
+    (pré-requis et dépendances, lexical durci, sémantique, fusion et
+    API, observabilité, tests et benchmark, clôture). Chaque étape liste
+    les fichiers impactés (tous couverts par les 16 target_paths cumulés
+    des deux permits), sa dépendance amont, et son critère de validation.
+    Le plan ne remet pas en cause les décisions architecturales tranchées
+    par les iterations 2 et 3 du RFC et du design-doc. Si un trou de
+    permit est découvert en cours d'exécution (par exemple un nouveau
+    fichier non listé), l'Implementer s'arrête et demande extension via
     agent-message, conformément à la lesson 611fde3e.
   tags:
     - search
@@ -48,6 +125,9 @@ metadata:
       kind: diagnostic-report
       relationship: input
     - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+    - id: 8fd49300-14e5-4e7c-b75f-e0e4bd461aac
       kind: lesson-learned
       relationship: related
 
@@ -594,11 +674,56 @@ spec:
             max_iterations: u32,
             embedder: Arc<Embedder>,
           ) -> Self
-        Tous les callers internes (main.rs run_server et run_index)
-        sont mis à jour pour passer l'embedder. Le test setup_engine
-        utilise un Embedder::load_from_cache() ; en CI cela exige
-        que le cache soit présent, gated par le mode
-        `--prefetch-embeddings` en pré-CI.
+
+        CHECKLIST des call sites à migrer (réponse au finding
+        F-plan-5 iteration 2, identifiée par grep empirique sur le
+        code actuel) :
+
+          1. crates/mcp-servers/orchestrator/src/main.rs:848
+             — dans run_index, OrchestratorEngine::new(db,
+             DEFAULT_MAX_ITERATIONS). Il faut charger l'embedder
+             via Embedder::load_from_cache(&root) avant cet appel
+             et le passer en 3e argument. Si load échoue (cache
+             absent), exit non-zero immédiat avec message clair.
+
+          2. crates/mcp-servers/orchestrator/src/main.rs:905
+             — dans run_server, première instanciation de
+             l'engine avant integrity_check. Mêmes modifications.
+             L'Arc<Embedder> est chargé UNE seule fois en haut de
+             run_server et partagé entre les deux engines
+             (instance initiale + instance post-autorepair).
+
+          3. crates/mcp-servers/orchestrator/src/main.rs:926
+             — dans run_server, deuxième instanciation après
+             autorepair (new_engine = OrchestratorEngine::new(
+             new_db, max_iterations)). L'Arc<Embedder> clone'd
+             pour la deuxième fois, c'est gratuit (Arc::clone).
+
+          4. crates/orchestrator/src/engine.rs:796
+             — dans le module tests, fn setup_engine(). Il
+             faut charger un embedder de test, ce qui exige le
+             cache embedding pré-fetché. Gating proposé :
+             si cache absent au démarrage du test, panic avec
+             message "test requires prefetched embedding cache,
+             run cargo run --bin companyos-orchestrator-server
+             -- --prefetch-embeddings first". Alternative : créer
+             un MockEmbedder qui retourne un vecteur constant
+             (déterministe mais dénué de sens sémantique), gated
+             par #[cfg(test)]. Décision : pour les tests unitaires
+             du module engine.rs qui testent la logique de
+             consensus / review (test_consensus_*), on utilise
+             MockEmbedder ; pour les tests qui testent le pipeline
+             d'embedding (test_index_artifact_writes_embedding),
+             on utilise Embedder::load_from_cache. Le helper
+             setup_engine accepte un paramètre embedder ou existe
+             en deux variantes : setup_engine_mock() et
+             setup_engine_real().
+
+        Tous les callers transverses (autres crates) ont été
+        vérifiés : aucun n'instancie OrchestratorEngine directement
+        (les tests integration_lock du crate orchestrator passent
+        par les helpers de tests/test_helpers.rs, à vérifier au
+        moment du code).
 
         index_artifact() est étendue :
           (1) Parse YAML comme aujourd'hui.
@@ -1311,6 +1436,141 @@ spec:
         - crates/orchestrator/tests/integration_search.rs
 
     - description: >
+        ÉTAPE 18-BIS — Validation à corpus 10x (p95 < 2s).
+        Ajoutée en iteration 2 du plan (réponse au finding
+        F-plan-2 BLOQUANT : l'AC 8 du task-request 02c9f6eb
+        exige p95 < 500ms à corpus actuel ET p95 < 2s à un
+        corpus 10x plus gros). L'étape 18 d'origine ne couvrait
+        que la première moitié.
+
+        APPROCHE PRINCIPALE — corpus synthétique 10x.
+
+        Sous-étape (a) — génération du corpus de bench.
+
+          Helper Rust dans crates/orchestrator/tests/
+          integration_search.rs (ou sous-fichier
+          bench_synthetic.rs gated par #[cfg(test)]) :
+
+            fn generate_synthetic_corpus(
+              source: &[IndexedArtifact],
+              multiplier: usize,
+            ) -> Vec<SyntheticArtifact>;
+
+          Stratégie : pour chaque artifact source du corpus
+          réel (84 actuels), générer (multiplier - 1) copies
+          dérivées avec :
+            - UUID v4 frais à chaque copie (zero collision).
+            - Titre suffixé d'un marker " [synth-N]" (N =
+              numéro de copie) pour garantir unicité tout en
+              gardant le contenu sémantique proche.
+            - Description et body : conservés à 90%, avec un
+              shuffle léger des paragraphes ET ajout d'un
+              paragraphe "synth filler" de 200-300 mots
+              généré déterministiquement (par exemple en
+              concaténant les tags + permutation d'un
+              vocabulaire technique fixe). Ce filler évite
+              que tous les artifacts soient strictement
+              dupliqués, ce qui dégénérerait la qualité de
+              l'index FTS5 (toutes les rows ayant le même
+              score BM25) et masquerait la latence vraie de
+              la kNN.
+            - Tags conservés tels quels.
+            - kind conservé tel quel.
+          Cible : multiplier = 9 → 84 + 84*9 = 840 artifacts.
+          Cohérent avec la cible AC8 "corpus 10x" (~840
+          artifacts).
+
+        Sous-étape (b) — indexation du corpus synthétique
+        dans une DB temporaire isolée.
+
+          Le test #[ignore] crée un répertoire temporaire
+          via tempfile::tempdir(), pointe COMPANYOS_ROOT
+          vers ce dossier, copie les YAML source (84
+          artifacts du corpus actuel) + écrit les YAML
+          synthétiques générés (756) dans projects/
+          synthetic-bench/<kind>s/. reindex_all sur ce
+          root → ~840 artifacts indexés.
+
+          Coût attendu :
+            - 840 embeddings * ~25ms = ~21s en synchrone.
+            - Acceptable pour un test #[ignore] manuel.
+            - Si trop lent, batch via fastembed embed(vec!) :
+              fastembed supporte le batching, on peut passer
+              64 textes à la fois → ~10s en pratique.
+          Mesure de la latence de bench : on mesure
+          uniquement search(), pas l'indexation.
+
+        Sous-étape (c) — mesure des mêmes 20 queries de
+        référence.
+
+          Pour chaque query du fichier search_eval.yml :
+            - Exécuter 10 fois pour réchauffer le cache OS
+              et obtenir une distribution stable.
+            - Mesurer t0..t9, calculer p50/p95/p99.
+          Agréger sur les 20 queries : p50 globale, p95
+          globale, p99 globale, par mode (hybrid, lexical,
+          semantic).
+
+          Critère de succès :
+            - p95 hybrid à 10x corpus < 2000ms (AC 8).
+            - p95 lexical et semantic sub-1000ms (gestes
+              raisonnables).
+          Si p95 > 2000ms, log l'écart et escalade au PM
+          via agent-message ; arbitrage : soit on accepte
+          la dégradation, soit on optimise (sqlite-vec
+          activera un index ANN approximatif au-delà de
+          quelques milliers de docs, hors scope iteration 1,
+          mais on peut documenter le ticket de suivi).
+
+        Sous-étape (d) — sortie du benchmark.
+
+          Production de target/bench-results/
+          search-latency-10x-<timestamp>.json avec p50/p95/p99
+          par mode à 84 vs 840 artifacts. Récap stdout :
+          tableau comparatif. La lesson-learned finale
+          (étape 22) cite les chiffres.
+
+        APPROCHE FALLBACK — extrapolation théorique
+        rigoureuse (à utiliser SEULEMENT si la génération du
+        corpus 10x se révèle bloquante, par exemple > 5min
+        de wall-clock pour reindex).
+
+          Décomposer search() en composants et borner chacun :
+            (i)  Embedder query : O(1) constant, ~25ms
+                 mesuré à corpus actuel. Inchangé à corpus 10x.
+            (ii) FTS5 BM25 lexical : O(nb matches * log K),
+                 avec nb matches grandissant linéairement avec
+                 le corpus. À corpus actuel < 2ms (mesuré
+                 6cfd1c62), extrapolation 10x = ~20ms. Marge
+                 acceptable.
+            (iii) sqlite-vec brute force kNN : O(N) sur le
+                  nombre de vecteurs, latence dominée par le
+                  dot product. À 84 vecteurs dim 384 : ~5ms
+                  empirique attendu, extrapolation 10x =
+                  ~50ms. Marge acceptable.
+            (iv)  RRF : O(K_lex + K_sem + K log K) = ~50
+                  candidats, négligeable < 1ms.
+            (v)   Hydratation top-N : 10 SELECT par PK,
+                  négligeable < 1ms par row.
+          Somme bornée : 25 + 20 + 50 + 1 + 10 = ~106ms p50
+          attendue à corpus 10x. p95 raisonnable 2-3x p50 →
+          ~250-300ms. Largement sous 2s AC.
+
+          L'extrapolation est documentée comme borne théorique ;
+          on n'arbitre PAS l'AC sur l'extrapolation seule, on
+          vise la mesure empirique. L'extrapolation sert à
+          (a) justifier que le corpus 10x ne va pas exploser,
+          (b) donner un budget par composant pour identifier
+          rapidement le coupable si la mesure dérive.
+
+        Validation finale étape 18-bis : `cargo test
+        --test integration_search -- --ignored
+        bench_search_latency_10x` produit un JSON conforme,
+        p95 hybrid < 2000ms.
+      files:
+        - crates/orchestrator/tests/integration_search.rs
+
+    - description: >
         ÉTAPE 19 — Migration du tokenizer FTS5 au boot. Cette
         étape garantit que le serveur, au premier démarrage
         post-merge, détecte l'ancien schéma FTS5 (sans
@@ -1399,24 +1659,112 @@ spec:
         - docs/search-guide.md
 
     - description: >
-        ÉTAPE 21 — Consume write permit. APRÈS tous les commits de
-        code et APRÈS un cargo build + cargo test verts (validation
-        finale exigée par la règle hotreload_last).
+        ÉTAPE 21 — Clôture du cycle write permits (séquence de
+        commits chirurgicaux pendant l'impl, validation finale,
+        consume des DEUX permits, reload_config).
 
-        Procédure :
-          - cargo build (sans --target-dir, déclenche hot-reload
-            MCP).
-          - cargo test (toute la suite, 0 failed).
-          - Si OK : consume_write_permit(persona=implementer,
-            permit_id=a0b34bcd-2af6-407a-b5a6-a264d28b3c7d, token=
-            <token de session>).
-          - git add company/data/orchestrator.db et commit pour
-            persister l'état consommé du permit.
-          - reload_config() en TOUT DERNIER, uniquement si build
-            + test verts.
+        RÉÉCRITE en iteration 2 (réponse au finding F-plan-3
+        BLOQUANT). Trois clarifications par rapport à l'iteration 1 :
+        (a) le scellement initial des permits est DÉJÀ FAIT par le
+        PM en amont (cf. statut commits ci-dessous), donc cette
+        étape ne le re-mentionne plus. (b) L'ordre commit final
+        → consume est strict, conforme à la lesson 8fd49300 (Layer 2
+        defense-in-depth vérifie status=active au moment du commit ;
+        un consume avant le commit final bloque le commit). (c) La
+        phrase fautive sur `git add company/data/orchestrator.db`
+        est supprimée : .gitignore contient `*.db*` donc cet add
+        est no-op sans `-f`, et de toute façon l'état consumed du
+        permit ne doit pas être persisté en git (la DB reste
+        volatile par design, cohérent avec PILIER D du RFC
+        cdbfee72 — la DB est reconstructible depuis les YAML).
 
-        Ne PAS consume avant le commit final du code, sinon hook
-        rejet (règle write_permit_full_sequence).
+        STATUT INITIAL DES PERMITS (rappel, déjà fait par PM).
+
+          Permit a0b34bcd-2af6-407a-b5a6-a264d28b3c7d :
+            - Émis par CEO le 2026-06-01T13:36:32Z.
+            - 15 target_paths originaux.
+            - Scellé en git par le PM dans le commit 5919adb
+              ("chore: seal write permit a0b34bcd for RFC
+              bdee1af4").
+
+          Permit fb2a5053-3a29-4ba5-a125-f0b23cdbcf4b :
+            - Émis par CEO le 2026-06-01T14:01:19Z en réponse au
+              finding F-plan-1 de l'iteration 1 du présent plan.
+            - 1 target_path : crates/orchestrator/src/types.rs.
+            - Scellé en git par le PM avant relance Architect
+              iteration 2.
+
+        SÉQUENCE PENDANT L'IMPLÉMENTATION (Phase 2).
+
+          (1) Commits chirurgicaux. Chaque étape (ou groupe d'étapes
+              cohérent) est commité dès que cargo build + tests
+              unitaires locaux sont verts. Format de message :
+              "feat(<scope>): <résumé> (plan 640e2894 étape N)".
+              Ces commits TOUCHENT les zones protégées listées
+              dans les target_paths cumulés des deux permits, donc
+              le Layer 2 defense-in-depth vérifiera que au moins
+              un permit actif couvre les fichiers à chaque commit.
+              C'est garanti par construction tant que les deux
+              permits sont status=active.
+
+          (2) get_diagnostics LSP après chaque modif Rust pour
+              capture immédiate des erreurs de typage / import.
+
+          (3) cargo test au fur et à mesure pour valider les tests
+              unitaires nouveaux.
+
+        SÉQUENCE FINALE DE CLÔTURE (à exécuter dans cet ordre
+        strict, après que TOUTES les étapes 2-20 sont commitées).
+
+          (a) cargo build (sans --target-dir, conformément à la
+              règle hotreload_last : c'est cet appel précis qui
+              déclenche le hot-reload du binaire MCP).
+
+          (b) cargo test (toute la suite, 0 failed). Inclut les
+              tests unitaires nouveaux (étape 16) et les tests
+              d'intégration (étape 17). Les tests bench p95 et
+              le test 10x sont #[ignore] par défaut, non bloquants
+              pour cette étape mais on les exécute en plus avec
+              --ignored pour valider les AC 6 et 8.
+
+          (c) COMMIT FINAL du code restant non-commité (si
+              applicable, par exemple un dernier ajustement de
+              constantes après le benchmark étape 18). Ce commit
+              est le DERNIER commit qui touche les zones protégées.
+              Si tout a déjà été commité chirurgicalement, cette
+              étape (c) est un no-op et on saute directement à (d).
+
+          (d) consume_write_permit(persona=implementer, permit_id=
+              a0b34bcd-2af6-407a-b5a6-a264d28b3c7d, token=<token
+              de session>). Le permit principal passe de status
+              active à consumed. Le Layer 2 defense-in-depth ne
+              rejettera plus les commits suivants sur les 15 paths
+              de a0b34bcd car il n'y a plus de commit prévu sur ces
+              paths.
+
+          (e) consume_write_permit(persona=implementer, permit_id=
+              fb2a5053-3a29-4ba5-a125-f0b23cdbcf4b, token=<token
+              de session>). Le permit complémentaire passe à
+              consumed lui aussi. Les deux permits sont désormais
+              clos.
+
+          (f) reload_config() en TOUT DERNIER. C'est l'application
+              de la règle hotreload_last : reload_config peut
+              recharger le binaire MCP et couper la connexion
+              active, perdant le contexte de session. Les
+              conditions préalables (a) et (b) sont vérifiées, et
+              les deux consume_write_permit (d) et (e) sont faits.
+
+        IMPORTANT — ce qu'il ne faut PAS faire à cette étape.
+          - Ne PAS consume avant le commit final (lesson 8fd49300 :
+            Layer 2 rejette les commits si permit consumed).
+          - Ne PAS faire `git add company/data/orchestrator.db`
+            sans `-f` : .gitignore (`*.db*`) rend cet add no-op.
+            Et l'état consumed des permits n'a pas vocation à être
+            persisté en git (volontaire, cohérent avec PILIER D).
+          - Ne PAS oublier le second permit fb2a5053 : oublier la
+            consommation laisse un permit actif inutile en DB,
+            détecté à la prochaine session.
       files: []
 
     - description: >
@@ -1494,12 +1842,13 @@ spec:
       files: []
 
   dependencies:
-    - "Write permit a0b34bcd-2af6-407a-b5a6-a264d28b3c7d actif et scellé en git (commit 5919adb)."
+    - "Write permit a0b34bcd-2af6-407a-b5a6-a264d28b3c7d actif et scellé en git (commit 5919adb par le PM)."
+    - "Write permit complémentaire fb2a5053-3a29-4ba5-a125-f0b23cdbcf4b actif et scellé en git par le PM (réponse au finding F-plan-1 iteration 1)."
     - "RFC bdee1af4 approved (PM + CEO + Implementer)."
     - "Design-doc f433fefc approved."
     - "Diagnostic-report 6cfd1c62 resolved (baseline FTS5 mesurée < 2ms)."
     - "Cache embedding pré-fetché via --prefetch-embeddings AVANT premier boot."
-    - "Crates fastembed (=5.x.y) et sqlite-vec (=0.1.x) disponibles sur crates.io aux versions visées."
+    - "Crates fastembed (=5.x.y), sqlite-vec (=0.1.x) et ureq (dernière stable) disponibles sur crates.io aux versions visées."
   risks:
     - >
       Risque sqlite-vec pre-1.0 ABI/API. Mitigation : pin exact (=0.1.x),
@@ -1531,10 +1880,23 @@ spec:
       nécessaire en cours (ex. nouveau .cargo/config.toml pour ort),
       agent-message au PM, pas de contournement.
     - >
-      Risque dépendance ureq absente du permit Cargo.toml. Mitigation
-      étape 13 : ureq est ajouté à workspace.dependencies dans
-      Cargo.toml qui EST couvert. Si CEO/PM demande une autre stack
-      HTTP, ajuster avant l'étape 13.
+      Arbitrage ureq vs reqwest (réponse explicite au finding F-plan-4
+      iteration 2). Le RFC proposition 5 et le design-doc composant
+      reranker-claude-optionnel ne fixent pas un binding HTTP précis.
+      Le plan retient ureq pour les appels Anthropic Claude des couches
+      optionnelles rerank/HyDE, sur trois critères : (a) synchrone par
+      défaut, ce qui s'aligne avec le runtime fastembed lui-même
+      synchrone et évite un mix async/sync à orchestrer ; (b) footprint
+      plus léger (~150KB vs ~2MB pour reqwest avec ses features TLS +
+      tokio) ; (c) zero feature flag à gérer côté Cargo. Inconvénient :
+      pas d'API async native, donc l'engine.search wrap l'appel dans
+      tokio::task::spawn_blocking pour ne pas bloquer le runtime tokio
+      du serveur MCP. Décision maintenue pour cette itération. Mitigation
+      en cas de regret : switch reqwest envisageable dans une seconde
+      itération du système async-first transverse, coût ~1h de
+      refactor localisé à engine.rs si nécessaire. Le risque de
+      blocage permit (ureq absent du Cargo.toml workspace) est nul :
+      Cargo.toml EST dans le permit a0b34bcd target_paths.
     - >
       Risque cargo test ignoré par défaut sur les tests d'intégration
       qui requièrent le cache embedding. Mitigation : documenter en
