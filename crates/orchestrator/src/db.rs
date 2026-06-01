@@ -97,9 +97,6 @@ CREATE INDEX IF NOT EXISTS idx_rounds_status ON review_rounds(status);
 CREATE INDEX IF NOT EXISTS idx_permits_status ON write_permits(status);
 CREATE INDEX IF NOT EXISTS idx_permits_granted_to ON write_permits(granted_to);
 CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(kind);
-CREATE INDEX IF NOT EXISTS idx_artifacts_author ON artifacts(author);
-CREATE INDEX IF NOT EXISTS idx_artifacts_project ON artifacts(project);
-CREATE INDEX IF NOT EXISTS idx_artifacts_created_at ON artifacts(created_at);
 CREATE INDEX IF NOT EXISTS idx_relations_target ON artifact_relations(target_id);
 ";
 
@@ -381,6 +378,19 @@ impl OrchestratorDb {
                 let _ = col;
             }
         }
+
+        // Step 2bis: create indexes on the columns added in step 2.
+        // These indexes MUST come AFTER the ALTER TABLE because legacy
+        // DBs do not have these columns when migrate() starts — emitting
+        // these CREATE INDEX in SCHEMA_SQL would fail with
+        // "no such column: author" on a pre-existing artifacts table
+        // before step 2 has a chance to add the columns (cf. hotfix RFC
+        // bdee1af4: server crashed at boot with exactly this message).
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_artifacts_author ON artifacts(author);\
+             CREATE INDEX IF NOT EXISTS idx_artifacts_project ON artifacts(project);\
+             CREATE INDEX IF NOT EXISTS idx_artifacts_created_at ON artifacts(created_at);",
+        )?;
 
         // Step 3: detect tokenizer drift on artifacts_fts. If the live
         // DDL does not include our explicit unicode61 tokenizer, drop +
@@ -1605,6 +1615,62 @@ mod tests {
         db.migrate().unwrap();
         let ok = db.integrity_check().unwrap();
         assert!(ok);
+    }
+
+    // Hotfix RFC bdee1af4: a legacy DB whose `artifacts` table predates
+    // the (author, project, created_at) columns must still migrate
+    // successfully. The bug was: SCHEMA_SQL emitted CREATE INDEX on
+    // those columns before step 2's ALTER TABLE could add them, so
+    // migrate() failed with "no such column: author" on boot.
+    #[test]
+    fn test_migrate_legacy_db_without_filter_columns_succeeds() {
+        let db = OrchestratorDb::open(":memory:").unwrap();
+
+        // Hand-craft a pre-migration `artifacts` table that mirrors the
+        // legacy schema (no author / project / created_at columns).
+        db.conn
+            .execute_batch(
+                "CREATE TABLE artifacts (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    description TEXT NOT NULL DEFAULT '',
+                    tags TEXT NOT NULL DEFAULT '[]',
+                    file_path TEXT NOT NULL,
+                    indexed_at TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+
+        // migrate() must NOT fail with "no such column: author".
+        db.migrate()
+            .expect("migrate() must succeed on a legacy DB lacking the filter columns");
+
+        // Verify the three indexes now exist on the artifacts table.
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'artifacts' \
+                 ORDER BY name",
+            )
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        for expected in [
+            "idx_artifacts_author",
+            "idx_artifacts_created_at",
+            "idx_artifacts_kind",
+            "idx_artifacts_project",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing expected index {expected} on artifacts; got {names:?}"
+            );
+        }
     }
 
     #[test]
