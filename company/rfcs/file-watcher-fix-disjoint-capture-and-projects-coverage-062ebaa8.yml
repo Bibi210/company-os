@@ -1,0 +1,270 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 062ebaa8-8876-42e4-b1a7-8ed3655238e2
+  title: "Fix file watcher orchestrator : capture explicite du RecommendedWatcher en edition 2024 + extension du scope à projects/"
+  author: architect
+  created_at: "2026-06-03"
+  status: draft
+  description: >
+    Corrige le bug du file watcher mort au boot diagnostiqué dans le
+    diagnostic-report 9534dd33 (disjoint capture en Rust edition 2024 qui
+    drop le RecommendedWatcher avant la première iteration du consumer task)
+    et profite du même write permit pour livrer l'extension du scope du
+    watcher demandée par le task-request 36ecb829 (acceptance criterion 4 :
+    surveiller projects/ en plus de company/ et des protected zones).
+    Ajoute aussi un eprintln explicite quand le _watcher est dropé pour
+    rendre tout futur problème équivalent visible immédiatement.
+    Touche les zones protégées `crates/mcp-servers/orchestrator/src/main.rs`
+    et `crates/config/src/watcher.rs`. Approbation CEO et write permit
+    requis.
+  tags:
+    - watcher
+    - inotify
+    - rust-edition-2024
+    - disjoint-capture
+    - critical-infra
+    - bug-fix
+    - regression
+    - orchestrator
+    - auto-indexation
+  related:
+    - id: 9534dd33-313c-42d7-b6ac-3801ba97dbc7
+      kind: diagnostic-report
+      relationship: input
+    - id: 36ecb829-d884-4e17-848b-c0f7ee2fc171
+      kind: task-request
+      relationship: input
+    - id: bdee1af4-4944-4bee-b7c0-18efd6c7961f
+      kind: rfc
+      relationship: related
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: related
+
+spec:
+  motivation: >
+    Le bug du file watcher provoque trois conséquences cumulatives :
+
+    1. L'auto-indexation post-write est cassée. Toute écriture YAML est
+       silencieusement ignorée par l'index FTS+VEC du serveur. Les call
+       sites du hook defense-in-depth qui s'appuient sur --index délèguent
+       au file watcher (cf. RFC bdee1af4 amendement 5) et le watcher étant
+       mort, l'index dérive systématiquement.
+
+    2. Les artifacts projet (projects/<slug>/...) ne sont PAS surveillés
+       du tout, même quand le watcher fonctionne, parce que `spawn_watcher`
+       ne watche que les protected zones plus le top-level `company/`.
+       C'est un manque de couverture indépendant du bug 1, mais qui
+       devient visible dès qu'on règle le bug 1 et qu'on commence à se
+       fier au watcher.
+
+    3. L'erreur est totalement silencieuse : aucun warning, aucune erreur,
+       et le seul indicateur (file_watcher_alive) requiert un appel manuel
+       à index_status. Tout futur problème d'attachement inotify sera
+       difficile à diagnostiquer si rien n'est loggé au moment du drop.
+
+    Le bug est expliqué par la disjoint capture des async closures en
+    edition 2024 (Cargo workspace edition = "2024") : le compilateur ne
+    capture dans le future généré que les champs réellement utilisés. Le
+    champ `_watcher: RecommendedWatcher` de `FileWatcherHandle`, préfixé
+    par underscore et jamais référencé dans le corps de la closure, est
+    laissé dans le binding outer et dropé à la fin du match arm. La
+    reproduction empirique est documentée dans le diagnostic-report
+    9534dd33 (4 étapes, fix vérifié).
+
+    L'urgence est élevée : sans watcher, chaque création d'artifact
+    nécessite un appel manuel à index_now, ce qui dégrade l'expérience PM
+    et casse l'invariant fondamental "écrire un YAML c'est indexer un
+    YAML" qui sous-tend la mémoire collective de l'organisation (règle
+    artifact_index de shared-rules.yml).
+
+  proposal: >
+    Trois modifications coordonnées dans la même PR.
+
+    Modification 1 — fix du drop prématuré du RecommendedWatcher
+    ============================================================
+    Dans crates/mcp-servers/orchestrator/src/main.rs entre lignes 1215
+    et 1265, restructurer le `Ok(mut handle) => { tokio::spawn(async move
+    { ... }) }` pour forcer la capture explicite du watcher :
+
+      Ok(handle) => {
+          // Destructure pour casser la disjoint capture rule : on
+          // bindge explicitement _watcher et on l'embarque dans la
+          // closure async via un `let _keep = _watcher;`.
+          let companyos_config::watcher::FileWatcherHandle { mut rx, _watcher } = handle;
+          let engine = engine.clone();
+          ...
+          let watcher_alive = watcher_alive.clone();
+          let task_handle = tokio::spawn(async move {
+              // Le watcher doit vivre aussi longtemps que la consumer
+              // task. Sans cette ligne, l'edition 2024 ne le capture
+              // pas (champ jamais lu dans la closure) et le drop à la
+              // fin du match arm tue le fd inotify (cf. diagnostic
+              // 9534dd33).
+              let _keep_watcher = _watcher;
+
+              watcher_alive.store(true, Ordering::Release);
+              struct AliveGuard(Arc<AtomicBool>);
+              impl Drop for AliveGuard { fn drop(&mut self) { self.0.store(false, Ordering::Release); } }
+              let _alive_guard = AliveGuard(watcher_alive.clone());
+
+              while let Some(change) = rx.recv().await { ... }
+          });
+          Some(task_handle)
+      }
+
+    Ajouter un commentaire long en tête du match arm qui pointe vers
+    9534dd33 et explique pourquoi le binding `_keep_watcher` ne doit
+    JAMAIS être supprimé même s'il a l'air inutilisé. Sinon le bug
+    reviendra silencieusement à la prochaine refonte.
+
+    Modification 2 — extension à projects/
+    ======================================
+    Dans crates/config/src/watcher.rs, après le bloc qui watche
+    `company/` (lignes 92-95), ajouter le même bloc pour
+    `projects/` :
+
+      let projects_dir = root_path.join(constants::PROJECTS_DIR);
+      if projects_dir.is_dir() {
+          watcher.watch(&projects_dir, RecursiveMode::Recursive)?;
+      }
+
+    Étendre `classify()` (lignes 34-54) pour qu'un YAML sous
+    `projects/<slug>/...` retourne `ConfigChangeKind::Artifacts` (les
+    artifacts projet sont indexés comme les autres). La logique
+    actuelle traite déjà tous les `.yml`/`.yaml` hors protected zones
+    comme `Artifacts`, donc la modification consiste juste à s'assurer
+    que projects/ n'est pas accidentellement classé comme zone
+    protégée (vérifier que `PROJECTS_DIR` n'apparaît pas dans
+    protected-zones.json — ce qui est déjà le cas).
+
+    Si la constante `PROJECTS_DIR` n'existe pas encore dans
+    crates/config/src/constants.rs, l'ajouter (valeur `"projects"`).
+
+    Modification 3 — defensive observability
+    ========================================
+    Dans crates/config/src/watcher.rs, instrumenter `FileWatcherHandle`
+    avec un `impl Drop for FileWatcherHandle` qui appelle
+    `tracing::error!("FileWatcherHandle dropped — file watcher is now
+    DEAD; inotify watches released. Investigate immediately if this is
+    not a shutdown.")`. Couplé à un panic_handler dans la consumer task
+    (catch_unwind autour de la boucle `while let Some(change) = rx.recv()`)
+    qui logue `tracing::error!("Watcher consumer task panicked: {e:?}")`
+    avant de drop le guard. Le but est qu'aucun futur régression
+    silencieuse ne soit possible : si le watcher meurt pour QUELQUE
+    raison que ce soit, on le sait dans les logs.
+
+    Renommer aussi le champ `_watcher` en `keep_alive_watcher` (sans
+    le préfixe `_`) avec un commentaire `/// HOLD this field alive...`
+    pour qu'un futur lecteur du code comprenne immédiatement que le
+    champ doit être tenu en vie.
+
+    Test de régression
+    ==================
+    Ajouter dans crates/config/tests/ (ou crates/mcp-servers/orchestrator
+    /tests/, selon ce qui est le plus naturel pour l'Implementer) un
+    test d'intégration qui :
+
+      (a) spawne le watcher sur un répertoire temporaire ayant les
+          mêmes sous-dirs que le repo (company/config, etc.),
+      (b) attend 200ms,
+      (c) écrit un fichier .yml sous le répertoire temporaire,
+      (d) attend debounce+200ms,
+      (e) vérifie que le receiver a bien produit un événement.
+
+    Ce test attrape immédiatement le retour du bug si une refonte
+    future re-déclenche la disjoint capture (par exemple en
+    re-supprimant le `let _keep_watcher = _watcher;`).
+
+    Critère d'acceptation au merge
+    ==============================
+    - file_watcher_alive remonte à true en moins de 3 secondes après
+      le boot d'un serveur sain (sans drift fts/model).
+    - lsof -p <server_pid> | grep inotify retourne au moins un fd
+      anon_inode:inotify ouvert tant que le serveur tourne.
+    - Écrire un YAML dans company/agent-messages/ ou dans
+      projects/company-os/diagnostic-reports/ produit une apparition
+      du fichier dans artifacts/fts/vec en moins de 1s (500ms
+      debounce + marge).
+    - Le test de régression ci-dessus passe en CI.
+
+  impact: >
+    Conséquences positives (recherchées) :
+
+    - L'invariant "écrire un YAML c'est indexer un YAML" est restauré.
+      Les agents (PM, Architect, Implementer) peuvent à nouveau se fier
+      au search() pour trouver leurs artifacts juste produits sans
+      passer par index_now manuel.
+    - Les artifacts projet (task-requests, design-docs, etc.) deviennent
+      enfin visibles au watcher, ce qui élimine la dérive systématique
+      de l'index sur les projets actifs.
+    - Tout futur problème d'attachement inotify sera bruyant dans les
+      logs (defensive observability), ce qui évite une régression
+      silencieuse comme celle d'aujourd'hui.
+
+    Conséquences neutres :
+
+    - Le fix lui-même est local : ~20-30 lignes de Rust modifiées dans
+      deux fichiers, plus le test de régression. Pas de changement
+      d'API, pas de breaking change.
+    - L'extension à projects/ augmente légèrement la charge du watcher
+      (un dir supplémentaire à inotify_watch récursif), mais reste très
+      en-dessous des limites système (max_user_watches=524288).
+
+    Risques :
+
+    - Le `let _keep_watcher = _watcher;` est une convention fragile.
+      Un futur clippy strict pourrait le signaler comme "unused
+      binding" et un developer pourrait le retirer. Le commentaire
+      en tête de la closure plus le renaming `_watcher` → `keep_alive_watcher`
+      doivent rendre ce risque négligeable, mais il existe.
+    - Le test de régression doit utiliser un répertoire temporaire (via
+      tempfile) pour ne pas polluer l'arbre du repo. Si l'Implementer
+      l'oublie et watche le repo lui-même, les events parasites
+      pourraient flaker le test.
+    - Le tracing::error! dans le Drop de FileWatcherHandle s'exécutera
+      aussi au shutdown propre (SIGTERM/SIGINT). Le message doit
+      mentionner explicitement "investigate immediately if this is not
+      a shutdown" pour ne pas générer des faux positifs paniqués. Une
+      alternative est de désarmer le drop dans le handler SIGTERM via
+      une AtomicBool "is_shutting_down".
+
+    Estimation de complexité : faible. Fichiers touchés :
+    - crates/mcp-servers/orchestrator/src/main.rs (lignes 1215-1271,
+      ~30 lignes modifiées y compris commentaires)
+    - crates/config/src/watcher.rs (~40 lignes modifiées : rename
+      `_watcher` → `keep_alive_watcher`, Drop instrumenté, extension à
+      projects/, doc inline)
+    - crates/config/src/constants.rs (~1 ligne ajoutée si PROJECTS_DIR
+      n'existe pas)
+    - crates/config/tests/watcher_integration.rs (nouveau, ~80 lignes
+      de test).
+    Temps de mise en œuvre estimé : 2 à 3 heures, dont la moitié sur
+    le test de régression et la validation manuelle bout en bout
+    (boot du serveur, lsof, touch d'un yml, search()).
+
+  rollback_plan: >
+    Le fix est localisé et sans effet sur la persistence (DB SQLite,
+    schémas, protected-zones.json). En cas de régression imprévue :
+
+    1. Revert du commit qui implémente ce RFC. Le binaire d'avant
+       avait le bug du watcher mais TOUT le reste fonctionne, le
+       workaround index_now manuel reste utilisable.
+    2. Le rollback ne nécessite aucune migration DB ni aucun
+       changement de schéma. La DB orchestrator.db et son contenu
+       restent valides.
+    3. Réémettre une éventuelle communication PM aux agents pour
+       leur rappeler le workaround temporaire (call index_now après
+       chaque write critique).
+
+    Si le rollback révèle que la régression vient d'un effet de bord
+    inattendu sur le defense-in-depth hook (qui appelle --index en
+    aval), produire un diagnostic-report enchainé sur 9534dd33 et
+    rééditer un RFC plus prudent.
+
+  affected_files:
+    - crates/mcp-servers/orchestrator/src/main.rs
+    - crates/config/src/watcher.rs
+    - crates/config/src/constants.rs
+    - crates/config/tests/watcher_integration.rs

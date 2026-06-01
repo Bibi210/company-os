@@ -1,0 +1,113 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 36ecb829-d884-4e17-848b-c0f7ee2fc171
+  title: "File watcher tokio orchestrator ne démarre pas au boot, auto-indexation cassée"
+  author: pm
+  created_at: "2026-06-01"
+  project: company-os
+  description: >
+    Le tool MCP index_status retourne file_watcher_alive: false de
+    manière persistante, même après reload_config. Conséquence :
+    les écritures de fichiers YAML pendant une session (qui passent
+    par le hook defense-in-depth → autoIndex → --index) sont
+    bloquées en no-op silencieux. Le binaire --index détecte que le
+    serveur tient le flock et délègue l'indexation au watcher
+    (selon amendement iteration 5 du RFC bdee1af4), mais le watcher
+    étant mort, le YAML n'est jamais indexé. Workaround temporaire :
+    appeler index_now(path) manuellement après chaque write
+    critique. Hypothèses initiales à valider : (a) spawn_watcher
+    a échoué silencieusement au boot (le code logue un warning
+    mais ne propage pas l'erreur), (b) une condition de race avec
+    le PILIER D du RFC cdbfee72 (reindex_all synchrone au boot
+    après wipe DB) empêche le watcher d'attacher, (c) la canonicalisation
+    du root path échoue à cause d'un cwd inattendu. À investiguer.
+  tags:
+    - watcher
+    - indexation
+    - orchestrator
+    - bug
+    - regression
+    - critical-infra
+  related:
+    - id: bdee1af4-4944-4bee-b7c0-18efd6c7961f
+      kind: rfc
+      relationship: related
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: related
+
+spec:
+  priority: high
+  status: backlog
+  acceptance_criteria:
+    - >
+      Diagnostic produit avec root cause vérifiée par reproduction
+      (pas une hypothèse). Identifier précisément pourquoi spawn_watcher
+      retourne Err au boot OU pourquoi la tokio task associée meurt
+      immédiatement après son démarrage.
+    - >
+      Correctif mergé. Après le fix, démarrer le serveur depuis
+      une DB saine doit produire file_watcher_alive: true au bout
+      de quelques secondes. Vérification via index_status global.
+    - >
+      Test de régression : écrire un YAML d'artifact dans une zone
+      surveillée (par exemple company/agent-messages/), attendre
+      le debounce 500ms + ~500ms de marge, puis vérifier via
+      index_status(path=...) que le fichier est présent dans FTS
+      et VEC.
+    - >
+      Le watcher doit aussi surveiller projects/ (actuellement il
+      ne surveille que company/ et les protected zones, donc les
+      task-requests / design-docs / etc. écrits dans projects/
+      sont ignorés par le watcher).
+    - >
+      Si spawn_watcher échoue au boot, l'erreur doit être visible
+      dans les logs serveur de manière non ambiguë (pas juste un
+      tracing::warn silencieux qui se perd) ET file_watcher_alive
+      doit refléter cet état pour qu'index_status soit honnête.
+    - >
+      Lesson-learned produite à la clôture chainant la lesson
+      600307a4 (refonte search hybrid).
+
+  investigation_hints: >
+    Pistes non prescriptives, l'Architect arbitre :
+
+    (1) Lancer le binaire manuellement avec RUST_LOG=debug et
+        observer les logs au boot. spawn_watcher logue un warning
+        si elle échoue (main.rs ligne 1268), mais ce warning peut
+        être avalé par la redirection stderr du proxy MCP.
+
+    (2) Vérifier le cwd effectif du binaire enfant lancé par le
+        proxy MCP. spawn() sans cwd hérite du parent ; si opencode
+        n'est pas lancé depuis le repo root, root_path peut être
+        un répertoire qui n'existe pas → canonicalize échoue.
+
+    (3) Vérifier les limites inotify système (max_user_watches,
+        max_user_instances). Sur cette machine elles sont à 524288
+        et 1024 respectivement, donc pas un problème ici. Mais si
+        la DB a été précédemment opened plusieurs fois avec des
+        watchers oubliés (cas PILIER A : crash sans drop guard),
+        les watchers leakés peuvent saturer la limite par instance.
+
+    (4) Vérifier si le PILIER D du RFC cdbfee72 (reindex_all
+        synchrone au boot) bloque le tokio runtime pendant assez
+        longtemps pour que le watcher meure ou ne soit jamais
+        spawné. Le code actuel lance le watcher APRÈS le PILIER D,
+        donc en principe non, mais à vérifier.
+
+    (5) Étendre le watcher pour qu'il surveille projects/ en plus
+        de company/. Actuellement watcher.rs lignes 92-95 ne
+        watche que company/. Les artifacts projet sont donc
+        complètement invisibles au watcher.
+
+    (6) Si spawn_watcher échoue de manière reproductible, basculer
+        peut-être de notify v6 vers notify v7+ qui a un meilleur
+        backend Linux (inotify-rs direct), ou tester avec
+        PollWatcher comme fallback.
+
+  out_of_scope: >
+    Ne PAS étendre le tool index_status pour exposer plus de
+    métriques (out of scope, sujet adjacent). Ne PAS modifier la
+    sémantique de --index ou de index_now côté MCP (ils
+    fonctionnent comme spécifié).

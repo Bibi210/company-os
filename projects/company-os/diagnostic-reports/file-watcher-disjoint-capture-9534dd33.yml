@@ -1,0 +1,184 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: 9534dd33-313c-42d7-b6ac-3801ba97dbc7
+  title: "File watcher orchestrator mort au boot : disjoint capture en edition 2024 drop le RecommendedWatcher avant la première iteration"
+  author: architect
+  created_at: "2026-06-03"
+  project: company-os
+  description: >
+    Diagnostic du bug rapporté par task-request 36ecb829 : index_status retourne
+    file_watcher_alive: false en permanence, et lsof confirme l'absence totale de
+    fd inotify dans le serveur. Root cause identifiée et empiriquement vérifiée
+    par reproduction isolée : un effet de bord de la "disjoint capture for async
+    closures" stabilisée en Rust edition 2024 fait que le champ _watcher
+    (préfixé par _ donc non utilisé textuellement dans le corps de la closure)
+    n'est PAS capturé par le `async move` de la consumer task, et est dropé à la
+    fin du match arm. Le fd inotify est libéré, le thread notify est signalé,
+    le notify_rx du forward task retourne None, le consumer task termine, et
+    le drop guard remet watcher_alive à false. Le tout sans aucun message
+    d'erreur dans les logs.
+  tags:
+    - watcher
+    - inotify
+    - notify-crate
+    - rust-edition-2024
+    - disjoint-capture
+    - async-move
+    - drop-semantics
+    - regression
+    - critical-infra
+  related:
+    - id: 36ecb829-d884-4e17-848b-c0f7ee2fc171
+      kind: task-request
+      relationship: input
+    - id: bdee1af4-4944-4bee-b7c0-18efd6c7961f
+      kind: rfc
+      relationship: related
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: related
+
+spec:
+  status: resolved
+  symptom: >
+    Trois symptômes observés en cascade :
+
+    (1) index_status retourne `file_watcher_alive: false` de manière persistante
+    sur le serveur en production (PID 10692 au moment du diagnostic), et reste
+    à false même après plusieurs cycles reload_config / cargo rebuild.
+
+    (2) Inspection directe des fds du processus serveur via /proc/<pid>/fd
+    confirme **zéro fd inotify ouvert** (aucun lien symbolique vers
+    anon_inode:inotify), alors que sur Linux un RecommendedWatcher de la crate
+    notify v7 doit obligatoirement détenir un tel fd pour qu'inotify_init1 ait
+    été appelé.
+
+    (3) Conséquence applicative : les écritures de fichiers YAML pendant une
+    session ne sont jamais auto-indexées par le serveur. Le binaire --index,
+    qui détecte le serveur via flock et délègue volontairement l'indexation au
+    file watcher (amendement iteration 5 du RFC bdee1af4), devient un no-op
+    silencieux. Workaround : appel manuel à index_now(path) après chaque write.
+
+    Aucun message tracing::warn `"File watcher unavailable, manual reload_config
+    still works: <err>"` n'apparaît dans les logs, donc spawn_watcher ne
+    retourne PAS Err. La fonction réussit, le watcher est créé, puis le
+    RecommendedWatcher est immédiatement dropé.
+
+  root_cause: >
+    "Disjoint capture for async closures" en Rust edition 2024 + champ préfixé
+    par underscore non utilisé textuellement dans la closure.
+
+    Le code de `crates/mcp-servers/orchestrator/src/main.rs` ligne 1216 fait :
+
+        match watcher::spawn_watcher(&root, Duration::from_millis(500)) {
+            Ok(mut handle) => {
+                let task_handle = tokio::spawn(async move {
+                    watcher_alive.store(true, Ordering::Release);
+                    let _alive_guard = AliveGuard(watcher_alive.clone());
+                    while let Some(change) = handle.rx.recv().await {
+                        ...
+                    }
+                });
+                Some(task_handle)
+            }
+            ...
+        }
+
+    Le `handle: FileWatcherHandle` retourné par spawn_watcher contient deux
+    champs :
+
+        pub struct FileWatcherHandle {
+            pub rx: mpsc::Receiver<ConfigChangeKind>,
+            _watcher: RecommendedWatcher,  // préfixé par _, jamais utilisé textuellement
+        }
+
+    Depuis l'edition 2021, et durci en edition 2024 (workspace = "2024" dans
+    Cargo.toml), le compilateur applique la disjoint capture rule : un
+    `async move { ... handle.rx.recv() ... }` ne capture QUE les champs
+    réellement utilisés dans le corps de la closure. Comme `_watcher` n'est
+    pas utilisé textuellement (le `_` annonce explicitement qu'on ne le lit
+    pas), le compilateur ne le déplace PAS dans le future généré.
+
+    Conséquence : à la fin du match arm `Ok(mut handle) => { ... }`, le champ
+    `handle._watcher` qui reste dans le `handle` local est dropé immédiatement.
+    Le destructeur de `RecommendedWatcher` ferme le fd inotify et signale au
+    thread notify de terminer.
+
+    Ce qu'on observe ensuite est cohérent avec cette explication :
+    - Au boot, le thread notify ne capte qu'une poignée d'événements (ceux
+      bufferisés dans le sender mpsc avant que le notify_tx ne soit lui-même
+      libéré quand le thread notify termine).
+    - Le forward task interne à `spawn_watcher` reçoit Some(event), forwarde
+      sur out_tx, puis le notify_rx retourne None → le forward task exit.
+    - Le consumer task (main.rs:1222) consomme les 1 à 2 changements
+      forwarded (typiquement Config + Schemas), logue "Auto-reloaded config
+      (max_iterations=3)" et "Auto-reloaded 14 schema(s)", puis sa boucle
+      `while let Some(change) = handle.rx.recv()` se termine.
+    - Le `_alive_guard` est dropé → watcher_alive repasse à false.
+    - À partir de ce moment, plus aucun nouvel événement n'est capté.
+
+    Cette séquence explique l'**unique manifestation indirecte** du watcher
+    dans les logs (deux "Auto-reloaded" en T0+~16s qui semblent venir de nulle
+    part) ET l'absence définitive de fd inotify visible.
+
+  resolution: >
+    Reproduction empirique en quatre étapes :
+
+    Étape 1 — repro positif en isolation. Un binaire de test (Cargo edition
+    2021) qui ré-implémente le pattern de spawn_watcher en pointant sur le
+    repo réel produit `inotify_fds = 1` stable. Le code de watcher.rs lui-même
+    n'a aucun bug.
+
+    Étape 2 — repro positif en edition 2024 AVEC `let mut handle = handle;`
+    en début de closure async (rebind explicite). `inotify_fds = 1` stable
+    aussi : le rebind force la capture intégrale.
+
+    Étape 3 — repro NÉGATIF reproduisant exactement le pattern de main.rs
+    (edition 2024, `Ok(mut handle) => { tokio::spawn(async move { handle.rx... }) }`
+    sans rebind intérieur, champ _watcher préfixé) :
+
+        [task] enter. inotify=0
+        [main] after match. inotify=0
+        [fwd] notify_rx CLOSED
+        [task] EXIT. inotify=0
+
+    Le `_watcher` est dropé AVANT que la task ne polle la première fois.
+
+    Étape 4 — fix vérifié. En remplaçant le `async move { while ... handle.rx.recv() ... }`
+    par une destructuration explicite et un keep-alive du watcher :
+
+        let FileWatcherHandle { mut rx, _watcher } = handle;
+        let task = tokio::spawn(async move {
+            let _keep_watcher = _watcher;   // capture explicite
+            while let Some(change) = rx.recv().await { ... }
+        });
+
+    On obtient `inotify_fds = 1` stable, les événements arrivent en continu,
+    et le file watcher reste vivant pendant toute la durée du serveur.
+
+    Le fix lui-même est ~5 lignes dans
+    crates/mcp-servers/orchestrator/src/main.rs entre 1216 et 1265. Il est
+    porté dans le RFC associé parce qu'il touche une zone protégée et parce
+    que le task-request demande un élargissement de scope (acceptance
+    criterion 4 : surveiller projects/ en plus de company/) qui justifie
+    de regrouper les modifications. Voir RFC 062ebaa8 pour la proposition
+    complète.
+
+    Diagnostics secondaires identifiés en passant, à traiter dans des RFC
+    séparés (hors scope de ce diagnostic) :
+
+    (a) tracing_subscriber est initialisé avec `with_env_filter("info")` en
+        dur, ce qui ignore RUST_LOG et empêche RUST_LOG=debug de fonctionner.
+        Petit problème d'observabilité.
+
+    (b) `tracing::warn!` côté spawn_watcher Err est suffisant pour le path
+        d'erreur explicite mais inutile dans le cas présent où spawn_watcher
+        retourne Ok et le watcher meurt silencieusement après. Le RFC ajoute
+        un panic_handler côté consumer task et un eprintln explicite au moment
+        du drop du _watcher (defensive logging).
+
+    (c) Le watcher actuel ne surveille pas projects/, ce qui rend les
+        artifacts projet (task-requests, design-docs, implementation-plans)
+        invisibles. Inclus dans le scope du fix car le bug et l'extension
+        touchent les mêmes lignes.

@@ -1,0 +1,112 @@
+api_version: companyos/v1
+kind: agent-message
+metadata:
+  id: 99089963-2e52-44ef-ae2e-6a07c3a2bef6
+  title: "File watcher orchestrator : diagnostic terminé, RFC prêt pour review"
+  author: architect
+  from: architect
+  to: pm
+  created_at: "2026-06-03"
+  description: >
+    Notification de fin d'investigation sur le bug file watcher tokio
+    (task-request 36ecb829). Root cause identifiée et empiriquement
+    vérifiée, RFC rédigé avec fix vérifié en isolation, scope élargi à
+    projects/ et instrumentation defensive ajoutée. Attente review PM +
+    Implementer puis approbation CEO + write permit pour exécution.
+  tags:
+    - watcher
+    - bug-fix
+    - rfc-ready
+    - orchestrator
+    - critical-infra
+  related:
+    - id: 36ecb829-d884-4e17-848b-c0f7ee2fc171
+      kind: task-request
+      relationship: input
+    - id: 9534dd33-313c-42d7-b6ac-3801ba97dbc7
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: 062ebaa8-8876-42e4-b1a7-8ed3655238e2
+      kind: rfc
+      relationship: derived-from
+
+spec:
+  content: |
+    Diagnostic terminé pour le task-request 36ecb829 (file watcher mort
+    au boot, file_watcher_alive: false persistant, 0 fd inotify dans le
+    serveur).
+
+    Root cause en une phrase : la "disjoint capture for async closures"
+    de Rust edition 2024 empêche le `async move { ... handle.rx.recv()
+    ... }` (main.rs ligne 1222) de capturer le champ `_watcher` (préfixé
+    par underscore, jamais lu textuellement dans la closure) ; le
+    RecommendedWatcher est dropé à la fin du match arm, le fd inotify
+    est libéré, et le watcher est mort avant la première iteration du
+    consumer task.
+
+    Reproduction en quatre étapes (voir diagnostic-report 9534dd33
+    section resolution pour les détails) :
+
+      1. repro positif en isolation → inotify=1, code de spawn_watcher OK
+      2. repro positif en edition 2024 AVEC `let mut handle = handle;`
+         intérieur → inotify=1
+      3. repro NÉGATIF reproduisant exactement le pattern main.rs
+         (sans rebind intérieur, _watcher préfixé) → inotify=0,
+         consumer task EXIT immédiat
+      4. fix vérifié : destructuration + `let _keep_watcher = _watcher;`
+         dans la closure → inotify=1 stable, events forwarded en continu
+
+    Livrables produits :
+
+      - diagnostic-report 9534dd33-313c-42d7-b6ac-3801ba97dbc7
+        (status: resolved, root cause vérifiée par reproduction empirique)
+      - RFC 062ebaa8-8876-42e4-b1a7-8ed3655238e2
+        (status: draft, trois modifications coordonnées dans la même PR)
+
+    Le RFC élargit le scope au-delà du strict bug fix pour adresser
+    l'acceptance criterion 4 du task-request (surveiller projects/ en
+    plus de company/) et ajoute une instrumentation defensive (Drop
+    bruyant sur FileWatcherHandle, panic_handler dans la consumer task,
+    rename `_watcher` → `keep_alive_watcher` pour rendre l'invariant
+    auto-documenté). Le test de régression empêche la disjoint capture
+    de réapparaitre silencieusement.
+
+    Estimation de complexité : faible. ~3 fichiers Rust modifiés (~70
+    lignes au total) + 1 fichier de test (~80 lignes). 2 à 3 heures de
+    mise en œuvre dont la moitié sur le test + validation manuelle.
+
+    Diagnostics secondaires identifiés en passant (HORS scope du RFC,
+    candidats à des RFC séparés si tu juges utile) :
+
+      (a) tracing_subscriber est initialisé avec `with_env_filter("info")`
+          en dur dans run_server (main.rs:1064), ce qui ignore RUST_LOG
+          complètement. Problème d'observabilité mineur.
+      (b) reindex_handle (main.rs:1200) prend `engine.lock().await` au
+          début et tient le lock pendant ~10 secondes (le reindex_all
+          synchrone). Pendant ce temps, AUCUN appel MCP qui touche
+          l'engine ne peut être servi. Pas critique aujourd'hui car
+          spawn_watcher est appelé après et n'a pas besoin de
+          l'engine, mais c'est un long pause au boot qui mériterait
+          d'être documenté ou borné.
+
+    Prochaines étapes côté workflow :
+
+      1. Tu peux initier le review round sur RFC 062ebaa8 (reviewers :
+         Implementer pour la faisabilité technique + Architect interdit
+         de s'auto-reviewer, donc CEO si tu n'as pas de second
+         reviewer).
+      2. Après approbation, le CEO grant un write permit sur les
+         affected_files listés dans le RFC (crates/mcp-servers/
+         orchestrator/src/main.rs, crates/config/src/watcher.rs,
+         crates/config/src/constants.rs, crates/config/tests/
+         watcher_integration.rs).
+      3. L'Implementer rédige un implementation-plan, je le review.
+      4. Implémentation, code review, merge.
+      5. Lesson-learned à la clôture (acceptance criterion 6) qui
+         chaine la lesson 600307a4-74f6-43dd-95e1-4dee3d2326c1 comme
+         spécifié.
+
+    Aucune action immédiate de ma part en attente. Le serveur courant
+    (PID 10692) garde son watcher mort jusqu'au merge du fix ; le
+    workaround index_now reste valide pour les writes critiques d'ici
+    là.

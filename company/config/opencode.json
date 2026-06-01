@@ -3,19 +3,19 @@
   "default_agent": "pm",
   "agent": {
     "pm": {
-      "model": "anthropic/claude-opus-4-7",
+      "model": "anthropic/claude-opus-4-8",
       "prompt": "{file:company/personas/pm.yml}"
     },
     "architect": {
-      "model": "anthropic/claude-opus-4-7",
+      "model": "anthropic/claude-opus-4-8",
       "prompt": "{file:company/personas/architect.yml}"
     },
     "implementer": {
-      "model": "anthropic/claude-opus-4-7",
+      "model": "anthropic/claude-opus-4-8",
       "prompt": "{file:company/personas/implementer.yml}"
     },
     "ceo": {
-      "model": "anthropic/claude-opus-4-7",
+      "model": "anthropic/claude-opus-4-8",
       "prompt": "{file:company/personas/ceo.yml}",
       "tools": {
         "write": false,
