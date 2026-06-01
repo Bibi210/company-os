@@ -354,9 +354,92 @@ impl OrchestratorDb {
     /// will rollback the partial transaction on the next open via WAL
     /// recovery, eliminating the FTS5 partially-materialized schema risk.
     pub fn migrate(&self) -> Result<(), OrchestratorError> {
+        // Step 1: base schema (idempotent CREATE IF NOT EXISTS).
         let migration_sql = format!("BEGIN IMMEDIATE;{SCHEMA_SQL}{FTS_SQL}{VEC_TABLE_SQL}COMMIT;");
         self.conn.execute_batch(&migration_sql)?;
+
+        // Step 2: ALTER artifacts to add the structured filter columns
+        // (author, project, created_at) if missing. These were added in
+        // RFC bdee1af4 étape 10; older DBs need a soft upgrade. SQLite
+        // does not have IF NOT EXISTS for ADD COLUMN, so we catch the
+        // 'duplicate column' error which means it is already there.
+        for (col, decl) in &[
+            ("author", "ALTER TABLE artifacts ADD COLUMN author TEXT"),
+            ("project", "ALTER TABLE artifacts ADD COLUMN project TEXT"),
+            (
+                "created_at",
+                "ALTER TABLE artifacts ADD COLUMN created_at TEXT",
+            ),
+        ] {
+            if let Err(e) = self.conn.execute(decl, []) {
+                // Match "duplicate column name" -> already there, safe.
+                let msg = e.to_string();
+                if !msg.contains("duplicate column") {
+                    return Err(OrchestratorError::Database(e));
+                }
+                // silent: column already exists.
+                let _ = col;
+            }
+        }
+
+        // Step 3: detect tokenizer drift on artifacts_fts. If the live
+        // DDL does not include our explicit unicode61 tokenizer, drop +
+        // recreate the FTS5 table. Caller (run_server) is responsible
+        // for triggering a reindex_all afterwards (we don't do it here
+        // to keep migrate() cheap and let the caller decide when to
+        // pay the cost).
+        let needs_fts_upgrade = self.fts_tokenizer_needs_upgrade()?;
+        if needs_fts_upgrade {
+            self.conn.execute_batch(
+                "BEGIN IMMEDIATE;\
+                 DROP TABLE IF EXISTS artifacts_fts;\
+                 COMMIT;",
+            )?;
+            self.conn
+                .execute_batch(&format!("BEGIN IMMEDIATE;{FTS_SQL}COMMIT;"))?;
+        }
+
         Ok(())
+    }
+
+    /// Inspect the live DDL of `artifacts_fts` and return true if the
+    /// tokenizer is not the explicit unicode61 + extra separators that
+    /// RFC bdee1af4 mandates.
+    fn fts_tokenizer_needs_upgrade(&self) -> Result<bool, OrchestratorError> {
+        let result = self.conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='artifacts_fts'",
+            [],
+            |row| row.get::<_, String>(0),
+        );
+        match result {
+            Ok(sql) => {
+                // Heuristic: presence of "unicode61" AND "separators".
+                Ok(!sql.contains("unicode61") || !sql.contains("separators"))
+            }
+            // Table missing => caller will create it through migrate(),
+            // no upgrade needed.
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Public flag: returns true iff the previous migrate() call detected
+    /// a stale FTS5 schema and dropped+recreated it. Callers (run_server)
+    /// can use this to trigger a reindex_all afterwards.
+    ///
+    /// Inspect using the same heuristic: if the live DDL contains
+    /// unicode61+separators, no upgrade was needed.
+    pub fn fts_was_upgraded(&self) -> Result<bool, OrchestratorError> {
+        // Counts as "upgraded" only if the table is currently empty
+        // (just dropped+recreated). On steady state we expect non-zero.
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM artifacts_fts", [], |r| r.get(0))?;
+        // If empty AND artifacts has rows, FTS was just upgraded.
+        let art_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))?;
+        Ok(count == 0 && art_count > 0)
     }
 
     /// Read the embedding model version recorded in `index_metadata`.

@@ -1087,6 +1087,9 @@ async fn run_server() -> anyhow::Result<()> {
     let db_file = format!("{db_dir}/{}", constants::DB_FILENAME);
     let db = OrchestratorDb::open(&db_file)?;
     db.migrate()?;
+    // RFC bdee1af4 étape 19: if migrate() dropped+recreated artifacts_fts
+    // (tokenizer drift), we must reindex_all to repopulate FTS rows.
+    let fts_drift = db.fts_was_upgraded().unwrap_or(false);
 
     let schemas_dir = format!("{root}/{}", constants::SCHEMAS_DIR);
     let registry = SchemaRegistry::load(&schemas_dir)?;
@@ -1098,6 +1101,26 @@ async fn run_server() -> anyhow::Result<()> {
         companyos_orchestrator::Embedder::load_from_cache(&root)
             .map_err(|e| anyhow::anyhow!("Failed to load embedder: {e}"))?,
     );
+
+    // RFC bdee1af4 étape 5+19: detect model_version drift (architecture
+    // marker, model upgrade). If the stored version differs from the
+    // runtime one, wipe artifacts_vec and force a reindex.
+    let model_drift = {
+        let tmp_db = OrchestratorDb::open(&db_file)?;
+        let stored = tmp_db.get_model_version().unwrap_or(None);
+        let current = companyos_orchestrator::embedding::model_version();
+        match stored {
+            None => true, // fresh DB: needs initial indexing anyway
+            Some(v) if v != current => {
+                eprintln!(
+                    "[companyos:{C}] embedding model_version drift: stored='{v}' current='{current}', wiping vec table"
+                );
+                tmp_db.wipe_vec_table()?;
+                true
+            }
+            _ => false,
+        }
+    };
 
     let engine = OrchestratorEngine::new(db, max_iterations, embedder.clone());
 
@@ -1138,6 +1161,24 @@ async fn run_server() -> anyhow::Result<()> {
                 "integrity_check failed before any work: {e}"
             ));
         }
+    };
+
+    // RFC bdee1af4 étape 19: if FTS or model drift was detected, force a
+    // synchronous reindex_all before serving any MCP request so the
+    // index is coherent and queries don't return stale or empty results.
+    let engine = if fts_drift || model_drift {
+        let mut e = engine;
+        let validator_guard = validator.read().await;
+        let count = e
+            .reindex_all(&root, &validator_guard)
+            .map_err(|e| anyhow::anyhow!("post-migrate reindex_all failed: {e}"))?;
+        drop(validator_guard);
+        eprintln!(
+            "[companyos:{C}] Post-migration reindex completed ({count} artifacts) — drift: fts={fts_drift} model={model_drift}"
+        );
+        e
+    } else {
+        engine
     };
 
     let engine = Arc::new(Mutex::new(engine));
