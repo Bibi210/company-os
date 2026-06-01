@@ -73,4 +73,16 @@ pub enum OrchestratorError {
 
     #[error("Database integrity check failed: {details}")]
     IntegrityFailure { details: String },
+
+    #[error(
+        "Embedding model cache not found at '{path}'. Run \
+         'cargo run -p companyos-orchestrator-server -- --prefetch-embeddings' first."
+    )]
+    EmbeddingModelMissing { path: String },
+
+    #[error("Embedding inference failed: {reason}")]
+    EmbeddingFailed { reason: String },
+
+    #[error("Anthropic API key required for {feature} (set ANTHROPIC_API_KEY)")]
+    AnthropicKeyMissing { feature: String },
 }

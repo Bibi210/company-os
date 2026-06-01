@@ -1,4 +1,5 @@
 pub mod db;
+pub mod embedding;
 pub mod engine;
 pub mod error;
 pub mod lock;
@@ -6,6 +7,7 @@ pub mod roadmap_summary;
 pub mod types;
 
 pub use db::OrchestratorDb;
+pub use embedding::{EMBEDDING_DIM, Embedder, build_embedding_view, model_version};
 pub use engine::{OrchestratorEngine, RfcUpdateResult, compute_consensus};
 pub use error::OrchestratorError;
 pub use lock::{DbLockGuard, acquire_exclusive_blocking, try_acquire_exclusive};

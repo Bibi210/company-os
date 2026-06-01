@@ -4,3 +4,7 @@ target/
 .companyos/
 Cargo.lock
 company/data/orchestrator.lock
+# Embedding model cache (downloaded via --prefetch-embeddings, ~500MB).
+# Reconstructible from network on demand; not part of the repo content.
+company/data/embeddings/
+

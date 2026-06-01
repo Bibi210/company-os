@@ -771,11 +771,39 @@ fn main() -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("usage: --index <path>"))?;
             run_index(path)
         }
+        Some("--prefetch-embeddings") => run_prefetch_embeddings(),
         _ => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
             .block_on(run_server()),
     }
+}
+
+/// CLI mode: pre-fetch the embedding model weights into the local cache.
+///
+/// This is the ONLY entry point that performs network I/O for the
+/// embedding model. The server boot path requires the cache to be
+/// present (via `Embedder::load_from_cache`) and fails fast if it is
+/// not (RFC bdee1af4 proposition 2, axis (i) — runtime autonomy).
+///
+/// Operators must run this once after install and after any change to
+/// `Embedder::model_version()`. Idempotent.
+fn run_prefetch_embeddings() -> anyhow::Result<()> {
+    let root = std::env::var(constants::ENV_COMPANYOS_ROOT).unwrap_or_else(|_| ".".into());
+    let cache = companyos_orchestrator::Embedder::prefetch_to_cache(&root)
+        .map_err(|e| anyhow::anyhow!("Failed to prefetch embeddings: {e}"))?;
+    println!(
+        "{}",
+        Diagnostic::info(
+            C,
+            format!(
+                "Embedding model cached at '{}'. Server can now boot.",
+                cache.display()
+            )
+        )
+        .with_context("run_prefetch_embeddings")
+    );
+    Ok(())
 }
 
 // --- PILIER A constants (file-lock coordination, RFC cdbfee72) ---
