@@ -15,3 +15,7 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 glob = { workspace = true }
 fs2 = "0.4"
+# Hybrid search (RFC bdee1af4)
+sqlite-vec = { workspace = true }
+fastembed = { workspace = true }
+ureq = { workspace = true }

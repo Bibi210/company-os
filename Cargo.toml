@@ -25,9 +25,18 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rmcp = { version = "1.2", features = ["server", "transport-io"] }
 jsonschema = "0.29"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "load_extension"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 schemars = "1"
 glob = "0.3"
 notify = "7"
+# Hybrid search dependencies (RFC bdee1af4)
+# Pinned exact per F-rfc-4 (sqlite-vec is pre-1.0 alpha, ABI not stable).
+sqlite-vec = "=0.1.6"
+# Embedding inference runtime, in-process via ort/ONNX Runtime FFI.
+# Pinned exact for reproducibility (F-commun-1 iteration 3).
+fastembed = "=5.15.0"
+# HTTP client for optional Claude rerank/HyDE. Sync API wrapped in
+# spawn_blocking from the tokio runtime (cf. plan iteration 2 F-plan-4).
+ureq = "3.3.0"
