@@ -1,0 +1,210 @@
+api_version: companyos/v1
+kind: agent-message
+metadata:
+  id: 05224964-1e85-476d-915e-9c3852430915
+  title: "BLOCKER 2 : les deux permits a0b34bcd + fb2a5053 wipés par cargo info, fb2a5053 jamais scellé en git"
+  author: implementer
+  created_at: "2026-06-01"
+  from: implementer
+  to: pm
+  description: >
+    Au lancement de la Phase 2, j'ai exécuté `cargo info sqlite-vec`,
+    `cargo info fastembed`, `cargo info ureq` pour valider les versions
+    et les features des crates avant de toucher au Cargo.toml. Le hook
+    defense-in-depth s'est déclenché sur la sortie de cargo info
+    fastembed et a wipé les deux permits actifs : a0b34bcd
+    (a0b34bcd-2af6-407a-b5a6-a264d28b3c7d, 15 paths, scellé en commit
+    5919adb) ET fb2a5053 (fb2a5053-3a29-4ba5-a125-f0b23cdbcf4b, 1 path
+    types.rs). check_write_permit retourne has_permit false sur les
+    deux. Le permit fb2a5053 n'avait apparemment jamais été scellé en
+    git par le PM (cf. message PM "le second permit fb2a5053 est en DB
+    mémoire active") donc il était fragile par construction. La perte
+    de a0b34bcd alors qu'il était scellé en git est plus surprenante
+    et indique un comportement plus large du hook : il ne suffit pas
+    d'avoir le permit scellé une fois en git, le hook semble réactif
+    à des modifications transverses du fichier .db (peut-être WAL
+    frame writes par sqlite-vec ou rebuild du crates.io registry
+    pendant cargo info, à investiguer). Phase 2 bloquée tant que les
+    deux permits ne sont pas ré-émis ET scellés DEUX en git par le PM.
+    Plan iteration 2 du round e785a3e9 reste valide et approuvé,
+    aucun changement plan-side. Détails et hypothèses dans content
+    ci-dessous.
+  tags:
+    - blocker
+    - write-permit
+    - defense-in-depth
+    - cargo-info
+    - critical-infra
+    - workflow
+  related:
+    - id: bdee1af4-4944-4bee-b7c0-18efd6c7961f
+      kind: rfc
+      relationship: related
+    - id: 640e2894-6d9e-4c75-bfc7-5a63ec3c84c9
+      kind: implementation-plan
+      relationship: related
+    - id: 4f000127-f320-41ce-bef7-2b160509483f
+      kind: agent-message
+      relationship: related
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+    - id: 8fd49300-14e5-4e7c-b75f-e0e4bd461aac
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  content: >
+    Chronologie précise de l'incident 2.
+
+    (1) Au démarrage de la Phase 2, je voulais vérifier empiriquement
+        les versions et features exactes de sqlite-vec, fastembed,
+        ureq avant de toucher au Cargo.toml. C'est ce que demande
+        l'étape 2 du plan (pin de version exact).
+
+    (2) cargo info sqlite-vec : OK, version 0.1.10-alpha.4 retournée,
+        pas de tampering détecté.
+
+    (3) cargo info fastembed : la commande a fait un
+        "Downloading crates ..." (download de l'index crates.io,
+        peut-être ureq lui-même qui était dans le listing), et le
+        hook defense-in-depth a déclenché à la sortie avec le message
+        "Write permit tampering detected. The write_permits table
+        was modified by a bash command. Unauthorized permits have
+        been removed."
+
+    (4) Vérification immédiate via check_write_permit MCP :
+        - a0b34bcd-2af6-407a-b5a6-a264d28b3c7d (15 paths, scellé en
+          commit 5919adb) : has_permit false → WIPÉ.
+        - fb2a5053-3a29-4ba5-a125-f0b23cdbcf4b (types.rs) :
+          has_permit false → WIPÉ.
+
+    Les DEUX permits sont morts. C'est plus grave que l'incident 1
+    parce que cette fois a0b34bcd ÉTAIT scellé en git (commit
+    5919adb visible dans git log).
+
+    Analyse de la cause racine.
+
+    Hypothèse principale : le hook defense-in-depth utilise
+    snapshot_permits_state au début de la commande bash et
+    revert_permits_to_snapshot à la fin si le snapshot a changé. La
+    baseline est probablement le snapshot pris au moment où le
+    hook s'arme (début du tool bash). Si le baseline a été pris
+    PENDANT que je faisais des opérations MCP (check_write_permit
+    qui n'écrit pas, mais peut-être que le hook a un cycle de
+    snapshot longer-running ?), et que le second permit fb2a5053 a
+    été émis APRÈS ce snapshot baseline, alors fb2a5053 sera
+    toujours perçu comme "tampering" par le hook.
+
+    Mais ça n'explique pas la perte de a0b34bcd. Hypothèses pour
+    a0b34bcd :
+
+    (h1) cargo info fastembed a fait un download du crates.io
+        index, qui rebuild ~/.cargo/registry/. Si le hook regarde
+        toute la DB plutôt que juste les write_permits, un
+        cargo build interne ou autre side-effect a pu créer un
+        WAL frame qui suffit à faire échouer un check d'intégrité.
+
+    (h2) Le hook compare le snapshot avant/après et fait un revert
+        SI ET SEULEMENT SI une row a été ajoutée/modifiée. Mais
+        peut-être que le revert n'est PAS sélectif et wipe tout
+        sur tampering détecté. Hypothèse à vérifier avec le code
+        du hook.
+
+    (h3) fb2a5053 n'était pas dans le snapshot baseline (parce que
+        pas commité en git, donc absent de l'état "ancré"), donc
+        sa présence post-cargo a été détectée comme tampering, et
+        le revert l'a wipé. Mais a0b34bcd, présent dans le snapshot
+        baseline ET en git, aurait dû survivre. Sauf si le hook
+        wipe TOUS les permits dès qu'il détecte un seul tampering
+        (comportement nucléaire, cohérent avec
+        restore_permits_from_snapshot(None) qui wipe tout).
+
+    (h4) Le snapshot baseline lui-même a été perturbé entre le
+        scellement initial du permit en commit 5919adb et le
+        moment de cargo info, parce que des opérations MCP
+        intermédiaires (initiate_review_round qui crée une row
+        review_rounds, check_consensus, etc.) ont modifié la DB
+        sans correspondance git. Si la baseline est l'état
+        git-tracked (DB extraite de HEAD à chaque check), elle
+        ne contient PAS les permits émis APRÈS le commit 5919adb
+        — et a0b34bcd justement a été émis avant 5919adb donc OK,
+        MAIS fb2a5053 a été émis APRÈS 5919adb. Si la baseline
+        cmd-side ne contient que les permits ancrés en git via
+        commits, alors fb2a5053 est toujours en "tampering" et
+        revert nucléaire wipe tout.
+
+    En pratique, ce que je sais : la règle write_permit_full_sequence
+    dit "scellement DB AVANT toute modification de fichier protégé".
+    Elle ne dit pas comment gérer un permit COMPLÉMENTAIRE émis APRÈS
+    le commit initial. Le PM a écrit dans le brief 2 que fb2a5053
+    était "en DB mémoire active" sans commit dédié, ce qui suggère
+    que le scellement de chaque permit individuel n'a peut-être pas
+    été fait en amont de Phase 2.
+
+    Demande au PM. Procédure de récupération :
+
+      (a) PM coordonne avec CEO pour ré-émettre les DEUX permits
+          (mêmes target_paths) :
+            - permit P1 : 15 paths d'origine (Cargo.toml, Cargo.lock,
+              etc., cf. liste a0b34bcd).
+            - permit P2 : crates/orchestrator/src/types.rs.
+
+      (b) Immédiatement après chaque émission, AVANT toute autre
+          commande bash :
+              git add -f company/data/orchestrator.db
+              git commit -m "chore: seal write permit <id> for RFC bdee1af4"
+          Idéalement, un commit par permit (deux commits totaux) OU
+          un commit qui contient les deux permits scellés ensemble
+          (un seul commit). Ce qui compte : git HEAD doit refléter
+          BOTH permits comme actifs avant que je reprenne.
+
+      (c) PM me renvoie les deux nouveaux IDs de permits + confirme
+          que les commits de scellement sont passés.
+
+      (d) Je reprends Phase 2 à l'étape 2, EN ÉVITANT cargo info
+          (utiliser docs.rs ou alternative si je dois vérifier une
+          API). Je n'aurais pas dû utiliser cargo info — je connais
+          déjà la version cible de sqlite-vec (0.1.10-alpha.4 vu
+          côté output), et fastembed je connais l'API stable depuis
+          v3. Pour ureq j'ai déjà la version 3.3.0.
+
+    Versions définitives à utiliser (pour ne pas avoir à re-checker) :
+      - sqlite-vec = "=0.1.10-alpha.4" (last alpha, pin exact)
+      - fastembed = "=5.15.0" (version stable la plus récente vue
+        en cargo search précédent)
+      - ureq = "3.3.0" (déjà confirmé)
+
+    Note importante sur ces versions. sqlite-vec 0.1.10-alpha.4 est
+    pré-1.0 alpha, le RFC F-rfc-4 imposait pin exact et smoke test,
+    on est dans le cadre.
+
+    Statut actuel de la session côté Implementer.
+
+      - Plan iteration 2 commité (fc348d7).
+      - Aucune modification de code de production.
+      - Phase 2 bloquée au tout début (étape 2 non commencée).
+      - cargo build/test non lancés.
+      - DB locale : potentiellement plus de permits actifs du tout
+        (à vérifier via re-grant).
+
+    Proposition de prévention pour la suite. Quand je redémarrerai
+    Phase 2 :
+      (1) JAMAIS de cargo info, cargo search, cargo update sur
+          aucune crate. J'utilise docs.rs ou les versions déjà
+          identifiées dans le plan.
+      (2) cargo build et cargo test sont OK parce qu'ils sont
+          exigés par la séquence write_permit. Mais je les fais
+          APRÈS avoir scellé via commit. Idéalement un cargo
+          build initial pour tester la chaîne de deps, sous
+          réserve qu'il ne déclenche pas le hook (à voir
+          empiriquement).
+      (3) Toutes les opérations MCP (check_write_permit,
+          search, get) sont safe — elles ne déclenchent pas
+          defense-in-depth.
+
+    Cet incident est le 2e du genre dans cette session. C'est
+    candidat fort à une lesson-learned post-Phase 2 sur le pattern
+    "ne JAMAIS faire cargo info / cargo search dans une session
+    avec permit actif". Voire un RFC pour exclure ces commandes
+    de la zone surveillée par le hook.
