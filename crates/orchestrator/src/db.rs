@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Once;
 
 use chrono::Utc;
 use companyos_config::PersonaId;
@@ -7,6 +8,44 @@ use uuid::Uuid;
 
 use crate::error::OrchestratorError;
 use crate::types::*;
+
+/// One-shot process-wide registration of the `sqlite-vec` C extension via
+/// `sqlite3_auto_extension`. Idempotent: subsequent calls are no-ops.
+///
+/// Rationale (RFC bdee1af4 proposition 2(c)): the orchestrator opens
+/// SQLite from three sites — `run_server`, `run_index`, and tests via
+/// `open_in_memory`. Registering the extension once at process startup
+/// guarantees that every subsequent `Connection::open` loads vec0
+/// automatically, without scattering `load_extension` calls. The
+/// upstream `sqlite-vec` README and tests use the same pattern.
+///
+/// SAFETY: `sqlite3_vec_init` is a C function from the linked
+/// `sqlite_vec0` library, with the canonical SQLite extension entry-point
+/// signature. Casting through `*const ()` mirrors the documented usage in
+/// the sqlite-vec crate's own test (lib.rs lines 9-13).
+static SQLITE_VEC_INIT: Once = Once::new();
+
+fn ensure_sqlite_vec_loaded() {
+    SQLITE_VEC_INIT.call_once(|| {
+        // The SQLite C API expects the auto-extension entry point to have
+        // signature `int (*)(sqlite3*, char**, const sqlite3_api_routines*)`,
+        // but `sqlite_vec::sqlite3_vec_init` is declared in the crate as
+        // `extern "C" fn()` (zero-arg). Both signatures are ABI-compatible
+        // when the underlying C symbol ignores extra arguments (which is
+        // the documented contract for sqlite-vec). We transmute through a
+        // pointer to bridge the type-system gap.
+        type AutoExtensionFn = unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *mut std::os::raw::c_char,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> std::os::raw::c_int;
+        unsafe {
+            let entry: AutoExtensionFn =
+                std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ());
+            rusqlite::ffi::sqlite3_auto_extension(Some(entry));
+        }
+    });
+}
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS review_rounds (
@@ -96,17 +135,108 @@ pub struct OrchestratorDb {
 
 impl OrchestratorDb {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OrchestratorError> {
+        ensure_sqlite_vec_loaded();
         let conn = Connection::open(path)?;
         conn.execute_batch(DEFENSIVE_PRAGMAS)?;
+        Self::smoke_test_sqlite_vec(&conn)?;
         Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> Result<Self, OrchestratorError> {
+        ensure_sqlite_vec_loaded();
         let conn = Connection::open_in_memory()?;
         // In-memory DBs return "memory" for journal_mode but accept all
         // other PRAGMAs harmlessly. Apply the same preamble for uniformity.
         conn.execute_batch(DEFENSIVE_PRAGMAS)?;
+        Self::smoke_test_sqlite_vec(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Smoke test the `sqlite-vec` extension at boot. Creates a temporary
+    /// in-memory vec0 table with two known vectors, runs a kNN, and
+    /// asserts the result matches a known-good answer (rowid 1 with
+    /// distance < 1e-3, rowid 2 with distance much greater).
+    ///
+    /// Rationale (RFC bdee1af4 proposition 2(d.2)): sqlite-vec is pre-1.0,
+    /// pinning a version is not sufficient — a silent kNN regression
+    /// could pass type checks but return wrong results. This 10ms test
+    /// fails fast when the wiring is broken, with a clear error message
+    /// that surfaces to the operator instead of producing garbage
+    /// search results downstream.
+    ///
+    /// The test uses a temp vec0 table that is dropped immediately to
+    /// avoid polluting the live schema.
+    fn smoke_test_sqlite_vec(conn: &Connection) -> Result<(), OrchestratorError> {
+        // Verify the extension itself responds.
+        let version: String = conn
+            .query_row("SELECT vec_version()", [], |row| row.get(0))
+            .map_err(|e| OrchestratorError::IntegrityFailure {
+                details: format!("sqlite-vec extension not loaded: {e}"),
+            })?;
+        if !version.starts_with('v') {
+            return Err(OrchestratorError::IntegrityFailure {
+                details: format!(
+                    "sqlite-vec returned unexpected version string '{version}' (expected to start with 'v')"
+                ),
+            });
+        }
+
+        // Create a throwaway vec0 table, insert two known vectors, run kNN.
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE temp.vec0_smoketest USING vec0(emb float[3]);
+             INSERT INTO temp.vec0_smoketest(rowid, emb) VALUES (1, '[1.0, 0.0, 0.0]');
+             INSERT INTO temp.vec0_smoketest(rowid, emb) VALUES (2, '[0.0, 1.0, 0.0]');",
+        )
+        .map_err(|e| OrchestratorError::IntegrityFailure {
+            details: format!("sqlite-vec smoke test: vec0 create/insert failed: {e}"),
+        })?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT rowid, distance FROM temp.vec0_smoketest
+                 WHERE emb MATCH '[1.0, 0.0, 0.0]' AND k = 2 ORDER BY distance",
+            )
+            .map_err(|e| OrchestratorError::IntegrityFailure {
+                details: format!("sqlite-vec smoke test: kNN prepare failed: {e}"),
+            })?;
+
+        let rows: Vec<(i64, f64)> = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)))
+            .and_then(|iter| iter.collect::<Result<Vec<_>, _>>())
+            .map_err(|e| OrchestratorError::IntegrityFailure {
+                details: format!("sqlite-vec smoke test: kNN query failed: {e}"),
+            })?;
+
+        drop(stmt);
+        // Always drop the throwaway table even if we are about to fail.
+        let _ = conn.execute_batch("DROP TABLE temp.vec0_smoketest;");
+
+        if rows.len() != 2 {
+            return Err(OrchestratorError::IntegrityFailure {
+                details: format!(
+                    "sqlite-vec smoke test: kNN returned {} rows, expected 2",
+                    rows.len()
+                ),
+            });
+        }
+        if rows[0].0 != 1 || rows[0].1 > 1e-3 {
+            return Err(OrchestratorError::IntegrityFailure {
+                details: format!(
+                    "sqlite-vec smoke test: closest vector should be rowid=1 with distance ~0, got rowid={} distance={}",
+                    rows[0].0, rows[0].1
+                ),
+            });
+        }
+        if rows[1].0 != 2 || rows[1].1 < 0.5 {
+            return Err(OrchestratorError::IntegrityFailure {
+                details: format!(
+                    "sqlite-vec smoke test: second vector should be rowid=2 with distance > 0.5, got rowid={} distance={}",
+                    rows[1].0, rows[1].1
+                ),
+            });
+        }
+
+        Ok(())
     }
 
     /// Apply the schema migration inside a single BEGIN IMMEDIATE/COMMIT
@@ -834,6 +964,24 @@ mod tests {
         let db = setup_db();
         let ok = db.integrity_check().unwrap();
         assert!(ok, "integrity_check should return true on a fresh DB");
+    }
+
+    // PILIER E (RFC bdee1af4): sqlite-vec smoke test must pass on fresh DB.
+    // open() and open_in_memory() both call smoke_test_sqlite_vec internally,
+    // so a successful setup_db() is implicit proof; this test makes the
+    // expectation explicit and would fail loudly if the wiring breaks.
+    #[test]
+    fn test_smoke_test_sqlite_vec_passes_on_fresh_db() {
+        // setup_db() calls OrchestratorDb::open_in_memory() which itself
+        // runs smoke_test_sqlite_vec — if this assertion-only test runs to
+        // completion the smoke test passed.
+        let db = setup_db();
+        // Sanity: vec_version() is now callable on the live connection.
+        let version: String = db
+            .conn
+            .query_row("SELECT vec_version()", [], |r| r.get(0))
+            .unwrap();
+        assert!(version.starts_with('v'), "vec_version() = {version}");
     }
 
     #[test]
