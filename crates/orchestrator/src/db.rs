@@ -80,7 +80,10 @@ CREATE TABLE IF NOT EXISTS artifacts (
     description TEXT NOT NULL DEFAULT '',
     tags TEXT NOT NULL DEFAULT '[]',
     file_path TEXT NOT NULL,
-    indexed_at TEXT NOT NULL
+    indexed_at TEXT NOT NULL,
+    author TEXT,
+    project TEXT,
+    created_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS artifact_relations (
@@ -94,6 +97,9 @@ CREATE INDEX IF NOT EXISTS idx_rounds_status ON review_rounds(status);
 CREATE INDEX IF NOT EXISTS idx_permits_status ON write_permits(status);
 CREATE INDEX IF NOT EXISTS idx_permits_granted_to ON write_permits(granted_to);
 CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(kind);
+CREATE INDEX IF NOT EXISTS idx_artifacts_author ON artifacts(author);
+CREATE INDEX IF NOT EXISTS idx_artifacts_project ON artifacts(project);
+CREATE INDEX IF NOT EXISTS idx_artifacts_created_at ON artifacts(created_at);
 CREATE INDEX IF NOT EXISTS idx_relations_target ON artifact_relations(target_id);
 ";
 
@@ -138,6 +144,78 @@ CREATE TABLE IF NOT EXISTS index_metadata (
 
 /// Metadata key for the embedding model version string.
 const META_MODEL_VERSION_KEY: &str = "model_version";
+
+/// Structured filters for `search_lexical` / `search_semantic`. All
+/// fields are optional and combined with AND in the SQL WHERE clause.
+/// `tags` and `kinds` use IN semantics (OR within a single field).
+#[derive(Debug, Clone, Default)]
+pub struct SearchFilters {
+    pub kinds: Option<Vec<String>>,
+    pub author: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub project: Option<String>,
+    pub created_after: Option<String>,
+    pub created_before: Option<String>,
+    pub id_prefix: Option<String>,
+}
+
+/// Append the WHERE-clause conjuncts and bind parameters for a
+/// [`SearchFilters`]. Used by both lexical and semantic SQL paths so
+/// the filter semantics are kept identical.
+fn append_filter_clauses(
+    filters: &SearchFilters,
+    sql: &mut String,
+    params_vec: &mut Vec<Box<dyn rusqlite::ToSql>>,
+) {
+    if let Some(kinds) = &filters.kinds
+        && !kinds.is_empty()
+    {
+        sql.push_str(" AND a.kind IN (");
+        for (i, k) in kinds.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+            params_vec.push(Box::new(k.clone()));
+        }
+        sql.push(')');
+    }
+    if let Some(author) = &filters.author {
+        sql.push_str(" AND a.author = ?");
+        params_vec.push(Box::new(author.clone()));
+    }
+    if let Some(project) = &filters.project {
+        sql.push_str(" AND a.project = ?");
+        params_vec.push(Box::new(project.clone()));
+    }
+    if let Some(after) = &filters.created_after {
+        sql.push_str(" AND a.created_at >= ?");
+        params_vec.push(Box::new(after.clone()));
+    }
+    if let Some(before) = &filters.created_before {
+        sql.push_str(" AND a.created_at <= ?");
+        params_vec.push(Box::new(before.clone()));
+    }
+    if let Some(prefix) = &filters.id_prefix {
+        sql.push_str(" AND a.id LIKE ?");
+        params_vec.push(Box::new(format!("{prefix}%")));
+    }
+    if let Some(tags) = &filters.tags
+        && !tags.is_empty()
+    {
+        // tags are stored as a JSON array string in `artifacts.tags`.
+        // EXISTS over json_each gives an OR-of-tags semantic.
+        sql.push_str(" AND EXISTS (SELECT 1 FROM json_each(a.tags) WHERE json_each.value IN (");
+        for (i, t) in tags.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+            params_vec.push(Box::new(t.clone()));
+        }
+        sql.push_str("))");
+    }
+}
 
 /// Defensive PRAGMA preamble applied at every open.
 ///
@@ -634,12 +712,35 @@ impl OrchestratorDb {
     /// The `embedding` slice must have exactly [`embedding::EMBEDDING_DIM`]
     /// (= 384) f32 components; sqlite-vec accepts a JSON array literal
     /// `'[f1, f2, ...]'` as a textual representation of the vector.
+    ///
+    /// Structured filter columns (`author`, `project`, `created_at`) are
+    /// passed as `Option<&str>` so a YAML without those fields stores
+    /// NULL — the SQL filters in `search_lexical` / `search_semantic`
+    /// treat NULL as "does not match".
     pub fn upsert_artifact(
         &mut self,
         artifact: &IndexedArtifact,
         content: &str,
         embedding: &[f32],
         relations: &[ParsedRelation],
+    ) -> Result<(), OrchestratorError> {
+        self.upsert_artifact_full(artifact, content, embedding, relations, None, None, None)
+    }
+
+    /// Same as `upsert_artifact` but with the structured filter columns
+    /// explicit. Production code paths (engine.index_artifact) extract
+    /// these from the YAML; tests use the simpler form which stores
+    /// NULL for all three.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_artifact_full(
+        &mut self,
+        artifact: &IndexedArtifact,
+        content: &str,
+        embedding: &[f32],
+        relations: &[ParsedRelation],
+        author: Option<&str>,
+        project: Option<&str>,
+        created_at: Option<&str>,
     ) -> Result<(), OrchestratorError> {
         if embedding.len() != crate::embedding::EMBEDDING_DIM {
             return Err(OrchestratorError::EmbeddingFailed {
@@ -670,10 +771,12 @@ impl OrchestratorDb {
             params![artifact.id],
         )?;
 
-        // Insert artifact
+        // Insert artifact (full row including filter columns).
         tx.execute(
-            "INSERT INTO artifacts (id, kind, title, description, tags, file_path, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO artifacts
+               (id, kind, title, description, tags, file_path, indexed_at,
+                author, project, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 artifact.id,
                 artifact.kind,
@@ -682,6 +785,9 @@ impl OrchestratorDb {
                 tags_json,
                 artifact.file_path,
                 artifact.indexed_at,
+                author,
+                project,
+                created_at,
             ],
         )?;
 
@@ -718,6 +824,114 @@ impl OrchestratorDb {
         Ok(())
     }
 
+    /// Lexical-only search via FTS5 + BM25 + structured filter push-down.
+    /// Returns ranked ids (1-indexed) for downstream fusion.
+    ///
+    /// `fts_query` must already be sanitised by
+    /// [`crate::query::sanitize_fts_query`]; if empty, the lexical path
+    /// is short-circuited and returns an empty Vec.
+    pub fn search_lexical(
+        &self,
+        fts_query: &str,
+        filters: &SearchFilters,
+        limit: usize,
+    ) -> Result<Vec<crate::fusion::RankedResult>, OrchestratorError> {
+        if fts_query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build dynamic WHERE + params. The base is always:
+        //   WHERE artifacts_fts MATCH ?
+        let mut sql = String::from(
+            "SELECT a.id FROM artifacts_fts f \
+             JOIN artifacts a ON a.id = f.id \
+             WHERE artifacts_fts MATCH ?",
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        params_vec.push(Box::new(fts_query.to_string()));
+
+        append_filter_clauses(filters, &mut sql, &mut params_vec);
+
+        // BM25 ranking. Five indexed columns in artifacts_fts (kind,
+        // title, description, tags, content — id is UNINDEXED). Weights:
+        //   kind=0 (filter only), title=10, description=3, tags=5, content=1.
+        sql.push_str(" ORDER BY bm25(artifacts_fts, 0.0, 10.0, 3.0, 5.0, 1.0) LIMIT ?");
+        params_vec.push(Box::new(limit as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+
+        let ids: Vec<String> = stmt
+            .query_map(params_refs.as_slice(), |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(ids
+            .into_iter()
+            .enumerate()
+            .map(|(i, id)| crate::fusion::RankedResult { id, rank: i + 1 })
+            .collect())
+    }
+
+    /// Semantic search via sqlite-vec kNN over `artifacts_vec`. Returns
+    /// ranked ids (1-indexed). Filters are applied as a post-filter on
+    /// the JOIN; for our corpus (< 1000 rows) brute-force kNN + JOIN
+    /// is sub-50ms.
+    pub fn search_semantic(
+        &self,
+        embedding: &[f32],
+        filters: &SearchFilters,
+        limit: usize,
+    ) -> Result<Vec<crate::fusion::RankedResult>, OrchestratorError> {
+        if embedding.len() != crate::embedding::EMBEDDING_DIM {
+            return Err(OrchestratorError::EmbeddingFailed {
+                reason: format!(
+                    "search_semantic: query embedding has dim {} but EMBEDDING_DIM = {}",
+                    embedding.len(),
+                    crate::embedding::EMBEDDING_DIM
+                ),
+            });
+        }
+        let q_json = encode_embedding_as_json(embedding);
+
+        // Inner kNN over vec0; outer JOIN applies structured filters.
+        // We over-fetch (limit * 3, capped at 200) to leave headroom for
+        // the post-filter to still produce `limit` results in the
+        // common case.
+        let knn_k = (limit * 3).clamp(limit, 200);
+        let mut sql = format!(
+            "SELECT v.artifact_id, v.distance \
+             FROM artifacts_vec v \
+             JOIN artifacts a ON a.id = v.artifact_id \
+             WHERE v.embedding MATCH ? AND v.k = {knn_k}"
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        params_vec.push(Box::new(q_json));
+
+        append_filter_clauses(filters, &mut sql, &mut params_vec);
+
+        sql.push_str(" ORDER BY v.distance LIMIT ?");
+        params_vec.push(Box::new(limit as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+
+        let ids: Vec<String> = stmt
+            .query_map(params_refs.as_slice(), |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(ids
+            .into_iter()
+            .enumerate()
+            .map(|(i, id)| crate::fusion::RankedResult { id, rank: i + 1 })
+            .collect())
+    }
+
+    /// Legacy lexical search used by callers that have not yet migrated
+    /// to the (filters, mode) API. Kept for backwards compat during the
+    /// transition; new callers should use `search_lexical` or the engine
+    /// `search` entry point.
     pub fn search_artifacts(
         &self,
         query: &str,
@@ -1606,6 +1820,172 @@ mod tests {
         let too_short = vec![1.0_f32; 100]; // not 384
         let res = db.upsert_artifact(&art, "content", &too_short, &[]);
         assert!(res.is_err(), "wrong-dim embedding must be rejected");
+    }
+
+    // RFC bdee1af4 étape 10: lexical search via search_lexical + filters.
+
+    fn insert_test_artifact(db: &mut OrchestratorDb, id: &str, kind: &str, title: &str) {
+        let art = IndexedArtifact {
+            id: id.into(),
+            kind: kind.into(),
+            title: title.into(),
+            description: String::new(),
+            tags: vec![],
+            file_path: format!("fixtures/{id}.yml"),
+            indexed_at: Utc::now().to_rfc3339(),
+        };
+        db.upsert_artifact(&art, title, &dummy_embedding(id.as_bytes()[0]), &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn test_search_lexical_returns_ranked_results() {
+        let mut db = setup_db();
+        insert_test_artifact(&mut db, "a", "rfc", "embeddings tutorial");
+        insert_test_artifact(&mut db, "b", "design-doc", "unrelated topic");
+
+        let q = crate::query::sanitize_fts_query("embeddings", crate::query::QueryMode::Natural);
+        let results = db
+            .search_lexical(&q, &SearchFilters::default(), 10)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "a");
+        assert_eq!(results[0].rank, 1);
+    }
+
+    #[test]
+    fn test_search_lexical_filter_kind_excludes_others() {
+        let mut db = setup_db();
+        insert_test_artifact(&mut db, "rfc1", "rfc", "foo bar");
+        insert_test_artifact(&mut db, "dd1", "design-doc", "foo bar");
+
+        let q = crate::query::sanitize_fts_query("foo", crate::query::QueryMode::Natural);
+        let filters = SearchFilters {
+            kinds: Some(vec!["rfc".into()]),
+            ..Default::default()
+        };
+        let results = db.search_lexical(&q, &filters, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "rfc1");
+    }
+
+    #[test]
+    fn test_search_lexical_empty_query_returns_empty() {
+        let db = setup_db();
+        let results = db
+            .search_lexical("", &SearchFilters::default(), 10)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_lexical_bm25_orders_title_above_body() {
+        let mut db = setup_db();
+        // a has the term in the title, b has it in the content only.
+        let art_a = IndexedArtifact {
+            id: "a".into(),
+            kind: "rfc".into(),
+            title: "caching layer overview".into(),
+            description: String::new(),
+            tags: vec![],
+            file_path: "a.yml".into(),
+            indexed_at: Utc::now().to_rfc3339(),
+        };
+        let art_b = IndexedArtifact {
+            id: "b".into(),
+            kind: "rfc".into(),
+            title: "unrelated".into(),
+            description: String::new(),
+            tags: vec![],
+            file_path: "b.yml".into(),
+            indexed_at: Utc::now().to_rfc3339(),
+        };
+        db.upsert_artifact(&art_a, "body without keyword", &dummy_embedding(1), &[])
+            .unwrap();
+        db.upsert_artifact(
+            &art_b,
+            "long body that mentions caching once and that is it",
+            &dummy_embedding(2),
+            &[],
+        )
+        .unwrap();
+
+        let q = crate::query::sanitize_fts_query("caching", crate::query::QueryMode::Natural);
+        let results = db
+            .search_lexical(&q, &SearchFilters::default(), 10)
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        // 'a' has title match (weight 10), should rank above 'b'.
+        assert_eq!(results[0].id, "a");
+    }
+
+    #[test]
+    fn test_search_semantic_returns_nearest_first() {
+        let mut db = setup_db();
+        // We craft three deterministic vectors and ensure the closest
+        // one to the query vector comes first.
+        let mut v_close = vec![0.0_f32; crate::embedding::EMBEDDING_DIM];
+        v_close[0] = 1.0;
+        let mut v_far = vec![0.0_f32; crate::embedding::EMBEDDING_DIM];
+        v_far[1] = 1.0;
+
+        let art_close = IndexedArtifact {
+            id: "close".into(),
+            kind: "rfc".into(),
+            title: "close".into(),
+            description: String::new(),
+            tags: vec![],
+            file_path: "close.yml".into(),
+            indexed_at: Utc::now().to_rfc3339(),
+        };
+        let art_far = IndexedArtifact {
+            id: "far".into(),
+            kind: "rfc".into(),
+            title: "far".into(),
+            description: String::new(),
+            tags: vec![],
+            file_path: "far.yml".into(),
+            indexed_at: Utc::now().to_rfc3339(),
+        };
+        db.upsert_artifact(&art_close, "c", &v_close, &[]).unwrap();
+        db.upsert_artifact(&art_far, "f", &v_far, &[]).unwrap();
+
+        let mut query = vec![0.0_f32; crate::embedding::EMBEDDING_DIM];
+        query[0] = 1.0; // identical to v_close
+
+        let results = db
+            .search_semantic(&query, &SearchFilters::default(), 5)
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, "close");
+        assert_eq!(results[1].id, "far");
+    }
+
+    #[test]
+    fn test_search_semantic_filter_kind() {
+        let mut db = setup_db();
+        let mut v = vec![0.0_f32; crate::embedding::EMBEDDING_DIM];
+        v[0] = 1.0;
+        let make = |id: &str, kind: &str| IndexedArtifact {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            title: id.to_string(),
+            description: String::new(),
+            tags: vec![],
+            file_path: format!("{id}.yml"),
+            indexed_at: Utc::now().to_rfc3339(),
+        };
+        db.upsert_artifact(&make("rfc1", "rfc"), "c", &v, &[])
+            .unwrap();
+        db.upsert_artifact(&make("dd1", "design-doc"), "c", &v, &[])
+            .unwrap();
+        let filters = SearchFilters {
+            kinds: Some(vec!["rfc".into()]),
+            ..Default::default()
+        };
+        let results = db.search_semantic(&v, &filters, 5).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "rfc1");
     }
 
     #[test]

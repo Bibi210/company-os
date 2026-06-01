@@ -450,8 +450,30 @@ impl OrchestratorEngine {
             .require_embedder()?
             .embed_artifact_view(&yaml, &artifact.kind)?;
 
-        self.db
-            .upsert_artifact(&artifact, &searchable, &embedding, &relations)?;
+        // Extract structured filter columns. These mirror the YAML
+        // metadata fields and feed into the SearchFilters WHERE clause.
+        let author = yaml
+            .pointer("/metadata/author")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let project = yaml
+            .pointer("/metadata/project")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let created_at = yaml
+            .pointer("/metadata/created_at")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        self.db.upsert_artifact_full(
+            &artifact,
+            &searchable,
+            &embedding,
+            &relations,
+            author.as_deref(),
+            project.as_deref(),
+            created_at.as_deref(),
+        )?;
         Ok(artifact)
     }
 

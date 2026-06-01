@@ -8,7 +8,7 @@ pub mod query;
 pub mod roadmap_summary;
 pub mod types;
 
-pub use db::OrchestratorDb;
+pub use db::{OrchestratorDb, SearchFilters};
 pub use embedding::{EMBEDDING_DIM, Embedder, build_embedding_view, model_version};
 pub use engine::{OrchestratorEngine, RfcUpdateResult, compute_consensus};
 pub use error::OrchestratorError;
