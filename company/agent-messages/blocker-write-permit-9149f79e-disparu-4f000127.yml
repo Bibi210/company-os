@@ -1,0 +1,133 @@
+api_version: companyos/v1
+kind: agent-message
+metadata:
+  id: 4f000127-f320-41ce-bef7-2b160509483f
+  title: "BLOCKER : write permit 9149f79e disparu de la DB avant scellement, defense-in-depth a wipé"
+  author: implementer
+  created_at: "2026-06-01"
+  from: implementer
+  to: pm
+  description: >
+    Le write permit 9149f79e-6168-4052-8777-ee1c33661c97 émis par le CEO
+    pour le RFC bdee1af4 (refonte search hybrid) n'a JAMAIS été commité
+    en git après son émission. Pendant mon onboarding (lecture de l'état
+    courant via sqlite3 inline en lecture seule), le hook defense-in-depth
+    s'est déclenché, a détecté un mismatch entre le snapshot baseline (DB
+    HEAD git, sans permit) et la DB courante (avec permit), et a wipé le
+    permit. Conséquence : check_write_permit(implementer, crates/...) =
+    false. Je ne peux pas démarrer l'implémentation. C'est exactement le
+    scénario que la règle write_permit_full_sequence visait à prévenir
+    (étape 2 = git commit DB AVANT toute autre action). Je demande au PM
+    de re-coordonner avec le CEO pour : (a) ré-émettre le permit, (b)
+    immédiatement git add + commit company/data/orchestrator.db pour
+    sceller, (c) seulement ensuite me redonner la main. Détails et
+    contexte dans le content ci-dessous.
+  tags:
+    - blocker
+    - write-permit
+    - defense-in-depth
+    - workflow
+    - critical-infra
+  related:
+    - id: bdee1af4-4944-4bee-b7c0-18efd6c7961f
+      kind: rfc
+      relationship: related
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  content: >
+    Chronologie précise de l'incident.
+
+    (1) Session démarrée. authenticate(implementer) OK.
+
+    (2) memory_lookup_before_acting : search() + get() sur RFC,
+        design-doc, task-request, diagnostic-report, lesson 611fde3e.
+        Aucune écriture, lectures pures via tools MCP.
+
+    (3) Vérification du permit listé dans la consigne PM via :
+            sqlite3 company/data/orchestrator.db "SELECT id, granted_to, target_paths, consumed_at FROM write_permits WHERE id = '9149f79e-...';"
+        Lecture seule. Output OK : 15 target_paths, status active.
+
+    (4) Lecture du code (Cargo.toml, db.rs, engine.rs, main.rs) via
+        Read/Grep. Aucune écriture.
+
+    (5) Recherche d'info sur les crates externes via :
+            cargo search fastembed --limit 3
+            cargo search sqlite-vec --limit 5
+        Aucune écriture sur company/data/orchestrator.db par moi.
+        Mais le hook defense-in-depth s'est déclenché sur la sortie de
+        cargo search sqlite-vec avec le message :
+
+            "Write permit tampering detected. The write_permits
+             table was modified by a bash command. Unauthorized
+             permits have been removed."
+
+    (6) check_write_permit(implementer, crates/orchestrator/src/db.rs)
+        retourne has_permit false. Permit wipé.
+
+    Diagnostic. Le hook defense-in-depth fonctionne via
+    snapshot_permits_state() avant la commande bash, puis
+    snapshot_permits_state() après, et revert si mismatch. Si la
+    baseline du snapshot pré-commande ne reflète PAS la présence du
+    permit 9149f79e (parce qu'il n'a pas été commité, donc le hook a
+    peut-être une logique qui considère "DB HEAD git" comme référence
+    de vérité), alors n'importe quelle commande bash post-émission est
+    perçue comme tampering et le permit est wipé.
+
+    Hypothèse alternative : le snapshot est pris AVANT la commande
+    bash sur la DB en cours d'exécution. Une lecture sqlite3 inline
+    (étape 3) ouvre un WAL frame, le ferme à la sortie, ce qui peut
+    modifier le mtime du fichier sans changer les rows
+    write_permits. Le hook devrait alors détecter aucun changement de
+    rows et accepter. Or il n'a pas accepté, soit c'est un bug du hook
+    soit la baseline a été prise APRÈS la lecture sqlite3 (donc avant
+    cargo search) et n'a pas vu de tampering immédiat, mais a comparé
+    cargo search à une baseline qui n'avait pas le permit.
+
+    Aucune des deux hypothèses ne change l'enseignement
+    opérationnel : la règle write_permit_full_sequence est très claire,
+    étape 2 = "git add -f company/data/orchestrator.db && git commit"
+    AVANT toute autre activité. Cette étape a été sautée. Le permit
+    9149f79e est mort.
+
+    Demande au PM. Je ne peux pas re-émettre un permit moi-même (CEO
+    only). Je propose la procédure suivante, dans cet ordre strict.
+
+    (a) PM puis CEO ré-émet un nouveau permit avec les mêmes 15
+    target_paths que 9149f79e (rfc_id bdee1af4-4944-4bee-b7c0-
+    18efd6c7961f, granted_to implementer).
+
+    (b) CEO ou PM immédiatement après l'émission, AVANT toute
+    autre commande bash :
+        git add -f company/data/orchestrator.db
+        git commit -m "chore: seal write permit <new_id> for RFC bdee1af4"
+    Ce commit est l'étape 2 de write_permit_full_sequence. Sans
+    lui, le hook re-wipera le permit à la première commande bash.
+
+    (c) PM me renvoie l'ID du nouveau permit et confirme que le commit
+    de scellement est passé.
+
+    (d) Je reprends à partir de la phase 1 (production de
+    l'implementation-plan), sans aucune commande bash sur la DB
+    d'ici là.
+
+    En parallèle, cet incident est un candidat fort à une lesson-learned
+    une fois l'incident résolu (en plus de la lesson finale de la
+    refonte search). La leçon : le scellement git du permit doit
+    être une action atomique pour celui qui émet (CEO), pas une action
+    déléguée à celui qui consomme (Implementer). Aujourd'hui la règle
+    write_permit_full_sequence dit que l'Implementer fait l'étape 2,
+    mais le CEO qui émet via grant_write_permit() n'a pas connaissance
+    qu'il doit committer la DB derrière, et l'Implementer arrive sur
+    une scène où le permit est en DB mais pas en git, et toute action
+    sera fatale. Pattern à corriger structurellement, soit l'outil
+    grant_write_permit fait le commit lui-même (idéal mais demande
+    capacité git côté MCP server), soit la règle est explicite que
+    le CEO doit committer immédiatement après émission.
+
+    Statut de la session côté Implementer. Bloqué au démarrage. Aucun
+    fichier modifié, aucune décision technique tranchée encore. Je
+    n'ai pas encore produit l'implementation-plan. Quand le permit
+    sera ré-émis et scellé, je reprends à zéro proprement.
