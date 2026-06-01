@@ -623,27 +623,55 @@ impl OrchestratorDb {
 
     // --- Artifact Index ---
 
+    /// Upsert an artifact in all four index tables (`artifacts`,
+    /// `artifacts_fts`, `artifacts_vec`, `artifact_relations`) inside a
+    /// single SQLite transaction.
+    ///
+    /// Rationale (RFC bdee1af4 proposition 7, invariant 1): a single
+    /// artifact is either present in all four tables or in none. If
+    /// any insert fails, the transaction is rolled back atomically.
+    ///
+    /// The `embedding` slice must have exactly [`embedding::EMBEDDING_DIM`]
+    /// (= 384) f32 components; sqlite-vec accepts a JSON array literal
+    /// `'[f1, f2, ...]'` as a textual representation of the vector.
     pub fn upsert_artifact(
-        &self,
+        &mut self,
         artifact: &IndexedArtifact,
         content: &str,
+        embedding: &[f32],
         relations: &[ParsedRelation],
     ) -> Result<(), OrchestratorError> {
-        // Delete old data
-        self.conn
-            .execute("DELETE FROM artifacts WHERE id = ?1", params![artifact.id])?;
-        self.conn.execute(
+        if embedding.len() != crate::embedding::EMBEDDING_DIM {
+            return Err(OrchestratorError::EmbeddingFailed {
+                reason: format!(
+                    "upsert_artifact: embedding has dim {} but EMBEDDING_DIM = {}",
+                    embedding.len(),
+                    crate::embedding::EMBEDDING_DIM
+                ),
+            });
+        }
+        let tags_json = serde_json::to_string(&artifact.tags)?;
+        let embedding_json = encode_embedding_as_json(embedding);
+
+        let tx = self.conn.transaction()?;
+
+        // Delete old data — keep the four tables aligned.
+        tx.execute("DELETE FROM artifacts WHERE id = ?1", params![artifact.id])?;
+        tx.execute(
             "DELETE FROM artifacts_fts WHERE id = ?1",
             params![artifact.id],
         )?;
-        self.conn.execute(
+        tx.execute(
+            "DELETE FROM artifacts_vec WHERE artifact_id = ?1",
+            params![artifact.id],
+        )?;
+        tx.execute(
             "DELETE FROM artifact_relations WHERE source_id = ?1",
             params![artifact.id],
         )?;
 
         // Insert artifact
-        let tags_json = serde_json::to_string(&artifact.tags)?;
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO artifacts (id, kind, title, description, tags, file_path, indexed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -657,8 +685,8 @@ impl OrchestratorDb {
             ],
         )?;
 
-        // Insert FTS
-        self.conn.execute(
+        // Insert FTS row
+        tx.execute(
             "INSERT INTO artifacts_fts (id, kind, title, description, tags, content)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -671,15 +699,22 @@ impl OrchestratorDb {
             ],
         )?;
 
+        // Insert vector row.
+        tx.execute(
+            "INSERT INTO artifacts_vec (artifact_id, embedding) VALUES (?1, ?2)",
+            params![artifact.id, embedding_json],
+        )?;
+
         // Insert relations
         for rel in relations {
-            self.conn.execute(
+            tx.execute(
                 "INSERT OR IGNORE INTO artifact_relations (source_id, target_id, relationship)
                  VALUES (?1, ?2, ?3)",
                 params![artifact.id, rel.target_id, rel.relationship],
             )?;
         }
 
+        tx.commit()?;
         Ok(())
     }
 
@@ -869,9 +904,32 @@ impl OrchestratorDb {
     pub fn delete_all_artifacts(&self) -> Result<(), OrchestratorError> {
         self.conn.execute("DELETE FROM artifact_relations", [])?;
         self.conn.execute("DELETE FROM artifacts_fts", [])?;
+        self.conn.execute("DELETE FROM artifacts_vec", [])?;
         self.conn.execute("DELETE FROM artifacts", [])?;
         Ok(())
     }
+}
+
+/// Encode a float32 embedding vector as the JSON-array textual format
+/// accepted by `sqlite-vec`'s vec0 INSERT (e.g. `"[0.1, -0.2, ...]"`).
+///
+/// Round-trips through `Vec<f64>` is intentionally avoided: keeping the
+/// f32 precision matches the storage layout (`float[384]`) and avoids
+/// silent precision inflation in the JSON.
+fn encode_embedding_as_json(embedding: &[f32]) -> String {
+    let mut out = String::with_capacity(embedding.len() * 12 + 2);
+    out.push('[');
+    for (i, v) in embedding.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        // Use `{:?}` so NaN / inf are reported verbatim and SQLite-vec
+        // will reject them deterministically rather than silently coerce.
+        use std::fmt::Write;
+        let _ = write!(out, "{v:?}");
+    }
+    out.push(']');
+    out
 }
 
 /// Simple glob-like path matching (supports prefix matching with trailing /).
@@ -1024,6 +1082,19 @@ mod tests {
         let db = OrchestratorDb::open(":memory:").unwrap();
         db.migrate().unwrap();
         db
+    }
+
+    /// Dummy embedding of the correct dimension for tests that just want
+    /// to exercise the SQL pipeline without invoking fastembed. The
+    /// vector is unit-L2 (cosine-friendly) and varies a little per id
+    /// (first byte tweak) so that kNN tests are not degenerate.
+    fn dummy_embedding(seed: u8) -> Vec<f32> {
+        let mut v = vec![0.0_f32; crate::embedding::EMBEDDING_DIM];
+        v[0] = 1.0;
+        if seed != 0 {
+            v[1] = (seed as f32) * 1e-3;
+        }
+        v
     }
 
     // --- PILIER B / PILIER C / PILIER D : defensive PRAGMAs, transactional
@@ -1441,7 +1512,7 @@ mod tests {
 
     #[test]
     fn test_upsert_and_search() {
-        let db = setup_db();
+        let mut db = setup_db();
         let artifact = IndexedArtifact {
             id: "rfc-001".into(),
             kind: "rfc".into(),
@@ -1454,6 +1525,7 @@ mod tests {
         db.upsert_artifact(
             &artifact,
             "Full content about caching and Redis integration",
+            &dummy_embedding(1),
             &[],
         )
         .unwrap();
@@ -1478,13 +1550,16 @@ mod tests {
 
     #[test]
     fn test_list_by_kind_returns_only_matching_kind() {
-        let db = setup_db();
+        let mut db = setup_db();
         let r1 = make_indexed("road-001", "roadmap", "Beta Roadmap");
         let r2 = make_indexed("road-002", "roadmap", "Alpha Roadmap");
         let other = make_indexed("rfc-001", "rfc", "Some RFC");
-        db.upsert_artifact(&r1, "content", &[]).unwrap();
-        db.upsert_artifact(&r2, "content", &[]).unwrap();
-        db.upsert_artifact(&other, "content", &[]).unwrap();
+        db.upsert_artifact(&r1, "content", &dummy_embedding(1), &[])
+            .unwrap();
+        db.upsert_artifact(&r2, "content", &dummy_embedding(2), &[])
+            .unwrap();
+        db.upsert_artifact(&other, "content", &dummy_embedding(3), &[])
+            .unwrap();
 
         let results = db.list_by_kind("roadmap").unwrap();
         assert_eq!(results.len(), 2);
@@ -1496,11 +1571,59 @@ mod tests {
 
     #[test]
     fn test_list_by_kind_empty_when_no_match() {
-        let db = setup_db();
+        let mut db = setup_db();
         let rfc = make_indexed("rfc-only", "rfc", "Lonely RFC");
-        db.upsert_artifact(&rfc, "content", &[]).unwrap();
+        db.upsert_artifact(&rfc, "content", &dummy_embedding(1), &[])
+            .unwrap();
 
         let results = db.list_by_kind("roadmap").unwrap();
         assert!(results.is_empty());
+    }
+
+    // RFC bdee1af4 étape 6: transactional upsert writes all four tables.
+
+    #[test]
+    fn test_upsert_writes_artifacts_vec_too() {
+        let mut db = setup_db();
+        let art = make_indexed("vec-1", "rfc", "T");
+        db.upsert_artifact(&art, "content", &dummy_embedding(7), &[])
+            .unwrap();
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM artifacts_vec WHERE artifact_id = ?1",
+                params!["vec-1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "artifacts_vec must contain one row for vec-1");
+    }
+
+    #[test]
+    fn test_upsert_rejects_wrong_dimension() {
+        let mut db = setup_db();
+        let art = make_indexed("vec-1", "rfc", "T");
+        let too_short = vec![1.0_f32; 100]; // not 384
+        let res = db.upsert_artifact(&art, "content", &too_short, &[]);
+        assert!(res.is_err(), "wrong-dim embedding must be rejected");
+    }
+
+    #[test]
+    fn test_upsert_replaces_old_vector() {
+        let mut db = setup_db();
+        let art = make_indexed("v", "rfc", "T");
+        db.upsert_artifact(&art, "c1", &dummy_embedding(1), &[])
+            .unwrap();
+        db.upsert_artifact(&art, "c2", &dummy_embedding(2), &[])
+            .unwrap();
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM artifacts_vec WHERE artifact_id = ?1",
+                params!["v"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "re-upsert must keep exactly one vector row");
     }
 }

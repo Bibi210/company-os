@@ -502,7 +502,7 @@ impl OrchestratorServer {
         params: Parameters<IndexNowParams>,
     ) -> Result<CallToolResult, McpError> {
         let params = params.0;
-        let engine = self.engine.lock().await;
+        let mut engine = self.engine.lock().await;
         let validator = self.validator.read().await;
         match engine.index_artifact(&self.root_path, &params.path, &validator) {
             Ok(artifact) => ok(serde_json::to_string_pretty(&artifact).unwrap_or_default()),
@@ -627,7 +627,7 @@ impl OrchestratorServer {
         params: Parameters<IndexArtifactParams>,
     ) -> Result<CallToolResult, McpError> {
         let params = params.0;
-        let engine = self.engine.lock().await;
+        let mut engine = self.engine.lock().await;
         let validator = self.validator.read().await;
         match engine.index_artifact(&self.root_path, &params.path, &validator) {
             Ok(artifact) => ok(serde_json::to_string_pretty(&serde_json::json!({
@@ -650,7 +650,7 @@ impl OrchestratorServer {
         description = "Rebuild the entire artifact index from all YAML files under company/. Use after bulk file changes."
     )]
     async fn reindex_all(&self) -> Result<CallToolResult, McpError> {
-        let engine = self.engine.lock().await;
+        let mut engine = self.engine.lock().await;
         let validator = self.validator.read().await;
         match engine.reindex_all(&self.root_path, &validator) {
             Ok(count) => ok(serde_json::to_string_pretty(&serde_json::json!({
@@ -873,7 +873,13 @@ fn run_index(file_path: &str) -> anyhow::Result<()> {
     let registry = SchemaRegistry::load(&schemas_dir)?;
     let validator = ArtifactValidator::new(registry);
 
-    let engine = OrchestratorEngine::new(db, constants::DEFAULT_MAX_ITERATIONS);
+    // RFC bdee1af4 étape 7: load embedder before any indexing. Cache must
+    // be present (run --prefetch-embeddings first).
+    let embedder = Arc::new(
+        companyos_orchestrator::Embedder::load_from_cache(&root)
+            .map_err(|e| anyhow::anyhow!("Failed to load embedder: {e}"))?,
+    );
+    let mut engine = OrchestratorEngine::new(db, constants::DEFAULT_MAX_ITERATIONS, embedder);
     match engine.index_artifact(&root, file_path, &validator) {
         Ok(artifact) => {
             println!(
@@ -930,7 +936,14 @@ async fn run_server() -> anyhow::Result<()> {
     let registry = SchemaRegistry::load(&schemas_dir)?;
     let validator = Arc::new(RwLock::new(ArtifactValidator::new(registry)));
 
-    let engine = OrchestratorEngine::new(db, max_iterations);
+    // RFC bdee1af4 étape 7: load the embedder once at boot, share via Arc.
+    // Cache must be present on disk (run --prefetch-embeddings first).
+    let embedder = Arc::new(
+        companyos_orchestrator::Embedder::load_from_cache(&root)
+            .map_err(|e| anyhow::anyhow!("Failed to load embedder: {e}"))?,
+    );
+
+    let engine = OrchestratorEngine::new(db, max_iterations, embedder.clone());
 
     // PILIER D — autorepair at boot. If integrity_check reports
     // corruption, rebuild the DB from the YAML index source of truth.
@@ -951,7 +964,7 @@ async fn run_server() -> anyhow::Result<()> {
 
             let new_db = OrchestratorDb::open(&db_file)?;
             new_db.migrate()?;
-            let new_engine = OrchestratorEngine::new(new_db, max_iterations);
+            let mut new_engine = OrchestratorEngine::new(new_db, max_iterations, embedder.clone());
             // Rebuild synchronously before the server starts serving
             // requests. read() the validator under its RwLock once.
             let validator_guard = validator.read().await;
@@ -983,7 +996,7 @@ async fn run_server() -> anyhow::Result<()> {
         let validator = validator.clone();
         let root = root.clone();
         async move {
-            let engine = engine.lock().await;
+            let mut engine = engine.lock().await;
             let validator = validator.read().await;
             let count = engine.reindex_all(&root, &validator).unwrap_or(0);
             if count > 0 {
@@ -1019,7 +1032,7 @@ async fn run_server() -> anyhow::Result<()> {
                             Err(e) => tracing::warn!("Auto-reload schemas failed: {e}"),
                         },
                         ConfigChangeKind::Artifacts => {
-                            let engine = engine.lock().await;
+                            let mut engine = engine.lock().await;
                             let validator = validator.read().await;
                             match engine.reindex_all(&root, &validator) {
                                 Ok(count) => tracing::info!("Auto-reindexed {count} artifact(s)"),

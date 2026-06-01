@@ -22,7 +22,7 @@ fn setup_validator() -> ArtifactValidator {
 fn setup_engine() -> OrchestratorEngine {
     let db = OrchestratorDb::open(":memory:").expect("open db");
     db.migrate().expect("migrate");
-    OrchestratorEngine::new(db, constants::DEFAULT_MAX_ITERATIONS)
+    OrchestratorEngine::new_without_embedder(db, constants::DEFAULT_MAX_ITERATIONS)
 }
 
 // =====================================================================

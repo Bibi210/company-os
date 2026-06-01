@@ -1,9 +1,12 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::Utc;
 use companyos_config::{ArtifactKind, PersonaId, constants};
 use companyos_validation::ArtifactValidator;
 use uuid::Uuid;
+
+use crate::embedding::Embedder;
 
 /// Result of an RFC status auto-update triggered by close_round.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,11 +36,53 @@ const ROADMAP_KIND: &str = "roadmap";
 pub struct OrchestratorEngine {
     db: OrchestratorDb,
     max_iterations: u32,
+    /// Embedder used by `index_artifact` and `search` (semantic path).
+    /// `None` is permitted for tests that do not exercise the indexing or
+    /// search pipelines (e.g. pure review-round / consensus / permit
+    /// tests). Indexing or semantic search without an embedder returns
+    /// [`OrchestratorError::EmbeddingFailed`] with a clear message.
+    embedder: Option<Arc<Embedder>>,
 }
 
 impl OrchestratorEngine {
-    pub fn new(db: OrchestratorDb, max_iterations: u32) -> Self {
-        Self { db, max_iterations }
+    /// Construct an engine wired with an embedder. This is the production
+    /// constructor used by `run_server` and `run_index`.
+    pub fn new(db: OrchestratorDb, max_iterations: u32, embedder: Arc<Embedder>) -> Self {
+        Self {
+            db,
+            max_iterations,
+            embedder: Some(embedder),
+        }
+    }
+
+    /// Construct an engine without an embedder. Reserved for tests of
+    /// review-round / consensus / permit machinery that never call
+    /// `index_artifact` or `search`. Any such call returns
+    /// [`OrchestratorError::EmbeddingFailed`] with the message
+    /// "engine constructed without embedder".
+    pub fn new_without_embedder(db: OrchestratorDb, max_iterations: u32) -> Self {
+        Self {
+            db,
+            max_iterations,
+            embedder: None,
+        }
+    }
+
+    /// Borrow the engine's shared embedder. Used by `search()` to embed
+    /// the query under the same model as the persisted vectors. Returns
+    /// `None` when the engine was constructed via `new_without_embedder`.
+    pub fn embedder(&self) -> Option<&Arc<Embedder>> {
+        self.embedder.as_ref()
+    }
+
+    fn require_embedder(&self) -> Result<&Arc<Embedder>, OrchestratorError> {
+        self.embedder
+            .as_ref()
+            .ok_or_else(|| OrchestratorError::EmbeddingFailed {
+                reason: "engine constructed without embedder (test mode); \
+                         cannot index or run semantic search"
+                    .into(),
+            })
     }
 
     pub fn set_max_iterations(&mut self, val: u32) {
@@ -357,9 +402,17 @@ impl OrchestratorEngine {
 
     // --- Artifact Index Operations ---
 
-    /// Index a single artifact file. Reads YAML, validates, extracts metadata, upserts into index.
+    /// Index a single artifact file. Reads YAML, validates, extracts
+    /// metadata, computes the dense embedding, and upserts the four
+    /// index tables atomically.
+    ///
+    /// Rationale (RFC bdee1af4 proposition 7): the embedding step happens
+    /// BEFORE the transaction opens, so a model failure (OOM, panic in
+    /// the runtime, invalid input) leaves the existing artifact data
+    /// untouched. If the embedding succeeds, all four tables are updated
+    /// in a single transaction.
     pub fn index_artifact(
-        &self,
+        &mut self,
         root: &str,
         file_path: &str,
         validator: &ArtifactValidator,
@@ -392,8 +445,13 @@ impl OrchestratorEngine {
         let searchable = extract_searchable_content(&yaml);
         let relations = extract_relations(&yaml);
 
+        // Embedding step. Failure here -> early return, no DB write.
+        let embedding = self
+            .require_embedder()?
+            .embed_artifact_view(&yaml, &artifact.kind)?;
+
         self.db
-            .upsert_artifact(&artifact, &searchable, &relations)?;
+            .upsert_artifact(&artifact, &searchable, &embedding, &relations)?;
         Ok(artifact)
     }
 
@@ -631,16 +689,27 @@ impl OrchestratorEngine {
     }
 
     /// Reindex all artifacts under the given directory.
+    ///
+    /// Mutating because each `index_artifact` opens a transaction on the
+    /// underlying `Connection` (`&mut Connection::transaction`). Called
+    /// from the boot path (PILIER D) and on file watcher Artifacts events.
     pub fn reindex_all(
-        &self,
+        &mut self,
         root: &str,
         validator: &ArtifactValidator,
     ) -> Result<usize, OrchestratorError> {
         self.db.delete_all_artifacts()?;
+        // After delete_all, persist the current model_version so a future
+        // boot can detect a mismatch and trigger a wipe + reindex.
+        self.db
+            .set_model_version(&crate::embedding::model_version())?;
 
         let mut count = 0;
         let scan_roots = [constants::ARTIFACTS_DIR, constants::PROJECTS_DIR];
 
+        // Collect first to avoid holding a closure borrow while we mutate
+        // self via index_artifact.
+        let mut yaml_paths: Vec<String> = Vec::new();
         for dir_name in &scan_roots {
             let scan_dir = format!("{root}/{dir_name}");
             walk_yaml_files(Path::new(&scan_dir), &mut |path| {
@@ -649,13 +718,15 @@ impl OrchestratorEngine {
                     .unwrap_or(path)
                     .to_string_lossy()
                     .to_string();
-                // Strip leading / if present
-                let rel = rel.trim_start_matches('/');
-
-                if self.index_artifact(root, rel, validator).is_ok() {
-                    count += 1;
-                }
+                let rel = rel.trim_start_matches('/').to_string();
+                yaml_paths.push(rel);
             });
+        }
+
+        for rel in yaml_paths {
+            if self.index_artifact(root, &rel, validator).is_ok() {
+                count += 1;
+            }
         }
 
         Ok(count)
@@ -793,7 +864,7 @@ mod tests {
     fn setup_engine() -> OrchestratorEngine {
         let db = OrchestratorDb::open_in_memory().expect("open in-memory db");
         db.migrate().expect("migrate");
-        OrchestratorEngine::new(db, 3)
+        OrchestratorEngine::new_without_embedder(db, 3)
     }
 
     // --- Consensus tests ---
@@ -1094,11 +1165,20 @@ mod tests {
         }
     }
 
+    /// Dummy unit vector of the correct dimension for test-only direct
+    /// inserts. Bypasses the embedder while keeping the SQL pipeline
+    /// honest.
+    fn test_dummy_embedding() -> Vec<f32> {
+        let mut v = vec![0.0_f32; crate::embedding::EMBEDDING_DIM];
+        v[0] = 1.0;
+        v
+    }
+
     /// Index a roadmap directly via db.upsert_artifact, bypassing schema
     /// validation. We want full control over the YAML (including malformed
     /// fixtures) without depending on a populated schema registry.
     fn index_roadmap_directly(
-        engine: &OrchestratorEngine,
+        engine: &mut OrchestratorEngine,
         root: &RoadmapTestRoot,
         id: &str,
         file_path: &str,
@@ -1115,12 +1195,12 @@ mod tests {
         let content = std::fs::read_to_string(root.path.join(file_path)).unwrap_or_default();
         engine
             .db
-            .upsert_artifact(&artifact, &content, &[])
+            .upsert_artifact(&artifact, &content, &test_dummy_embedding(), &[])
             .expect("upsert");
     }
 
     fn index_artifact_with_kind(
-        engine: &OrchestratorEngine,
+        engine: &mut OrchestratorEngine,
         id: &str,
         kind: &str,
         file_path: &str,
@@ -1136,7 +1216,7 @@ mod tests {
         };
         engine
             .db
-            .upsert_artifact(&artifact, "", &[])
+            .upsert_artifact(&artifact, "", &test_dummy_embedding(), &[])
             .expect("upsert");
     }
 
@@ -1145,14 +1225,14 @@ mod tests {
     #[test]
     fn test_list_roadmaps_filters_by_status() {
         let root = RoadmapTestRoot::new();
-        let engine = setup_engine();
+        let mut engine = setup_engine();
 
         let id_a = "11111111-1111-1111-1111-111111111111";
         let id_b = "22222222-2222-2222-2222-222222222222";
         let p_a = root.write_roadmap(id_a, "Active one", "dom-a", "active", &[]);
         let p_b = root.write_roadmap(id_b, "Archived one", "dom-b", "archived", &[]);
-        index_roadmap_directly(&engine, &root, id_a, &p_a);
-        index_roadmap_directly(&engine, &root, id_b, &p_b);
+        index_roadmap_directly(&mut engine, &root, id_a, &p_a);
+        index_roadmap_directly(&mut engine, &root, id_b, &p_b);
 
         let active = engine
             .list_roadmaps(root.root_str(), Some("active"), None)
@@ -1173,7 +1253,7 @@ mod tests {
     #[test]
     fn test_list_roadmaps_filters_by_domain() {
         let root = RoadmapTestRoot::new();
-        let engine = setup_engine();
+        let mut engine = setup_engine();
 
         let ids = [
             ("33333333-3333-3333-3333-333333333333", "dom-a"),
@@ -1182,7 +1262,7 @@ mod tests {
         ];
         for (i, (id, dom)) in ids.iter().enumerate() {
             let p = root.write_roadmap(id, &format!("R{i}"), dom, "active", &[]);
-            index_roadmap_directly(&engine, &root, id, &p);
+            index_roadmap_directly(&mut engine, &root, id, &p);
         }
 
         let dom_a = engine
@@ -1200,7 +1280,7 @@ mod tests {
     #[test]
     fn test_list_roadmaps_sorts_active_first_then_blocked_desc() {
         let root = RoadmapTestRoot::new();
-        let engine = setup_engine();
+        let mut engine = setup_engine();
 
         let id_a = "aaaaaaaa-1111-1111-1111-111111111111";
         let id_b = "bbbbbbbb-2222-2222-2222-222222222222";
@@ -1234,9 +1314,9 @@ mod tests {
                 ("c5", "external", "x", "past", "blocked"),
             ],
         );
-        index_roadmap_directly(&engine, &root, id_a, &p_a);
-        index_roadmap_directly(&engine, &root, id_b, &p_b);
-        index_roadmap_directly(&engine, &root, id_c, &p_c);
+        index_roadmap_directly(&mut engine, &root, id_a, &p_a);
+        index_roadmap_directly(&mut engine, &root, id_b, &p_b);
+        index_roadmap_directly(&mut engine, &root, id_c, &p_c);
 
         let entries = engine.list_roadmaps(root.root_str(), None, None).unwrap();
         assert_eq!(entries.len(), 3);
@@ -1255,7 +1335,7 @@ mod tests {
     #[test]
     fn test_list_roadmaps_skips_corrupt_yaml_with_warning() {
         let root = RoadmapTestRoot::new();
-        let engine = setup_engine();
+        let mut engine = setup_engine();
 
         let id_good = "66666666-6666-6666-6666-666666666666";
         let id_bad = "77777777-7777-7777-7777-777777777777";
@@ -1267,8 +1347,8 @@ mod tests {
             &p_bad,
             "api_version: companyos/v1\nkind: roadmap\nbroken: :\n  - x: [",
         );
-        index_roadmap_directly(&engine, &root, id_good, &p_good);
-        index_roadmap_directly(&engine, &root, id_bad, &p_bad);
+        index_roadmap_directly(&mut engine, &root, id_good, &p_good);
+        index_roadmap_directly(&mut engine, &root, id_bad, &p_bad);
 
         let entries = engine.list_roadmaps(root.root_str(), None, None).unwrap();
         assert_eq!(entries.len(), 1, "corrupt roadmap should be skipped");
@@ -1280,7 +1360,7 @@ mod tests {
     #[test]
     fn test_summarize_by_id_basic_grouping() {
         let root = RoadmapTestRoot::new();
-        let engine = setup_engine();
+        let mut engine = setup_engine();
 
         let id = "88888888-8888-8888-8888-888888888888";
         let p = root.write_roadmap(
@@ -1295,7 +1375,7 @@ mod tests {
                 ("i4", "external", "x", "future", "blocked"),
             ],
         );
-        index_roadmap_directly(&engine, &root, id, &p);
+        index_roadmap_directly(&mut engine, &root, id, &p);
 
         let summary = engine
             .summarize_roadmap(root.root_str(), RoadmapSelector::ById(id.into()))
@@ -1326,14 +1406,14 @@ mod tests {
     #[test]
     fn test_summarize_by_domain_picks_unique_active() {
         let root = RoadmapTestRoot::new();
-        let engine = setup_engine();
+        let mut engine = setup_engine();
 
         let id_active = "99999999-9999-9999-9999-999999999999";
         let id_arch = "aaaaaaaa-0000-0000-0000-000000000000";
         let p_a = root.write_roadmap(id_active, "Active", "shared-dom", "active", &[]);
         let p_b = root.write_roadmap(id_arch, "Archived", "shared-dom", "archived", &[]);
-        index_roadmap_directly(&engine, &root, id_active, &p_a);
-        index_roadmap_directly(&engine, &root, id_arch, &p_b);
+        index_roadmap_directly(&mut engine, &root, id_active, &p_a);
+        index_roadmap_directly(&mut engine, &root, id_arch, &p_b);
 
         let summary = engine
             .summarize_roadmap(
@@ -1347,14 +1427,14 @@ mod tests {
     #[test]
     fn test_summarize_by_domain_ambiguous_returns_error() {
         let root = RoadmapTestRoot::new();
-        let engine = setup_engine();
+        let mut engine = setup_engine();
 
         let id1 = "bbbbbbbb-0000-0000-0000-000000000001";
         let id2 = "bbbbbbbb-0000-0000-0000-000000000002";
         let p1 = root.write_roadmap(id1, "First", "ambig", "active", &[]);
         let p2 = root.write_roadmap(id2, "Second", "ambig", "active", &[]);
-        index_roadmap_directly(&engine, &root, id1, &p1);
-        index_roadmap_directly(&engine, &root, id2, &p2);
+        index_roadmap_directly(&mut engine, &root, id1, &p1);
+        index_roadmap_directly(&mut engine, &root, id2, &p2);
 
         let res =
             engine.summarize_roadmap(root.root_str(), RoadmapSelector::ByDomain("ambig".into()));
@@ -1373,7 +1453,7 @@ mod tests {
     #[test]
     fn test_summarize_blocked_items_appear_in_blocked_list_and_in_by_status() {
         let root = RoadmapTestRoot::new();
-        let engine = setup_engine();
+        let mut engine = setup_engine();
 
         let id = "cccccccc-0000-0000-0000-000000000003";
         let p = root.write_roadmap(
@@ -1387,7 +1467,7 @@ mod tests {
                 ("d1", "external", "x", "past", "done"),
             ],
         );
-        index_roadmap_directly(&engine, &root, id, &p);
+        index_roadmap_directly(&mut engine, &root, id, &p);
 
         let summary = engine
             .summarize_roadmap(root.root_str(), RoadmapSelector::ById(id.into()))
@@ -1433,11 +1513,11 @@ mod tests {
     #[test]
     fn test_summarize_id_points_to_non_roadmap_kind_returns_error() {
         let root = RoadmapTestRoot::new();
-        let engine = setup_engine();
+        let mut engine = setup_engine();
 
         let rfc_id = "dddddddd-0000-0000-0000-000000000004";
         // Index an artifact with kind="rfc"
-        index_artifact_with_kind(&engine, rfc_id, "rfc", "company/rfcs/x.yml");
+        index_artifact_with_kind(&mut engine, rfc_id, "rfc", "company/rfcs/x.yml");
 
         let res = engine.summarize_roadmap(root.root_str(), RoadmapSelector::ById(rfc_id.into()));
         match res {
