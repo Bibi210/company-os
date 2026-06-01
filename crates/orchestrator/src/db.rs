@@ -104,9 +104,40 @@ CREATE VIRTUAL TABLE IF NOT EXISTS artifacts_fts USING fts5(
     title,
     description,
     tags,
-    content
+    content,
+    tokenize = \"unicode61 remove_diacritics 2 separators '-_./'\"
 );
 ";
+
+/// Vector index over artifact embeddings. The first column is a metadata
+/// column carrying the artifact UUID, with type TEXT — `sqlite-vec`
+/// allows the metadata column to appear in the WHERE clause of a kNN
+/// query, but our hybrid pipeline JOINs back to `artifacts` so the
+/// column is mainly there for lookup.
+///
+/// Distance metric: `cosine`. fastembed normalises sentence embeddings
+/// to unit L2 length, so cosine distance is the right metric (smaller
+/// = more similar). Dimension is fixed at compile time via
+/// `embedding::EMBEDDING_DIM` (384 for MultilingualE5Small).
+///
+/// `index_metadata` stores small key/value pairs that survive PILIER D
+/// rebuilds (themselves repopulated by the engine boot path). Used to
+/// pin the `model_version` at boot and to trigger wipe + reindex_all
+/// when the runtime model_version drifts from the stored one.
+const VEC_TABLE_SQL: &str = "
+CREATE VIRTUAL TABLE IF NOT EXISTS artifacts_vec USING vec0(
+    artifact_id text,
+    embedding float[384] distance_metric=cosine
+);
+
+CREATE TABLE IF NOT EXISTS index_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+";
+
+/// Metadata key for the embedding model version string.
+const META_MODEL_VERSION_KEY: &str = "model_version";
 
 /// Defensive PRAGMA preamble applied at every open.
 ///
@@ -245,8 +276,47 @@ impl OrchestratorDb {
     /// will rollback the partial transaction on the next open via WAL
     /// recovery, eliminating the FTS5 partially-materialized schema risk.
     pub fn migrate(&self) -> Result<(), OrchestratorError> {
-        let migration_sql = format!("BEGIN IMMEDIATE;{SCHEMA_SQL}{FTS_SQL}COMMIT;");
+        let migration_sql = format!("BEGIN IMMEDIATE;{SCHEMA_SQL}{FTS_SQL}{VEC_TABLE_SQL}COMMIT;");
         self.conn.execute_batch(&migration_sql)?;
+        Ok(())
+    }
+
+    /// Read the embedding model version recorded in `index_metadata`.
+    /// Returns `None` if the row is missing (fresh DB or after wipe).
+    pub fn get_model_version(&self) -> Result<Option<String>, OrchestratorError> {
+        let result = self.conn.query_row(
+            "SELECT value FROM index_metadata WHERE key = ?1",
+            params![META_MODEL_VERSION_KEY],
+            |row| row.get::<_, String>(0),
+        );
+        match result {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Write or replace the embedding model version row.
+    pub fn set_model_version(&self, version: &str) -> Result<(), OrchestratorError> {
+        self.conn.execute(
+            "INSERT INTO index_metadata(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![META_MODEL_VERSION_KEY, version],
+        )?;
+        Ok(())
+    }
+
+    /// Wipe every row in `artifacts_vec` and clear the stored model
+    /// version. Used by the boot autorepair path when the runtime
+    /// `model_version()` differs from the persisted one (architecture
+    /// marker change, model upgrade, etc.). After this call, the engine
+    /// must call `reindex_all` to repopulate embeddings.
+    pub fn wipe_vec_table(&self) -> Result<(), OrchestratorError> {
+        self.conn.execute("DELETE FROM artifacts_vec", [])?;
+        self.conn.execute(
+            "DELETE FROM index_metadata WHERE key = ?1",
+            params![META_MODEL_VERSION_KEY],
+        )?;
         Ok(())
     }
 
@@ -964,6 +1034,63 @@ mod tests {
         let db = setup_db();
         let ok = db.integrity_check().unwrap();
         assert!(ok, "integrity_check should return true on a fresh DB");
+    }
+
+    // RFC bdee1af4 étape 5: artifacts_vec + index_metadata.
+
+    #[test]
+    fn test_migrate_creates_artifacts_vec_table() {
+        let db = setup_db();
+        // A SELECT from the virtual table should succeed (returns 0 rows
+        // on fresh DB but no SQL error).
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM artifacts_vec", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_migrate_creates_index_metadata_table() {
+        let db = setup_db();
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM index_metadata", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_model_version_fresh_returns_none() {
+        let db = setup_db();
+        assert_eq!(db.get_model_version().unwrap(), None);
+    }
+
+    #[test]
+    fn test_model_version_set_then_get_roundtrip() {
+        let db = setup_db();
+        db.set_model_version("multilingual-e5-small-v1+x86_64")
+            .unwrap();
+        assert_eq!(
+            db.get_model_version().unwrap(),
+            Some("multilingual-e5-small-v1+x86_64".into())
+        );
+    }
+
+    #[test]
+    fn test_model_version_set_twice_upserts() {
+        let db = setup_db();
+        db.set_model_version("v1").unwrap();
+        db.set_model_version("v2").unwrap();
+        assert_eq!(db.get_model_version().unwrap(), Some("v2".into()));
+    }
+
+    #[test]
+    fn test_wipe_vec_clears_metadata_too() {
+        let db = setup_db();
+        db.set_model_version("v1").unwrap();
+        db.wipe_vec_table().unwrap();
+        assert_eq!(db.get_model_version().unwrap(), None);
     }
 
     // PILIER E (RFC bdee1af4): sqlite-vec smoke test must pass on fresh DB.
