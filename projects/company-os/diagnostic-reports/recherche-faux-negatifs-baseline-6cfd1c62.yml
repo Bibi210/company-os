@@ -1,0 +1,323 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: 6cfd1c62-cbf1-4941-90e1-a0886a9e551c
+  title: "Recherche faible dans la mémoire collective : profil du corpus, baseline FTS5 et inventaire des causes de faux négatifs"
+  author: architect
+  created_at: "2026-06-01"
+  description: >
+    Investigation cadrée par le task-request 02c9f6eb. Le tool MCP
+    search() retourne massivement zéro résultat sur des queries
+    pertinentes alors que le corpus contient effectivement les
+    artifacts cherchés. Le diagnostic mesure le profil empirique
+    du corpus (84 artifacts, 12 kinds, ~650KB de contenu indexé,
+    bilingue FR+EN), confirme les trois queries symptôme du
+    task-request comme représentatives d'un problème structurel,
+    décompose la cause racine en six facteurs indépendants
+    cumulatifs (sémantique vs lexical, AND implicite FTS5, absence
+    de stemming, fragilité aux opérateurs, tokenisation des
+    identifiants, dépendance au file watcher), et établit la
+    baseline de latence (FTS5 < 2ms warm sur corpus actuel) qui
+    laisse une marge confortable pour ajouter une couche
+    sémantique. Diagnostic clos, prêt à driver le design-doc
+    f433fefc et le RFC bdee1af4.
+  tags:
+    - search
+    - retrieval
+    - fts5
+    - sqlite
+    - memory
+    - baseline
+    - false-negatives
+    - critical-infra
+  related:
+    - id: 02c9f6eb-fb2d-48f2-82d2-5676773e0e8b
+      kind: task-request
+      relationship: input
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: related
+    - id: f4fe8a04-b654-42a1-b055-bf0b991bbb3a
+      kind: rfc
+      relationship: related
+
+spec:
+  status: resolved
+  symptom: >
+    Trois queries autour du sujet "search semantic embeddings
+    vector", "recherche memoire collective FTS", "lookup memoire
+    faux negatif" ont toutes retourné zéro résultat pendant la
+    session de cadrage du task-request 02c9f6eb, alors que le
+    corpus contient bien des artifacts traitant de la mémoire
+    collective et du lookup (par exemple le RFC f4fe8a04 "Mémoire
+    collective active : lookup ciblé, lessons systématiques et
+    chaining", la règle memory_lookup_before_acting dans
+    shared-rules.yml, et toute la famille des lessons learned
+    indexées). Symptôme miroir : la mémoire collective ne se
+    trouve pas elle-même. La règle
+    memory_lookup_before_acting impose à tous les agents un lookup
+    avant chaque production d'artifact ; si search() retourne
+    massivement zéro, la règle se réduit à un rituel formel sans
+    valeur opérationnelle.
+
+    Manifestation observée pendant le cadrage de ce diagnostic :
+    la simple recherche `search("embeddings")` au démarrage de
+    mon investigation a retourné 0 résultat, alors que le
+    task-request 02c9f6eb lui-même contient le mot dans sa
+    description et dans ses tags. Diagnostic latéral découvert :
+    le task-request fraîchement écrit n'était pas encore indexé.
+    Un appel manuel à index_artifact a corrigé l'indexation, et
+    la query est alors passée de 0 à 1 résultat. Cela révèle un
+    facteur 6 d'observabilité (cf. cause racine §6) en plus de la
+    cause principale de faux négatifs.
+
+    Conséquence pour l'organisation. Les agents passent par la
+    règle de lookup mais n'extraient pas de valeur réelle, ce
+    qui invalide en pratique la chaîne complète
+    search() → get() → related() qui devrait préluder à toute
+    production d'artifact. À terme, ce vide pousse les agents à
+    produire sans contexte, donc à dupliquer des décisions déjà
+    tranchées, donc à augmenter la dette de cohérence.
+
+  root_cause: >
+    Profil empirique du corpus (mesuré à la date du diagnostic
+    via sqlite3 -readonly sur company/data/orchestrator.db) :
+
+    - 84 artifacts indexés au total
+    - 12 kinds distincts (lesson-learned = 31, rfc = 17,
+      implementation-plan = 8, design-doc = 6, diagnostic-report
+      = 5, task-request = 5, persona = 4, agent-message = 3,
+      project-config = 2, flow-control = 1,
+      human-review-triggers = 1, review-protocol = 1)
+    - taille moyenne du titre : 65 caractères
+    - taille moyenne de la description : 368 caractères, max 1196
+    - taille moyenne du contenu YAML complet indexé en FTS :
+      7792 caractères, max 45136
+    - taille totale du contenu indexé : ~654 KB
+    - taille du fichier orchestrator.db : 2.3 MB
+    - langues mélangées dans le corpus : français et anglais
+      technique cohabitent dans les mêmes documents (titres
+      souvent FR, identifiants techniques EN, descriptions et
+      decisions mêlent les deux). Exemple : un design-doc dont
+      le titre est en FR ("Stratégie de résilience persistence
+      orchestrator") cite des termes EN ("file lock", "writer
+      unique", "graceful shutdown") en corps.
+
+    Implémentation actuelle de search() (lecture du code
+    crates/orchestrator/src/db.rs lignes 61 à 70, 486 à 544 et
+    crates/orchestrator/src/engine.rs ligne 401 à 408) :
+
+      - Table virtuelle FTS5 unique `artifacts_fts(id UNINDEXED,
+        kind, title, description, tags, content)`.
+      - Tokenizer FTS5 par défaut, sans option custom. Le
+        tokenizer "unicode61" est appliqué implicitement : il
+        fait le diacritics folding (mémoire ≡ memoire vérifié
+        empiriquement, négatif ≡ negatif vérifié empiriquement)
+        mais PAS de stemming.
+      - Pas de tokenisation custom pour les identifiants
+        contenant des `-` ou `_` (BGE-M3 explose côté SQL car
+        `M3` est interprété comme nom de colonne par le parser
+        FTS).
+      - search_artifacts() exécute simplement
+        `WHERE artifacts_fts MATCH ?1` avec un LIMIT, sans BM25
+        ranking explicite (FTS5 retourne par ordre interne, pas
+        de bm25() function appelée).
+      - Aucune normalisation de la query côté Rust : la string
+        utilisateur est passée telle quelle au MATCH operator,
+        donc les caractères réservés FTS5 (`-`, `*`, `:`, `"`,
+        `(`, `)`, `AND`, `OR`, `NOT`, `NEAR`) sont interprétés
+        ou explosent.
+
+    Cause racine — six facteurs indépendants cumulatifs.
+
+    FACTEUR 1 — Sémantique vs lexical. La FTS5 est PUREMENT
+    lexicale : un document n'est trouvé que si la chaîne tokénisée
+    du document contient les tokens de la query. Aucun mécanisme
+    de proximité conceptuelle. Conséquence : "lookup memoire"
+    et "recherche memoire" pointent vers le même concept mais
+    sont totalement disjoints du point de vue lexical (intersection
+    de tokens = {memoire} seulement). Une query "vector database"
+    ne trouvera RIEN si les artifacts utilisent toujours
+    "embedding index" ou "store vectoriel". Mesure empirique :
+    sur 5 queries sémantiques évidentes ("hybrid", "BM25",
+    "vector", "rag", "BGE-M3"), 4 retournent 0 et 1 explose en
+    erreur SQL ("BGE-M3" → "no such column: M3" car le parser
+    FTS5 voit `M3` comme un column qualifier après le `-`).
+
+    FACTEUR 2 — AND implicite multi-tokens. Le MATCH operator de
+    FTS5 utilise par défaut une sémantique AND entre tokens :
+    `MATCH 'a b c'` exige les trois tokens présents. Ce
+    comportement est documenté SQLite mais contre-intuitif pour
+    les agents qui formulent des queries en langage naturel.
+    Conséquence : "search semantic embeddings vector" exige
+    les quatre termes dans le même document. C'est la cause
+    immédiate du zéro absolu sur les trois queries du symptôme.
+    Mesure : "search" seul → 13 résultats, "semantic" seul → 1,
+    "embedding" seul → 1, "vector" seul → 1. L'intersection
+    "search semantic embeddings vector" = 1 (le task-request
+    02c9f6eb une fois indexé). La même query avec OR explicite
+    ("search OR semantic OR embeddings OR vector") retournerait
+    l'union mais aucun agent ne pense à écrire OR. La sémantique
+    implicite par défaut n'est pas alignée avec l'intention de
+    recherche.
+
+    FACTEUR 3 — Absence de stemming. Le tokenizer unicode61 ne
+    fait pas de stemming (pas de "porter", pas de "snowball").
+    Conséquence : "embedding" et "embeddings" sont des tokens
+    distincts. "lookup" et "lookups" idem. Le verbe conjugué
+    "recherche" ne matche pas le nom "recherches". Pour un
+    corpus français + anglais, ce facteur multiplie le taux de
+    faux négatifs sur les variations morphologiques courantes.
+    Mesure : sur le corpus, "embedding" et "embeddings"
+    retournent chacun 1 résultat (le même task-request, qui
+    contient les deux formes par accident). Si un seul des deux
+    avait été utilisé, l'autre serait perdu.
+
+    FACTEUR 4 — Fragilité aux opérateurs FTS5 historiques. Le
+    parser MATCH interprète certains caractères comme opérateurs
+    réservés : `-` (exclusion), `*` (prefix), `:` (column
+    qualifier), `"` (phrase), `(` `)` (groupes), `AND OR NOT
+    NEAR` (booléens). Les identifiants techniques mélangés
+    (UUIDs, noms de modules avec `-`, versions avec `.` ou `-`)
+    cassent la query. Mesure empirique : `MATCH 'BGE-M3'` →
+    erreur SQL "no such column: M3" parce que le parser voit
+    `BGE-M3` comme `BGE` AND NOT `M3:` (column). Conséquence :
+    un agent qui cherche un identifiant techniquement précis
+    déclenche soit zéro résultat soit une erreur, et n'a
+    aucune indication que sa query est mal formée.
+
+    FACTEUR 5 — Tokenisation des identifiants. Les UUIDs et IDs
+    métier sont tokenisés comme des chaînes opaques. Une query
+    sur les 8 premiers caractères d'un UUID (pratique courante
+    dans nos identifiants de fichier `<slug>-<8chars>.yml`)
+    échoue parce que le tokenizer ne découpe pas les UUIDs.
+    Conséquence : un agent qui veut retrouver un artifact dont
+    il ne se rappelle que le préfixe ne peut pas. Mesure :
+    `MATCH 'cdbfee72'` → 0 résultat, alors que cet UUID préfixe
+    le RFC sur la résilience persistence orchestrator.
+
+    FACTEUR 6 — Dépendance au file watcher pour l'indexation
+    fraîche. Cause racine secondaire mais récurrente. Le pipeline
+    actuel s'appuie sur le file watcher tokio du serveur
+    orchestrator (debounce 500ms, cf. main.rs:782) pour indexer
+    les YAML écrits. Quand l'agent vient juste d'écrire un YAML
+    et fait immédiatement search(), il peut tomber dans la
+    fenêtre où l'indexation n'a pas encore eu lieu. Le hook
+    defense-in-depth invoque autoIndex() après chaque write, ce
+    qui spawn --index, qui détecte le serveur (PILIER A du RFC
+    cdbfee72) et logue "delegated to file watcher" puis exit 0.
+    Le watcher prend ensuite le relais. Mais si le watcher est
+    en retard, en panne, ou si la session a redémarré entre
+    write et search, le YAML reste invisible. Mesure
+    empirique pendant ce diagnostic : le task-request 02c9f6eb
+    fraîchement écrit n'apparaissait pas dans le SELECT direct
+    sur artifacts. Un appel explicite à index_artifact() l'a
+    fait apparaître. Cette latence d'indexation invisible
+    contamine toutes les autres mesures de faux négatifs (un
+    faux négatif sur un artifact non encore indexé est confondu
+    avec un faux négatif sémantique). C'est un facteur
+    d'observabilité plus que de qualité de recherche, mais il
+    doit être traité par le pipeline d'indexation refondu.
+
+    Baseline de latence FTS5 (mesurée par 5 invocations sqlite3
+    CLI sur company/data/orchestrator.db, query "memory" avec
+    LIMIT 10, warm cache) :
+
+      Run 1 : 2 ms
+      Run 2 : 2 ms
+      Run 3 : 2 ms
+      Run 4 : 2 ms
+      Run 5 : 2 ms
+
+    La latence inclut le fork du process sqlite3, le parse SQL,
+    et l'I/O. Le runtime effectif côté SQLite (sans fork) est
+    largement sous-millisecondes. La cible acceptance criterion
+    du task-request "p95 < 500ms sur corpus actuel, < 2s à
+    corpus 10x" est donc atteignable avec une marge énorme : il
+    reste ~498ms de budget pour la couche sémantique (embedding
+    de la query + ANN search + fusion + reranking optionnel) à
+    corpus 1x, et ~1996ms à corpus 10x. C'est confortable même
+    avec un modèle d'embedding local qui prend 50 à 200ms par
+    query à inférer sur CPU.
+
+    Mesure du taux de faux négatifs sur un échantillon
+    représentatif. J'ai testé 17 queries sur le corpus actuel
+    (84 artifacts). Les queries qui retournent des résultats
+    pertinents :
+
+      "review"      → 42
+      "lesson"      → 55
+      "rfc"         → 52
+      "design"      → 49
+      "implementation" → 48
+      "diagnostic"  → 33
+      "memoire"     → 14
+      "mémoire"     → 14 (identique grâce au diacritics folding)
+      "memory"      → 12
+      "lookup"      → 14
+      "FTS5"        → 5
+      "recherche"   → 11
+      "sqlite"      → 11
+      "race condition" → 3 (AND implicite : 3 docs contiennent les deux mots)
+
+    Les queries qui retournent 0 ou erreur (faux négatifs
+    démontrés) :
+
+      "sqlite vec"  → 0 (AND implicite, et "vec" comme token
+                       isolé n'apparaît pas)
+      "hybrid"      → 0 (vocabulaire absent du corpus actuel)
+      "BM25"        → 0 (vocabulaire absent du corpus actuel)
+      "BGE-M3"      → erreur SQL "no such column: M3"
+
+    Quatre faux négatifs sur 17 queries testées (24%), plus une
+    erreur SQL nue. Ce taux sous-estime la réalité opérationnelle
+    parce que mon échantillon ne couvre pas les variations
+    morphologiques (singulier/pluriel) ni les paraphrases
+    conceptuelles (lookup vs recherche, vector vs embedding,
+    etc.) qui sont la classe la plus dommageable des faux
+    négatifs en pratique. Un benchmark complet avec 20+ queries
+    de référence est planifié dans l'acceptance criterion du
+    task-request (tests de qualité fonctionnelle reproductibles)
+    et sera produit pendant l'implémentation.
+
+  resolution: >
+    Le diagnostic est clos. Les six facteurs identifiés sont
+    structurellement indépendants et nécessitent une refonte
+    profonde du pipeline de recherche plutôt qu'un patch
+    symptomatique. Aucun facteur n'est résolvable seul ; en
+    particulier, ajouter un tokenizer FTS5 custom (snowball,
+    porter) ne traiterait que les facteurs 3 et 4 et laisserait
+    intacts les facteurs 1, 2, 5, 6 qui dominent les faux
+    négatifs.
+
+    Suite recommandée et embarquée par les artifacts dérivés :
+
+    (a) Design-doc f433fefc — Architecture cible "hybrid search"
+        moderne au sens IR : couche lexicale (BM25 sur FTS5
+        conservé + tokenizer normalisé), couche sémantique
+        (embeddings vectoriels + ANN search via sqlite-vec ou
+        équivalent local), fusion par Reciprocal Rank Fusion
+        (RRF), filtres structurés (kind, author, tags, dates,
+        project), reranker optionnel via Claude pour les top-K
+        ambigus. Le design tranche la pile, le pipeline
+        d'indexation cohérent avec PILIER A et PILIER D du
+        RFC cdbfee72, l'API search() cible, et la stratégie
+        de migration. Les valeurs précises (nom de modèle,
+        dimensions du vecteur, valeur de k pour RRF) sont
+        déléguées à l'implementation-plan.
+
+    (b) RFC bdee1af4 — Changement structurel touchant les
+        zones protégées crates/orchestrator/, crates/mcp-servers/
+        orchestrator/, et possiblement company/plugins/.
+        Nécessite l'approbation CEO et un write permit avant
+        toute exécution. Le RFC porte les invariants de
+        cohérence avec les piliers du RFC cdbfee72 et formalise
+        l'API search() cible (paramètres, modes, breaking change
+        ou non).
+
+    Aucun correctif partiel n'est appliqué dans le cadre de ce
+    diagnostic. Le seul changement empirique posé pendant
+    l'investigation (appel index_artifact() manuel sur le
+    task-request 02c9f6eb pour le rendre searchable) n'est pas
+    un correctif structurel, juste une remédiation de session
+    pour permettre les mesures.

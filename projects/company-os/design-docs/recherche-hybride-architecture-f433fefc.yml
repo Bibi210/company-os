@@ -1,0 +1,1811 @@
+api_version: companyos/v1
+kind: design-doc
+metadata:
+  id: f433fefc-81b7-4b32-b9a3-3ddd6a020a73
+  title: "Architecture hybride lexical + sémantique pour search() : BM25 sur FTS5 normalisé, embeddings locaux via sqlite-vec, fusion RRF, filtres structurés, reranking optionnel"
+  author: architect
+  created_at: "2026-06-01"
+  changelog:
+    - date: "2026-06-01"
+      author: architect
+      description: >
+        Révision iteration 3 suite au round 543a9d8d sur le
+        design-doc (vote Implementer = request_changes, PM =
+        approve). Trois findings spécifiques au design-doc +
+        un finding commun avec le RFC sont adressés.
+
+        F-commun-1 (recommandation "crate Rust pure" inexacte,
+        commune avec le RFC). Finding RETENU. Reformulation
+        du composant pipeline-embeddings-local sous-section
+        (b) "Runtime d'inférence" pour clarifier trois axes
+        orthogonaux : (i) AUTONOMIE RUNTIME de search() —
+        exigence DURE, aucun accès réseau au runtime ; (ii)
+        ABSENCE DE FFI — nice-to-have, pas de contrainte
+        dure ; (iii) BINAIRE AUTONOME AU BUILD — out of
+        scope, le téléchargement de poids ou de runtime au
+        build est acceptable. La décision "Runtime d'inférence
+        Rust pur..." dans la section decisions est
+        renommée et reformulée pour refléter cette
+        distinction. Cohérent avec la reformulation du RFC.
+
+        F-design-1 (observabilite-indexation sans stratégie
+        minimale). Finding RETENU. Le composant
+        observabilite-indexation est enrichi d'une sous-
+        section (a') "Mécanique minimale d'instrumentation"
+        qui spécifie pour chaque champ exposé par
+        index_status la propriété fonctionnelle visée et la
+        mécanique minimale acceptable. Cohérent avec la
+        précision iteration 3 du RFC bdee1af4 sur la même
+        PROPOSITION 8.
+
+        F-design-2 (tolérance epsilon cross-architecture
+        absente du design). Finding RETENU. Le composant
+        pipeline-embeddings-local est enrichi d'une note sur
+        la tolérance de déterminisme effectif. Le RFC
+        mentionne en risque résiduel (5) que des variations
+        float-precision de l'ordre de 1e-5 à 1e-6 peuvent
+        apparaître selon hardware/BLAS/version de librairie ;
+        le design-doc doit poser la propriété cible et la
+        stratégie de validation. Ajout d'une note explicite
+        dans le sous-composant (a) du modèle d'embedding qui
+        définit la tolérance acceptable (cosine entre deux
+        embeddings du même input > 0.9999, soit une distance
+        cosine < 1e-4) et la stratégie de validation (test
+        Rust qui embed le même input deux fois sur la même
+        machine et vérifie la similarité). Note : la
+        cross-architecture (machine A vs machine B) n'est
+        pas testable en CI sur un runner unique ; le design
+        accepte cette limite et prévoit qu'un mismatch
+        observé en production déclenche un wipe + reindex_all
+        automatique via le model_version (décision iteration
+        2 sur incertitude 5).
+
+        F-design-3 (triaxiale incomplète, cas négatif
+        d'embedding au RUNTIME de search()). Finding RETENU.
+        L'iteration 1 et 2 du design-doc couvraient l'échec
+        d'embedding pendant index_artifact (cas (1) du
+        triaxial), mais pas pendant un appel search(). Ajout
+        d'un nouveau cas (1') dans la section triaxial_analysis
+        sous-section "negatif" qui couvre : modèle pas encore
+        chargé en mémoire (lazy load), OOM transitoire pendant
+        une inférence, input de query trop long pour la
+        context length du modèle, panic interne du runtime
+        d'inférence. Sémantique tranchée : si l'embedding de
+        la query échoue, search() retourne une erreur explicite
+        (pas de fallback silencieux sur mode lexical), cohérent
+        avec la décision iteration 2 sur l'incertitude 3 (pas
+        de fallback silencieux). L'agent appelant voit l'erreur
+        et peut soit retry, soit basculer explicitement en
+        mode=lexical s'il accepte la dégradation.
+
+        Aucune autre modification structurelle. Les décisions
+        d'iteration 2 (pas de fallback, scope unique, model_
+        version dès la v1) restent fermes. Les incertitudes
+        1 et 2 restent ouvertes pour l'implementation-plan.
+
+    - date: "2026-06-01"
+      author: architect
+      description: >
+        Révision iteration 2 suite aux arbitrages PM sur les
+        cinq incertitudes structurelles remontées par l'agent-
+        message 382cf805. Trois décisions PM intégrées en dur
+        avant les review rounds, en cohérence avec la révision
+        iteration 2 du RFC bdee1af4 (même changelog côté RFC).
+
+        (a) Incertitude 3 — mode lexical-only en fallback.
+        Tranchée PAS de fallback, exit explicite. Mises à
+        jour : (i) le cas négatif (1) de l'analyse triaxiale
+        est aligné sur "exit au boot, code non-zero, message
+        clair", avec rationale PM cité ; (ii) une nouvelle
+        décision tranchée est ajoutée à la section decisions
+        ("Pas de mode dégradé lexical-only..."), avec
+        symétrie stricte entre les deux composants de la
+        couche sémantique (modèle ET extension sqlite-vec).
+        Note : le cas négatif (1) initial de l'iteration 1
+        contenait une CONTRADICTION INTERNE avec la
+        proposition de pipeline d'indexation transactionnel
+        (rollback complet vs commit FTS partiel) ; cette
+        iteration 2 corrige aussi cette incohérence en
+        alignant tout sur le rollback complet.
+
+        (b) Incertitude 4 — scope unique vs RFC découpé.
+        Tranchée scope unique. Mise à jour : nouvelle
+        décision "Le scope du RFC bdee1af4 reste UNIQUE et
+        indivisible" ajoutée à la section decisions, avec
+        rationale PM cité (period intermédiaire dommageable,
+        re-cadrage du process, flags OFF par défaut donc
+        zéro impact pour les agents qui ne les activent
+        pas).
+
+        (c) Incertitude 5 — model_version dans artifacts_vec.
+        Tranchée oui, dès la v1. Mises à jour : (i)
+        l'open_question correspondante est requalifiée — le
+        PRINCIPE est tranché, seul le format de stockage
+        reste arbitré dans l'implementation-plan ; (ii) une
+        nouvelle décision tranchée est ajoutée à la section
+        decisions ("Un model_version est persisté..."), avec
+        rationale PM cité (coût d'ajout faible en v1, coût
+        de rétrofit élevé en V2, mismatch silencieux
+        difficile à diagnostiquer si on ne le détecte pas
+        explicitement).
+
+        Les incertitudes 1 (modèle exact) et 2 (runtime
+        Rust pur vs sidecar) restent ouvertes pour
+        l'implementation-plan, sans changement. Aucune autre
+        modification du design n'est portée par cette
+        iteration : les composants, les autres décisions, et
+        l'analyse triaxiale restent inchangés sur le fond.
+  description: >
+    Design d'architecture qui refond search() de l'orchestrator
+    en hybrid search au sens IR moderne. Trois axes
+    complémentaires : un axe lexical conservé et durci (FTS5
+    avec tokenizer unicode61 normalisé, ranking BM25 explicite,
+    normalisation de la query côté Rust pour éliminer les
+    explosions d'opérateurs), un axe sémantique ajouté
+    (embeddings vectoriels denses calculés par un modèle local
+    multilingue, stockés et interrogés via une table virtuelle
+    sqlite-vec dans la même DB que FTS5), une fusion par
+    Reciprocal Rank Fusion qui combine les deux classements
+    sans avoir besoin de calibrer des scores hétérogènes. Trois
+    couches transverses : des filtres structurés sur les
+    métadonnées indexées (kind, author, tags, project, date),
+    un reranking optionnel par Claude (via la clé Anthropic
+    d'opencode) pour les top-K ambigus, et une query expansion
+    HyDE optionnelle qui synthétise un pseudo-document avant
+    embedding. Le pipeline d'indexation s'inscrit dans
+    l'invariant PILIER A du RFC cdbfee72 (un seul writer) :
+    l'embedding est calculé pendant index_artifact() côté
+    serveur, persisté dans la même connexion SQLite. La
+    compatibilité avec PILIER D (autorepair par rebuild
+    depuis YAML) est garantie par l'idempotence du calcul
+    d'embedding (modèle déterministe avec graine fixe), ce qui
+    rend reindex_all suffisant pour restaurer les embeddings
+    sans backup hors-DB. Multilingue FR + EN technique par
+    construction (modèle d'embedding multilingue obligatoire).
+    API search() breaking change accepté : la signature
+    s'étend avec un paramètre `mode` (lexical | semantic |
+    hybrid, défaut hybrid) et un objet de filtres ; le
+    paramètre query devient une string normalisée plutôt qu'un
+    fragment FTS5 brut. Les callers internes (lookup mémoire
+    des agents, autres tools MCP) sont migrés dans le même
+    cycle. Aucun détail d'implémentation (pas de chemin de
+    fichier, pas de signature exacte, pas d'ordre d'étapes) :
+    ces choix relèvent de l'implementation-plan dérivé.
+  tags:
+    - search
+    - retrieval
+    - hybrid-search
+    - bm25
+    - embeddings
+    - rag
+    - sqlite-vec
+    - rrf
+    - multilingual
+    - design
+    - critical-infra
+  related:
+    - id: 02c9f6eb-fb2d-48f2-82d2-5676773e0e8b
+      kind: task-request
+      relationship: input
+    - id: 6cfd1c62-cbf1-4941-90e1-a0886a9e551c
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: related
+    - id: f4fe8a04-b654-42a1-b055-bf0b991bbb3a
+      kind: rfc
+      relationship: related
+    - id: bdee1af4-4944-4bee-b7c0-18efd6c7961f
+      kind: rfc
+      relationship: related
+
+spec:
+  overview: >
+    Le problème. La recherche actuelle dans la mémoire
+    collective de CompanyOS échoue de manière systémique sur les
+    queries pertinentes (cf. diagnostic-report 6cfd1c62 : six
+    facteurs indépendants cumulatifs, 24% de faux négatifs sur
+    un échantillon de queries naturelles, et une dépendance
+    fragile au file watcher pour l'indexation fraîche). La
+    règle memory_lookup_before_acting du shared-rules impose à
+    tous les agents un lookup avant chaque production
+    d'artifact ; quand search() retourne du vide, la règle
+    perd son sens.
+
+    Le but. Refondre search() pour qu'elle se comporte comme
+    un moteur de retrieval moderne : lexical robuste sur les
+    identifiants et termes exacts, sémantique sur les
+    paraphrases et synonymes, structurellement filtrable, et
+    bilingue FR + EN technique par construction. Cible
+    fonctionnelle : les trois queries du symptôme du
+    task-request 02c9f6eb retournent des résultats pertinents
+    sans intervention. Cible non-fonctionnelle : p95 < 500ms à
+    corpus actuel (84 artifacts), < 2s à corpus 10x (~840
+    artifacts), zéro dépendance réseau obligatoire au runtime
+    de search().
+
+    Cap stratégique. Le design ne réinvente pas la roue : il
+    adopte l'état de l'art "hybrid search + RRF" qui domine les
+    benchmarks IR depuis 2022 (cf. Microsoft Bing, Vespa,
+    Elastic, Weaviate, LangChain, LlamaIndex tous l'utilisent
+    par défaut). La spécificité de notre contexte est l'échelle
+    (corpus < 1000 docs, pas des milliards) et la contrainte
+    locale autonome (pas de service cloud obligatoire). Ces
+    deux contraintes permettent un choix de pile minimaliste :
+    SQLite extended par sqlite-vec, un modèle d'embedding
+    local CPU-friendly, et une fusion en Rust pur. Pas de
+    Postgres, pas de Qdrant, pas d'Elasticsearch, pas de
+    daemon supplémentaire.
+
+    Quatre piliers transverses portent le design.
+
+    PILIER 1 — LEXICAL DURCI. La FTS5 actuelle est conservée
+    parce qu'elle est rapide, dépendance zéro, et bien intégrée
+    au binaire. Trois durcissements : (a) tokenizer unicode61
+    explicite avec options (remove_diacritics, separators
+    élargis pour gérer `-` `_` `.` `/` dans les identifiants),
+    (b) ranking BM25 explicite via la fonction bm25() de FTS5
+    avec column weights (titre > tags > description > content),
+    (c) normalisation de la query côté Rust avant injection
+    dans MATCH (échappement des caractères réservés, conversion
+    optionnelle de la requête multi-tokens en disjonction OR
+    pour casser l'AND implicite, support d'un mode "exact"
+    pour les identifiants).
+
+    PILIER 2 — SÉMANTIQUE PAR EMBEDDINGS. Une couche dense est
+    ajoutée. Chaque artifact est embedé en un vecteur unique
+    par un modèle local multilingue. Le vecteur est stocké dans
+    une table virtuelle sqlite-vec dans la même DB que FTS5,
+    indexé en ANN par la primitive vec0 (cosine ou L2 selon
+    arbitrage implementation-plan). Au search, la query est
+    embedée à la volée et le top-K voisinage est récupéré par
+    `MATCH 'vec0(?)' AND k = K`. Pas de chunking pour ce corpus
+    (artifacts < 10kB en moyenne, embedding global suffisant),
+    décision motivée par la simplicité et le coût opérationnel.
+
+    PILIER 3 — FUSION PAR RECIPROCAL RANK FUSION. Les deux
+    classements lexical et sémantique sont fusionnés par RRF.
+    La formule canonique est `score(d) = sum over rankers r of
+    1 / (k + rank_r(d))` avec k typiquement entre 30 et 60.
+    Avantages : ne nécessite aucune calibration des scores
+    hétérogènes BM25 vs cosine similarity, robuste aux outliers,
+    stable empiriquement sur des corpus de toutes tailles.
+    Les documents qui apparaissent dans les deux classements
+    remontent naturellement ; les documents uniquement
+    sémantiques (paraphrase) ou uniquement lexicaux (identifiant
+    exact) restent visibles. RRF est de loin la fusion la
+    mieux supportée empiriquement et la plus simple à
+    maintenir : pas de modèle de rerank à entraîner, pas de
+    seuils à recalibrer corpus par corpus.
+
+    PILIER 4 — FILTRES STRUCTURÉS. Les métadonnées (kind,
+    author, tags, project, dates) sont disponibles comme
+    filtres orthogonaux qui réduisent le candidate set AVANT
+    fusion (push-down côté SQL). Un agent qui cherche un
+    lesson-learned avec le tag "concurrency" doit pouvoir
+    contraindre la recherche à ce sous-ensemble plutôt que
+    filtrer le résultat fusionné a posteriori. Ces filtres
+    sont la traduction directe du paramètre `kind` actuel,
+    étendu.
+
+    Deux couches optionnelles enrichissent le design sans le
+    bloquer.
+
+    COUCHE 5 — RERANKER CLAUDE OPTIONNEL. Si la clé Anthropic
+    est disponible (opencode l'expose au runtime), le top-K
+    fusionné (typiquement K = 20) peut être passé à Claude
+    pour un reranking sémantique fin qui contextualise la
+    pertinence en regard de l'intent de la query. Activé par
+    un flag opt-in dans le paramètre search(rerank=true).
+    Coût attendu : +1 à 3 secondes par query, +1 appel
+    Anthropic. Off par défaut. Mesurable.
+
+    COUCHE 6 — QUERY EXPANSION HyDE OPTIONNELLE. Pour les
+    queries vagues ou exclusivement langagières, Claude
+    synthétise un pseudo-document qui répond à la query, et
+    c'est ce pseudo-document qu'on embed pour la phase
+    sémantique. Active par un flag opt-in dans le paramètre
+    search(hyde=true). Off par défaut. Mesurable.
+
+    Les couches 5 et 6 sont fonctionnellement séparées : ni
+    le pipeline lexical ni le pipeline sémantique ne dépend
+    de la clé Anthropic. Si elle est absente, search() reste
+    100% local et fonctionnel.
+
+    Cohérence avec l'écosystème existant.
+
+    PILIER A du RFC cdbfee72 (writer unique). L'embedding est
+    calculé et persisté DANS la même connexion SQLite que les
+    upserts artifacts/FTS, donc serialisé naturellement par le
+    Mutex tokio de l'engine côté serveur. Aucun second writer
+    n'est introduit. Le binaire --index, quand il acquiert le
+    lock exclusif (cas hors-serveur), calcule lui aussi
+    l'embedding et l'upserte dans la même transaction. Le hook
+    defense-in-depth n'écrit jamais d'embedding (il n'écrit
+    déjà rien d'autre que ses sqlite3 inline sur les permits).
+
+    PILIER D du RFC cdbfee72 (autorepair par reindex_all
+    depuis YAML). L'embedding doit être reconstructible depuis
+    le YAML source. Le design impose un modèle déterministe
+    (graine fixe, mode inference float32 stable), donc
+    embed(yaml) → vecteur identique à chaque appel. reindex_all
+    régénère l'embedding pour chaque artifact lu sur disque,
+    repeuple la table sqlite-vec, et le système est restauré.
+    Pas de backup hors-DB nécessaire. Cette exigence détermine
+    le choix du modèle (cf. décisions ci-dessous).
+
+    INVARIANT D'INDEXATION (extension de l'invariant du RFC
+    cdbfee72). À tout instant, au plus un processus écrit dans
+    artifacts, artifacts_fts ET artifacts_vec. Les trois tables
+    sont mises à jour dans la MÊME transaction SQLite à chaque
+    upsert pour garantir la cohérence triplet (un artifact a
+    une ligne dans les trois, ou dans aucune). Pas de fenêtre
+    où FTS contient un doc mais pas embeddings, ou inversement.
+
+    Hors scope. Ce design ne modifie pas le schéma des artifacts
+    YAML (titres, descriptions, tags inchangés). Il ne modifie
+    pas le format du file lock ni la sémantique PILIER A. Il
+    ne change pas les autres tools MCP (get, related,
+    initiate_review_round, etc.). Il n'introduit pas de système
+    de feedback explicite sur la qualité des résultats (cf.
+    out_of_scope du task-request). Il ne propose pas de
+    chunking sub-document — l'embedding global de l'artifact
+    suffit pour notre profil de corpus.
+
+  components:
+    - name: tokenizer-et-normalisation-lexicale
+      description: >
+        Le tokenizer FTS5 est explicité avec options. Le default
+        actuel ("unicode61" implicite, sans paramètres) est
+        remplacé par une déclaration explicite qui élargit la
+        liste des séparateurs et garde le diacritics folding.
+        Sans cette modification, les identifiants techniques
+        (UUIDs préfixes, noms de modules avec `-`, versions)
+        restent tokenisés en chaînes opaques.
+
+        Trois sous-composants logiques :
+
+        (a) Tokenisation à l'indexation. Le tokenizer
+        unicode61 est explicitement déclaré sur artifacts_fts
+        avec remove_diacritics=2 (folding NFKD) et un set de
+        séparateurs élargi incluant au moins `-_./`. Cela
+        scinde "BGE-M3" en {bge, m3}, "sqlite-vec" en {sqlite,
+        vec}, et un UUID 8-chars peut être recherché comme
+        token autonome après split sur le `-`. L'option exacte
+        et la valeur de "tokenchars" / "separators" sont
+        déléguées à l'implementation-plan ; le design impose
+        seulement la propriété "les identifiants techniques
+        avec séparateurs courants sont tokenisés en
+        sous-tokens".
+
+        (b) Normalisation de la query côté Rust. Avant
+        injection dans le MATCH operator, la query est
+        traversée par une fonction `sanitize_fts_query` qui :
+        échappe ou retire les caractères réservés FTS5
+        (`-` `*` `:` `"` `(` `)`) sauf en mode "exact",
+        convertit les tokens en disjonction OR par défaut
+        pour casser l'AND implicite (paramètre arbitrable),
+        et garantit l'absence d'erreur SQL "no such column".
+        La fonction expose explicitement deux modes : "natural"
+        (tokens en OR, casse les opérateurs hérités) et
+        "advanced" (l'utilisateur fournit une expression FTS5
+        valide qu'on passe telle quelle). Le mode "advanced"
+        est un échappatoire pour les power users et les
+        tests ; il n'est pas le mode par défaut.
+
+        (c) Ranking BM25. La requête lexicale exécute
+        `SELECT id, bm25(artifacts_fts, w_title, w_tags,
+        w_description, w_content) AS rank FROM artifacts_fts
+        WHERE artifacts_fts MATCH ?1 ORDER BY rank LIMIT ?2`.
+        Les poids w_* sont configurables ; la recommandation
+        initiale du design est w_title >> w_tags >
+        w_description > w_content (par exemple 10, 5, 3, 1) :
+        un terme qui matche dans le titre signale beaucoup
+        plus de pertinence qu'un terme noyé dans le body.
+        La valeur précise est déléguée à
+        l'implementation-plan, à mesurer empiriquement sur
+        le jeu de queries de référence.
+
+        Aucun stemming n'est introduit dans ce composant. Le
+        stemming est volontairement laissé à la couche
+        sémantique : un stemmer FR + EN combiné coûte de
+        l'ingénierie (snowball multi-langue) sans bénéfice
+        face à un modèle d'embedding multilingue qui capture
+        de toute façon les variations morphologiques. Cette
+        décision est tranchée dans la section decisions.
+
+    - name: pipeline-embeddings-local
+      description: >
+        Le composant d'embedding produit un vecteur unique par
+        artifact. Trois sous-composants logiques :
+
+        (a) Modèle d'embedding. Local, multilingue (FR + EN
+        technique obligatoire), exécutable sur CPU avec une
+        latence d'inférence acceptable (< 100ms par query
+        recommandé, < 500ms acceptable). Le design impose
+        trois contraintes structurelles sur le choix du
+        modèle, sans figer le modèle exact (arbitré dans
+        l'implementation-plan) :
+
+          (i) DÉTERMINISTE. embed(text) doit retourner le
+          même vecteur à chaque appel pour le même input,
+          afin que PILIER D du RFC cdbfee72 (rebuild depuis
+          YAML) régénère exactement les embeddings stockés.
+          Conséquence : pas de dropout au inference time, pas
+          de quantization stochastique, graine de
+          randomisation fixée si applicable. Tous les modèles
+          standard sentence-transformers le sont par défaut
+          en mode .encode() inference.
+
+          (ii) MULTILINGUE NATIF. Le corpus mélange FR et EN
+          technique dans les mêmes documents. Un modèle
+          monolingue EN seul (par exemple nomic-embed-text v1)
+          peut sous-performer sur les passages FR ;
+          inversement un modèle FR-only (camemBERT-sts) sous-
+          performe sur l'anglais technique. Cible : modèle
+          entraîné explicitement multilingue. Candidats
+          classiques 2025-2026 : bge-m3 (multilingual, dense
+          + sparse + colbert, mais on n'utilise que le dense
+          path), multilingual-e5-large, paraphrase-multilingual-
+          mpnet-base-v2, ou nomic-embed-text-v1.5 en mode
+          multilingue si disponible. L'arbitrage final est
+          dans l'implementation-plan, avec un protocole de
+          mesure : exécuter le jeu de queries de référence
+          sur chaque candidat, comparer précision et rappel,
+          choisir le meilleur sous la contrainte de latence.
+
+          (iii) FOOTPRINT RAISONNABLE. Modèle qui tient en
+          RAM en steady-state (< 1 GB recommandé, < 2 GB
+          acceptable) et qui peut être loadé en moins de 5s au
+          boot du serveur. Cible pratique : 100M à 600M
+          paramètres en quantization int8 ou float16. Cela
+          exclut les très gros modèles (e5-mistral-7b,
+          jina-embeddings-v3 large) au bénéfice de modèles
+          moyens robustes.
+
+        (b) Runtime d'inférence. Précision iteration 3
+        (réponse au finding F-commun-1) : la formulation
+        initiale "crate Rust pure" était techniquement
+        inexacte. Aucune option disponible n'est strictement
+        "Rust pur + zéro réseau". candle est Rust pur côté
+        code mais télécharge les poids HuggingFace à la
+        première utilisation. fastembed-rs dépend de ort
+        (ONNX Runtime, C++ via FFI) avec téléchargement
+        possible de binaires natifs au build. Les sidecar
+        (ollama, llama.cpp) sont des process externes. Le
+        design sépare donc trois axes orthogonaux et impose
+        des contraintes différentes sur chacun :
+
+          (i) AUTONOMIE RUNTIME de search() — EXIGENCE DURE
+          non-négociable. Aucun appel search(), aucun appel
+          index_artifact() ne doit déclencher d'accès réseau.
+          Le modèle doit être chargé en RAM au boot, à
+          partir d'un cache local. Si le cache est absent
+          au boot, le serveur exite avec un message clair.
+          C'est l'unique contrainte structurelle qui survit
+          à la reformulation. Cette exigence dérive
+          directement de l'acceptance criterion du
+          task-request 02c9f6eb ("la solution est AUTONOME
+          LOCALE par défaut, pas de dépendance réseau
+          obligatoire au runtime de search()").
+
+          (ii) ABSENCE DE FFI — NICE-TO-HAVE. Aucune
+          contrainte dure. Une crate qui dépend de FFI vers
+          ONNX Runtime ou GGML est acceptable tant qu'elle
+          respecte (i). Le seul critère est l'autonomie
+          runtime, pas la pureté du langage.
+
+          (iii) BINAIRE AUTONOME AU BUILD — OUT OF SCOPE.
+          Un téléchargement de poids ou de runtime AU BUILD
+          est acceptable tant qu'il produit un artifact
+          reproductible (checksum stable, version pinned).
+          Le build est un événement orchestré (cargo build,
+          CI), pas un événement runtime du serveur.
+
+          (iv) SIDECAR PROCESS — autorisé sous condition de
+          (i). Un sidecar qui tourne en local et qui est
+          interrogé via socket UNIX ou loopback respecte
+          (i) tant que le sidecar lui-même ne déclenche pas
+          de download au runtime. La coordination de cycle
+          de vie avec le PILIER A du RFC cdbfee72 ajoute
+          de la complexité mais reste acceptable.
+
+        Recommandation MAINTENUE : préférer l'embedding
+        in-process si un modèle convenable est disponible
+        dans un runtime acceptable, pour minimiser les
+        degrés de liberté opérationnels (un seul process,
+        un seul cycle de vie, un seul fichier de logs).
+        L'arbitrage final dépend de la disponibilité du
+        modèle retenu (cf. open question 1 de
+        l'implementation-plan).
+
+        Mécanique de pre-fetch des poids. L'implementation-
+        plan doit définir une procédure de pre-fetch
+        déterministe : (1) une commande CLI ou une étape de
+        build qui télécharge les poids dans un cache local
+        versionné par model_version (cf. décision iteration
+        2 sur incertitude 5) ; (2) un check au boot du
+        serveur qui vérifie présence et intégrité du cache ;
+        (3) un mode CI qui pré-chauffe le cache avant les
+        tests. Le détail technique est dans le plan ; le
+        design impose les trois propriétés et l'autonomie
+        (i).
+
+        (b') Déterminisme effectif et tolérance epsilon
+        cross-architecture (précision iteration 3, réponse
+        au finding F-design-2). La contrainte (i) du
+        sous-composant (a) impose un modèle déterministe
+        ("embed(text) retourne le même vecteur à chaque
+        appel pour le même input"). Cette propriété est
+        théoriquement satisfaite par tous les
+        sentence-transformers en mode .encode() inference,
+        mais en pratique des variations float-precision de
+        l'ordre de 1e-5 à 1e-6 peuvent apparaître selon
+        l'architecture CPU (AVX2 vs NEON), la version de la
+        librairie BLAS, ou le runtime d'inférence (ort vs
+        candle vs llama.cpp). Le design pose la propriété
+        suivante :
+
+          Tolérance acceptée — pour deux invocations
+          successives d'embed(text) avec le même input sur
+          la MÊME machine, la distance cosine entre les
+          deux vecteurs doit être < 1e-4 (équivalemment,
+          cosine_similarity > 0.9999). C'est la tolérance
+          opérationnelle qui permet à PILIER D du RFC
+          cdbfee72 (reindex_all depuis YAML) de régénérer
+          des vecteurs sémantiquement équivalents même si
+          les bits ne sont pas strictement identiques.
+
+        Stratégie de validation. Un test Rust dans
+        crates/orchestrator/tests/ exécute embed(text) deux
+        fois sur le même input et vérifie la similarité
+        cosine > 0.9999. Le test échoue si la tolérance
+        n'est pas tenue. Le détail (taille de l'input test,
+        nombre d'itérations) est arbitré dans
+        l'implementation-plan.
+
+        Cas cross-architecture (machine A produit des
+        embeddings, machine B les consomme). Le design
+        accepte qu'on ne puisse PAS tester ce cas en CI
+        sur un runner unique. Le filet de sécurité est le
+        model_version (décision iteration 2 sur
+        incertitude 5) couplé à un champ optionnel
+        architecture_marker (par exemple "x86_64-avx2" ou
+        "aarch64-neon") stocké à côté des vecteurs. Si un
+        binaire reconnaît un marker différent du sien au
+        boot, il déclenche wipe + reindex_all automatique,
+        au même titre qu'un mismatch de model_version. Le
+        détail (faut-il un champ séparé ou
+        model_version peut encoder l'architecture) est
+        arbitré dans l'implementation-plan ; le design
+        impose seulement la propriété "un mismatch
+        d'architecture est traité de la même manière qu'un
+        mismatch de modèle".
+
+        (c) Source textuelle de l'embedding. Pas tout le YAML
+        est sémantiquement pertinent : metadata.id (UUID)
+        n'a pas de sens à embeder, metadata.created_at non
+        plus. Le design définit la "vue embeddable" d'un
+        artifact comme la concaténation contrôlée de :
+        metadata.title + ". " + metadata.description + ". " +
+        join(metadata.tags, ", ") + ". " + body sémantique
+        (spec.symptom + spec.root_cause + spec.overview +
+        spec.motivation + ... selon le kind). Le mapping
+        précis kind → champs embedables est dans
+        l'implementation-plan. La taille des inputs ne dépasse
+        en pratique pas la context length usuelle des modèles
+        d'embedding (512 à 8192 tokens). Si un artifact
+        dépasse, on tronque proprement à la limite du modèle
+        choisi (truncation à droite, pas de chunking : décision
+        de simplicité tranchée ci-dessous).
+
+    - name: stockage-vectoriel-sqlite-vec
+      description: >
+        Le composant de stockage vectoriel s'appuie sur
+        l'extension sqlite-vec (anciennement sqlite-vss
+        rewritten), une extension SQLite officielle de
+        Mozilla/Alex Garcia, écrite en C, qui expose des
+        tables virtuelles `vec0` indexées en ANN.
+
+        Justification du choix de sqlite-vec parmi les
+        candidats :
+
+        (a) Cohérence architecturale forte. sqlite-vec
+        s'exécute dans le même process SQLite que FTS5 et les
+        tables artifacts/artifact_relations. Une seule
+        connexion ouvre tout. Le PILIER A du RFC cdbfee72
+        (writer unique flock) s'applique uniformément. Aucun
+        second daemon, aucun second protocole réseau, aucun
+        second backup à gérer.
+
+        (b) Transactions cohérentes. Un upsert d'artifact peut
+        écrire dans artifacts, artifacts_fts, ET artifacts_vec
+        dans la même transaction BEGIN/COMMIT. Pas de fenêtre
+        d'inconsistance entre les trois représentations.
+
+        (c) Performance suffisante pour notre échelle. sqlite-vec
+        supporte aujourd'hui jusqu'à plusieurs millions de
+        vecteurs avec une latence ANN sub-100ms. Notre corpus
+        cible (< 1000 artifacts) est largement sous ce
+        plafond ; on obtient des latences ANN < 10ms warm.
+
+        (d) Maintenance. Extension active (versions
+        régulières), licence permissive (Apache 2 / MIT),
+        empaquetée comme une simple .so ou crate.
+
+        Alternatives rejetées dans le design.
+
+        Alternative 1 — LanceDB embedded. Excellente
+        performance, mais format de stockage séparé du
+        SQLite principal. Force à gérer un second store, donc
+        deux backups, deux mécaniques de cohérence, et un
+        deuxième PILIER A. Rejeté pour simplicité.
+
+        Alternative 2 — Qdrant ou Weaviate en standalone.
+        Performance excellente, écosystème mature, mais
+        violation explicite de la contrainte "autonome local"
+        (daemon supplémentaire à gérer, port à exposer, état
+        à backup séparément). Rejeté.
+
+        Alternative 3 — Tantivy avec extension vector. Tantivy
+        est un index FTS Rust pur très performant qui pourrait
+        remplacer la pile FTS5 complète. Mais cela double le
+        scope (refactorer aussi tout l'index lexical actuel),
+        et l'extension vector de tantivy est moins mature que
+        sqlite-vec. Rejeté pour conservatisme : on garde FTS5
+        durci sur le lexical et on ajoute sqlite-vec
+        seulement sur le sémantique.
+
+        Alternative 4 — HNSW Rust pur (instant-distance,
+        hnsw_rs). Stockage en RAM ou fichier custom. Plus
+        rapide en pure latence ANN mais réintroduit un store
+        séparé du SQLite. Rejeté pour la même raison que
+        l'alternative 1.
+
+        Schéma logique de la table sqlite-vec. La table
+        virtuelle (nom indicatif `artifacts_vec`) contient au
+        minimum un rowid corrélable avec artifacts.id et le
+        vecteur d'embedding. La dimension du vecteur dépend
+        du modèle (384, 768, 1024 sont les tailles courantes).
+        Une métrique de distance est figée à la création de
+        la table virtuelle (cosine recommandé pour les
+        embeddings sentence-transformers normalisés ; L2
+        acceptable pour les modèles à norme variable). Le
+        choix précis est dans l'implementation-plan.
+
+        Indexation. sqlite-vec supporte aujourd'hui les
+        recherches "brute force ANN" (linéaire sur tous les
+        vecteurs) qui sont suffisantes pour notre échelle
+        actuelle (< 1000 docs, scan ~5ms). Si le corpus
+        grossit substantiellement, sqlite-vec gagnera des
+        index ANN approximatifs (HNSW, IVF) qui sont sur la
+        roadmap upstream. Pour l'instant, brute force suffit
+        et garantit un rappel exact (pas d'approximation
+        ratée).
+
+    - name: fusion-reciprocal-rank
+      description: >
+        Le composant de fusion combine les deux classements
+        (lexical BM25 et sémantique cosine) en un classement
+        unifié via Reciprocal Rank Fusion.
+
+        Formule. Pour chaque document d apparaissant dans au
+        moins l'un des deux classements :
+          score_RRF(d) = sum_{r in {lexical, semantic}}
+                            1 / (k + rank_r(d))
+        où rank_r(d) est le rang 1-indexé du document d dans
+        le classement r (typiquement de 1 à K = 50 à 100,
+        documents absents traités comme rank = infini c'est-à-dire
+        contribution nulle), et k est une constante de
+        smoothing (k = 60 est la valeur canonique de la
+        littérature TREC, robuste empiriquement sur de
+        nombreux benchmarks).
+
+        Pipeline. (1) On exécute la requête lexicale et la
+        requête sémantique en parallèle (deux Mutex tokio
+        partagés ou sequentiel selon le coût d'inférence ; à
+        arbitrer dans l'implementation-plan). (2) Chaque
+        chemin retourne un top-K candidat (K = 50 par défaut,
+        modulable). (3) On calcule le score RRF pour chaque
+        candidat de l'union. (4) On trie par score décroissant
+        et on retourne les top-N demandés par l'appelant
+        (N = 10 par défaut, comme aujourd'hui).
+
+        Pourquoi RRF plutôt qu'une combinaison linéaire ou un
+        modèle de fusion entraîné. Les scores BM25 (relatifs,
+        non bornés) et cosine (entre -1 et 1, ou 0 et 1 après
+        normalisation) ne sont pas comparables sans
+        calibration. Une combinaison linéaire `alpha *
+        score_BM25 + (1 - alpha) * score_cosine` exige de
+        recalibrer alpha à chaque changement de corpus ou de
+        modèle. RRF n'utilise QUE les rangs, pas les scores
+        bruts, donc reste correct même quand les distributions
+        de scores changent radicalement (par exemple si on
+        change de modèle d'embedding). Un modèle de fusion
+        entraîné (LightGBM rank, neural reranker) demande un
+        dataset annoté qu'on n'a pas. RRF est le compromis
+        sans-feature-engineering qui marche.
+
+        Edge case : un document apparaît seulement dans le
+        chemin lexical (parce que la query contient un
+        identifiant exact que la sémantique ne capture pas
+        bien). Ou seulement dans le chemin sémantique (parce
+        que la query est une paraphrase sans aucun token en
+        commun avec le doc). RRF préserve la visibilité de
+        ces documents : leur score est moins élevé que pour
+        un doc présent dans les deux, mais ils restent dans
+        le résultat. Cette propriété est la raison principale
+        du choix de RRF.
+
+    - name: filtres-structures
+      description: >
+        Les filtres structurés s'appliquent en push-down
+        AVANT fusion : on contraint le candidate set de
+        chacun des deux chemins (lexical et sémantique) par
+        une clause WHERE sur la table artifacts. Cela évite
+        de fusionner puis filtrer (coûteux et conceptuellement
+        bancal : un top-K pré-filtre n'est pas le même top-K
+        post-filtre).
+
+        Filtres disponibles dans l'API search() cible :
+        - kind : un kind unique ou une liste (déjà supporté,
+          étendu à une liste)
+        - author : persona ID exact
+        - tags : un tag unique ou liste (AND ou OR à
+          arbitrer ; recommandation OR pour matcher l'esprit
+          des tags multiples)
+        - project : project slug exact
+        - created_after / created_before : bornes temporelles
+          sur metadata.created_at
+        - id_prefix : préfixe d'UUID (utile pour retrouver
+          un artifact par son préfixe court)
+
+        Mécanique côté lexical. La query SQL devient
+        `... WHERE artifacts_fts MATCH ?1 AND a.kind IN (...)
+        AND a.author = ? ...` avec les filtres injectés
+        comme paramètres bindés.
+
+        Mécanique côté sémantique. sqlite-vec supporte les
+        JOIN ; on JOIN artifacts_vec ON artifacts.id et on
+        applique les mêmes filtres avant le k-nearest search.
+        Note : selon les versions de sqlite-vec, le filtre
+        peut nécessiter un pattern particulier (pre-filter
+        via row_id IN (SELECT...) ou post-filter sur k'
+        élargi). L'arbitrage technique est dans
+        l'implementation-plan, mais le contrat fonctionnel
+        est garanti : le top-K sémantique respecte les filtres.
+
+        Cas dégénérés. Si les filtres sont trop restrictifs
+        au point que le candidate set est vide, search()
+        retourne 0 résultat (comportement attendu). Si la
+        query est vide mais les filtres pleins, on tombe sur
+        un cas spécial : list_artifacts (cf. composant
+        api-search-cible) plutôt que search().
+
+    - name: reranker-claude-optionnel
+      description: >
+        Composant optionnel activé par un flag dans l'appel
+        search(rerank=true). Quand actif, le top-K fusionné
+        (typiquement K = 20) est envoyé à Claude (clé
+        Anthropic d'opencode) avec la query originale et la
+        liste des candidats (titre + description + tags). Le
+        prompt demande à Claude de reranker les K candidats
+        par pertinence à la query. La réponse est un ordering
+        complet des K, qu'on réinjecte comme classement final
+        pour les top-N retournés à l'appelant.
+
+        Sémantique d'activation. Le flag rerank=true est
+        accepté UNIQUEMENT si la variable d'environnement
+        ANTHROPIC_API_KEY (ou équivalent injecté par opencode)
+        est présente au runtime du serveur. Sinon, l'appel
+        retourne une erreur explicite "rerank=true requires
+        ANTHROPIC_API_KEY". Pas de fallback silencieux : un
+        appelant qui demande rerank=true veut explicitement
+        ce comportement, et un fallback silencieux masque
+        l'écart de qualité attendu.
+
+        Coût attendu. +1 à 3 secondes par query (latence
+        Claude haiku ou claude-3.5-haiku, K = 20, prompt
+        court). +1 appel API Anthropic facturé. Ce coût est
+        suffisamment significatif pour que le flag ne soit
+        PAS on par défaut. L'API search() impose rerank=false
+        en valeur par défaut.
+
+        Disponibilité opérationnelle. Si Claude est
+        injoignable (rate limit, panne, timeout), l'appel
+        rerank fallback sur le classement RRF non-rerangé,
+        avec un warning dans les logs. Le fallback est
+        explicite (pas silencieux) parce que la qualité
+        attendue avec rerank différait de celle sans.
+
+        Limite. Le reranker Claude voit seulement les
+        métadonnées + le top des descriptions des candidats
+        ; pas le contenu intégral des artifacts. Si la
+        pertinence dépend du body, un reranker plus profond
+        (voir le contenu complet) serait nécessaire mais
+        explose le contexte et le coût. Le design accepte
+        cette limite pour la première itération ; un V2
+        pourrait étendre le payload Claude.
+
+    - name: query-expansion-hyde-optionnelle
+      description: >
+        Composant optionnel activé par un flag dans l'appel
+        search(hyde=true). HyDE (Hypothetical Document
+        Embeddings) est une technique 2023 (Gao et al.,
+        "Precise Zero-Shot Dense Retrieval without Relevance
+        Labels") qui consiste à : (1) demander à un LLM de
+        générer un pseudo-document qui répondrait
+        hypothétiquement à la query, (2) embeder ce
+        pseudo-document plutôt que la query elle-même, (3)
+        utiliser cet embedding pour la phase sémantique.
+
+        Justification. Une query courte ("hybrid search RRF")
+        est sémantiquement éloignée de la signature d'un
+        document long qui développe le sujet en plusieurs
+        paragraphes. L'embedding d'un pseudo-doc qui
+        ressemble à la cible que l'on cherche augmente le
+        rappel sémantique.
+
+        Sémantique d'activation. Comme pour rerank, hyde=true
+        nécessite ANTHROPIC_API_KEY. Pas de fallback
+        silencieux. La query lexicale n'est PAS modifiée par
+        HyDE (le pseudo-doc serait trop bruité pour le
+        lexical ; HyDE ne joue que sur l'axe sémantique).
+
+        Coût attendu. +500ms à 2s par query (latence Claude
+        haiku, prompt court, output 100 à 200 tokens). +1
+        appel API. Comme rerank, OFF par défaut. Les deux
+        flags peuvent être combinés (hyde=true + rerank=true)
+        pour les queries critiques.
+
+        Cas dégénéré. Si la query est très courte ou très
+        longue, le pseudo-doc généré peut être de mauvaise
+        qualité (trop générique ou trop spécifique). Le
+        design ne tente PAS de détecter ces cas
+        automatiquement ; c'est à l'appelant de juger.
+
+    - name: pipeline-indexation
+      description: >
+        Le pipeline d'indexation est étendu pour calculer et
+        persister l'embedding à chaque upsert d'artifact.
+
+        Chemin nominal — write YAML déclenche indexation.
+        (1) Un agent écrit un fichier YAML d'artifact
+        (zone non-protégée ou via write permit en zone
+        protégée).
+        (2) Le hook defense-in-depth post-write spawn --index
+        (autoIndex côté hook).
+        (3) --index acquiert flock LOCK_EX | LOCK_NB. Deux
+        sous-cas (cf. PILIER A du RFC cdbfee72) :
+          (3a) Aucun serveur en vie → --index acquiert le
+          lock, lit le YAML, calcule l'embedding, upsert dans
+          la même transaction artifacts + artifacts_fts +
+          artifacts_vec, relâche le lock.
+          (3b) Serveur en vie → --index logue "delegated to
+          file watcher" et exit 0 (sémantique RFC cdbfee72
+          amendement iteration 5).
+        (4) Si on est dans le cas (3b), le file watcher tokio
+        du serveur détecte la modification (debounce 500ms)
+        et appelle engine.index_artifact() qui à son tour
+        calcule l'embedding et upsert dans les trois tables.
+
+        Cas où le file watcher est en panne ou en retard. Le
+        composant indexation-coordination du design-doc
+        45c04902 a réglé ce sujet pour FTS via index_now(path).
+        Le présent design étend index_now pour qu'il calcule
+        aussi l'embedding (extension naturelle puisque
+        index_now appelle déjà engine.index_artifact en
+        interne, qui est la même fonction utilisée par le
+        file watcher). Aucun nouveau tool MCP n'est requis ;
+        seul le contenu de engine.index_artifact évolue.
+
+        Cohérence transactionnelle. Le design impose que les
+        trois écritures (artifacts, artifacts_fts,
+        artifacts_vec) soient dans la même transaction
+        SQLite. Conséquence : si le calcul d'embedding échoue
+        (modèle absent au boot, OOM, input invalide),
+        l'upsert COMPLET est rollbacké et l'artifact n'est
+        pas indexé du tout. C'est intentionnel : un artifact
+        à moitié indexé (dans FTS mais pas dans vec) violerait
+        l'invariant et créerait un état où search() en mode
+        hybrid trouverait incohéremment le doc dans une couche
+        mais pas l'autre. Le rollback complet est plus simple
+        à diagnostiquer (l'agent voit que l'indexation a
+        échoué, vérifie pourquoi, retry).
+
+        Note importante : le rollback complet introduit une
+        nouvelle classe de panne d'indexation (modèle indispo
+        au boot), à mitiger par le composant
+        observabilite-indexation ci-dessous.
+
+        Cohérence avec PILIER D du RFC cdbfee72 (autorepair).
+        Quand integrity_check au boot échoue, le serveur
+        wipe la DB et exécute reindex_all SYNCHRONEMENT
+        depuis les YAML. reindex_all itère tous les YAML,
+        calcule l'embedding de chacun, upsert dans les trois
+        tables. Coût attendu : 84 artifacts * 50ms par
+        embedding = 4.2s sur le corpus actuel. À 10x
+        corpus : ~42s. Acceptable pour un boot après
+        corruption (rare).
+
+    - name: api-search-cible
+      description: >
+        La signature de search() évolue vers un objet de
+        paramètres plus riche. Le design fige la sémantique ;
+        les noms exacts sont délégués à l'implementation-plan.
+
+        Paramètres :
+
+          - query : string. La requête en langage naturel.
+            Vide autorisé SEULEMENT si au moins un filtre est
+            fourni (sinon erreur "empty query requires at
+            least one filter"). Quand la query est vide et
+            qu'un filtre est fourni, search() retourne les
+            documents matchant les filtres ordonnés par date
+            décroissante (équivalent fonctionnel de l'actuel
+            list_*).
+          - mode : enum {lexical, semantic, hybrid}. Défaut
+            hybrid. Mode lexical = FTS5 BM25 seul (utile pour
+            les identifiants exacts, plus rapide). Mode
+            semantic = embeddings seuls. Mode hybrid = fusion
+            RRF des deux.
+          - kind : string optional ou liste. Conservé pour
+            rétrocompat, étendu à une liste de kinds.
+          - author : string optional. Filtre persona ID.
+          - tags : liste optional. Filtre tags (sémantique OR).
+          - project : string optional. Filtre project slug.
+          - created_after / created_before : timestamps RFC3339
+            optionnels.
+          - id_prefix : string optional. Filtre préfixe d'UUID.
+          - limit : entier optional, défaut 10 (inchangé), max
+            100.
+          - rerank : bool optional, défaut false. Active le
+            reranker Claude (nécessite ANTHROPIC_API_KEY).
+          - hyde : bool optional, défaut false. Active la
+            query expansion HyDE (nécessite ANTHROPIC_API_KEY).
+          - explain : bool optional, défaut false. Quand true,
+            la réponse inclut pour chaque résultat les scores
+            individuels (BM25, cosine, RRF) et la trace des
+            étapes appliquées. Utile pour debug et
+            calibration.
+
+        Retour. Format JSON conservé pour les champs existants
+        (results: liste de {id, kind, title, description,
+        tags}, count: entier). Ajout de champs optionnels
+        quand explain=true : scores: {bm25, cosine, rrf} par
+        résultat, mode_applied, candidate_set_sizes:
+        {lexical, semantic, fused}, latency_breakdown_ms.
+
+        Breaking change ou non. La signature actuelle de
+        search() expose (query, kind?, limit?). Le RFC retient
+        un breaking change CONTRÔLÉ : tous les paramètres
+        actuels gardent leur position et leur sémantique
+        ; les nouveaux paramètres sont optionnels avec
+        defaults. Cas de compatibilité testé : search("foo")
+        et search("foo", kind="rfc") continuent de marcher,
+        mais avec sémantique mode=hybrid plutôt que pur
+        lexical, ce qui change le ranking observable. La
+        documentation du tool MCP explicite cette évolution.
+        Les appelants qui veulent strictement l'ancien
+        comportement passent mode=lexical.
+
+        Pourquoi mode=hybrid en défaut. C'est la valeur qui
+        maximise le rappel et qui répare le symptôme du
+        task-request. Les appelants par défaut (les agents
+        qui font le lookup mémoire) en bénéficient sans
+        changement de code.
+
+    - name: observabilite-indexation
+      description: >
+        Composant transverse qui rend visible l'état de
+        l'indexation et facilite le diagnostic. Identifié
+        comme nécessaire par le FACTEUR 6 du diagnostic
+        6cfd1c62 (dépendance fragile au file watcher).
+
+        Trois sous-composants :
+
+        (a) Un tool MCP `index_status(path?)` qui retourne :
+        l'âge du dernier indexed_at par rapport à mtime du
+        fichier sur disque, la cohérence triplet artifacts /
+        artifacts_fts / artifacts_vec (un doc orphelin dans
+        une table mais pas les autres est un bug à signaler),
+        le statut du file watcher tokio (alive / dead /
+        unknown), et la queue de fichiers en attente
+        d'indexation s'il y en a. Un agent qui suspecte un
+        faux négatif peut appeler ce tool pour vérifier que
+        son artifact est bien indexé.
+
+        (a') Mécanique minimale d'instrumentation (précision
+        iteration 3, réponse au finding F-design-1). Pour
+        chaque champ exposé par index_status, le design fixe
+        la propriété fonctionnelle et la mécanique minimale
+        acceptable. L'implementation-plan peut affiner mais
+        ne peut pas remettre en cause les contrats ci-dessous :
+
+          - artifacts_count, fts_count, vec_count :
+            propriété "compte exact des rows par table".
+            Mécanique : trois SELECT COUNT(*) sur la
+            connexion partagée de l'engine, sérialisé sous
+            son Mutex tokio. Coût négligeable jusqu'à un
+            corpus de plusieurs milliers de docs.
+
+          - triplet_coherent (bool) :
+            propriété "les trois compteurs sont égaux ET
+            aucun id présent dans une table n'est absent
+            des deux autres". Mécanique minimale :
+            comparaison des trois COUNT (rapide). Si false,
+            un champ optionnel triplet_diff doit pouvoir
+            nommer au moins un id divergent (SQL EXCEPT ou
+            NOT IN, détail dans l'implementation-plan).
+
+          - file_watcher_alive (bool) :
+            propriété "la task tokio file watcher est en
+            train de tourner et capable de recevoir des
+            événements notify". Mécanique minimale au choix
+            entre deux options équivalentes :
+              - un Arc<AtomicBool> partagé, écrit true au
+                démarrage de la boucle de réception et
+                false dans un Drop guard ou un branch de
+                select! avec cancellation token ;
+              - un JoinHandle détenu par l'engine dont on
+                vérifie is_finished() au moment de la
+                lecture.
+            Pas de heartbeat périodique requis : le watcher
+            est passif en attente d'événements, donc
+            "vivant mais idle" et "mort" ne se distinguent
+            que par l'état du runtime tokio, pas par un
+            timestamp.
+
+          - last_indexed_at (timestamp ou null) :
+            propriété "horodatage du upsert le plus récent
+            toutes tables confondues". Mécanique : SELECT
+            MAX(indexed_at) FROM artifacts. Retourne null
+            si la table est vide.
+
+          - pending_index_queue_size (int) :
+            propriété "nombre de fichiers en attente de
+            traitement par le file watcher". Mécanique : si
+            le file watcher utilise un mpsc::channel borné
+            comme buffer intermédiaire, exposer
+            channel.capacity() - channel.free_capacity() (ou
+            un AtomicUsize compteur). Si le watcher
+            n'utilise PAS de queue intermédiaire (debounce
+            simple in-place), retourner 0 explicitement avec
+            la documentation "0 = watcher en mode sans queue
+            intermédiaire" plutôt qu'une fausse mesure. La
+            décision (introduire la queue ou non) est dans
+            l'implementation-plan.
+
+          Pour les champs per_path (indexed_at, file_mtime,
+          stale, present_in_fts, present_in_vec) : SQL
+          standard sur les trois tables et std::fs::metadata
+          pour le mtime. Latences négligeables.
+
+          Cible de latence globale du tool : < 10ms sur
+          corpus actuel, < 50ms à 10x. Si la cohérence
+          triplet exige un EXCEPT coûteux sur gros corpus,
+          un mode "fast" (juste les COUNT) peut être
+          introduit, mais le mode unique avec triplet_diff
+          seulement quand triplet_coherent=false est
+          recommandé en priorité.
+
+        (b) Le logging serveur enrichi : à chaque
+        index_artifact, le serveur logue le timing de
+        l'embedding (ms) et le timing de l'upsert SQL (ms),
+        et l'éventuelle erreur d'embedding (avec rollback).
+        Ces logs sont consultables dans les sorties standard
+        du process opencode.
+
+        (c) Mode `explain=true` du search() (cf. composant
+        api-search-cible) qui rend visible le candidate set,
+        les rangs, les scores, et la latency breakdown. Utile
+        pour répondre à "pourquoi ce résultat est en tête" et
+        pour le tuning des poids BM25.
+
+    - name: jeu-de-queries-de-reference
+      description: >
+        Composant non-fonctionnel mais essentiel à la qualité.
+        Acceptance criterion du task-request impose ≥ 20
+        queries de référence avec résultats attendus. Le
+        design fige le format et la structure ; la production
+        des queries spécifiques est dans l'implementation-plan.
+
+        Format. Un fichier YAML versionné dans le repo (par
+        exemple sous tests/search-eval/ ou
+        crates/orchestrator/tests/queries.yml) qui liste pour
+        chaque query : la query string, le mode attendu
+        (lexical / semantic / hybrid), les filtres
+        éventuels, les artifacts attendus en top-K (par id),
+        et un type de query (lexical pur, sémantique pur,
+        mixte, edge case).
+
+        Coverage cible (à atteindre par l'implementation-plan,
+        non figé dans le design) :
+          - 5 queries lexicales pures (identifiants, termes
+            exacts, UUIDs préfixes).
+          - 5 queries sémantiques pures (paraphrases, synonymes,
+            concepts).
+          - 5 queries mixtes (terme exact + concept).
+          - 5 queries edge cases (vide + filtre, langue
+            mélangée, query trop longue, query avec opérateurs
+            FTS5 historiques, query UUID complet).
+
+        Métriques calculées par le runner de test :
+          - precision@K : fraction des top-K qui sont
+            pertinents (attendus).
+          - recall@K : fraction des artifacts pertinents
+            attendus qui sont dans le top-K.
+          - MRR (Mean Reciprocal Rank) : moyenne sur les
+            queries du rang du premier résultat pertinent.
+
+        Les trois queries du symptôme du task-request 02c9f6eb
+        DOIVENT figurer parmi les queries de référence, et
+        DOIVENT retourner précision > 0 et rappel > 0 après
+        refonte. C'est la condition de clôture binaire.
+
+  decisions:
+    - decision: >
+        Adopter une architecture hybride lexical + sémantique
+        avec fusion RRF plutôt que de remplacer FTS5 par une
+        recherche purement sémantique.
+      rationale: >
+        Les benchmarks IR depuis 2022 (BEIR, MTEB, MS MARCO)
+        montrent uniformément que ni le lexical pur ni le
+        sémantique pur ne dominent. Les deux capturent des
+        signaux complémentaires : le lexical retrouve les
+        identifiants exacts, les versions, les numéros, les
+        termes rares qui ne sont pas bien représentés dans
+        l'espace d'embedding (un UUID 8-chars n'a aucune
+        sémantique pour un sentence-transformer). Le
+        sémantique retrouve les paraphrases, synonymes,
+        concepts apparentés. Une recherche purement sémantique
+        régresserait sur les queries d'identifiants — exactement
+        le cas que les agents utilisent pour retrouver un
+        artifact par préfixe ou par tag littéral. La fusion
+        RRF capture les deux signaux sans recalibration.
+
+    - decision: >
+        Conserver FTS5 comme couche lexicale plutôt que la
+        remplacer par tantivy ou une implémentation custom.
+      rationale: >
+        FTS5 est intégré nativement à SQLite, déjà déployé,
+        zéro dépendance supplémentaire, et performant (1-2ms
+        sur notre corpus). Le tokenizer unicode61 explicité
+        avec les bons paramètres résout les facteurs 3 et 5
+        du diagnostic. Remplacer FTS5 par tantivy doublerait
+        la surface du refactor sans bénéfice immédiat. Si
+        l'expérience opérationnelle révèle des limites
+        structurelles de FTS5 (par exemple un besoin de
+        ranking sophistiqué que bm25() ne supporte pas), la
+        migration vers tantivy reste possible plus tard sans
+        changer le contrat externe de search().
+
+    - decision: >
+        Choisir sqlite-vec comme backend vectoriel plutôt
+        que LanceDB embedded, Qdrant, Weaviate, ou un index
+        HNSW Rust pur.
+      rationale: >
+        sqlite-vec est la seule option qui partage la même
+        connexion SQLite que FTS5 et les tables artifacts.
+        Cette unicité du store est critique pour le PILIER A
+        du RFC cdbfee72 (writer unique flock) : on n'introduit
+        AUCUN second writer, AUCUN second backup, AUCUNE
+        seconde mécanique de cohérence. Les upserts d'artifact
+        peuvent se faire en transaction atomique sur les trois
+        tables, ce qui élimine structurellement la classe de
+        bugs "indexé dans une couche mais pas l'autre". La
+        performance de sqlite-vec en brute force ANN est
+        suffisante pour notre corpus < 1000 docs (latence
+        ANN < 10ms warm), et l'extension est maintenue
+        activement. Les alternatives à store séparé
+        (LanceDB, Qdrant, HNSW Rust) sont rejetées pour
+        complexité opérationnelle, pas pour performance.
+
+    - decision: >
+        Fusion par Reciprocal Rank Fusion (RRF) plutôt qu'une
+        combinaison linéaire pondérée ou un modèle de fusion
+        entraîné.
+      rationale: >
+        RRF n'exige aucune calibration de scores hétérogènes
+        (BM25 non borné vs cosine normalisé). Une combinaison
+        linéaire `alpha * BM25 + (1 - alpha) * cosine` exige
+        un alpha calibré sur des données annotées qu'on n'a
+        pas. Un modèle de fusion entraîné (LightGBM rank ou
+        neural reranker) exige un dataset supervisé encore
+        plus large. RRF est zero-feature, robuste aux
+        changements de modèle d'embedding, et stable
+        empiriquement sur des corpus de toutes tailles
+        (publiée TREC 2009, validée massivement depuis).
+        C'est le compromis qui marche sans annotation.
+
+    - decision: >
+        Modèle d'embedding multilingue local déterministe,
+        choix exact arbitré par l'implementation-plan parmi
+        les candidats bge-m3, multilingual-e5-large,
+        paraphrase-multilingual-mpnet-base-v2,
+        nomic-embed-text-v1.5.
+      rationale: >
+        Trois contraintes structurelles cumulatives :
+        déterminisme (PILIER D du RFC cdbfee72 exige que
+        reindex_all régénère exactement les mêmes embeddings),
+        multilinguisme natif (corpus FR + EN technique
+        mélangés), footprint raisonnable (< 1GB RAM, < 5s
+        load). Le design fige ces contraintes structurelles ;
+        l'arbitrage entre candidats demande une mesure
+        empirique sur le jeu de queries de référence
+        (précision / rappel sous contrainte de latence). Cette
+        mesure relève de l'implementation-plan, pas du
+        design. Le design impose seulement que l'arbitrage
+        soit documenté dans le plan avec les chiffres mesurés.
+
+    - decision: >
+        Embedding global de l'artifact (un vecteur par
+        artifact) plutôt que chunking sub-document.
+      rationale: >
+        Notre corpus typique fait < 10kB par artifact, donc
+        rentre largement dans la context length d'un
+        sentence-transformer (512 à 8192 tokens selon le
+        modèle). Le chunking introduit deux complications :
+        (a) la fusion des résultats au niveau document à
+        partir de scores chunk (max-pool ? avg-pool ?
+        reciprocal-rank ?), (b) le stockage de N vecteurs par
+        artifact au lieu d'un seul, donc N foreign keys vers
+        artifacts.id. Le bénéfice (granularité fine de
+        pertinence) est marginal sur notre échelle. Décision
+        de simplicité : un vecteur par artifact, troncature
+        à droite si l'artifact dépasse la context length du
+        modèle. Si on observe en production que cette
+        troncature perd de l'info utile (cas des très gros
+        artifacts), le V2 pourra introduire le chunking
+        sans casser le contrat externe de search().
+
+    - decision: >
+        Pas de stemming au niveau lexical (ni snowball, ni
+        porter). Le stemming morphologique est laissé à la
+        couche sémantique.
+      rationale: >
+        Un stemmer FR + EN combiné introduit de l'ingénierie
+        (snowball ou tokenizer custom FTS5) sans bénéfice
+        clair face à un modèle d'embedding multilingue qui
+        capture déjà les variations morphologiques par
+        proximité d'embedding. "embedding" et "embeddings"
+        n'auront pas le même token FTS5 (donc faux négatif
+        sur le lexical seul), MAIS leur embedding cosine
+        sera quasi identique (cosine > 0.98), donc la fusion
+        RRF les retrouvera via le chemin sémantique. Le coût
+        d'ajouter un stemmer est plus élevé que le bénéfice
+        marginal. Décision de simplicité.
+
+    - decision: >
+        API search() breaking change contrôlé : ajout de
+        paramètres optionnels avec defaults, conservation des
+        paramètres existants, mais sémantique par défaut
+        modifiée (mode=hybrid plutôt que pur FTS5).
+      rationale: >
+        Le task-request accepte explicitement un breaking
+        change si la migration est gérée. Imposer un nouveau
+        nom (search_v2) doublerait l'API et obligerait à
+        propager le changement chez tous les appelants, ce
+        qui est plus douloureux qu'un changement de
+        sémantique du défaut. Les appelants qui veulent
+        strictement l'ancien comportement passent
+        mode=lexical. Le breaking change est documenté dans
+        la doc du tool MCP et dans le RFC bdee1af4.
+
+    - decision: >
+        Le reranker Claude et le query expansion HyDE sont
+        des composants optionnels OFF par défaut, activés
+        par flags individuels dans l'appel search.
+      rationale: >
+        Les deux dépendent d'une clé Anthropic non garantie
+        (présente quand opencode tourne, absente en CLI pur).
+        Ils introduisent une latence (+1 à 3s) et un coût
+        (appel API facturé) qui ne sont pas justifiés pour
+        chaque lookup mémoire. Activation explicite par
+        l'appelant qui sait ce qu'il fait. Pas de fallback
+        silencieux sur absence de clé : la sémantique
+        attendue avec rerank=true diffère trop de celle sans
+        pour que le fallback silencieux soit acceptable.
+
+    - decision: >
+        Indexation transactionnelle stricte : artifacts,
+        artifacts_fts, artifacts_vec écrits dans la même
+        transaction SQLite, rollback complet si l'embedding
+        échoue.
+      rationale: >
+        L'invariant "un artifact est indexé dans les trois
+        tables ou dans aucune" est critique pour la cohérence
+        du mode hybrid. Sans transaction atomique, une panne
+        au calcul d'embedding (modèle non chargé, OOM)
+        produirait un artifact présent dans FTS mais absent
+        dans vec, donc trouvable en mode lexical mais
+        invisible en mode hybrid avec ranking incohérent.
+        Diagnostiquer cet état est très difficile. Le
+        rollback complet rend l'erreur explicite et
+        diagnosticable : l'agent voit que son YAML n'est pas
+        indexé du tout, vérifie pourquoi (logs serveur),
+        agit. La perte fonctionnelle (artifact non indexé)
+        est compensée par l'observabilité (composant
+        observabilite-indexation).
+
+    - decision: >
+        Cohabitation transitoire FTS5 ancien / FTS5 nouveau
+        avec tokenizer changé : NON, migration atomique en
+        un seul reindex_all post-déploiement.
+      rationale: >
+        Le task-request suggère "à arbitrer". Trois options :
+        (a) garder l'ancien schéma FTS5 + ajouter le nouveau,
+        switcher search() entre les deux selon un flag, et
+        retirer l'ancien à la fin d'une période transitoire.
+        (b) recréer la table FTS5 avec le nouveau tokenizer
+        et reindex_all l'ensemble, migration atomique au
+        boot post-merge.
+        (c) ne pas changer le tokenizer FTS5 (statu quo) et
+        ne s'appuyer que sur la couche sémantique pour
+        capturer les faux négatifs.
+        Option (b) retenue. Justifications : (1) la table
+        FTS5 est entièrement reconstructible depuis les YAML
+        via reindex_all (PILIER D), donc une migration
+        atomique est sans risque de perte de données ; (2)
+        le coût de reindex_all sur 84 artifacts est < 10s,
+        invisible au boot ; (3) gérer deux schémas FTS en
+        parallèle complique la logique de search() sans
+        bénéfice clair (un agent ne sait pas distinguer les
+        deux périodes) ; (4) garder l'ancien tokenizer
+        (option c) laisse les facteurs 3, 4, 5 du
+        diagnostic non résolus et fait reposer toute la
+        qualité sur la sémantique, ce qui rend le système
+        fragile aux pannes d'embedder. Migration atomique
+        propre.
+
+    - decision: >
+        Aucun mécanisme de rollback applicatif via flag
+        d'environnement ; le rollback se fait par git revert
+        + recompilation + reindex_all au boot suivant.
+      rationale: >
+        Un flag d'env "use_old_search=1" qui restaurerait
+        l'ancien comportement obligerait à conserver TOUT le
+        code de l'ancien chemin lexical + le nouveau,
+        doublant la surface de bug. Le rollback par git
+        revert est cohérent avec le pattern utilisé par le
+        RFC cdbfee72 et lessons learned associées. La table
+        artifacts_vec inutilisée après revert ne cause pas
+        d'erreur (elle existe mais aucun code ne la lit).
+        Au prochain reindex_all post-revert, les écritures
+        dans artifacts_vec cesseront (le code n'existe plus
+        post-revert). Un nettoyage final de la table peut
+        être fait par PILIER D via integrity_check + wipe +
+        rebuild si nécessaire.
+
+    - decision: >
+        L'observabilité de l'indexation est élevée au rang
+        de composant first-class via le tool MCP index_status
+        et le mode explain=true.
+      rationale: >
+        Le diagnostic 6cfd1c62 a identifié le FACTEUR 6
+        (dépendance au file watcher) comme cause d'opacité
+        : les agents ne peuvent pas distinguer un faux
+        négatif sémantique d'un faux négatif d'indexation.
+        Avec index_status, un agent qui doute peut vérifier
+        l'état de son artifact en quelques ms. Avec
+        explain=true, un agent qui veut comprendre pourquoi
+        un résultat est en tête (ou absent) a la trace.
+        Cette observabilité est un investissement faible
+        (~quelques dizaines de lignes) qui paie sur tout le
+        cycle de vie du système.
+
+    - decision: >
+        Pas de mode dégradé "lexical-only" en fallback si
+        le modèle d'embedding ou l'extension sqlite-vec ne
+        charge pas au boot. Le serveur exite avec un message
+        clair. Symétrie stricte entre les deux composants de
+        la couche sémantique (modèle ET extension).
+      rationale: >
+        Décision PM iteration 2 sur l'incertitude 3 remontée
+        par l'agent-message 382cf805. La règle
+        memory_lookup_before_acting de shared-rules impose
+        la recherche à TOUS les agents avant TOUTE production
+        d'artifact. Si la couche sémantique ne tourne pas,
+        un fallback silencieux sur lexical-only maquille la
+        situation et donne une fausse impression de
+        fonctionnement, ce qui est précisément le mode
+        d'échec contre lequel le diagnostic 6cfd1c62 met en
+        garde (la mémoire collective qui ne se trouve pas
+        elle-même). Mieux vaut un échec clair que les agents
+        constatent immédiatement (le serveur ne démarre pas,
+        l'incident est traité) qu'une dégradation invisible.
+        Pour les environnements minimaux (CI, scripts de
+        maintenance) qui n'ont pas besoin de la sémantique,
+        la posture retenue est "installer le modèle dans CI"
+        plutôt que "introduire un flag de bypass". Aucun flag
+        d'environnement (par exemple un hypothétique
+        ORCHESTRATOR_LEXICAL_ONLY=1) n'est introduit ; il
+        n'existe qu'un seul mode opérationnel pour le serveur,
+        ce qui simplifie le debug et empêche les configurations
+        accidentelles silencieusement dégradées. Conséquence
+        symétrique sur le pipeline d'indexation : si l'embedding
+        échoue par artifact en runtime (modèle OOM, input
+        corrompu), rollback complet de la transaction (les
+        trois tables ou aucune), pas d'écriture partielle.
+
+    - decision: >
+        Un model_version est persisté à côté des embeddings
+        dès la v1, comparé au boot au model_version du modèle
+        chargé, et un mismatch déclenche wipe automatique de
+        artifacts_vec + reindex_all synchrone.
+      rationale: >
+        Décision PM iteration 2 sur l'incertitude 5 remontée
+        par l'agent-message 382cf805. Sans cette mécanique,
+        un changement de modèle entre deux versions du binaire
+        (downgrade, hotfix, switch entre candidats du choix
+        d'implementation-plan) laisse des embeddings stockés
+        qui ne sont plus comparables aux embeddings produits
+        par le nouveau modèle. Conséquence pratique : les
+        scores cosine deviennent incohérents, la fusion RRF
+        retourne du bruit, et le symptôme est difficile à
+        diagnostiquer parce que rien ne crashe explicitement.
+        Le PM a tranché en faveur de l'implémentation dès la
+        v1 plutôt que de différer en V2 : le coût d'ajout
+        est faible (quelques lignes au boot + à l'upsert),
+        le coût de rétrofit serait beaucoup plus élevé (il
+        faudrait migrer un parc d'embeddings déjà installé en
+        production sans savoir avec quel modèle ils ont été
+        produits). Format de stockage arbitré dans
+        l'implementation-plan parmi trois options techniquement
+        équivalentes (colonne par row, table séparée
+        single-row, PRAGMA user_version) sous contrainte de
+        détection O(1) au boot. La procédure de rebuild
+        post-mismatch réutilise reindex_all synchrone (déjà
+        nécessaire pour PILIER D du RFC cdbfee72), donc
+        aucune nouvelle mécanique structurelle à introduire.
+
+    - decision: >
+        Le scope du RFC bdee1af4 reste UNIQUE et indivisible
+        pour ce cycle : pas de découpage en plusieurs RFCs
+        séparés (lexical durci, embeddings, rerank/HyDE).
+      rationale: >
+        Décision PM iteration 2 sur l'incertitude 4 remontée
+        par l'agent-message 382cf805. L'utilisateur a
+        explicitement demandé "le truc qui marche" et a accepté
+        le breaking change sur search(). Un découpage en
+        plusieurs RFCs introduirait une période intermédiaire
+        où search() serait partiellement amélioré (par exemple
+        FTS5 durci seul, sans la couche sémantique) : ce mode
+        partiel ne résoudrait pas le symptôme du diagnostic
+        6cfd1c62 (les faux négatifs dominants sont sémantiques,
+        pas lexicaux). De plus, le découpage forcerait à
+        re-cadrer la suite à chaque étape, ce qui est un
+        mauvais usage du process. Les flags optionnels
+        (rerank, hyde) restent OFF par défaut, donc zéro
+        impact pour les agents qui ne les activent pas — leur
+        présence dans le scope est gratuite pour l'utilisateur
+        nominal et utile pour mesurer leur valeur dans le
+        même cycle. Les onze propositions du RFC forment un
+        tout cohérent qui rend search() opérationnel d'un
+        coup. La note d'agent-message qui évoquait la
+        possibilité de découper est explicitement caduque.
+
+  open_questions:
+    - >
+      Choix exact du modèle d'embedding parmi bge-m3,
+      multilingual-e5-large, paraphrase-multilingual-mpnet-base-v2,
+      nomic-embed-text-v1.5. Critère de tranche : précision
+      et rappel mesurés sur le jeu de queries de référence,
+      sous contrainte de latence < 200ms par query et footprint
+      < 1GB RAM. Arbitré dans l'implementation-plan.
+
+    - >
+      Dimension du vecteur résultant (384, 768, 1024). Dépend
+      du modèle retenu. Impact stockage : 84 artifacts * 1024
+      dims * 4 bytes = 344 KB par dimension, négligeable.
+      Impact ANN latence : linéaire en dimension sur brute
+      force, négligeable jusqu'à 1024. Arbitré dans
+      l'implementation-plan.
+
+    - >
+      Métrique de distance pour sqlite-vec : cosine vs L2 vs
+      dot product. Cosine est standard pour les
+      sentence-transformers normalisés. L2 peut être utilisé
+      sur des modèles à norme variable. Arbitré dans
+      l'implementation-plan selon le modèle retenu.
+
+    - >
+      Runtime d'inférence Rust pur (candle, fastembed-rs,
+      llm-chain-rs) vs sidecar (ollama, llama.cpp en
+      embedding mode). Recommandation initiale du design :
+      Rust pur pour simplicité opérationnelle. Arbitré dans
+      l'implementation-plan selon la disponibilité du modèle
+      retenu en runtime Rust.
+
+    - >
+      Constante k de RRF : valeur canonique 60 ou ajusté
+      empiriquement sur le jeu de queries de référence
+      ? Arbitré dans l'implementation-plan, après mesure
+      MRR sur le bench.
+
+    - >
+      Poids BM25 par colonne (titre, tags, description,
+      content). Recommandation initiale du design :
+      10 / 5 / 3 / 1. Valeur exacte mesurée empiriquement
+      dans l'implementation-plan.
+
+    - >
+      Taille du top-K candidat par chemin avant fusion : K =
+      50 par défaut. Augmenter K améliore le rappel mais
+      augmente le coût de calcul du RRF (négligeable jusqu'à
+      K = 500). Arbitré dans l'implementation-plan.
+
+    - >
+      Sémantique exacte du paramètre `tags` (AND vs OR).
+      Recommandation initiale : OR (un artifact qui matche
+      au moins un tag de la query). Arbitré dans
+      l'implementation-plan.
+
+    - >
+      Sémantique exacte du mode "natural" de
+      sanitize_fts_query : conversion des tokens en OR ou en
+      phrase implicite ? Arbitré dans l'implementation-plan.
+      Recommandation initiale : OR pour maximiser le rappel
+      au lexical, ce qui restera ranké correctement par
+      BM25.
+
+    - >
+      Le tool MCP `index_status` est-il un nouveau tool ou
+      une extension du tool existant `reindex_all` ?
+      Recommandation initiale du design : un nouveau tool
+      séparé parce que sa sémantique (lecture, instantané)
+      est différente de reindex_all (écriture, scan complet).
+      Arbitré dans l'implementation-plan.
+
+    - >
+      Comportement de search() en mode `mode=lexical` avec
+      query vide : retourner les filtrés par date desc (le
+      design pose cette sémantique pour le mode hybrid),
+      ou retourner une erreur ? Recommandation : sémantique
+      uniforme entre les trois modes (toujours filtrés par
+      date desc). Arbitré dans l'implementation-plan.
+
+    - >
+      Stratégie d'invalidation des embeddings après un
+      changement de modèle. Format de stockage du
+      model_version arbitré dans l'implementation-plan : champ
+      dédié dans artifacts_vec, table séparée
+      artifacts_vec_meta, ou PRAGMA user_version SQLite. Le
+      PRINCIPE est tranché (cf. section decisions ci-dessus,
+      décision "model_version persisté dès la v1") : un
+      identifiant de version est persisté à côté des vecteurs
+      dès la v1, comparé au boot au model_version du modèle
+      chargé, et un mismatch déclenche wipe automatique de
+      artifacts_vec + reindex_all synchrone. Cette open
+      question ne porte plus que sur le format de stockage,
+      pas sur le mécanisme.
+
+  triaxial_analysis:
+    nominal: >
+      Cas nominal — agent appelle search(query, kind=...) en
+      mode hybrid implicite. La query est normalisée côté
+      Rust, embedée par le modèle local en ~50ms, la couche
+      lexicale FTS5 retourne 50 candidats BM25-rangés, la
+      couche sémantique sqlite-vec retourne 50 candidats
+      cosine-rangés, le RRF fusionne en ~1ms, les top-10
+      sont retournés à l'agent. Latence totale : ~50ms +
+      ~5ms + ~10ms + ~1ms + ~5ms (sérialisation) = ~70ms.
+      Bien en dessous du p95 < 500ms. Indexation d'un
+      nouveau YAML : l'agent write, le hook spawn --index,
+      --index no-op au file watcher serveur (PILIER A), le
+      watcher index_artifact calcule embedding ~50ms +
+      upsert SQL transactionnel ~5ms, total ~55ms +
+      debounce 500ms. Searchable dans la seconde qui suit
+      le write.
+
+    negatif: >
+      Cas négatifs explicitement traités :
+
+      (1) Modèle d'embedding indisponible au boot (fichier
+      modèle absent du disque, OOM au load). Le serveur logue
+      ERROR et EXITE avec code non-zero. Pas de fallback
+      silencieux sur lexical-only, pas de flag de bypass.
+      Décision PM iteration 2 sur l'incertitude 3 : la règle
+      memory_lookup_before_acting impose la recherche à TOUS
+      les agents avant TOUTE production ; un fallback
+      silencieux maquillerait la situation et donnerait une
+      fausse impression de fonctionnement. Si CI manque le
+      modèle, le modèle est installé dans CI plutôt que
+      d'introduire un flag. Comportement symétrique au cas
+      sqlite-vec absent : tous les défauts d'infrastructure
+      de la couche sémantique font exiter le serveur au boot,
+      pas de matrix de modes. Le proxy résilient constate
+      l'exit, déclenche son circuit breaker, et l'utilisateur
+      est notifié immédiatement plutôt que de découvrir le
+      problème via une série de search() dégradés
+      inexpliqués.
+
+      (1') Échec d'embedding pendant un appel search() au
+      RUNTIME (précision iteration 3, réponse au finding
+      F-design-3). Distinct du cas (1) (boot) et du cas (h)
+      (échec pendant index_artifact). Quatre sous-cas
+      possibles à l'embedding de la query au moment d'un
+      search() :
+
+        (1'.a) Modèle pas encore en RAM (lazy load
+        accidentel). Ne devrait pas arriver si le sous-
+        composant (b) du pipeline-embeddings-local est
+        respecté (chargement obligatoire au boot, exit si
+        échec). Si malgré tout l'embedder n'est pas
+        initialisé au moment d'un search(), c'est un bug
+        d'initialisation : search() retourne une erreur
+        explicite "embedder not initialized, internal
+        bug" (code 500-equivalent côté MCP). Pas de
+        fallback silencieux sur lexical-only, cohérent
+        avec la décision iteration 2 sur l'incertitude 3.
+
+        (1'.b) OOM transitoire pendant l'inférence (la
+        machine a manqué de RAM le temps d'un batch).
+        search() retourne une erreur explicite "embedding
+        failed (oom), retry later or use mode=lexical".
+        L'agent appelant peut soit retry après quelques
+        secondes, soit basculer EXPLICITEMENT en
+        mode=lexical s'il accepte de perdre la couche
+        sémantique pour cette query. Pas de fallback
+        silencieux : si l'agent ne change pas son code, la
+        prochaine query échouera de la même façon, ce qui
+        est l'information utile.
+
+        (1'.c) Query trop longue pour la context length du
+        modèle (par exemple > 8192 tokens). Traitement
+        spécifié au cas (3) ci-dessous : truncation à
+        droite avec warning serveur, pas d'erreur retournée
+        à l'appelant. La distinction avec (1'.b) : (3) est
+        une dégradation acceptable, (1'.b) est un échec
+        bloquant.
+
+        (1'.d) Panic interne du runtime d'inférence (bug
+        de candle/ort/sidecar, segfault FFI rattrapé par
+        catch_unwind). search() retourne une erreur
+        explicite "embedding runtime panicked", code
+        non-zero. Le serveur lui-même ne crashe pas (la
+        panic est isolée au scope de l'inférence via
+        catch_unwind ou un thread dédié, à arbitrer dans
+        l'implementation-plan). Si les panics se répètent,
+        c'est un signal pour basculer le runtime
+        d'inférence ou réinstaller les poids ; sortie de
+        scope de la couche search().
+
+      Sémantique unifiée des sous-cas (1'.a/b/d). Pas de
+      fallback silencieux. Erreur explicite avec un message
+      qui distingue les sous-cas, code non-zero MCP. La
+      raison structurelle : l'agent qui a appelé search()
+      avait une intention (mode hybrid par défaut) ; lui
+      retourner silencieusement le résultat d'un autre mode
+      (lexical) lui ment sur la qualité du résultat. Mieux
+      vaut l'erreur explicite que l'agent peut soit retry
+      soit traiter en demandant explicitement
+      mode=lexical.
+
+      (2) Query vide sans filtres. search() retourne une
+      erreur explicite "empty query requires at least one
+      filter". Pas de fallback silencieux.
+
+      (3) Query trop longue (par exemple > 10000 caractères).
+      Le tokenizer FTS5 tronque naturellement, le modèle
+      d'embedding tronque selon sa context length max. La
+      query est acceptée et traitée sur sa version
+      tronquée, avec un warning dans les logs côté serveur.
+      Pas d'erreur retournée à l'appelant.
+
+      (4) Corpus vide (cas après wipe + avant reindex_all
+      complet). search() retourne 0 résultats sans erreur.
+      Comportement attendu, pas un cas d'erreur.
+
+      (5) sqlite-vec absent (extension non chargée par
+      le binaire). Détection au boot, le serveur exite avec
+      un message clair "sqlite-vec extension required, not
+      loaded — see build instructions". Pas de fallback
+      silencieux : on refuse de démarrer plutôt que de
+      servir un search() dégradé sans le savoir.
+
+      (6) ANTHROPIC_API_KEY absent mais rerank=true ou
+      hyde=true demandé. Erreur explicite côté search() :
+      "rerank/hyde requires ANTHROPIC_API_KEY". Pas de
+      fallback silencieux.
+
+      (7) Claude injoignable au runtime (timeout, rate
+      limit, panne réseau). Pour rerank : fallback sur RRF
+      sans rerank avec un warning. Pour HyDE : fallback sur
+      la query originale avec un warning. Les fallbacks
+      sont explicitement loggés parce que la qualité
+      attendue diffère.
+
+      (8) Filtre trop restrictif → 0 résultat. Comportement
+      attendu (pas un cas d'erreur).
+
+      (9) Erreur de validation du YAML pendant
+      index_artifact (yaml mal formé). La transaction
+      rollback les trois tables. L'artifact n'est pas
+      indexé. Log côté serveur. Pas de propagation
+      d'erreur côté search() (qui ne voit pas les YAML
+      invalides).
+
+    edge_cases: >
+      Cas limites explicitement traités :
+
+      (a) Langues mélangées dans la même query
+      ("hybrid recherche embeddings"). Le tokenizer
+      lexical traite chaque token indépendamment. Le
+      modèle d'embedding multilingue génère un vecteur
+      cohérent sur la query globale. La fusion RRF
+      combine. Pas de traitement spécial requis.
+
+      (b) Query UUID complet ("02c9f6eb-fb2d-48f2-82d2-
+      5676773e0e8b"). Le tokenizer unicode61 avec
+      séparateur `-` scinde en 5 tokens. Le lexical
+      trouve les artifacts qui contiennent ces tokens.
+      Le sémantique génère un embedding peu
+      discriminant (UUIDs n'ont pas de sens). En pratique
+      l'agent qui cherche par UUID complet utilisera
+      plutôt get(id=...). Cas géré sans surprise.
+
+      (c) Query UUID préfixe ("02c9f6eb"). Le filtre
+      id_prefix de l'API est l'usage idiomatique. Mais
+      si l'agent passe le préfixe comme query, le
+      tokenizer génère un token autonome après split sur
+      `-` (cas (b) ci-dessus), le lexical trouve les
+      artifacts qui contiennent ce préfixe dans titre,
+      tags, ou content. OK.
+
+      (d) Query avec opérateurs FTS5 historiques ("-foo",
+      "foo:bar", "foo OR bar"). En mode "natural"
+      (défaut), sanitize_fts_query échappe ces caractères
+      en tokens littéraux, donc la query devient
+      `MATCH "-foo"` ou équivalent, qui retourne 0
+      résultat lexical (pas de doc contenant littéralement
+      "-foo") mais le chemin sémantique passe quand même
+      via l'embedding de la query. En mode "advanced"
+      l'opérateur est interprété. Plus de "no such column"
+      stupide.
+
+      (e) Corpus 10x (840 artifacts). Mesure prédite :
+      lexical FTS5 < 20ms (linéaire en taille), embedding
+      query inchangé ~50ms (ne dépend pas du corpus),
+      ANN sqlite-vec brute force ~50ms (linéaire en
+      corpus, 10x = 50ms), RRF ~5ms (linéaire en K=50).
+      Total p95 estimé : ~130ms. Bien en dessous de la
+      cible 2s à 10x.
+
+      (f) Concurrence search() pendant un upsert
+      (index_artifact d'un nouveau YAML en parallèle).
+      Le Mutex tokio de l'engine sérialise les writes,
+      mais SQLite WAL autorise les reads pendant les
+      writes. search() lit FTS5 + sqlite-vec sans bloquer
+      le upsert. Au pire, search() voit l'état
+      pré-upsert pendant les ~55ms du upsert, ce qui
+      est acceptable.
+
+      (g) Concurrence avec PILIER A (RFC cdbfee72). Le
+      serveur tient le lock exclusif ; --index transitoire
+      no-op + délégue au file watcher. Ce design étend
+      simplement index_artifact pour calculer l'embedding,
+      sans modifier la sémantique du lock. L'invariant
+      writer unique est strictement préservé.
+
+      (h) Concurrence avec PILIER D (RFC cdbfee72). Au
+      boot après corruption, le serveur wipe + reindex_all
+      synchrone. reindex_all itère 84 artifacts, calcule
+      embedding pour chaque, upsert dans les trois tables.
+      Coût : ~4s au boot après corruption. À 10x : ~42s.
+      Acceptable (rare). L'invariant "tout ce qui est
+      indexé est cohérent" est préservé par construction.
+
+      (i) Embedding identique pour deux documents
+      différents (collision). Le mode hybrid RRF est
+      stable : si le sémantique les classe identiques,
+      le lexical les départage. Pas d'instabilité du
+      résultat.
+
+      (j) Première requête après boot, modèle pas encore
+      warm. Latence d'inférence peut être 200 à 500ms au
+      lieu de 50ms. Acceptable (cas isolé), masqué par le
+      load au boot du modèle (warm-up via une query
+      synthétique dans le startup, recommandation à
+      arbitrer dans l'implementation-plan).
