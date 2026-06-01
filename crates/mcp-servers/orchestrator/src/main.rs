@@ -146,11 +146,38 @@ struct SearchParams {
     #[schemars(description = "Full-text search query")]
     query: String,
     #[schemars(
-        description = "Optional: filter by artifact kind (e.g., lesson-learned, design-doc)"
+        description = "Optional: filter by artifact kind (e.g., lesson-learned, design-doc). \
+                       Accepts a single string for backwards compatibility."
     )]
     kind: Option<String>,
     #[schemars(description = "Maximum number of results (default 10)")]
     limit: Option<usize>,
+    #[schemars(description = "Optional: search mode 'lexical', 'semantic', or 'hybrid' (default)")]
+    mode: Option<String>,
+    #[schemars(description = "Optional: filter by author persona id")]
+    author: Option<String>,
+    #[schemars(description = "Optional: filter by project slug")]
+    project: Option<String>,
+    #[schemars(description = "Optional: filter by tag (OR semantics across the list)")]
+    tags: Option<Vec<String>>,
+    #[schemars(description = "Optional: artifacts created on or after this RFC3339 timestamp")]
+    created_after: Option<String>,
+    #[schemars(description = "Optional: artifacts created on or before this RFC3339 timestamp")]
+    created_before: Option<String>,
+    #[schemars(description = "Optional: filter by metadata.id prefix")]
+    id_prefix: Option<String>,
+    #[schemars(description = "Optional: when true, return scores and timing trace")]
+    explain: Option<bool>,
+    #[schemars(
+        description = "Optional: rerank top-K via Claude (requires ANTHROPIC_API_KEY; not yet \
+                       wired in step 13)"
+    )]
+    rerank: Option<bool>,
+    #[schemars(
+        description = "Optional: expand the query via Claude HyDE (requires ANTHROPIC_API_KEY; \
+                       not yet wired in step 13)"
+    )]
+    hyde: Option<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -564,14 +591,62 @@ impl OrchestratorServer {
     )]
     async fn search(&self, params: Parameters<SearchParams>) -> Result<CallToolResult, McpError> {
         let params = params.0;
-        let limit = params.limit.unwrap_or(constants::DEFAULT_SEARCH_LIMIT);
+        let limit = params
+            .limit
+            .unwrap_or(constants::DEFAULT_SEARCH_LIMIT)
+            .min(100);
+        let mode = match params.mode.as_deref() {
+            Some("lexical") => companyos_orchestrator::engine::SearchMode::Lexical,
+            Some("semantic") => companyos_orchestrator::engine::SearchMode::Semantic,
+            None | Some("hybrid") => companyos_orchestrator::engine::SearchMode::Hybrid,
+            Some(other) => {
+                return err(Diagnostic::error(C, "Invalid search mode")
+                    .with_context(format!("search(mode={other})"))
+                    .with_reason(format!("unknown mode '{other}'"))
+                    .with_fix("Use one of: 'lexical', 'semantic', 'hybrid'")
+                    .to_string());
+            }
+        };
+        let filters = companyos_orchestrator::SearchFilters {
+            kinds: params.kind.map(|k| vec![k]),
+            author: params.author,
+            tags: params.tags,
+            project: params.project,
+            created_after: params.created_after,
+            created_before: params.created_before,
+            id_prefix: params.id_prefix,
+        };
+        let req = companyos_orchestrator::engine::SearchRequest {
+            query: params.query.clone(),
+            mode,
+            filters,
+            limit,
+            rerank: params.rerank.unwrap_or(false),
+            hyde: params.hyde.unwrap_or(false),
+            explain: params.explain.unwrap_or(false),
+        };
+
         let engine = self.engine.lock().await;
-        match engine.search(&params.query, params.kind.as_deref(), limit) {
-            Ok(results) => ok(serde_json::to_string_pretty(&serde_json::json!({
-                "results": results,
-                "count": results.len(),
-            }))
-            .unwrap_or_default()),
+        match engine.search_hybrid(req) {
+            Ok(resp) => {
+                let count = resp.results.len();
+                let mut json_out = serde_json::json!({
+                    "results": resp.results,
+                    "count": count,
+                });
+                if let Some(trace) = resp.explain {
+                    json_out["explain"] = serde_json::json!({
+                        "mode_applied": trace.mode_applied,
+                        "candidate_set_sizes": {
+                            "lexical": trace.candidate_set_sizes_lexical,
+                            "semantic": trace.candidate_set_sizes_semantic,
+                            "fused": trace.candidate_set_sizes_fused,
+                        },
+                        "latency_ms": trace.latency_ms,
+                    });
+                }
+                ok(serde_json::to_string_pretty(&json_out).unwrap_or_default())
+            }
             Err(e) => err(Diagnostic::error(C, "Search failed")
                 .with_context(format!("search(query={})", params.query))
                 .with_reason(format!("{e}"))

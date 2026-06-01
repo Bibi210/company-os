@@ -33,6 +33,52 @@ use crate::types::*;
 /// to roadmap artifacts. Keep in sync with crates/config/src/types.rs.
 const ROADMAP_KIND: &str = "roadmap";
 
+/// Top-K candidate set size per axis BEFORE fusion. The RRF then selects
+/// the top `limit` from the union. 50 is the canonical choice from the
+/// hybrid search literature and gives ample slack for an N=10 final
+/// answer (RFC bdee1af4 proposition 3, plan 640e2894 étape 1).
+const SEARCH_RETRIEVE_K: usize = 50;
+
+/// Mode of the search pipeline. `Hybrid` is the default everywhere; the
+/// other two exist for callers that want to bypass fusion (e.g. an
+/// agent that knows the answer is a UUID and wants strict lexical).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchMode {
+    Lexical,
+    Semantic,
+    #[default]
+    Hybrid,
+}
+
+/// Request payload for [`OrchestratorEngine::search_hybrid`].
+#[derive(Debug, Clone)]
+pub struct SearchRequest {
+    pub query: String,
+    pub mode: SearchMode,
+    pub filters: crate::db::SearchFilters,
+    pub limit: usize,
+    pub rerank: bool,
+    pub hyde: bool,
+    pub explain: bool,
+}
+
+/// Response payload for [`OrchestratorEngine::search_hybrid`].
+#[derive(Debug, Clone)]
+pub struct SearchResponse {
+    pub results: Vec<ArtifactSummary>,
+    pub explain: Option<ExplainTrace>,
+}
+
+/// Optional per-call trace data, populated when `explain=true`.
+#[derive(Debug, Clone, Default)]
+pub struct ExplainTrace {
+    pub mode_applied: String,
+    pub candidate_set_sizes_lexical: usize,
+    pub candidate_set_sizes_semantic: usize,
+    pub candidate_set_sizes_fused: usize,
+    pub latency_ms: u64,
+}
+
 pub struct OrchestratorEngine {
     db: OrchestratorDb,
     max_iterations: u32,
@@ -477,14 +523,165 @@ impl OrchestratorEngine {
         Ok(artifact)
     }
 
-    /// Search the artifact index. Returns lightweight summaries.
+    /// Legacy single-mode search kept for direct callers that did not
+    /// migrate to [`Self::search_hybrid`]. Internally calls the new
+    /// hybrid pipeline with `mode = Hybrid` and falls back to lexical
+    /// if the embedder is unavailable.
     pub fn search(
         &self,
         query: &str,
         kind: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ArtifactSummary>, OrchestratorError> {
-        self.db.search_artifacts(query, kind, limit)
+        let filters = crate::db::SearchFilters {
+            kinds: kind.map(|k| vec![k.to_string()]),
+            ..Default::default()
+        };
+        let req = SearchRequest {
+            query: query.to_string(),
+            mode: SearchMode::Hybrid,
+            filters,
+            limit,
+            rerank: false,
+            hyde: false,
+            explain: false,
+        };
+        Ok(self.search_hybrid(req)?.results)
+    }
+
+    /// Hybrid search entry point. Drives the lexical + semantic + fusion
+    /// pipeline per the request mode and filters.
+    pub fn search_hybrid(&self, req: SearchRequest) -> Result<SearchResponse, OrchestratorError> {
+        let started = std::time::Instant::now();
+        let mut trace = ExplainTrace {
+            mode_applied: format!("{:?}", req.mode),
+            ..Default::default()
+        };
+
+        // (1) Empty query handling
+        let query_empty = req.query.trim().is_empty();
+        let has_filter = req.filters.kinds.is_some()
+            || req.filters.author.is_some()
+            || req.filters.tags.is_some()
+            || req.filters.project.is_some()
+            || req.filters.created_after.is_some()
+            || req.filters.created_before.is_some()
+            || req.filters.id_prefix.is_some();
+
+        if query_empty && !has_filter {
+            return Err(OrchestratorError::ValidationFailed {
+                id: "search".into(),
+                errors: "empty query requires at least one filter".into(),
+            });
+        }
+        if query_empty && has_filter {
+            // List-mode: filtered scan ordered by created_at desc (recent
+            // first), bypassing FTS and embed entirely.
+            let summaries = self.list_with_filters(&req.filters, req.limit)?;
+            trace.candidate_set_sizes_fused = summaries.len();
+            return Ok(SearchResponse {
+                results: summaries,
+                explain: if req.explain { Some(trace) } else { None },
+            });
+        }
+
+        // (2) Lexical path
+        let fts_query =
+            crate::query::sanitize_fts_query(&req.query, crate::query::QueryMode::Natural);
+        let lex = match req.mode {
+            SearchMode::Semantic => Vec::new(),
+            _ => self
+                .db
+                .search_lexical(&fts_query, &req.filters, SEARCH_RETRIEVE_K)?,
+        };
+        trace.candidate_set_sizes_lexical = lex.len();
+
+        // (3) Semantic path
+        let sem = match req.mode {
+            SearchMode::Lexical => Vec::new(),
+            _ => {
+                let embedder = self.require_embedder()?;
+                // HyDE / rerank stubs — étape 13.
+                if req.hyde {
+                    return Err(OrchestratorError::AnthropicKeyMissing {
+                        feature: "hyde (step 13 not yet wired)".into(),
+                    });
+                }
+                let q_embedding = embedder.embed_text(&req.query)?;
+                self.db
+                    .search_semantic(&q_embedding, &req.filters, SEARCH_RETRIEVE_K)?
+            }
+        };
+        trace.candidate_set_sizes_semantic = sem.len();
+
+        // (4) Fusion
+        let fused = match req.mode {
+            SearchMode::Lexical => lex
+                .iter()
+                .map(|r| crate::fusion::FusedResult {
+                    id: r.id.clone(),
+                    score: 1.0 / (crate::fusion::DEFAULT_RRF_K + r.rank as f64),
+                    lexical_rank: Some(r.rank),
+                    semantic_rank: None,
+                })
+                .take(req.limit)
+                .collect::<Vec<_>>(),
+            SearchMode::Semantic => sem
+                .iter()
+                .map(|r| crate::fusion::FusedResult {
+                    id: r.id.clone(),
+                    score: 1.0 / (crate::fusion::DEFAULT_RRF_K + r.rank as f64),
+                    lexical_rank: None,
+                    semantic_rank: Some(r.rank),
+                })
+                .take(req.limit)
+                .collect::<Vec<_>>(),
+            SearchMode::Hybrid => {
+                crate::fusion::rrf_fuse(&lex, &sem, crate::fusion::DEFAULT_RRF_K, req.limit)
+            }
+        };
+        trace.candidate_set_sizes_fused = fused.len();
+
+        // (5) Hydrate
+        let mut results: Vec<ArtifactSummary> = Vec::with_capacity(fused.len());
+        for r in &fused {
+            if let Some(art) = self.db.get_artifact(&r.id)? {
+                let tags: Vec<String> =
+                    serde_json::from_str(&serde_json::to_string(&art.tags)?).unwrap_or_default();
+                results.push(ArtifactSummary {
+                    id: art.id,
+                    kind: art.kind,
+                    title: art.title,
+                    description: art.description,
+                    tags,
+                });
+            }
+        }
+
+        // (6) Rerank (stub — étape 13)
+        if req.rerank {
+            return Err(OrchestratorError::AnthropicKeyMissing {
+                feature: "rerank (step 13 not yet wired)".into(),
+            });
+        }
+
+        trace.latency_ms = started.elapsed().as_millis() as u64;
+
+        Ok(SearchResponse {
+            results,
+            explain: if req.explain { Some(trace) } else { None },
+        })
+    }
+
+    /// Filtered list mode (empty query + filters). Returns artifacts
+    /// matching the filters ordered by created_at desc (recent first),
+    /// or by indexed_at desc when created_at is NULL.
+    fn list_with_filters(
+        &self,
+        filters: &crate::db::SearchFilters,
+        limit: usize,
+    ) -> Result<Vec<ArtifactSummary>, OrchestratorError> {
+        self.db.list_with_filters(filters, limit)
     }
 
     /// Get full artifact content by ID. Reads the file from disk.

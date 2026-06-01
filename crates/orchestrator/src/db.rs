@@ -928,6 +928,53 @@ impl OrchestratorDb {
             .collect())
     }
 
+    /// List artifacts matching the given filters ordered by created_at
+    /// desc (recent first, NULLs last). Used for the empty-query +
+    /// filters mode of `search`.
+    pub fn list_with_filters(
+        &self,
+        filters: &SearchFilters,
+        limit: usize,
+    ) -> Result<Vec<ArtifactSummary>, OrchestratorError> {
+        let mut sql = String::from(
+            "SELECT a.id, a.kind, a.title, a.description, a.tags \
+             FROM artifacts a WHERE 1=1",
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        append_filter_clauses(filters, &mut sql, &mut params_vec);
+        sql.push_str(" ORDER BY COALESCE(a.created_at, a.indexed_at) DESC LIMIT ?");
+        params_vec.push(Box::new(limit as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|b| b.as_ref()).collect();
+        let rows: Vec<(String, String, String, String, String)> = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(id, kind, title, description, tags_json)| {
+                let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+                ArtifactSummary {
+                    id,
+                    kind,
+                    title,
+                    description,
+                    tags,
+                }
+            })
+            .collect())
+    }
+
     /// Legacy lexical search used by callers that have not yet migrated
     /// to the (filters, mode) API. Kept for backwards compat during the
     /// transition; new callers should use `search_lexical` or the engine
