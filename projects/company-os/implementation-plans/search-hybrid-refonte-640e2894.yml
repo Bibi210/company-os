@@ -1,0 +1,1549 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 640e2894-6d9e-4c75-bfc7-5a63ec3c84c9
+  title: "Refonte search() en hybrid retrieval : plan d'implémentation détaillé (FTS5 BM25 durci + fastembed-rs + sqlite-vec + RRF + filtres + index_status)"
+  author: implementer
+  created_at: "2026-06-01"
+  project: company-os
+  description: >
+    Plan d'implémentation dérivé du design-doc f433fefc et du RFC bdee1af4
+    (approuvé, write permit a0b34bcd actif). Tranche les deux incertitudes
+    structurelles laissées ouvertes par l'Architect en cohérence avec les
+    contraintes du RFC (autonomie runtime DURE, footprint < 1GB, latence
+    p95 < 100ms par embedding, déterminisme effectif > 0.9999 cosine
+    similarity sur la même machine). Décompose le chantier en 24 étapes
+    ordonnées, regroupées en sept blocs cohérents (pré-requis et
+    dépendances, lexical durci, sémantique, fusion et API, observabilité,
+    tests et benchmark, clôture). Chaque étape liste les fichiers
+    impactés (tous couverts par les 15 target_paths du permit a0b34bcd),
+    sa dépendance amont, et son critère de validation. Le plan ne remet
+    pas en cause les décisions architecturales tranchées par les
+    iterations 2 et 3 du RFC et du design-doc. Si un trou de permit est
+    découvert en cours d'exécution (par exemple un nouveau fichier non
+    listé), l'Implementer s'arrête et demande extension via
+    agent-message, conformément à la lesson 611fde3e.
+  tags:
+    - search
+    - retrieval
+    - hybrid-search
+    - bm25
+    - embeddings
+    - sqlite-vec
+    - rrf
+    - fastembed
+    - implementation-plan
+    - critical-infra
+  related:
+    - id: bdee1af4-4944-4bee-b7c0-18efd6c7961f
+      kind: rfc
+      relationship: input
+    - id: f433fefc-81b7-4b32-b9a3-3ddd6a020a73
+      kind: design-doc
+      relationship: input
+    - id: 02c9f6eb-fb2d-48f2-82d2-5676773e0e8b
+      kind: task-request
+      relationship: input
+    - id: 6cfd1c62-cbf1-4941-90e1-a0886a9e551c
+      kind: diagnostic-report
+      relationship: input
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  steps:
+    - description: >
+        ÉTAPE 1 — Décisions tranchées et constantes. Ce n'est pas une
+        étape d'écriture : c'est la table des arbitrages que les étapes
+        suivantes appliquent. Les valeurs ci-dessous sont les défauts ;
+        elles peuvent être ajustées par l'étape 18 (benchmark) si une
+        mesure empirique le justifie, avec rationale documenté en
+        changelog du plan.
+
+        DÉPENDANCES EXTERNES (target_paths Cargo.toml + Cargo.lock du
+        permit).
+          - rusqlite : conserver "0.32" (compatible avec sqlite-vec
+            actuel), AJOUTER la feature "load_extension" en plus de
+            "bundled".
+          - sqlite-vec (crate Rust qui empacquette la lib C statique
+            via build.rs) : version exacte pinnée. Cible "=0.1.6" ou la
+            dernière 0.1.x publiée à l'instant du merge, à confirmer
+            empiriquement à l'étape 2. La crate expose
+            sqlite_vec::sqlite3_vec_init et un helper d'enregistrement
+            via sqlite3_auto_extension. Pin EXACT (=) imposé par
+            F-rfc-4 du RFC, smoke test au boot imposé à l'étape 3.
+          - fastembed : version "=5.x.y" exact, dernière 5.x publiée
+            au merge. Justification du choix : seul runtime Rust qui
+            respecte (i) autonomie runtime au moment de embed() une
+            fois les poids en cache local, (ii) catalogue de modèles
+            multilingues testés et quantizés int8/fp16, (iii) API
+            synchrone simple (TextEmbedding::try_new + embed(&[txt])),
+            (iv) gestion des poids déterministe via Hugging Face
+            cache. Le RFC F-commun-1 (iteration 3) a explicitement
+            assoupli la contrainte "Rust pur" et accepte FFI vers ONNX
+            Runtime.
+
+        MODÈLE D'EMBEDDING BASELINE.
+          - Choix : fastembed::EmbeddingModel::MultilingualE5Small.
+          - Justification : 118M paramètres, dimension 384, quantization
+            int8, footprint disk ~120MB, footprint RAM chargé ~150MB,
+            latence CPU ~20-40ms par texte court, multilingue natif
+            (entraîné sur 100+ langues dont FR et EN technique). Tient
+            largement dans la contrainte footprint < 1GB et latence
+            < 100ms. Score MIRACL/MTEB multilingue solide pour la
+            taille.
+          - model_version stocké en DB : la chaîne
+            "intfloat/multilingual-e5-small@v1" (model_name + tag
+            interne). Tout changement de modèle bump cette chaîne et
+            déclenche wipe + reindex_all automatique au boot (cf.
+            étape 5).
+          - Fallback documenté : si le benchmark de l'étape 18 montre
+            précision@10 < 0.5 sur le bench, escalade vers
+            MultilingualE5Base (278M, dim 768, ~280MB) puis
+            ParaphraseMlMpnetBaseV2 (278M, dim 768). Si toutes
+            insuffisantes, BgeM3 quantizé (568M, dim 1024). Le
+            changement de modèle change model_version, donc tout
+            reindex au boot est gratuit.
+
+        DIMENSIONS DU VECTEUR.
+          - 384 pour la baseline E5Small. La création de la table
+            virtuelle artifacts_vec fige ce paramètre. Un changement
+            de modèle qui changerait la dimension déclenche
+            wipe + DROP + CREATE de artifacts_vec dans le code de
+            détection model_version (étape 5).
+
+        MÉTRIQUE DE DISTANCE.
+          - cosine. Les embeddings sentence-transformers sont
+            normalisés L2 implicitement par fastembed (option
+            normalize=true). cosine distance = 1 - dot product, donc
+            sqlite-vec va calculer L2 distance sur vecteurs L2-normés
+            = équivalent monotone à cosine. Le SELECT trie sur
+            distance ASC, donc plus petit = plus proche, sans
+            ambiguïté.
+
+        CONSTANTES DE FUSION ET BM25.
+          - K_RETRIEVE (top-K par chemin avant fusion) : 50. Couvre
+            largement le besoin d'un top-N=10 fusionné et reste
+            sub-10ms en lexical comme en sémantique sur le corpus
+            actuel.
+          - k_RRF (smoothing constant) : 60. Valeur canonique TREC,
+            robuste empiriquement. À éventuellement ajuster à l'étape
+            18.
+          - Poids BM25 par colonne : w_title=10, w_tags=5,
+            w_description=3, w_content=1. Cohérent avec la
+            recommandation initiale du RFC proposition 1. La fonction
+            bm25() de FTS5 attend les poids dans l'ordre des colonnes
+            indexées (cf. étape 10).
+
+        TOKENIZER FTS5 EXPLICITE.
+          - unicode61, remove_diacritics=2 (NFKD folding),
+            tokenchars="" (rien à ajouter aux tokens par défaut),
+            separators="-_./'\"" (cinq caractères ajoutés aux
+            séparateurs par défaut de unicode61). Cela tokenise
+            "sqlite-vec" en {sqlite, vec}, "BGE-M3" en {bge, m3},
+            "rfc/bdee1af4" en {rfc, bdee1af4}, et l'apostrophe et
+            le guillemet en séparateurs garantit qu'un "l'agent"
+            tokenise en {l, agent}. NFKD fold diacritics donc
+            "résumé" et "resume" matchent.
+
+        PIPELINE DE CALCUL D'EMBEDDING.
+          - Vue embeddable : metadata.title + ". " +
+            metadata.description + ". " + tags.join(", ") + ". " +
+            body_text_by_kind, où body_text_by_kind concatène les
+            champs sémantiques de spec selon le kind (mapping détaillé
+            à l'étape 4). Si la concaténation dépasse 8192 caractères
+            (proxy raisonnable de 2048 tokens E5), tronquer à droite
+            sans chunking (décision design-doc).
+          - normalize=true (cosine via L2 sur vecteurs normés).
+
+        MÉCANIQUE PRE-FETCH.
+          - Mode CLI dédié du binaire orchestrator :
+            `--prefetch-embeddings`. Charge le modèle via
+            fastembed::TextEmbedding::try_new (qui télécharge dans le
+            cache HF par défaut, redirigé vers
+            company/data/embeddings/cache/<model_version>/ via
+            variable d'environnement HF_HOME ou option fastembed).
+            Affiche "OK" et exit 0 si succès. Cette commande est
+            idempotente.
+          - Check au boot : avant ouverture du serveur (run_server),
+            APRÈS load_extension sqlite-vec et AVANT smoke test,
+            vérifier la présence du cache. Si absent : exit non-zero
+            avec message "embedding model cache not found at <path>,
+            run cargo run -- --prefetch-embeddings first".
+          - Note : fastembed gère la résolution du cache en interne ;
+            on peut s'appuyer sur cette gestion plutôt que ré-
+            inventer le check fichier-par-fichier. Décision tactique
+            à l'étape 4 : essayer un load "léger" (initialiser le
+            TextEmbedding et capturer l'erreur si pas de cache et pas
+            de réseau) plutôt qu'un check filesystem. Si fastembed
+            tente le réseau et échoue, on remonte une erreur claire.
+            Si fastembed s'appuie sur HF_HUB_OFFLINE=1 pour bloquer
+            le réseau, on set la variable au boot. Détail technique
+            à valider en code à l'étape 4.
+
+        CACHE_DIR.
+          - company/data/embeddings/cache/<model_version>/ avec
+            <model_version> = "multilingual-e5-small-v1" (slug du
+            model_version pour éviter les "@" dans le path). Le path
+            est créé par --prefetch-embeddings et lu au boot.
+          - Le dossier company/data/embeddings/ est ajouté au
+            .gitignore (étape 4 inclut cette modification, mais
+            .gitignore n'est PAS dans le permit donc on devra demander
+            extension si nécessaire ; alternatif : un nouveau
+            sous-dossier company/data/ déjà gitignored par
+            company/data/orchestrator.db pattern. À vérifier au
+            moment du code).
+
+        Aucune écriture de fichier à cette étape ; c'est la table
+        des décisions que les étapes suivantes consomment.
+      files: []
+
+    - description: >
+        ÉTAPE 2 — Ajout des dépendances workspace. Modification
+        unique du Cargo.toml racine pour activer la feature
+        load_extension de rusqlite, et ajout de fastembed et
+        sqlite-vec dans workspace.dependencies. Cargo.lock va se
+        régénérer au prochain build, c'est attendu.
+
+        Modifications précises :
+          - rusqlite : `features = ["bundled", "load_extension"]`
+            (au lieu de `["bundled"]` actuel).
+          - Ajouter : `fastembed = "=5.x.y"` (version exacte à fixer
+            au moment de l'écriture du code en consultant crates.io
+            pour la dernière 5.x stable).
+          - Ajouter : `sqlite-vec = "=0.1.x"` (idem dernière 0.1.x
+            stable, contrainte F-rfc-4).
+
+        Le crate orchestrator (crates/orchestrator/Cargo.toml) ajoute
+        ces deux dépendances avec workspace = true.
+
+        Le crate mcp-servers/orchestrator (crates/mcp-servers/
+        orchestrator/Cargo.toml) ne change PAS : il consomme
+        l'orchestrator via le path, donc bénéficie transitivement
+        des nouvelles dépendances.
+
+        Validation : `cargo check -p companyos-orchestrator` au
+        terme de cette étape doit passer (les nouvelles deps sont
+        importables même si pas encore utilisées). Note: ce check
+        sera fait avec le build complet à la fin de l'étape 4.
+      files:
+        - Cargo.toml
+        - Cargo.lock
+        - crates/orchestrator/Cargo.toml
+
+    - description: >
+        ÉTAPE 3 — Intégration de sqlite-vec et smoke test au boot.
+        Création du module helper d'enregistrement de l'extension
+        et du smoke test obligatoire (proposition 2(d.2) du RFC).
+
+        Modifications dans crates/orchestrator/src/db.rs :
+
+          (a) Imports : `use sqlite_vec::sqlite3_vec_init;` (le
+              binding crate expose la fonction d'initialisation
+              de l'extension comme un symbole C). Si l'API est
+              différente (par exemple via un `auto_extension()`
+              helper), adapter en conséquence — vérifier la doc de
+              la version pinnée.
+
+          (b) Dans `OrchestratorDb::open`, AVANT l'application des
+              defensive pragmas et AVANT migrate :
+
+                conn.load_extension_enable()?;
+                // SAFETY : load_extension est unsafe pour la
+                // possibilité de charger une lib arbitraire ; ici
+                // on charge la fonction Rust embarquée statiquement
+                // par la crate sqlite-vec, pas un .so externe.
+                unsafe {
+                  conn.load_extension(sqlite_vec_init_path, None)?;
+                  // ou via sqlite3_auto_extension selon l'API
+                  // exacte de la crate.
+                }
+                conn.load_extension_disable()?;
+
+              Plus précisément, sqlite-vec crate fournit
+              probablement une API safe du genre
+              `sqlite_vec::load_module(&conn)` ou similaire. Utiliser
+              l'API safe si elle existe, sinon le pattern unsafe
+              ci-dessus.
+
+          (c) Smoke test : nouvelle méthode privée
+              `fn smoke_test_sqlite_vec(&self) -> Result<()>` qui :
+                - Crée une table virtuelle `vec0_smoketest USING
+                  vec0(emb float[3])` en mémoire de la connexion
+                  courante (utilisable parce que c'est une table
+                  TEMPORAIRE ou définie sur la DB ouverte). À la fin
+                  du test, DROP TABLE vec0_smoketest.
+                - INSERT INTO vec0_smoketest (rowid, emb) VALUES
+                  (1, '[1.0, 0.0, 0.0]'), (2, '[0.0, 1.0, 0.0]').
+                - Exécute `SELECT rowid, distance FROM vec0_smoketest
+                  WHERE emb MATCH '[1.0, 0.0, 0.0]' AND k = 2 ORDER
+                  BY distance` (syntaxe sqlite-vec).
+                - Vérifie que la première row a rowid=1 et distance
+                  proche de 0 (< 1e-3), et que la seconde a rowid=2
+                  et distance > 0 (au moins 1.0 pour L2 ou ~1 pour
+                  cosine).
+                - Si la vérification échoue : retourne
+                  OrchestratorError::IntegrityFailure avec details
+                  "sqlite-vec smoke test failed: <observed>".
+                - DROP TABLE en fin.
+              Cette méthode est appelée par OrchestratorDb::open
+              après load_extension et avant le retour.
+
+          (d) Si load_extension échoue (lib mal liée, ABI cassé) :
+              propager l'erreur, qui remontera jusqu'à main et
+              causera l'exit non-zero du serveur (cohérent avec
+              proposition 2(c)(d) du RFC : pas de fallback
+              silencieux).
+
+        Test unitaire à ajouter dans le module tests existant de
+        db.rs : `test_smoke_test_sqlite_vec_passes_on_fresh_db`
+        et `test_smoke_test_detects_broken_knn` (ce dernier test
+        peut être skip si pas trivial à simuler, on accepte une
+        couverture partielle ; le test positif suffit pour
+        l'acceptance).
+
+        Validation : `cargo test -p companyos-orchestrator
+        test_smoke_test` passe.
+      files:
+        - crates/orchestrator/src/db.rs
+
+    - description: >
+        ÉTAPE 4 — Module embedding.rs. Nouveau fichier qui implémente
+        la couche d'embedding via fastembed.
+
+        Création de crates/orchestrator/src/embedding.rs avec :
+
+          (a) Constantes au sommet :
+                pub const MODEL_VERSION: &str =
+                  "multilingual-e5-small-v1";
+                pub const EMBEDDING_DIM: usize = 384;
+                pub const CACHE_DIR_REL: &str =
+                  "company/data/embeddings/cache/multilingual-e5-small-v1";
+                pub const MAX_INPUT_CHARS: usize = 8192;
+
+          (b) Struct publique :
+                pub struct Embedder {
+                  inner: fastembed::TextEmbedding,
+                }
+
+                impl Embedder {
+                  pub fn load_from_cache(root: &str)
+                    -> Result<Self, OrchestratorError>;
+                  pub fn embed_text(&self, text: &str)
+                    -> Result<Vec<f32>, OrchestratorError>;
+                  pub fn embed_artifact_view(
+                    &self,
+                    yaml: &serde_json::Value,
+                    kind: &str,
+                  ) -> Result<Vec<f32>, OrchestratorError>;
+                }
+
+          (c) load_from_cache(root) :
+                - Construit cache_path = {root}/{CACHE_DIR_REL}.
+                - Définit HF_HUB_OFFLINE=1 et HF_HOME=cache_path
+                  via std::env::set_var AVANT l'init de
+                  TextEmbedding, pour forcer le mode offline.
+                - Appelle fastembed::TextEmbedding::try_new(
+                    InitOptions::new(EmbeddingModel::
+                    MultilingualE5Small).with_cache_dir(cache_path)
+                    .with_show_download_progress(false)
+                  ).
+                - Si erreur (cache absent, modèle pas téléchargé) :
+                  retourne OrchestratorError::EmbeddingModelMissing
+                  avec un message clair contenant le path du cache
+                  et la commande de pre-fetch.
+
+          (d) embed_text(text) :
+                - Truncate à MAX_INPUT_CHARS (slice sur byte
+                  boundary safe via String::from_utf8_lossy ou
+                  char_indices).
+                - Appelle self.inner.embed(vec![text.to_string()],
+                  Some(1)) (batch size 1).
+                - Vérifie que len(result) == 1 et len(result[0]) ==
+                  EMBEDDING_DIM.
+                - Retourne result.into_iter().next().unwrap().
+                - Tout panic du fastembed wrapper est converti en
+                  OrchestratorError::EmbeddingFailed avec message.
+
+          (e) embed_artifact_view(yaml, kind) :
+                - Construit la vue embeddable selon le kind :
+                  Universal prefix : title + ". " + description +
+                    ". " + tags.join(", ").
+                  Extensions par kind :
+                    - "task-request" : + spec.description
+                    - "design-doc"   : + spec.overview
+                    - "rfc"          : + spec.motivation
+                                      + " " + spec.proposal_summary
+                                      (truncated à 4000 chars)
+                    - "implementation-plan" : + concat des
+                      spec.steps[].description (truncated)
+                    - "diagnostic-report" : + spec.symptom
+                                          + " " + spec.root_cause
+                                          + " " + spec.resolution
+                    - "lesson-learned" : + spec.context
+                                       + " " + spec.insight
+                                       + " " + spec.recommendation
+                    - autres : juste le prefix universel.
+                - Appelle embed_text sur la vue construite.
+
+          (f) Mode --prefetch-embeddings dans main.rs (modification
+              du dispatcher CLI existant à l'étape 11) :
+                - Crée le dossier cache si absent.
+                - Lance fastembed::TextEmbedding::try_new SANS
+                  HF_HUB_OFFLINE pour autoriser le téléchargement.
+                - Affiche "Embedding model downloaded to <path>" et
+                  exit 0.
+
+        Ajout dans crates/orchestrator/src/error.rs :
+          variants EmbeddingModelMissing { path: String } et
+          EmbeddingFailed { reason: String }.
+
+        Ajout dans crates/orchestrator/src/lib.rs :
+          `pub mod embedding;` + re-exports utiles.
+
+        Tests unitaires (dans le module tests à la fin de
+        embedding.rs) :
+          - test_embedder_is_deterministic_same_text : deux appels
+            embed_text("hello world"), vérifier que cosine
+            similarity > 0.9999 (déterminisme effectif imposé par
+            iteration 3 du design-doc, finding F-design-2).
+          - test_embed_artifact_view_includes_title_and_tags : YAML
+            synthétique, vérifier que le texte est bien construit.
+          - test_embed_truncates_long_input : input > 10000 chars,
+            vérifie que ça n'échoue pas.
+        Note : ces tests exigent que le cache soit présent, donc
+        ils sont gated derrière #[cfg(test)] et exécutés en CI
+        après un --prefetch-embeddings préalable. Documenter dans
+        un README local.
+
+        Validation : cargo test après --prefetch-embeddings doit
+        passer.
+      files:
+        - crates/orchestrator/src/embedding.rs
+        - crates/orchestrator/src/error.rs
+        - crates/orchestrator/src/lib.rs
+
+    - description: >
+        ÉTAPE 5 — Schéma de la table virtuelle artifacts_vec et
+        métadonnées model_version. Modifications dans
+        crates/orchestrator/src/db.rs.
+
+        Ajout d'une constante :
+          const VEC_TABLE_SQL: &str = "
+            CREATE VIRTUAL TABLE IF NOT EXISTS artifacts_vec
+              USING vec0(
+                embedding float[384]
+              );
+            CREATE TABLE IF NOT EXISTS index_metadata (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            );
+          ";
+
+        Note : sqlite-vec vec0 utilise le rowid de la table virtuelle
+        pour corrélation. Pour faire le lien rowid <-> artifacts.id
+        (qui est un UUID string), on ajoute une colonne lookup :
+        soit on stocke artifact_id en colonne side via
+        `vec0(artifact_id text, embedding float[384])` (sqlite-vec
+        supporte les colonnes auxiliaires), soit on maintient une
+        table d'index `vec_artifact_id (rowid INTEGER PRIMARY KEY,
+        artifact_id TEXT NOT NULL UNIQUE)` à côté.
+
+        Décision pour ce plan : `vec0(artifact_id text, embedding
+        float[384])` avec partition_key sur artifact_id si sqlite-vec
+        le supporte ; sinon, la table `vec_artifact_id` séparée. Le
+        SQL exact est à finaliser au moment du code en consultant la
+        doc sqlite-vec, la propriété fonctionnelle est : on doit
+        pouvoir JOIN artifacts ON artifacts.id = <colonne dans
+        artifacts_vec>.
+
+        Migration du schéma. La fonction OrchestratorDb::migrate()
+        est étendue pour exécuter aussi VEC_TABLE_SQL dans la même
+        transaction BEGIN IMMEDIATE / COMMIT. La constante MIGRATION
+        devient :
+          "BEGIN IMMEDIATE; {SCHEMA_SQL} {FTS_SQL_NEW} {VEC_TABLE_SQL}
+           COMMIT;"
+        (où FTS_SQL_NEW est défini à l'étape 9 avec le tokenizer
+        explicite).
+
+        Détection model_version au boot :
+          - Nouvelle méthode OrchestratorDb::get_index_metadata(key)
+            et set_index_metadata(key, value) qui lisent/écrivent
+            dans index_metadata.
+          - Nouvelle méthode OrchestratorDb::check_and_update_
+            model_version(current: &str) -> Result<ModelVersionState>
+            où ModelVersionState enum { Fresh, Match, Mismatch }.
+            Fresh = pas de row dans index_metadata, on insère et
+            retourne Fresh. Match = row présente et égale, retourne
+            Match. Mismatch = row présente et différente, retourne
+            Mismatch (caller décide quoi faire : wipe + reindex).
+          - L'architecture_marker (F-design-2 design-doc iteration
+            3) est encodée dans la même chaîne :
+            "multilingual-e5-small-v1+<arch>", où <arch> vient de
+            std::env::consts::ARCH (par exemple "x86_64" ou
+            "aarch64"). Tout mismatch d'architecture déclenche aussi
+            un wipe + reindex via la même logique. Décision : on ne
+            fait PAS de champ séparé, on concatène dans
+            model_version.
+
+        Wipe + reindex en cas de mismatch. Le caller (run_server à
+        l'étape 11) consomme le résultat de
+        check_and_update_model_version. En cas de Mismatch, il
+        appelle une nouvelle méthode
+        OrchestratorDb::wipe_vec_table_and_metadata() qui
+        DELETE FROM artifacts_vec et DELETE FROM index_metadata
+        WHERE key = 'model_version', puis le code de run_server
+        déclenche reindex_all qui recalculera tous les embeddings
+        avec le nouveau modèle.
+
+        Tests unitaires :
+          - test_migrate_creates_vec_table : après migrate(), une
+            requête sur artifacts_vec ne doit pas échouer.
+          - test_model_version_fresh_then_match : appel deux fois
+            check_and_update avec la même chaîne, état Fresh puis
+            Match.
+          - test_model_version_mismatch_detected : insert "v1",
+            check avec "v2", état Mismatch.
+          - test_wipe_vec_clears_table.
+      files:
+        - crates/orchestrator/src/db.rs
+
+    - description: >
+        ÉTAPE 6 — Pipeline d'indexation transactionnel. Modification
+        de upsert_artifact dans db.rs pour inclure l'embedding dans
+        la même transaction.
+
+        Avant cette étape, upsert_artifact fait 3 DELETE puis 3
+        INSERT séparés (artifacts, artifacts_fts,
+        artifact_relations) hors transaction explicite. On passe à
+        une transaction atomique englobant artifacts +
+        artifacts_fts + artifacts_vec + artifact_relations.
+
+        Nouvelle signature :
+          pub fn upsert_artifact(
+            &self,
+            artifact: &IndexedArtifact,
+            content: &str,
+            embedding: &[f32],
+            relations: &[ParsedRelation],
+          ) -> Result<(), OrchestratorError>
+        Le paramètre embedding est slice de f32 de longueur
+        EMBEDDING_DIM (384). Le caller (engine.index_artifact à
+        l'étape 7) calcule l'embedding avant l'appel.
+
+        Corps :
+          let tx = self.conn.transaction()?;
+          tx.execute("DELETE FROM artifacts WHERE id = ?1", ...)?;
+          tx.execute("DELETE FROM artifacts_fts WHERE id = ?1", ...)?;
+          tx.execute("DELETE FROM artifacts_vec WHERE artifact_id =
+            ?1", ...)?;  // ou DELETE BY rowid via subquery selon le
+            schéma exact étape 5
+          tx.execute("DELETE FROM artifact_relations WHERE source_id
+            = ?1", ...)?;
+          tx.execute("INSERT INTO artifacts ...", ...)?;
+          tx.execute("INSERT INTO artifacts_fts ...", ...)?;
+          // serialize embedding as the bytes blob attendu par
+          // sqlite-vec (probably JSON array literal "[f1,f2,...]"
+          // or raw little-endian f32 bytes, selon la doc
+          // sqlite-vec pour la version pinnée)
+          tx.execute("INSERT INTO artifacts_vec (artifact_id,
+            embedding) VALUES (?1, ?2)", params![artifact.id,
+            embedding_serialized])?;
+          for rel in relations {
+            tx.execute("INSERT OR IGNORE INTO artifact_relations
+              ...", ...)?;
+          }
+          tx.commit()?;
+
+        Si une seule étape échoue, le rollback automatique laisse
+        la DB cohérente (aucune des 4 tables n'a écrit).
+
+        Note importante : si le commit échoue après le calcul de
+        l'embedding, on doit pouvoir signaler clairement à
+        engine.index_artifact que l'artifact n'a PAS été indexé. La
+        signature retourne Result, c'est l'usage habituel.
+
+        Tests unitaires :
+          - test_upsert_writes_all_three_tables : vérifie qu'après
+            upsert, l'id est présent dans artifacts, artifacts_fts
+            ET artifacts_vec.
+          - test_upsert_rollback_on_vec_failure : provoquer une
+            erreur sur l'INSERT vec (par exemple dimension wrong)
+            et vérifier qu'aucune des autres tables n'a écrit.
+            Marge tolérable : si la simulation d'erreur est trop
+            invasive, ce test peut être skipé avec un commentaire.
+          - test_upsert_re_index_replaces : upsert deux fois le
+            même id avec embeddings différents, vérifie que la
+            seconde valeur a remplacé la première dans
+            artifacts_vec.
+      files:
+        - crates/orchestrator/src/db.rs
+
+    - description: >
+        ÉTAPE 7 — Engine.index_artifact étendu pour calculer
+        l'embedding. Modification dans
+        crates/orchestrator/src/engine.rs.
+
+        OrchestratorEngine gagne un champ :
+          embedder: Arc<Embedder>
+
+        Le constructeur `new` prend l'embedder en paramètre :
+          pub fn new(
+            db: OrchestratorDb,
+            max_iterations: u32,
+            embedder: Arc<Embedder>,
+          ) -> Self
+        Tous les callers internes (main.rs run_server et run_index)
+        sont mis à jour pour passer l'embedder. Le test setup_engine
+        utilise un Embedder::load_from_cache() ; en CI cela exige
+        que le cache soit présent, gated par le mode
+        `--prefetch-embeddings` en pré-CI.
+
+        index_artifact() est étendue :
+          (1) Parse YAML comme aujourd'hui.
+          (2) extract_artifact_metadata.
+          (3) extract_searchable_content (le `content` actuel pour
+              FTS).
+          (4) extract_relations.
+          (5) NOUVEAU : embedder.embed_artifact_view(yaml, kind)
+              avant l'appel db.upsert_artifact.
+          (6) db.upsert_artifact(&artifact, &searchable, &embedding,
+              &relations).
+        Si (5) échoue (modèle indispo, OOM, panic) : on retourne
+        l'erreur, rien n'est upserté dans aucune des tables
+        (cohérent avec le rollback complet imposé par la
+        proposition 7 du RFC).
+
+        Note de performance. L'embedder.embed est synchrone côté
+        fastembed (potentiel blocage du thread tokio). Mesure
+        attendue ~25ms par texte. Sur le file watcher (debounce
+        500ms par fichier) c'est négligeable. Sur reindex_all,
+        84 artifacts * 25ms ~= 2.1s synchrones, acceptable au
+        boot. Si l'étape 18 mesure > 100ms par embedding,
+        envisager :
+          (a) spawn_blocking pour ne pas bloquer le tokio runtime,
+          (b) batch d'embeddings sur reindex_all (fastembed
+              supporte batch).
+        À ce stade, pas d'optimisation prématurée.
+
+        Tests unitaires :
+          - test_index_artifact_writes_embedding : index un YAML,
+            vérifie via db que artifacts_vec contient une row.
+          - test_index_artifact_failure_no_partial_write :
+            si embedder retourne Err (simuler via un trait mock ou
+            un embedder factice), aucune des 3 tables n'a écrit.
+            Si trop invasif à simuler, accepter une marge.
+      files:
+        - crates/orchestrator/src/engine.rs
+
+    - description: >
+        ÉTAPE 8 — Module fusion.rs (Reciprocal Rank Fusion).
+        Nouveau fichier crates/orchestrator/src/fusion.rs, pure
+        Rust, zéro I/O.
+
+        API :
+          pub struct RankedResult {
+            pub id: String,
+            pub rank: usize,  // 1-indexed
+          }
+
+          pub struct FusedResult {
+            pub id: String,
+            pub score: f64,
+            pub lexical_rank: Option<usize>,
+            pub semantic_rank: Option<usize>,
+          }
+
+          pub fn rrf_fuse(
+            lexical: &[RankedResult],
+            semantic: &[RankedResult],
+            k: f64,
+            top_n: usize,
+          ) -> Vec<FusedResult>;
+
+        Implémentation :
+          - HashMap<String, FusedResult>.
+          - Parcours lexical, set entry.lexical_rank = rank,
+            score += 1.0 / (k + rank as f64).
+          - Parcours semantic, set entry.semantic_rank = rank,
+            score += 1.0 / (k + rank as f64).
+          - Collect vers Vec, sort by score desc (avec id en
+            tie-breaker pour déterminisme).
+          - Truncate à top_n.
+
+        Ajout dans lib.rs : `pub mod fusion;`.
+
+        Tests unitaires :
+          - test_rrf_only_lexical : un résultat présent uniquement
+            dans lexical, son score = 1 / (k + 1).
+          - test_rrf_only_semantic : symétrique.
+          - test_rrf_both_higher_than_one : un résultat présent
+            dans les deux a un score = 2 / (k + 1), supérieur à
+            ceux présents dans une seule.
+          - test_rrf_top_n_truncation.
+          - test_rrf_deterministic_tie_breaker : deux ids avec
+            même score, ordre stable.
+      files:
+        - crates/orchestrator/src/fusion.rs
+        - crates/orchestrator/src/lib.rs
+
+    - description: >
+        ÉTAPE 9 — Module query.rs (sanitize_fts_query, modes
+        Natural / Advanced / Exact). Nouveau fichier
+        crates/orchestrator/src/query.rs.
+
+        API :
+          pub enum QueryMode { Natural, Advanced, Exact }
+
+          pub fn sanitize_fts_query(input: &str, mode: QueryMode)
+            -> String;
+
+        Implémentation :
+          Natural (défaut) :
+            - Strip leading/trailing whitespace.
+            - Si input vide, retourner "" (caller responsabilité).
+            - Tokenize sur whitespace (split_whitespace).
+            - Pour chaque token :
+                - Strip chars in {`*`, `:`, `"`, `(`, `)`, `-` (en
+                  position préfixe pour ne pas l'interpréter comme
+                  NOT)}.
+                - Si token vide après strip, skip.
+                - Wrap dans des double-quotes pour neutraliser tout
+                  caractère restant : '"' + token + '"'.
+            - Joindre tokens avec " OR ".
+            - Si liste vide, retourner "" (caller décide quoi faire,
+              par exemple skip lexical path).
+
+          Advanced :
+            - Retourner input tel quel (caller assume la
+              responsabilité d'une FTS5 expression valide).
+
+          Exact :
+            - Strip whitespace.
+            - Wrap dans double-quotes : '"' + escaped + '"' (échapper
+              les double-quotes internes en les doublant).
+            - Cas d'usage : id_prefix, recherche exacte d'UUID.
+
+        Ajout dans lib.rs : `pub mod query;`.
+
+        Tests unitaires (au moins 8) :
+          - test_natural_simple_words.
+          - test_natural_strips_dash.
+          - test_natural_strips_quotes_and_parens.
+          - test_natural_uuid_like_input.
+          - test_natural_empty_returns_empty.
+          - test_advanced_passthrough.
+          - test_exact_wraps_double_quotes.
+          - test_exact_escapes_internal_quotes.
+      files:
+        - crates/orchestrator/src/query.rs
+        - crates/orchestrator/src/lib.rs
+
+    - description: >
+        ÉTAPE 10 — Tokenizer FTS5 explicite et BM25 ranking côté
+        SQL. Modifications dans crates/orchestrator/src/db.rs.
+
+        (a) Constante FTS_SQL remplacée par FTS_SQL_NEW :
+              "CREATE VIRTUAL TABLE IF NOT EXISTS artifacts_fts
+                USING fts5(
+                  id UNINDEXED,
+                  kind,
+                  title,
+                  description,
+                  tags,
+                  content,
+                  tokenize = 'unicode61 remove_diacritics 2
+                             separators ''-_./\""'''
+                );"
+            Note : la syntaxe FTS5 pour tokenize accepte une string
+            avec options. Le `separators` accepte une chaîne où
+            chaque caractère est un séparateur. Apostrophes et
+            guillemets doivent être échappés selon les règles
+            SQLite (double-quote / double-single-quote). Validation
+            empirique au cours de l'étape 19 (migration au boot).
+
+        (b) search_artifacts() est REMPLACÉE par une nouvelle
+            méthode signature :
+
+              pub fn search_lexical(
+                &self,
+                fts_query: &str,  // déjà sanitizé par caller
+                filters: &SearchFilters,
+                limit: usize,
+              ) -> Result<Vec<RankedResult>, OrchestratorError>;
+
+            où SearchFilters est une nouvelle struct dans types.rs :
+              pub struct SearchFilters {
+                pub kind: Option<Vec<String>>,
+                pub author: Option<String>,
+                pub tags: Option<Vec<String>>,
+                pub project: Option<String>,
+                pub created_after: Option<String>, // RFC3339
+                pub created_before: Option<String>,
+                pub id_prefix: Option<String>,
+              }
+            Pas tous les filtres ont une colonne dédiée dans
+            artifacts. Note : artifacts.author, artifacts.project,
+            artifacts.created_at NE SONT PAS dans le schéma actuel
+            (cf. db.rs lignes 37-45). Décision : étendre la table
+            artifacts pour ajouter ces colonnes en NULL-tolerant,
+            et les peupler dans extract_artifact_metadata (étape
+            14 si nécessaire). Pour la première version, on peut
+            commencer minimaliste : kind et tags supportés en SQL,
+            author/project/dates ignorés avec un commentaire
+            "TODO : nécessite extension du schéma artifacts".
+            Décision plan : ON IMPLÉMENTE le schéma étendu DÈS
+            cette étape pour ne pas refactorer plus tard.
+
+            Extension de la table artifacts (modif du SCHEMA_SQL) :
+              CREATE TABLE IF NOT EXISTS artifacts (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '[]',
+                file_path TEXT NOT NULL,
+                indexed_at TEXT NOT NULL,
+                author TEXT NULL,
+                project TEXT NULL,
+                created_at TEXT NULL
+              );
+            extract_artifact_metadata (engine.rs) lit metadata.author,
+            metadata.project, metadata.created_at depuis le YAML.
+            La migration au boot (étape 19) DROP + CREATE de la
+            table fera l'upgrade automatiquement.
+
+          SQL généré dans search_lexical (squelette) :
+            SELECT a.id, bm25(artifacts_fts, 10, 5, 3, 1) AS rank
+            FROM artifacts_fts f
+            JOIN artifacts a ON a.id = f.id
+            WHERE artifacts_fts MATCH ?
+              AND (?kind IS NULL OR a.kind IN (...))
+              AND (?author IS NULL OR a.author = ?)
+              AND (?project IS NULL OR a.project = ?)
+              AND (?created_after IS NULL OR a.created_at >= ?)
+              AND (?created_before IS NULL OR a.created_at <= ?)
+              AND (?id_prefix IS NULL OR a.id LIKE ?)
+            ORDER BY rank
+            LIMIT ?
+          Les filtres conditionnels sont implémentés via
+          construction dynamique de la WHERE clause + paramètres
+          bindés (pas de string formatting des valeurs, sécurité
+          SQL).
+
+          Filtre tags : artifacts.tags est JSON. Pour matcher OR
+          d'un tag, EXISTS (SELECT 1 FROM json_each(a.tags) WHERE
+          json_each.value IN (?, ?, ?)). Coût acceptable pour
+          notre échelle.
+
+        Note : bm25(table, w1, w2, w3, w4) requiert AUTANT de
+        poids que de colonnes INDEXÉES (kind, title, description,
+        tags, content soit 5 — id est UNINDEXED). Ajuster : 5
+        poids : w_kind=0, w_title=10, w_description=3, w_tags=5,
+        w_content=1. w_kind=0 parce que kind n'a pas vocation à
+        contribuer au ranking (c'est un filtre).
+
+        Tests unitaires :
+          - test_search_lexical_kind_filter.
+          - test_search_lexical_tags_filter.
+          - test_search_lexical_bm25_orders_title_above_body :
+            deux artifacts, un avec le mot dans le title, l'autre
+            dans le content, le premier remonte premier.
+          - test_search_lexical_unicode_diacritics : "résumé"
+            matche "resume".
+          - test_search_lexical_separators_tokenize_identifier :
+            "sqlite-vec" indexé peut être trouvé par "sqlite" ou
+            "vec".
+      files:
+        - crates/orchestrator/src/db.rs
+        - crates/orchestrator/src/types.rs
+
+    - description: >
+        ÉTAPE 11 — Nouvelle méthode search_semantic dans db.rs,
+        puis engine.search() refondue qui orchestre lexical +
+        semantic + fusion + filtres + (rerank/hyde optionnels), et
+        enfin MCP main.rs avec la nouvelle struct SearchParams.
+
+        (A) crates/orchestrator/src/db.rs : nouvelle méthode
+
+              pub fn search_semantic(
+                &self,
+                embedding: &[f32],
+                filters: &SearchFilters,
+                limit: usize,
+              ) -> Result<Vec<RankedResult>, OrchestratorError>;
+
+            SQL squelette (sqlite-vec syntax) :
+              SELECT a.id,
+                     ROW_NUMBER() OVER (ORDER BY v.distance) AS rank
+              FROM artifacts_vec v
+              JOIN artifacts a ON a.id = v.artifact_id
+              WHERE v.embedding MATCH ?
+                AND v.k = ?
+                AND (filtres ...)
+              ORDER BY v.distance;
+
+            Note : selon la version de sqlite-vec, le pré-filtre
+            avec JOIN avant le MATCH peut nécessiter un sous-SELECT
+            ou un partition_key. À tester à l'écriture : si le
+            JOIN dégrade la qualité de la kNN, fallback sur post-
+            filter : récupérer top-K' > K élargi sans filtre, puis
+            filtrer en Rust à K. Le contrat fonctionnel est
+            préservé.
+
+        (B) crates/orchestrator/src/engine.rs : refonte de search()
+
+              pub enum SearchMode { Lexical, Semantic, Hybrid }
+
+              pub struct SearchRequest {
+                pub query: String,
+                pub mode: SearchMode,  // default Hybrid
+                pub filters: SearchFilters,
+                pub limit: usize,
+                pub rerank: bool,
+                pub hyde: bool,
+                pub explain: bool,
+              }
+
+              pub struct SearchResponse {
+                pub results: Vec<ArtifactSummary>,
+                pub explain: Option<ExplainTrace>,
+              }
+
+              pub fn search(&self, req: SearchRequest)
+                -> Result<SearchResponse, OrchestratorError>;
+
+            Pipeline interne :
+              (1) Si query vide ET filters tous vides : erreur
+                  "empty query requires at least one filter".
+              (2) Si query vide ET filters non vides : list par
+                  filtres ordonnés par created_at desc (bypass FTS
+                  et embed).
+              (3) Normaliser query : sanitize_fts_query(query,
+                  Natural).
+              (4) Selon mode :
+                  Lexical : lexical_path uniquement.
+                  Semantic : semantic_path uniquement.
+                  Hybrid : les deux + rrf_fuse.
+              (5) lexical_path : db.search_lexical(fts_query,
+                  filters, K_RETRIEVE=50). Retourne
+                  Vec<RankedResult>.
+              (6) semantic_path : si hyde=true et clé Anthropic OK,
+                  query_for_embed = hyde_expansion(query) (étape
+                  13) sinon query_for_embed = query original.
+                  embedding = embedder.embed_text(query_for_embed).
+                  db.search_semantic(&embedding, filters,
+                  K_RETRIEVE=50). Retourne Vec<RankedResult>.
+              (7) Fusion : rrf_fuse(lex, sem, 60.0, limit).
+              (8) Hydrater FusedResult en ArtifactSummary via
+                  db.get_artifact pour chaque id (lecture rapide,
+                  PRIMARY KEY).
+              (9) Si rerank=true et clé Anthropic OK : passer
+                  top-K=20 à claude_rerank (étape 13). Sinon top-N.
+              (10) Si explain=true : remplir ExplainTrace
+                   (mode_applied, candidate_set_sizes, scores RRF,
+                   timings). Sinon None.
+
+            Branchements pour rerank/hyde (étape 13). Pour cette
+            étape on stub : on accepte les paramètres mais on
+            retourne une erreur explicite "rerank/hyde requires
+            implementation (step 13)" si activés. L'étape 13 lève
+            le stub.
+
+        (C) crates/mcp-servers/orchestrator/src/main.rs : nouvelle
+            SearchParams qui supporte les paramètres optionnels du
+            RFC. Compat ascendante : query, kind, limit conservent
+            leur position et leur sémantique. Nouveaux paramètres
+            : author, tags, project, created_after, created_before,
+            id_prefix, mode, rerank, hyde, explain. Tous Option<T>.
+
+            Dans `async fn search`, construire une SearchRequest et
+            appeler engine.search(req). Reformater la réponse en
+            JSON identique au format actuel pour les champs
+            existants, et ajouter explain si demandé.
+
+            Migration du seul caller interne main.rs:569 (qui était
+            engine.search(&params.query, params.kind.as_deref(),
+            limit)) : transformé en un appel via SearchRequest
+            construite à partir de SearchParams.
+
+        Tests unitaires (engine.rs et db.rs) :
+          - test_search_hybrid_returns_results_present_in_lex_or_sem
+          - test_search_lexical_mode_returns_only_lex
+          - test_search_semantic_mode_returns_only_sem
+          - test_search_empty_query_with_filter_returns_list
+          - test_search_empty_query_without_filter_errors
+          - test_search_explain_populates_trace
+      files:
+        - crates/orchestrator/src/db.rs
+        - crates/orchestrator/src/engine.rs
+        - crates/orchestrator/src/types.rs
+        - crates/mcp-servers/orchestrator/src/main.rs
+
+    - description: >
+        ÉTAPE 12 — Migration du caller interne main.rs:569
+        formellement. Cette étape est en grande partie absorbée par
+        l'étape 11(C), mais on la liste séparément pour faire
+        passer la check-list. La sémantique de search() pour les
+        agents qui passent (query, kind?, limit?) reste compatible
+        (mode=hybrid par défaut, kind accepte string ou liste).
+
+        Cas testé : l'appel JSON-RPC
+        `{"query": "embeddings", "kind": "rfc", "limit": 5}` doit
+        marcher sans changement côté client. Validation
+        empirique via le smoke test de l'intégration MCP (étape
+        17).
+
+        Aucun nouveau fichier ; juste validation que le code de
+        l'étape 11 est compatible ascendant.
+      files: []
+
+    - description: >
+        ÉTAPE 13 — Couches optionnelles reranker Claude et HyDE.
+        Modifications dans engine.rs (lift le stub de l'étape 11).
+
+        Architecture :
+          - Deux fonctions privées dans engine.rs :
+              fn claude_rerank(&self, query: &str,
+                candidates: Vec<ArtifactSummary>)
+                -> Result<Vec<ArtifactSummary>, OrchestratorError>;
+              fn hyde_expansion(&self, query: &str)
+                -> Result<String, OrchestratorError>;
+
+          - Both check std::env::var("ANTHROPIC_API_KEY"). Si
+            absente, retourne OrchestratorError::AnthropicKeyMissing
+            avec message "rerank=true (resp. hyde=true) requires
+            ANTHROPIC_API_KEY".
+
+          - Implémentation HTTP. Pour la première version, on
+            utilise reqwest::blocking via tokio::task::spawn_blocking
+            depuis l'engine. Note : pour ne pas alourdir les
+            dépendances workspace, alternative : utiliser
+            `ureq` (plus léger, dépendance unique). Décision plan :
+            commencer avec `ureq` pour minimiser le footprint deps.
+            Si refactor nécessaire, switch ultérieur.
+
+          - Note dépendances : ureq n'est PAS dans le permit
+            target_paths. STOP. Cette étape exige d'ajouter ureq à
+            workspace.dependencies (Cargo.toml DANS le permit) et
+            à crates/orchestrator/Cargo.toml (DANS le permit). OK,
+            on peut ajouter. Si le PM/CEO préfère une autre stack
+            HTTP, le signaler.
+
+          - Modèle Claude : claude-3-5-haiku-latest (ou variable
+            d'env ANTHROPIC_MODEL pour override). Timeout 5s.
+
+          - HyDE prompt :
+            "Generate a single short technical paragraph (100-200
+            words) that hypothetically answers this query.
+            Query: <query>. Paragraph:"
+            Output retourné as-is, c'est embedé par le pipeline.
+
+          - Rerank prompt :
+            "Given the query <query>, rerank the following
+            candidates by relevance. Return a JSON array of ids in
+            best-to-worst order. Candidates: [<id, title, desc>
+            ...]"
+            Parser le JSON ; en cas d'échec de parse, fallback
+            silent SUR LE CLASSEMENT RRF NON-RERANGÉ et log un
+            warning explicite (proposition 5 du RFC : fallback
+            EXPLICITE avec warning).
+
+        Modifications dans engine.search (étape 11(B)) :
+          - HyDE : appelé AVANT embedder.embed_text si hyde=true.
+            L'embedding est calculé sur le pseudo-document, pas la
+            query originale. Le chemin lexical garde la query
+            originale.
+          - Rerank : appelé APRÈS rrf_fuse, prend top-K=20 et
+            retourne top-N.
+
+        Tests unitaires : exigent ANTHROPIC_API_KEY donc gated par
+        une feature flag de test `#[cfg_attr(not(feature =
+        "anthropic-tests"), ignore)]`. Tests minimum :
+          - test_rerank_requires_api_key (avec env vide, erreur
+            attendue, ne dépend pas de la clé).
+          - test_hyde_requires_api_key (idem).
+
+        Note : le test "appel HTTP réussit" n'est PAS dans le
+        scope automatisé CI (dépend du réseau et coûte un appel
+        API). Documenté en lesson-learned finale.
+      files:
+        - Cargo.toml
+        - Cargo.lock
+        - crates/orchestrator/Cargo.toml
+        - crates/orchestrator/src/engine.rs
+        - crates/orchestrator/src/error.rs
+
+    - description: >
+        ÉTAPE 14 — Tool MCP index_status. Modifications dans
+        crates/mcp-servers/orchestrator/src/main.rs et engine.rs.
+
+        (A) Côté engine.rs : nouvelle méthode
+
+              pub struct IndexStatusGlobal {
+                pub artifacts_count: usize,
+                pub fts_count: usize,
+                pub vec_count: usize,
+                pub triplet_coherent: bool,
+                pub triplet_diff: Option<TripletDiff>,
+                pub file_watcher_alive: bool,
+                pub pending_index_queue_size: usize,
+                pub last_indexed_at: Option<String>,
+              }
+
+              pub struct IndexStatusPerPath {
+                pub indexed_at: Option<String>,
+                pub file_mtime: Option<String>,
+                pub stale: bool,
+                pub present_in_fts: bool,
+                pub present_in_vec: bool,
+              }
+
+              pub fn index_status(
+                &self,
+                path: Option<&str>,
+                watcher_alive: bool,
+                queue_size: usize,
+              ) -> Result<IndexStatusResponse, OrchestratorError>;
+
+            Le champ file_watcher_alive et pending_index_queue_size
+            sont passés par le caller (main.rs) parce qu'ils
+            vivent au niveau du serveur, pas de l'engine. L'engine
+            traite seulement les COUNT SQL.
+
+            triplet_coherent : artifacts_count == fts_count ==
+            vec_count.
+            triplet_diff (rempli SEULEMENT si !triplet_coherent) :
+              in_artifacts_not_in_fts, etc. (4 listes d'ids via
+              SELECT id FROM A EXCEPT SELECT id FROM B). Coûteux
+              sur grand corpus ; sur 84 artifacts c'est < 5ms.
+
+        (B) Côté main.rs :
+            - Nouveau champ dans OrchestratorServer :
+              `watcher_alive: Arc<AtomicBool>`.
+            - La tokio task du file watcher (run_server) wrap son
+              code dans une closure qui set true au début, et un
+              drop guard ou un select! cleanup qui set false en
+              sortie.
+            - Nouveau tool MCP :
+              #[tool(description = "Inspect indexation state")]
+              async fn index_status(&self, params:
+                Parameters<IndexStatusParams>)
+                -> Result<CallToolResult, McpError>;
+            - IndexStatusParams : { path: Option<String> }.
+
+            La queue size : si on n'introduit pas de
+            tokio::sync::mpsc::channel intermédiaire (cf. RFC
+            proposition 8 alinéa "queue"), exposer 0 par défaut
+            avec documentation. Décision plan : on EXPOSE 0
+            (watcher en mode notify direct sans queue) et on
+            commente ça dans le retour JSON via un champ
+            `queue_mode: "direct"`.
+
+        Tests :
+          - test_index_status_returns_counts.
+          - test_triplet_coherent_after_upsert.
+          - test_per_path_stale_when_mtime_newer.
+      files:
+        - crates/orchestrator/src/engine.rs
+        - crates/orchestrator/src/db.rs
+        - crates/mcp-servers/orchestrator/src/main.rs
+
+    - description: >
+        ÉTAPE 15 — Jeu de queries de référence search_eval.yml.
+        Création de
+        crates/orchestrator/tests/search_eval.yml.
+
+        Format YAML :
+          version: 1
+          queries:
+            - id: q01
+              query: "search semantic embeddings vector"
+              category: symptom  # nominal / semantic / lexical
+                                 # / mixed / edge_case / symptom
+              expected_ids:
+                - 6cfd1c62-...  # diagnostic report
+                - f433fefc-...  # design doc
+                - bdee1af4-...  # rfc
+              note: "Query du symptôme original task-request"
+            - ... (20 queries au total)
+
+        Couverture obligatoire (proposition 10 du RFC) :
+          - 5 queries lexicales pures (UUIDs, identifiants).
+          - 5 queries sémantiques pures (paraphrases).
+          - 5 queries mixtes.
+          - 5 queries edge cases (vide+filtre, multilingue mélangé,
+            query trop longue, opérateurs FTS5 hérités, UUID
+            complet).
+          - 3 queries du symptôme task-request 02c9f6eb (incluses
+            dans les 20).
+
+        Liste suggérée (à finaliser au moment de l'écriture en
+        regardant le corpus actuel) :
+          symptom : q01 "search semantic embeddings vector",
+                    q02 "recherche memoire collective FTS",
+                    q03 "lookup memoire faux negatif".
+          lexical_pur : q04 "bdee1af4", q05 "cdbfee72",
+                        q06 "PILIER A flock", q07 "fastembed",
+                        q08 "sqlite-vec".
+          semantic_pur : q09 "concurrence base de données",
+                         q10 "tests de qualité review",
+                         q11 "modèle d'embedding multilingue",
+                         q12 "fenêtre de contention SQL",
+                         q13 "stratégie de retrieval moderne".
+          mixed : q14 "RFC cdbfee72 résilience WAL",
+                  q15 "lesson learned 611fde3e",
+                  q16 "design-doc embedding RRF",
+                  q17 "diagnostic search faux négatif",
+                  q18 "implementation plan orchestrator".
+          edge : q19 query="" + filter kind=rfc,
+                 q20 query="résumé du jeu de queries 20+ words ..."
+                 (string > 200 chars).
+
+        Tests dans crates/orchestrator/tests/integration_search.rs
+        (étape 17) chargent ce fichier et mesurent
+        precision@10 et recall@10 par query, MRR global. Le test
+        échoue si :
+          - une des 3 queries symptôme retourne 0 résultat ;
+          - precision@10 globale < 0.5 ;
+          - les expected_ids ne sont pas connus dans le corpus
+            réellement présent.
+      files:
+        - crates/orchestrator/tests/search_eval.yml
+
+    - description: >
+        ÉTAPE 16 — Tests unitaires de chaque module. Cette étape
+        agrège les tests cités dans chaque étape précédente
+        (étape 3 db smoke test, étape 4 embedding, étape 5
+        model_version, étape 6 upsert transactionnel, étape 7
+        index_artifact, étape 8 fusion, étape 9 query, étape 10
+        lexical, étape 11 search engine, étape 13 rerank/hyde
+        gating, étape 14 index_status).
+
+        Total estimé : ~30-40 tests unitaires nouveaux dans le
+        crate orchestrator. Aucun fichier de test séparé créé à
+        cette étape (les tests vivent dans le module
+        #[cfg(test)] de chaque source). Cette étape est un point
+        de checkpoint : à son issue, `cargo test -p
+        companyos-orchestrator --lib` passe à 100%.
+
+        Note : tests dépendant du cache embedding sont gated par
+        un cfg-feature et skip si pas pré-fetché. CI doit
+        exécuter `cargo run -- --prefetch-embeddings` avant
+        `cargo test`. Documenter ça en docs/search-guide.md.
+      files: []
+
+    - description: >
+        ÉTAPE 17 — Tests d'intégration. Nouveau fichier
+        crates/orchestrator/tests/integration_search.rs.
+
+        Suite de tests cross-module :
+          (a) test_pipeline_end_to_end_index_then_search :
+              - setup_engine() avec embedder réel.
+              - index 5 artifacts YAML synthétiques bilingues.
+              - search 3 queries variées, vérifier résultats
+                pertinents en top-3.
+
+          (b) test_quality_eval_against_corpus :
+              - charge search_eval.yml.
+              - utilise le corpus RÉEL company/ via reindex_all
+                (cela exige que le test path le root du projet, à
+                gérer via env var COMPANYOS_ROOT ou cwd).
+              - exécute chaque query, calcule precision@10,
+                recall@10, MRR.
+              - asserts :
+                  * les 3 queries symptôme retournent ≥ 1
+                    expected_id en top-10.
+                  * precision@10 globale ≥ 0.5.
+                  * MRR globale ≥ 0.3.
+
+          (c) test_breaking_change_compat_old_signature :
+              - simule un appel MCP avec ONLY query (sans mode),
+              - vérifie que mode=hybrid est appliqué par défaut,
+              - vérifie que résultats sont au moins ceux de
+                l'ancien comportement (kind, title présents).
+
+          (d) test_filters_push_down :
+              - 10 artifacts dont 3 de kind=rfc.
+              - search avec filter kind=rfc, vérifie que les 3 et
+                seulement les 3 remontent.
+
+          (e) test_index_status_basic :
+              - après reindex_all sur 5 artifacts, index_status()
+                retourne counts cohérents.
+
+        Validation : `cargo test -p companyos-orchestrator
+        --test integration_search` passe.
+      files:
+        - crates/orchestrator/tests/integration_search.rs
+
+    - description: >
+        ÉTAPE 18 — Benchmark de latence et qualité. Sous-section du
+        test integration_search.rs (ou fichier séparé
+        benches/search_bench.rs, mais Criterion ajouterait une
+        dépendance lourde — décision plan : test ignoré sauf en
+        mode bench).
+
+        Mesure cible :
+          - p50, p95, p99 sur un corpus actuel (84 artifacts) avec
+            les 20 queries de référence.
+          - Modes : hybrid, lexical, semantic.
+          - Cible non-négociable du task-request : p95 < 500ms à
+            corpus actuel.
+
+        Implémentation :
+          #[test]
+          #[ignore]  // run with cargo test -- --ignored
+          fn bench_search_latency() { ... }
+
+        Production d'un fichier de log :
+          target/bench-results/search-latency-<timestamp>.json
+        avec p50, p95, p99 par mode, et un récapitulatif texte
+        humain en stdout.
+
+        Décision d'arbitrage : SI le benchmark révèle que la
+        baseline E5Small ne tient pas precision@10 ≥ 0.5 OU
+        latence p95 > 500ms, repasser à l'étape 1 et changer le
+        modèle (cf. fallback documenté). Coût d'un re-run : ~5
+        minutes (changement de constante + reindex_all complet).
+      files:
+        - crates/orchestrator/tests/integration_search.rs
+
+    - description: >
+        ÉTAPE 19 — Migration du tokenizer FTS5 au boot. Cette
+        étape garantit que le serveur, au premier démarrage
+        post-merge, détecte l'ancien schéma FTS5 (sans
+        tokenizer explicite) et le remplace.
+
+        Implémentation : dans OrchestratorDb::migrate() ou un
+        nouveau helper migrate_fts_if_needed() :
+          - Lire le DDL actuel de artifacts_fts via
+            SELECT sql FROM sqlite_master WHERE
+              name='artifacts_fts'.
+          - Si la chaîne ne contient pas "tokenize" ou ne contient
+            pas "unicode61 remove_diacritics 2" : DROP TABLE
+            artifacts_fts ; CREATE VIRTUAL TABLE selon
+            FTS_SQL_NEW (qui contient le tokenizer explicite).
+          - Idem pour artifacts table si elle ne contient pas
+            les colonnes author/project/created_at (étape 10).
+          - Idem pour artifacts_vec : si absente, créer
+            (idempotent).
+          - Après le DROP+CREATE : appeler le code de reindex_all
+            (engine.reindex_all) pour repeupler. Mais reindex_all
+            est sur l'engine, pas la DB. Solution : la migration
+            elle-même ne reindex pas ; à la place, le code de
+            run_server détecte qu'une migration a eu lieu (via un
+            flag retourné par migrate) et appelle reindex_all
+            synchrone APRÈS la création de l'engine.
+          - Tout ce qui touche au schema est dans une transaction
+            BEGIN IMMEDIATE.
+
+        Garantie : un boot sur un repo qui était sur l'ancien
+        schéma fait :
+          1. Acquire flock.
+          2. Open DB.
+          3. integrity_check (PILIER D).
+          4. load_extension sqlite-vec + smoke test.
+          5. Check embedding cache.
+          6. migrate (avec détection upgrade FTS5 + artifacts).
+          7. Si upgrade FTS5 ou artifacts détecté : reindex_all
+             synchrone.
+          8. Check model_version : si mismatch, wipe vec +
+             reindex_all (qui réutilise potentiellement le run
+             précédent si déjà fait).
+          9. Servir MCP.
+
+        Coût attendu sur corpus 84 artifacts : < 10s total.
+
+        Tests :
+          - test_boot_upgrade_from_old_fts5_schema (peut être
+            simulé en créant un OrchestratorDb avec l'ancien DDL,
+            puis appeler migrate, vérifier que le nouveau DDL est
+            en place).
+      files:
+        - crates/orchestrator/src/db.rs
+
+    - description: >
+        ÉTAPE 20 — Documentation. Création de docs/search-guide.md.
+
+        Sections :
+          1. Vue d'ensemble : pourquoi hybrid search, contexte
+             refonte (lien vers diagnostic 6cfd1c62, design-doc
+             f433fefc, RFC bdee1af4).
+          2. Architecture : trois piliers (FTS5 durci, embeddings
+             via sqlite-vec, RRF fusion), pipeline d'indexation
+             transactionnel.
+          3. Modèle d'embedding utilisé : multilingual-e5-small,
+             dimension 384, footprint, déterminisme effectif.
+          4. Pre-fetch des poids :
+             `cargo run --bin companyos-orchestrator-server
+              -- --prefetch-embeddings`
+             Doit être exécuté avant le premier boot ET en CI
+             avant `cargo test`.
+          5. Format de la query : modes natural / advanced /
+             exact, filtres disponibles, exemples.
+          6. Flags optionnels : rerank, hyde, explain. Cas
+             d'usage.
+          7. Tool index_status : usage, champs retournés.
+          8. Limites connues : pas de chunking, déterminisme
+             cross-architecture non garanti (wipe + reindex au
+             mismatch architecture_marker).
+          9. Troubleshooting : 0 résultat sur query attendue,
+             warnings rerank/hyde, recovery après crash.
+         10. FAQ : pourquoi sqlite-vec et pas Qdrant/LanceDB ?
+             pourquoi RRF et pas combinaison linéaire ?
+
+        Pas de tests sur ce fichier ; revue manuelle.
+      files:
+        - docs/search-guide.md
+
+    - description: >
+        ÉTAPE 21 — Consume write permit. APRÈS tous les commits de
+        code et APRÈS un cargo build + cargo test verts (validation
+        finale exigée par la règle hotreload_last).
+
+        Procédure :
+          - cargo build (sans --target-dir, déclenche hot-reload
+            MCP).
+          - cargo test (toute la suite, 0 failed).
+          - Si OK : consume_write_permit(persona=implementer,
+            permit_id=a0b34bcd-2af6-407a-b5a6-a264d28b3c7d, token=
+            <token de session>).
+          - git add company/data/orchestrator.db et commit pour
+            persister l'état consommé du permit.
+          - reload_config() en TOUT DERNIER, uniquement si build
+            + test verts.
+
+        Ne PAS consume avant le commit final du code, sinon hook
+        rejet (règle write_permit_full_sequence).
+      files: []
+
+    - description: >
+        ÉTAPE 22 — Lesson-learned finale. Création d'une lesson
+        capitalisant la refonte search.
+
+        Trois axes (cf. instructions task-request) :
+          (a) Architecture hybrid + RRF qui marche : ce qui a été
+              décisif (fastembed-rs + sqlite-vec + RRF + filtres).
+          (b) Surprises rencontrées en exécution : modèle effectif
+              retenu (E5Small vs autres tentés), déterminisme
+              cross-architecture, latence réelle vs attendue,
+              pièges de l'API fastembed/sqlite-vec.
+          (c) Arbitrages tranchés pendant le plan : modèle exact,
+              poids BM25, k de RRF, choix sidecar vs in-process.
+
+        Plus mention pour mémoire (sans en faire un RFC ici) du
+        pattern incident write_permit non-scellé (cf. incident en
+        ouverture de session : permit 9149f79e wipé par
+        defense-in-depth parce que jamais commité en git). Candidat
+        à un futur RFC d'amélioration du process write_permit (par
+        exemple grant_write_permit + commit automatique côté MCP
+        server).
+
+        Chainage obligatoire (rule lesson_chaining) :
+          related[]:
+            - 611fde3e (lesson SQLite WAL multi-process) :
+              relationship = related (deux lessons d'implémentation
+              critical-infra dans l'orchestrator, patterns liés).
+            - 6cfd1c62 (diagnostic) : derived-from.
+            - bdee1af4 (RFC) : derived-from.
+
+        Tags minimaux : search, retrieval, hybrid-search, rrf,
+        embeddings, sqlite-vec, fastembed, implementation, critical-
+        infra.
+
+        L'écriture se fait via Write sur
+        company/lessons/<slug>-<8chars>.yml puis indexation
+        automatique.
+      files:
+        - company/lessons/refonte-search-hybrid-<8chars>.yml
+
+    - description: >
+        ÉTAPE 23 — Mise à jour du task-request 02c9f6eb à status
+        done. Édition du fichier YAML existant via Edit (le
+        task-request est dans company/, pas dans les target_paths
+        du permit, MAIS le permit ne couvre que les zones
+        protégées Rust ; l'écriture sur company/ pour mettre à
+        jour le status est libre).
+
+        Vérification préalable des 10 AC :
+          1. Diagnostic posé : FAIT (6cfd1c62).
+          2. Hybrid search 3 axes : étapes 8-11.
+          3. Solution autonome locale : étapes 3-4.
+          4. Anthropic optionnel : étape 13.
+          5. Reindex auto : étape 19.
+          6. ≥ 20 queries de référence : étape 15.
+          7. Tests automatisés : étapes 16-17.
+          8. Benchmark p95 < 500ms : étape 18.
+          9. Breaking change documenté : étapes 11, 20.
+         10. Doc + lesson : étapes 20, 22.
+
+        Validation : tous AC verts → spec.status: done.
+        Sinon : flag les AC manquants en agent-message au PM.
+      files: []
+
+    - description: >
+        ÉTAPE 24 — Mise à jour du RFC bdee1af4 à status implemented.
+        Édition du fichier RFC pour passer metadata.status à
+        "implemented" et ajouter une entrée changelog "implémenté
+        via plan 640e2894, commits <range>".
+
+        Validation : `cargo run -- --validate <fichier>` reste vert
+        (le RFC schema accepte status=implemented).
+      files: []
+
+  dependencies:
+    - "Write permit a0b34bcd-2af6-407a-b5a6-a264d28b3c7d actif et scellé en git (commit 5919adb)."
+    - "RFC bdee1af4 approved (PM + CEO + Implementer)."
+    - "Design-doc f433fefc approved."
+    - "Diagnostic-report 6cfd1c62 resolved (baseline FTS5 mesurée < 2ms)."
+    - "Cache embedding pré-fetché via --prefetch-embeddings AVANT premier boot."
+    - "Crates fastembed (=5.x.y) et sqlite-vec (=0.1.x) disponibles sur crates.io aux versions visées."
+  risks:
+    - >
+      Risque sqlite-vec pre-1.0 ABI/API. Mitigation : pin exact (=0.1.x),
+      smoke test au boot (étape 3) qui détecte tout cassé silencieux.
+      Si la crate change d'API entre 0.1.6 et 0.1.7 par exemple, le
+      build fail et on adapte une seule fois.
+    - >
+      Risque fastembed-rs download au build sur certains environnements
+      (ort runtime binary). Si le build CI échoue à cause de ça, on
+      ajoute un .cargo/config.toml ou une étape CI pré-build qui
+      télécharge ort. Hors permit target_paths, demander extension au
+      moment si nécessaire.
+    - >
+      Risque déterminisme cross-architecture. Le déterminisme effectif
+      est garanti same-machine (test étape 4) mais pas cross. Mitigation
+      : architecture_marker concaténé dans model_version (étape 5), un
+      switch de machine déclenche wipe + reindex automatique. Coût
+      acceptable car rare.
+    - >
+      Risque dépassement latence p95 > 500ms. Mitigation : étape 18
+      mesure tôt, l'étape 1 prévoit le fallback vers modèles plus
+      petits ou batch d'embedding. Au pire, accepter p95 ~1s sur
+      corpus actuel et documenter en lesson-learned.
+    - >
+      Risque trou de permit sur un fichier non listé. Mitigation
+      proactive : la liste des fichiers à créer (embedding.rs,
+      fusion.rs, query.rs, search_eval.yml, integration_search.rs,
+      search-guide.md) EST dans le permit. Si une autre extension est
+      nécessaire en cours (ex. nouveau .cargo/config.toml pour ort),
+      agent-message au PM, pas de contournement.
+    - >
+      Risque dépendance ureq absente du permit Cargo.toml. Mitigation
+      étape 13 : ureq est ajouté à workspace.dependencies dans
+      Cargo.toml qui EST couvert. Si CEO/PM demande une autre stack
+      HTTP, ajuster avant l'étape 13.
+    - >
+      Risque cargo test ignoré par défaut sur les tests d'intégration
+      qui requièrent le cache embedding. Mitigation : documenter en
+      docs/search-guide.md la commande à exécuter en CI
+      (--prefetch-embeddings puis cargo test). Lesson-learned finale
+      capitalise.
+    - >
+      Risque incident hook defense-in-depth en cours d'implémentation
+      si une commande bash touche orchestrator.db. Mitigation : ne
+      JAMAIS faire de sqlite3 inline sur orchestrator.db pendant
+      l'implémentation. Utiliser check_write_permit() via MCP pour
+      vérifier. Le permit a0b34bcd est déjà scellé donc safe.
