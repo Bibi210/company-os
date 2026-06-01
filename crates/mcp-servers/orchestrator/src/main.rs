@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use companyos_config::watcher::{self, ConfigChangeKind};
@@ -53,6 +54,11 @@ struct OrchestratorServer {
     validator: Arc<RwLock<ArtifactValidator>>,
     root_path: String,
     tokens: TokenStore,
+    /// Liveness flag for the file watcher tokio task. Set to true at
+    /// task entry, false on exit (drop guard). Read by `index_status`.
+    /// `Arc<AtomicBool>` keeps the lock-free invariant of the
+    /// instrumentation (RFC bdee1af4 proposition 8).
+    watcher_alive: Arc<AtomicBool>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -198,6 +204,14 @@ struct IndexArtifactParams {
     path: String,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct IndexStatusParams {
+    #[schemars(
+        description = "Optional: relative path to a specific YAML to inspect. If absent, returns global counts only."
+    )]
+    path: Option<String>,
+}
+
 // --- Defense-in-depth coordination params (PILIER A / hook refactor) ---
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -250,12 +264,14 @@ impl OrchestratorServer {
         engine: Arc<Mutex<OrchestratorEngine>>,
         validator: Arc<RwLock<ArtifactValidator>>,
         root_path: String,
+        watcher_alive: Arc<AtomicBool>,
     ) -> Self {
         Self {
             engine,
             validator,
             root_path,
             tokens: TokenStore::default(),
+            watcher_alive,
             tool_router: Self::tool_router(),
         }
     }
@@ -825,6 +841,71 @@ impl OrchestratorServer {
                 .to_string()),
         }
     }
+
+    // --- Index status (RFC bdee1af4 proposition 8) ---
+
+    #[tool(
+        description = "Inspect indexation state. Without args returns global counts (artifacts/fts/vec, triplet_coherent, file_watcher_alive, last_indexed_at). With path returns per-path detail (indexed_at vs file_mtime, stale flag, presence flags). Lecture seule, latence < 10ms."
+    )]
+    async fn index_status(
+        &self,
+        params: Parameters<IndexStatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let params = params.0;
+        let engine = self.engine.lock().await;
+
+        let watcher = self.watcher_alive.load(Ordering::Acquire);
+        // No intermediate mpsc channel between notify and indexer in
+        // this codebase; queue size always 0 (queue_mode = direct), cf.
+        // plan 640e2894 étape 14 decision.
+        let queue_size = 0;
+
+        let global = match engine.index_status_global(watcher, queue_size) {
+            Ok(g) => g,
+            Err(e) => {
+                return err(Diagnostic::error(C, "index_status global failed")
+                    .with_context("index_status")
+                    .with_reason(format!("{e}"))
+                    .to_string());
+            }
+        };
+
+        let mut json = serde_json::json!({
+            "global": {
+                "artifacts_count": global.artifacts_count,
+                "fts_count": global.fts_count,
+                "vec_count": global.vec_count,
+                "triplet_coherent": global.triplet_coherent,
+                "file_watcher_alive": global.file_watcher_alive,
+                "pending_index_queue_size": global.pending_index_queue_size,
+                "queue_mode": "direct",
+                "last_indexed_at": global.last_indexed_at,
+            },
+        });
+
+        if let Some(path) = params.path {
+            match engine.index_status_per_path(&self.root_path, &path) {
+                Ok(per) => {
+                    json["per_path"] = serde_json::json!({
+                        "path": path,
+                        "indexed_at": per.indexed_at,
+                        "file_mtime": per.file_mtime,
+                        "stale": per.stale,
+                        "present_in_fts": per.present_in_fts,
+                        "present_in_vec": per.present_in_vec,
+                    });
+                }
+                Err(e) => {
+                    return err(Diagnostic::error(C, "index_status per_path failed")
+                        .with_context(format!("index_status(path={path})"))
+                        .with_reason(format!("{e}"))
+                        .to_string());
+                }
+            }
+        }
+
+        ok(serde_json::to_string_pretty(&json).unwrap_or_default())
+    }
 }
 
 #[tool_handler]
@@ -1061,7 +1142,16 @@ async fn run_server() -> anyhow::Result<()> {
 
     let engine = Arc::new(Mutex::new(engine));
 
-    let server = OrchestratorServer::new(engine.clone(), validator.clone(), root.clone());
+    // RFC bdee1af4 étape 14: shared liveness flag for the file watcher
+    // task, read by the `index_status` tool.
+    let watcher_alive = Arc::new(AtomicBool::new(false));
+
+    let server = OrchestratorServer::new(
+        engine.clone(),
+        validator.clone(),
+        root.clone(),
+        watcher_alive.clone(),
+    );
 
     let (stdin, stdout) = rmcp::transport::io::stdio();
 
@@ -1087,7 +1177,21 @@ async fn run_server() -> anyhow::Result<()> {
             let validator = validator.clone();
             let root = root.clone();
             let schemas_dir = schemas_dir.clone();
+            let watcher_alive = watcher_alive.clone();
             let task_handle = tokio::spawn(async move {
+                // Mark alive at task entry. The corresponding `false`
+                // write happens in a drop guard so SIGKILL of the
+                // process does not leave a stale `true` flag (the
+                // process is gone with it anyway).
+                watcher_alive.store(true, Ordering::Release);
+                struct AliveGuard(Arc<AtomicBool>);
+                impl Drop for AliveGuard {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Release);
+                    }
+                }
+                let _alive_guard = AliveGuard(watcher_alive.clone());
+
                 while let Some(change) = handle.rx.recv().await {
                     match change {
                         ConfigChangeKind::Config => match CompanyConfig::load(&root) {

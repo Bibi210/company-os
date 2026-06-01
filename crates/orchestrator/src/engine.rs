@@ -79,6 +79,31 @@ pub struct ExplainTrace {
     pub latency_ms: u64,
 }
 
+/// Global indexation status, returned by `index_status` (no per-path).
+/// All counts come from the live SQLite tables (`COUNT(*)`).
+#[derive(Debug, Clone, Default)]
+pub struct IndexStatusGlobal {
+    pub artifacts_count: usize,
+    pub fts_count: usize,
+    pub vec_count: usize,
+    pub triplet_coherent: bool,
+    pub last_indexed_at: Option<String>,
+    pub file_watcher_alive: bool,
+    pub pending_index_queue_size: usize,
+}
+
+/// Per-path indexation status, returned when `index_status` is called
+/// with a `path` parameter. Mirrors the inspection contract specified
+/// in RFC bdee1af4 proposition 8.
+#[derive(Debug, Clone, Default)]
+pub struct IndexStatusPerPath {
+    pub indexed_at: Option<String>,
+    pub file_mtime: Option<String>,
+    pub stale: bool,
+    pub present_in_fts: bool,
+    pub present_in_vec: bool,
+}
+
 pub struct OrchestratorEngine {
     db: OrchestratorDb,
     max_iterations: u32,
@@ -682,6 +707,74 @@ impl OrchestratorEngine {
         limit: usize,
     ) -> Result<Vec<ArtifactSummary>, OrchestratorError> {
         self.db.list_with_filters(filters, limit)
+    }
+
+    /// Compute global indexation status.
+    ///
+    /// `watcher_alive` is provided by the caller (main.rs reads its
+    /// `Arc<AtomicBool>`) — the engine has no direct view of the file
+    /// watcher task. `queue_size` similarly: the watcher in this
+    /// codebase has no intermediate mpsc channel, so callers can pass
+    /// 0 with the understanding documented in the RFC proposition 8.
+    pub fn index_status_global(
+        &self,
+        watcher_alive: bool,
+        queue_size: usize,
+    ) -> Result<IndexStatusGlobal, OrchestratorError> {
+        let (a, f, v) = self.db.index_table_counts()?;
+        let triplet_coherent = a == f && f == v;
+        let last_indexed_at = self.db.last_indexed_at()?;
+        Ok(IndexStatusGlobal {
+            artifacts_count: a,
+            fts_count: f,
+            vec_count: v,
+            triplet_coherent,
+            last_indexed_at,
+            file_watcher_alive: watcher_alive,
+            pending_index_queue_size: queue_size,
+        })
+    }
+
+    /// Compute per-path indexation status. `root` is the project root
+    /// so we can stat the file mtime; `path` is the relative path of
+    /// the YAML file (matching `artifacts.file_path`).
+    pub fn index_status_per_path(
+        &self,
+        root: &str,
+        path: &str,
+    ) -> Result<IndexStatusPerPath, OrchestratorError> {
+        let id_opt = self.db.artifact_id_by_path(path)?;
+        let mut out = IndexStatusPerPath::default();
+
+        if let Some(id) = id_opt
+            && let Some((_fp, indexed_at, in_fts, in_vec)) = self.db.artifact_by_id_status(&id)?
+        {
+            out.indexed_at = Some(indexed_at);
+            out.present_in_fts = in_fts;
+            out.present_in_vec = in_vec;
+        }
+
+        // mtime via fs::metadata.
+        let abs_path = format!("{root}/{path}");
+        if let Ok(meta) = std::fs::metadata(&abs_path)
+            && let Ok(mtime) = meta.modified()
+            && let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH)
+        {
+            // Convert to RFC3339 for symmetry with indexed_at.
+            let secs = dur.as_secs() as i64;
+            let nanos = dur.subsec_nanos();
+            let dt = chrono::DateTime::<Utc>::from_timestamp(secs, nanos).unwrap_or_else(Utc::now);
+            out.file_mtime = Some(dt.to_rfc3339());
+
+            // Stale flag: file mtime strictly greater than indexed_at.
+            if let Some(ix_at) = &out.indexed_at
+                && let Ok(ix_dt) = chrono::DateTime::parse_from_rfc3339(ix_at)
+            {
+                out.stale = dt > ix_dt.with_timezone(&Utc);
+            }
+        }
+
+        Ok(out)
     }
 
     /// Get full artifact content by ID. Reads the file from disk.

@@ -1162,6 +1162,75 @@ impl OrchestratorDb {
         Ok(results)
     }
 
+    /// Return the three table counts (`artifacts`, `artifacts_fts`,
+    /// `artifacts_vec`) for [`crate::engine::IndexStatusGlobal`].
+    pub fn index_table_counts(&self) -> Result<(usize, usize, usize), OrchestratorError> {
+        let a: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))?;
+        let f: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM artifacts_fts", [], |r| r.get(0))?;
+        let v: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM artifacts_vec", [], |r| r.get(0))?;
+        Ok((a as usize, f as usize, v as usize))
+    }
+
+    /// Return MAX(indexed_at) across the artifacts table, or None if
+    /// the table is empty.
+    pub fn last_indexed_at(&self) -> Result<Option<String>, OrchestratorError> {
+        let result = self
+            .conn
+            .query_row("SELECT MAX(indexed_at) FROM artifacts", [], |row| {
+                row.get::<_, Option<String>>(0)
+            })?;
+        Ok(result)
+    }
+
+    /// Return the row in artifacts matching `id`, if any (file_path +
+    /// indexed_at). Used by index_status per_path lookups.
+    pub fn artifact_by_id_status(
+        &self,
+        id: &str,
+    ) -> Result<Option<(String, String, bool, bool)>, OrchestratorError> {
+        // file_path, indexed_at, present_in_fts, present_in_vec
+        let result = self.conn.query_row(
+            "SELECT a.file_path, a.indexed_at,
+                    EXISTS(SELECT 1 FROM artifacts_fts WHERE id = ?1),
+                    EXISTS(SELECT 1 FROM artifacts_vec WHERE artifact_id = ?1)
+             FROM artifacts a WHERE a.id = ?1",
+            params![id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            },
+        );
+        match result {
+            Ok(t) => Ok(Some(t)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Return the artifact id corresponding to a given file_path, if any.
+    pub fn artifact_id_by_path(&self, path: &str) -> Result<Option<String>, OrchestratorError> {
+        let result = self.conn.query_row(
+            "SELECT id FROM artifacts WHERE file_path = ?1",
+            params![path],
+            |row| row.get::<_, String>(0),
+        );
+        match result {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub fn delete_all_artifacts(&self) -> Result<(), OrchestratorError> {
         self.conn.execute("DELETE FROM artifact_relations", [])?;
         self.conn.execute("DELETE FROM artifacts_fts", [])?;
