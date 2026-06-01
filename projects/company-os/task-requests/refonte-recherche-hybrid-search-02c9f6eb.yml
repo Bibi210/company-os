@@ -1,0 +1,179 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 02c9f6eb-fb2d-48f2-82d2-5676773e0e8b
+  title: "Refondre la recherche dans la mémoire collective : hybrid search lexical + sémantique"
+  author: pm
+  created_at: "2026-06-01"
+  project: company-os
+  description: >
+    Le tool MCP search() actuel utilise SQLite FTS5 en mode lexical
+    pur sur titre+description+tags des artifacts. Il retourne
+    massivement zéro résultat sur des requêtes pertinentes,
+    démontré empiriquement pendant la session de cadrage : trois
+    queries autour du sujet "search semantic embeddings vector",
+    "recherche memoire collective FTS", "lookup memoire faux
+    negatif" ont toutes retourné 0 résultat dans un corpus qui
+    contient justement des artifacts sur la mémoire collective et
+    sur le lookup. La recherche est le cœur fonctionnel de
+    CompanyOS : la règle memory_lookup_before_acting impose à
+    tous les agents un lookup avant chaque production
+    d'artifact. Si la recherche est faible, la mémoire collective
+    devient une promesse non tenue et la règle se transforme en
+    rituel formel sans valeur. Ce task-request cadre la refonte
+    profonde de search(), de son backend, et du pipeline
+    d'indexation associé. L'Architect mène le design, choisit la
+    pile technique, arbitre les compromis. Breaking change
+    accepté sur l'API search() si nécessaire, à condition que la
+    migration soit propre et que les appelants connus soient mis
+    à jour.
+  tags:
+    - search
+    - retrieval
+    - memory
+    - rag
+    - embeddings
+    - hybrid-search
+    - critical-infra
+  related:
+    - id: ffb85fc7-f5a4-4bfc-b207-1ff955ef77e5
+      kind: task-request
+      relationship: related
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: related
+
+spec:
+  priority: high
+  status: backlog
+  acceptance_criteria:
+    - >
+      Le diagnostic du problème actuel est posé proprement (corpus
+      typique, distribution des queries, taux de faux négatifs
+      mesuré, latence baseline). Pas un design qui repart de zéro
+      sans regarder ce qui existe.
+    - >
+      Le design retenu couvre trois axes de recherche : lexical
+      (mot exact, identifiant, tag), sémantique (concept similaire
+      même si vocabulaire différent), filtrage structuré (par
+      kind, author, tags, dates, project). Hybrid search au sens
+      moderne du terme (BM25 + embeddings + fusion type RRF) est
+      l'orientation par défaut, l'Architect peut s'en écarter avec
+      rationale clair.
+    - >
+      La solution est AUTONOME LOCALE par défaut. Modèle
+      d'embeddings local (BGE-M3, nomic-embed-text, ou équivalent
+      multilingue FR + EN technique) + backend vectoriel local
+      (sqlite-vec ou équivalent). Pas de dépendance réseau
+      obligatoire au runtime de search().
+    - >
+      Acceptation d'une dépendance à la clé Anthropic déjà
+      utilisée par opencode UNIQUEMENT pour des features
+      optionnelles d'enrichissement (query expansion, HyDE,
+      reranking sémantique via Claude). search() doit rester
+      fonctionnel sans cette clé.
+    - >
+      Le reindex complet du corpus existant est intégré au
+      déploiement et automatique. Aucune intervention manuelle
+      requise par l'utilisateur ou les agents post-merge.
+    - >
+      Tests de qualité fonctionnelle reproductibles : un jeu de
+      queries de référence (≥ 20 queries variées, couvrant lexical
+      pur, sémantique, mixte, edge cases) avec leurs résultats
+      attendus (artifacts pertinents nommés). Métriques précision
+      et rappel mesurables. Les trois queries qui ont retourné 0
+      en cadrage doivent toutes retourner les artifacts pertinents
+      post-refonte.
+    - >
+      Tests automatisés solides : tests unitaires sur chaque
+      composant (tokenizer, embedder, fusion, filtres), tests
+      d'intégration sur le pipeline complet (write YAML → indexé
+      → searchable en moins de N secondes), tests de régression
+      sur la qualité (les queries de référence ne régressent pas).
+    - >
+      Benchmark de latence documenté. Cible non-négociable : la
+      latence p95 d'un search() simple reste sous 500ms sur le
+      corpus actuel, et sous 2s à un corpus 10x plus gros. Si
+      la cible n'est pas atteignable, l'Architect le signale et
+      arbitre avec le PM.
+    - >
+      Breaking change sur l'API search() acceptable si nécessaire.
+      Dans ce cas la migration est documentée et tous les
+      appelants internes connus (lookup mémoire des personas via
+      memory_lookup_before_acting, tools MCP qui appellent
+      search() en interne s'il y en a) sont mis à jour dans le
+      même cycle.
+    - >
+      Documentation : un guide opérateur expliquant le pipeline,
+      les modèles utilisés, le format de la query, les filtres
+      disponibles, les limites connues. Une lesson-learned à la
+      clôture capitalisant le pattern de refonte.
+
+  investigation_hints: >
+    Pistes non prescriptives, l'Architect arbitre :
+
+    Backend vectoriel local : sqlite-vec (extension SQLite) est la
+    piste la plus cohérente avec l'archi actuelle (one-binary,
+    pas de daemon supplémentaire). Alternatives à considérer si
+    sqlite-vec a des limites : LanceDB embedded, tantivy + plugin
+    vector, ou intégrer un module Rust dédié.
+
+    Modèle d'embeddings local : doit être multilingue (français
+    et anglais technique mélangés dans nos artifacts).
+    BGE-M3 (multilingual, dense + sparse + colbert), 
+    nomic-embed-text (efficient, anglais surtout),
+    multilingual-e5-large, paraphrase-multilingual-mpnet-base-v2
+    sont les candidats classiques. Trade-off à arbitrer : qualité
+    sémantique vs taille du modèle vs latence d'embedding.
+
+    Pipeline d'indexation : actuellement le hook defense-in-depth
+    auto-index chaque write YAML via le binaire --index. À
+    étendre pour que cette même invocation calcule aussi
+    l'embedding et le persiste. Attention à la cohérence avec le
+    PILIER A du RFC cdbfee72 (writer unique).
+
+    Stratégie de chunking : à arbitrer. Embedder l'artifact entier
+    (titre + description + body sérialisé) en un seul vecteur est
+    le plus simple. Découper en chunks sémantiques permet une
+    granularité fine mais complexifie la fusion des résultats.
+    Pour notre corpus (artifacts YAML structurés, en général
+    < 10kB), l'embedding global est probablement suffisant.
+
+    Reranking et query expansion : la clé Anthropic d'opencode
+    rend possible (mais optionnel) d'utiliser Claude pour
+    reformuler la query, générer un HyDE, ou reranker les top-K.
+    Coût et latence à arbitrer. Recommandation initiale : sortir
+    sans, mesurer, ajouter si les résultats top-K restent du
+    bruit.
+
+    Métriques de qualité : intégrer dès le départ un mécanisme
+    léger de mesure (logger les queries + les résultats retournés
+    + idéalement un signal d'usage en post). Pas d'optimisation
+    aveugle sans données.
+
+    Compatibilité avec PILIER D du RFC cdbfee72 : l'autorepair au
+    boot reconstruit la DB depuis les YAML. La table des
+    embeddings doit être reconstructible de la même manière (donc
+    l'embedding doit être déterministe ou stockable hors-DB en
+    backup).
+
+    Coexistence FTS5 actuel : laisser le FTS5 en parallèle pendant
+    une période de coexistence est une option pour permettre un
+    rollback. À arbitrer selon le coût d'avoir deux pipelines
+    d'indexation.
+
+  out_of_scope: >
+    Ce task-request ne concerne PAS :
+    - L'amélioration de la qualité éditoriale des artifacts
+      (titres, descriptions, tags) ; sujet adjacent qui sera
+      facilité par une bonne recherche mais ne doit pas la
+      bloquer.
+    - L'ajout de nouveaux types d'artifacts ou la modification du
+      schema des artifacts existants.
+    - Le changement du protocole de review ou des règles de
+      lookup mémoire (memory_lookup_before_acting reste tel quel,
+      seule son efficacité change).
+    - La mise en place d'un système de notation ou de feedback
+      explicite par les agents sur la qualité des résultats. Un
+      logging passif des queries est dans le scope ; un système
+      de vote actif est out.
