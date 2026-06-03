@@ -118,6 +118,15 @@ struct GrantPermitParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct RfcSetImplementedParams {
+    #[schemars(
+        description = "metadata.id (UUID) of the approved RFC to mark as implemented",
+        with = "String"
+    )]
+    id: Uuid,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct CheckPermitParams {
     #[schemars(description = "Persona ID to check", with = "String")]
     persona: PersonaId,
@@ -339,6 +348,33 @@ fn rollback_permit(engine: &OrchestratorEngine, permit_id: Uuid, context: &str) 
              after {context}: {e}"
         );
     }
+}
+
+/// Build the JSON response for `rfc_set_implemented` (RFC 1c0f2570 §1).
+/// Pure function — extracted for direct unit testing of the response shape
+/// (RFC §7.b) without going through rmcp.
+fn build_set_implemented_response(
+    outcome: &companyos_orchestrator::engine::SetImplementedOutcome,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "rfc_id": outcome.rfc_id.to_string(),
+        "previous_status": outcome.previous_status,
+        "new_status": outcome.new_status,
+        "implemented_at": outcome.implemented_at,
+        "file_path": outcome.file_path,
+    });
+    if outcome.already_implemented
+        && let serde_json::Value::Object(map) = &mut value
+    {
+        map.insert(
+            "note".to_string(),
+            serde_json::Value::String(
+                "RFC was already implemented (idempotent), original implemented_at preserved"
+                    .to_string(),
+            ),
+        );
+    }
+    value
 }
 
 fn ok(json: String) -> Result<CallToolResult, McpError> {
@@ -609,6 +645,33 @@ impl OrchestratorServer {
                 .with_context(format!("close_review_round(round_id={})", params.round_id))
                 .with_reason(format!("{e}"))
                 .with_fix("Ensure the round exists and is still open before closing")
+                .to_string()),
+        }
+    }
+
+    #[tool(
+        description = "Mark an approved RFC as implemented. Transitions metadata.status from 'approved' to 'implemented' and stamps implemented_at. Server-side lifecycle transition: requires NO write permit (same model as close_review_round auto-approving an RFC). Refuses any RFC not currently in 'approved' status with an explicit error. Already-implemented RFCs return an idempotent success."
+    )]
+    async fn rfc_set_implemented(
+        &self,
+        params: Parameters<RfcSetImplementedParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let params = params.0;
+        // No token check (RFC 1c0f2570 decision CEO 2): this is a lifecycle
+        // transition, not a privileged operation.
+        // Serialize concurrent calls on the same id via the engine mutex.
+        let engine = self.engine.lock().await;
+        match engine.set_rfc_implemented(params.id, &self.root_path) {
+            Ok(outcome) => {
+                ok(serde_json::to_string_pretty(&build_set_implemented_response(&outcome))
+                    .unwrap_or_default())
+            }
+            Err(e) => err(Diagnostic::error(C, "Failed to mark RFC as implemented")
+                .with_context(format!("rfc_set_implemented(id={})", params.id))
+                .with_reason(format!("{e}"))
+                .with_fix(
+                    "Verify the id is an existing RFC (use search/get) and that it is currently in 'approved' status — only approved RFCs can be marked implemented",
+                )
                 .to_string()),
         }
     }
@@ -2026,5 +2089,60 @@ mod tests {
             v.get("consumed_at").map(|c| c.is_null()).unwrap_or(true),
             "permit must not be consumed by the grant"
         );
+    }
+
+    // --- rfc_set_implemented response shape (RFC 1c0f2570 §7.b) ---
+
+    #[test]
+    fn test_build_set_implemented_response_success_shape() {
+        let id = Uuid::parse_str("a0000000-0000-4000-8000-000000000010").unwrap();
+        let outcome = companyos_orchestrator::engine::SetImplementedOutcome {
+            rfc_id: id,
+            previous_status: "approved".to_string(),
+            new_status: "implemented".to_string(),
+            implemented_at: "2026-06-04T12:00:00+00:00".to_string(),
+            file_path: "company/rfcs/x.yml".to_string(),
+            already_implemented: false,
+        };
+        let v = build_set_implemented_response(&outcome);
+        assert_eq!(v.get("rfc_id").unwrap().as_str().unwrap(), id.to_string());
+        assert_eq!(
+            v.get("previous_status").unwrap().as_str().unwrap(),
+            "approved"
+        );
+        assert_eq!(
+            v.get("new_status").unwrap().as_str().unwrap(),
+            "implemented"
+        );
+        assert_eq!(
+            v.get("implemented_at").unwrap().as_str().unwrap(),
+            "2026-06-04T12:00:00+00:00"
+        );
+        assert_eq!(
+            v.get("file_path").unwrap().as_str().unwrap(),
+            "company/rfcs/x.yml"
+        );
+        // No idempotent note on a real transition.
+        assert!(v.get("note").is_none());
+    }
+
+    #[test]
+    fn test_build_set_implemented_response_idempotent_shape() {
+        let id = Uuid::parse_str("c0000000-0000-4000-8000-000000000010").unwrap();
+        let outcome = companyos_orchestrator::engine::SetImplementedOutcome {
+            rfc_id: id,
+            previous_status: "implemented".to_string(),
+            new_status: "implemented".to_string(),
+            implemented_at: "2026-06-01T10:00:00+00:00".to_string(),
+            file_path: "company/rfcs/y.yml".to_string(),
+            already_implemented: true,
+        };
+        let v = build_set_implemented_response(&outcome);
+        assert_eq!(
+            v.get("new_status").unwrap().as_str().unwrap(),
+            "implemented"
+        );
+        let note = v.get("note").expect("idempotent case must carry a note");
+        assert!(note.as_str().unwrap().contains("idempotent"));
     }
 }

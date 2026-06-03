@@ -21,6 +21,23 @@ pub enum RfcUpdateResult {
     Failed(String),
 }
 
+/// Outcome of [`OrchestratorEngine::set_rfc_implemented`].
+///
+/// Carries everything `main.rs` needs to build the MCP JSON response WITHOUT
+/// re-reading the file. `already_implemented` distinguishes a real
+/// approved -> implemented transition from the idempotent success case (RFC
+/// 1c0f2570 decision CEO 1: an already-implemented RFC is a success, never an
+/// error, and its original `implemented_at` is preserved).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetImplementedOutcome {
+    pub rfc_id: Uuid,
+    pub previous_status: String,
+    pub new_status: String,
+    pub implemented_at: String,
+    pub file_path: String,
+    pub already_implemented: bool,
+}
+
 use crate::db::OrchestratorDb;
 use crate::error::OrchestratorError;
 use crate::roadmap_summary::{
@@ -341,10 +358,10 @@ impl OrchestratorEngine {
         // Update status line and add timestamp using string replacement
         // Strategy: replace `status: <old>` with `status: <new>` in the metadata block,
         // then append the timestamp field.
-        let timestamp_field = if new_status == "approved" {
-            format!("  approved_at: \"{now_iso}\"")
-        } else {
-            format!("  rejected_at: \"{now_iso}\"")
+        let timestamp_field = match new_status {
+            "approved" => format!("  approved_at: \"{now_iso}\""),
+            "implemented" => format!("  implemented_at: \"{now_iso}\""),
+            _ => format!("  rejected_at: \"{now_iso}\""),
         };
 
         // Replace status in metadata block
@@ -380,6 +397,152 @@ impl OrchestratorEngine {
                 new_status: new_status.to_string(),
             },
             Err(e) => RfcUpdateResult::Failed(format!("cannot write {full_path}: {e}")),
+        }
+    }
+
+    /// Transition an approved RFC to `status: implemented`, stamping
+    /// `implemented_at`. Server-side lifecycle transition (RFC 1c0f2570),
+    /// modelled on `close_round_with_rfc_update`: writes through the SINGLE
+    /// `update_rfc_status_in_file` path, requires NO write permit.
+    ///
+    /// Transition matrix:
+    ///   - `approved`    -> writes `implemented`, `already_implemented = false`.
+    ///   - `implemented` -> idempotent success, original `implemented_at`
+    ///     preserved, NO write (`already_implemented = true`).
+    ///   - `draft` / `review` / `rejected` -> `ValidationFailed` naming the
+    ///     current status.
+    ///   - kind != rfc          -> `ValidationFailed` naming the actual kind.
+    ///   - id absent from index -> `ArtifactNotFound`.
+    pub fn set_rfc_implemented(
+        &self,
+        rfc_id: Uuid,
+        root: &str,
+    ) -> Result<SetImplementedOutcome, OrchestratorError> {
+        let id_str = rfc_id.to_string();
+
+        // 1. Resolve the artifact via the index.
+        let artifact = self
+            .db
+            .get_artifact(&id_str)?
+            .ok_or_else(|| OrchestratorError::ArtifactNotFound { id: id_str.clone() })?;
+
+        // 2. Verify it is an RFC.
+        if artifact.kind != "rfc" {
+            return Err(OrchestratorError::ValidationFailed {
+                id: id_str.clone(),
+                errors: format!("expected kind 'rfc', found '{}'", artifact.kind),
+            });
+        }
+
+        // 3. Coherence check: the indexed file_path must live under
+        //    company/rfcs/ (defends against index incoherence, RFC §3.b).
+        let file_path = artifact.file_path.clone();
+        if !file_path.starts_with("company/rfcs/") {
+            return Err(OrchestratorError::ValidationFailed {
+                id: id_str.clone(),
+                errors: format!(
+                    "indexed file_path '{file_path}' is not under company/rfcs/ — possible index incoherence"
+                ),
+            });
+        }
+
+        // 4. Read and parse the YAML once to obtain the current status.
+        let full_path = if file_path.starts_with('/') {
+            file_path.clone()
+        } else {
+            format!("{root}/{file_path}")
+        };
+        let content =
+            std::fs::read_to_string(&full_path).map_err(|source| OrchestratorError::FileRead {
+                path: full_path.clone(),
+                source,
+            })?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        let previous_status = parsed
+            .get("metadata")
+            .and_then(|m| m.get("status"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("draft")
+            .to_string();
+
+        // 5. Apply the transition matrix.
+        match previous_status.as_str() {
+            "implemented" => {
+                // Idempotent success (decision CEO 1): preserve the original
+                // implemented_at, NO write.
+                let existing_implemented_at = parsed
+                    .get("metadata")
+                    .and_then(|m| m.get("implemented_at"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Ok(SetImplementedOutcome {
+                    rfc_id,
+                    previous_status,
+                    new_status: "implemented".to_string(),
+                    implemented_at: existing_implemented_at,
+                    file_path,
+                    already_implemented: true,
+                })
+            }
+            "approved" => {
+                // Real transition: delegate the write to the SINGLE write path.
+                match self.update_rfc_status_in_file(root, &file_path, &id_str, "implemented") {
+                    RfcUpdateResult::Updated { .. } => {
+                        // Re-read implemented_at from disk so the outcome carries
+                        // the exact stamped value (single source of truth).
+                        let written = std::fs::read_to_string(&full_path).map_err(|source| {
+                            OrchestratorError::FileRead {
+                                path: full_path.clone(),
+                                source,
+                            }
+                        })?;
+                        let stamped = serde_yaml::from_str::<serde_yaml::Value>(&written)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("metadata")
+                                    .and_then(|m| m.get("implemented_at"))
+                                    .and_then(|s| s.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .unwrap_or_default();
+                        Ok(SetImplementedOutcome {
+                            rfc_id,
+                            previous_status,
+                            new_status: "implemented".to_string(),
+                            implemented_at: stamped,
+                            file_path,
+                            already_implemented: false,
+                        })
+                    }
+                    RfcUpdateResult::AlreadyUpToDate => {
+                        // Should not happen (previous_status was "approved"),
+                        // but treat defensively as idempotent success.
+                        Ok(SetImplementedOutcome {
+                            rfc_id,
+                            previous_status,
+                            new_status: "implemented".to_string(),
+                            implemented_at: String::new(),
+                            file_path,
+                            already_implemented: true,
+                        })
+                    }
+                    RfcUpdateResult::Failed(reason) => Err(OrchestratorError::ValidationFailed {
+                        id: id_str,
+                        errors: format!("failed to write status: {reason}"),
+                    }),
+                    RfcUpdateResult::NotAnRfc => Err(OrchestratorError::ValidationFailed {
+                        id: id_str,
+                        errors: "unexpected NotAnRfc result during RFC status write".to_string(),
+                    }),
+                }
+            }
+            other => Err(OrchestratorError::ValidationFailed {
+                id: id_str,
+                errors: format!(
+                    "cannot mark as implemented: current status is '{other}', only 'approved' allowed"
+                ),
+            }),
         }
     }
 
@@ -1192,6 +1355,7 @@ mod tests {
         ArtifactPath, ConsensusResult, Finding, OrchestratorDb, OrchestratorEngine, ReviewVerdict,
     };
     use companyos_config::{ArtifactKind, PersonaId};
+    use uuid::Uuid;
 
     fn setup_engine() -> OrchestratorEngine {
         let db = OrchestratorDb::open_in_memory().expect("open in-memory db");
@@ -1860,4 +2024,258 @@ mod tests {
             other => panic!("expected RoadmapKindMismatch, got {other:?}"),
         }
     }
+
+    // --- set_rfc_implemented tests (RFC 1c0f2570) ---
+
+    /// Write a minimal valid RFC YAML fixture under company/rfcs/<id>.yml.
+    /// If `implemented_at` is Some, the field is emitted in metadata (used to
+    /// assert preservation in the idempotent case).
+    ///
+    /// CONSTRAINT (lesson f3fc4a5d): built with push_str + literal \n +
+    /// explicit indentation — NEVER Rust backslash line-continuation, which
+    /// collapses YAML indentation.
+    fn write_rfc(
+        root: &RoadmapTestRoot,
+        id: &str,
+        status: &str,
+        implemented_at: Option<&str>,
+    ) -> String {
+        let mut content = String::new();
+        content.push_str("api_version: companyos/v1\n");
+        content.push_str("kind: rfc\n");
+        content.push_str("metadata:\n");
+        content.push_str(&format!("  id: {id}\n"));
+        content.push_str("  title: \"Test RFC\"\n");
+        content.push_str("  author: architect\n");
+        content.push_str(&format!("  status: {status}\n"));
+        if let Some(ts) = implemented_at {
+            content.push_str(&format!("  implemented_at: \"{ts}\"\n"));
+        }
+        content.push_str("  created_at: \"2026-06-04\"\n");
+        content.push_str("spec:\n");
+        content.push_str("  motivation: \"why\"\n");
+        let rel_path = format!("company/rfcs/{id}.yml");
+        root.write_raw(&rel_path, &content);
+        rel_path
+    }
+
+    /// Index an RFC fixture so set_rfc_implemented can resolve its file_path.
+    fn index_rfc(engine: &mut OrchestratorEngine, id: &str, file_path: &str) {
+        index_artifact_with_kind(engine, id, "rfc", file_path);
+    }
+
+    // NOMINAL
+
+    #[test]
+    fn test_set_implemented_from_approved_succeeds() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let id = "a0000000-0000-4000-8000-000000000001";
+        let path = write_rfc(&root, id, "approved", None);
+        index_rfc(&mut engine, id, &path);
+
+        let uuid = Uuid::parse_str(id).unwrap();
+        let outcome = engine
+            .set_rfc_implemented(uuid, root.root_str())
+            .expect("transition should succeed");
+
+        assert_eq!(outcome.previous_status, "approved");
+        assert_eq!(outcome.new_status, "implemented");
+        assert!(!outcome.already_implemented);
+        assert!(!outcome.implemented_at.is_empty());
+
+        // Re-read the YAML to confirm the write.
+        let written = std::fs::read_to_string(root.path.join(&path)).expect("read back");
+        assert!(written.contains("status: implemented"));
+        assert!(written.contains("implemented_at:"));
+    }
+
+    #[test]
+    fn test_set_implemented_reflects_new_status_after_write() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let id = "a0000000-0000-4000-8000-000000000002";
+        let path = write_rfc(&root, id, "approved", None);
+        index_rfc(&mut engine, id, &path);
+
+        let uuid = Uuid::parse_str(id).unwrap();
+        engine.set_rfc_implemented(uuid, root.root_str()).unwrap();
+
+        let written = std::fs::read_to_string(root.path.join(&path)).expect("read back");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&written).unwrap();
+        let status = parsed
+            .get("metadata")
+            .and_then(|m| m.get("status"))
+            .and_then(|s| s.as_str())
+            .unwrap();
+        assert_eq!(status, "implemented");
+    }
+
+    // NEGATIVE
+
+    #[test]
+    fn test_set_implemented_rfc_not_found() {
+        let root = RoadmapTestRoot::new();
+        let engine = setup_engine();
+        let uuid = Uuid::parse_str("b0000000-0000-4000-8000-000000000001").unwrap();
+        let res = engine.set_rfc_implemented(uuid, root.root_str());
+        match res {
+            Err(OrchestratorError::ArtifactNotFound { id }) => {
+                assert_eq!(id, uuid.to_string());
+            }
+            other => panic!("expected ArtifactNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_implemented_from_draft_refused() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let id = "b0000000-0000-4000-8000-000000000002";
+        let path = write_rfc(&root, id, "draft", None);
+        index_rfc(&mut engine, id, &path);
+
+        let uuid = Uuid::parse_str(id).unwrap();
+        match engine.set_rfc_implemented(uuid, root.root_str()) {
+            Err(OrchestratorError::ValidationFailed { errors, .. }) => {
+                assert!(
+                    errors.contains("draft"),
+                    "message should name 'draft': {errors}"
+                );
+            }
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_implemented_from_review_refused() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let id = "b0000000-0000-4000-8000-000000000003";
+        let path = write_rfc(&root, id, "review", None);
+        index_rfc(&mut engine, id, &path);
+
+        let uuid = Uuid::parse_str(id).unwrap();
+        match engine.set_rfc_implemented(uuid, root.root_str()) {
+            Err(OrchestratorError::ValidationFailed { errors, .. }) => {
+                assert!(
+                    errors.contains("review"),
+                    "message should name 'review': {errors}"
+                );
+            }
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_implemented_from_rejected_refused() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let id = "b0000000-0000-4000-8000-000000000004";
+        let path = write_rfc(&root, id, "rejected", None);
+        index_rfc(&mut engine, id, &path);
+
+        let uuid = Uuid::parse_str(id).unwrap();
+        match engine.set_rfc_implemented(uuid, root.root_str()) {
+            Err(OrchestratorError::ValidationFailed { errors, .. }) => {
+                assert!(
+                    errors.contains("rejected"),
+                    "message should name 'rejected': {errors}"
+                );
+            }
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_implemented_on_non_rfc_kind_refused() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let id = "b0000000-0000-4000-8000-000000000005";
+        // Index as a design-doc but place a file so the path check is reachable.
+        let path = format!("company/rfcs/{id}.yml");
+        root.write_raw(&path, "kind: design-doc\n");
+        index_artifact_with_kind(&mut engine, id, "design-doc", &path);
+
+        let uuid = Uuid::parse_str(id).unwrap();
+        match engine.set_rfc_implemented(uuid, root.root_str()) {
+            Err(OrchestratorError::ValidationFailed { errors, .. }) => {
+                assert!(
+                    errors.contains("design-doc"),
+                    "message should name actual kind: {errors}"
+                );
+            }
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+    }
+
+    // EDGE
+
+    #[test]
+    fn test_set_implemented_already_implemented_is_idempotent() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let id = "c0000000-0000-4000-8000-000000000001";
+        let original_ts = "2026-06-01T10:00:00+00:00";
+        let path = write_rfc(&root, id, "implemented", Some(original_ts));
+        index_rfc(&mut engine, id, &path);
+
+        let uuid = Uuid::parse_str(id).unwrap();
+        let outcome = engine
+            .set_rfc_implemented(uuid, root.root_str())
+            .expect("idempotent success");
+
+        assert!(outcome.already_implemented);
+        assert_eq!(outcome.previous_status, "implemented");
+        assert_eq!(outcome.implemented_at, original_ts);
+
+        // Decision CEO 1: original implemented_at preserved, NO rewrite.
+        let written = std::fs::read_to_string(root.path.join(&path)).expect("read back");
+        assert!(
+            written.contains(original_ts),
+            "original implemented_at must be preserved: {written}"
+        );
+    }
+
+    #[test]
+    fn test_set_implemented_corrupt_yaml() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let id = "c0000000-0000-4000-8000-000000000002";
+        let path = format!("company/rfcs/{id}.yml");
+        // Unparsable YAML (unterminated flow mapping).
+        root.write_raw(&path, "metadata: {status: approved\n  : : :\n");
+        index_rfc(&mut engine, id, &path);
+
+        let uuid = Uuid::parse_str(id).unwrap();
+        match engine.set_rfc_implemented(uuid, root.root_str()) {
+            Err(OrchestratorError::Yaml(_)) | Err(OrchestratorError::FileRead { .. }) => {}
+            other => panic!("expected Yaml/FileRead error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_implemented_twice_second_is_idempotent() {
+        // The real concurrency serialization is guaranteed by the tokio Mutex
+        // on the MCP side (engine.lock().await), not by the sync engine. Here
+        // we assert the sequential equivalent: calling twice on the same id
+        // yields a real transition then an idempotent success.
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let id = "c0000000-0000-4000-8000-000000000003";
+        let path = write_rfc(&root, id, "approved", None);
+        index_rfc(&mut engine, id, &path);
+
+        let uuid = Uuid::parse_str(id).unwrap();
+        let first = engine.set_rfc_implemented(uuid, root.root_str()).unwrap();
+        assert!(!first.already_implemented);
+
+        let second = engine.set_rfc_implemented(uuid, root.root_str()).unwrap();
+        assert!(second.already_implemented);
+        assert_eq!(second.previous_status, "implemented");
+    }
+
+    // NOTE: malformed id is rejected at the MCP deserializer level
+    // (RfcSetImplementedParams.id: Uuid + with="String"), so no engine-level
+    // test is possible — the method always receives a valid Uuid.
 }
