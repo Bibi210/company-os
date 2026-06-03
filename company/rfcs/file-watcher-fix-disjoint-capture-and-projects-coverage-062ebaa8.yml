@@ -5,7 +5,8 @@ metadata:
   title: "Fix file watcher orchestrator : capture explicite du RecommendedWatcher en edition 2024 + extension du scope à projects/"
   author: architect
   created_at: "2026-06-03"
-  status: draft
+  status: approved
+  approved_at: "2026-06-03T19:09:34.498857810+00:00"
   description: >
     Corrige le bug du file watcher mort au boot diagnostiqué dans le
     diagnostic-report 9534dd33 (disjoint capture en Rust edition 2024 qui
@@ -13,8 +14,9 @@ metadata:
     et profite du même write permit pour livrer l'extension du scope du
     watcher demandée par le task-request 36ecb829 (acceptance criterion 4 :
     surveiller projects/ en plus de company/ et des protected zones).
-    Ajoute aussi un eprintln explicite quand le _watcher est dropé pour
-    rendre tout futur problème équivalent visible immédiatement.
+    Ajoute aussi une instrumentation defensive (Drop bruyant gardé par un
+    flag is_shutting_down) pour rendre tout futur problème équivalent
+    visible immédiatement sans générer de faux positifs au shutdown propre.
     Touche les zones protégées `crates/mcp-servers/orchestrator/src/main.rs`
     et `crates/config/src/watcher.rs`. Approbation CEO et write permit
     requis.
@@ -28,6 +30,37 @@ metadata:
     - regression
     - orchestrator
     - auto-indexation
+  changelog:
+    - date: "2026-06-03"
+      author: architect
+      description: >
+        Iteration 2 — adresse les 6 findings du round
+        ae57a78b-2b82-4486-8a12-5f48798547c5 (Implementer + CEO sur le
+        fond approuvé).
+        F1 : extraction du watcher dans un newtype `WatcherGuard` interne
+        qui porte le Drop, FileWatcherHandle reste destructurable
+        (résout E0509). F2 : Drop conditionnel via un `Arc<AtomicBool>
+        is_shutting_down` partagé entre WatcherGuard et le handler
+        SIGTERM/SIGINT ; un drop pendant shutdown logue info, un drop
+        hors shutdown logue error. F3 : nommage unifié sur `_guard:
+        WatcherGuard` (préfixe underscore conservé pour éviter le warn
+        unused, le commentaire en doc-comment explique pourquoi). F4 :
+        spec du test enrichie (reload du cache protected_zones avant
+        chaque test, création explicite des sous-dirs minimaux dans le
+        tempdir, timeout réception passé à 2.5s). F5 : modification de
+        constants.rs retirée des affected_files (PROJECTS_DIR existe
+        déjà ligne 32), notice explicite que le permit couvre ce path
+        par asymétrie favorable sans modification effective. F6 :
+        watch(projects_dir) en best-effort, échec logué en warning,
+        n'invalide pas le watcher global ; les autres dirs (protected
+        zones + company/) restent en propagation stricte car leur
+        absence indique un repo malformé.
+    - date: "2026-06-03"
+      author: architect
+      description: >
+        Iteration 1 — première rédaction après diagnostic-report
+        9534dd33. Trois modifications : fix capture, extension projects/,
+        defensive observability.
   related:
     - id: 9534dd33-313c-42d7-b6ac-3801ba97dbc7
       kind: diagnostic-report
@@ -80,102 +113,332 @@ spec:
     artifact_index de shared-rules.yml).
 
   proposal: >
-    Trois modifications coordonnées dans la même PR.
+    Trois modifications coordonnées dans la même PR, amendées en
+    iteration 2 pour adresser les 6 findings du review round
+    ae57a78b-2b82-4486-8a12-5f48798547c5.
 
     Modification 1 — fix du drop prématuré du RecommendedWatcher
     ============================================================
-    Dans crates/mcp-servers/orchestrator/src/main.rs entre lignes 1215
-    et 1265, restructurer le `Ok(mut handle) => { tokio::spawn(async move
-    { ... }) }` pour forcer la capture explicite du watcher :
+    Cette modification est portée principalement par le refactor de
+    `crates/config/src/watcher.rs` (Modification 3 ci-dessous) qui
+    introduit le newtype `WatcherGuard`. Côté
+    `crates/mcp-servers/orchestrator/src/main.rs` lignes 1215 à 1265, on
+    restructure le `Ok(handle) => { tokio::spawn(async move { ... }) }`
+    pour forcer la capture explicite du guard :
 
       Ok(handle) => {
-          // Destructure pour casser la disjoint capture rule : on
-          // bindge explicitement _watcher et on l'embarque dans la
-          // closure async via un `let _keep = _watcher;`.
-          let companyos_config::watcher::FileWatcherHandle { mut rx, _watcher } = handle;
+          // Destructure pour casser la disjoint capture rule de l'edition
+          // 2024 : on bindge explicitement `_guard` et on l'embarque dans
+          // la closure async via un `let _keep = _guard;`. FileWatcherHandle
+          // ne porte PAS Drop (cf. F1) ; le Drop bruyant vit dans
+          // WatcherGuard.
+          let companyos_config::watcher::FileWatcherHandle { mut rx, _guard } = handle;
           let engine = engine.clone();
-          ...
+          let validator = validator.clone();
+          let root = root.clone();
+          let schemas_dir = schemas_dir.clone();
           let watcher_alive = watcher_alive.clone();
           let task_handle = tokio::spawn(async move {
-              // Le watcher doit vivre aussi longtemps que la consumer
-              // task. Sans cette ligne, l'edition 2024 ne le capture
-              // pas (champ jamais lu dans la closure) et le drop à la
-              // fin du match arm tue le fd inotify (cf. diagnostic
-              // 9534dd33).
-              let _keep_watcher = _watcher;
+              // Le guard (et donc le RecommendedWatcher qu'il porte) doit
+              // vivre aussi longtemps que la consumer task. Sans cette
+              // ligne, l'edition 2024 ne le capture pas (champ jamais lu
+              // dans la closure) et il est dropé à la fin du match arm,
+              // tuant le fd inotify (cf. diagnostic 9534dd33). NE PAS
+              // SUPPRIMER ce binding même s'il a l'air inutilisé.
+              let _keep_guard = _guard;
 
               watcher_alive.store(true, Ordering::Release);
               struct AliveGuard(Arc<AtomicBool>);
-              impl Drop for AliveGuard { fn drop(&mut self) { self.0.store(false, Ordering::Release); } }
+              impl Drop for AliveGuard {
+                  fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+              }
               let _alive_guard = AliveGuard(watcher_alive.clone());
 
-              while let Some(change) = rx.recv().await { ... }
+              while let Some(change) = rx.recv().await { /* match change ... */ }
           });
           Some(task_handle)
       }
 
-    Ajouter un commentaire long en tête du match arm qui pointe vers
-    9534dd33 et explique pourquoi le binding `_keep_watcher` ne doit
-    JAMAIS être supprimé même s'il a l'air inutilisé. Sinon le bug
-    reviendra silencieusement à la prochaine refonte.
+    Le commentaire long en tête du match arm pointe vers 9534dd33 et
+    explique pourquoi `_keep_guard` ne doit JAMAIS être supprimé, même
+    s'il a l'air inutilisé. Couplé au nommage `_guard` (warn unused
+    silencé) et au commentaire doc-comment du champ côté
+    FileWatcherHandle (Modif 3), un futur lecteur ne peut pas se tromper.
 
-    Modification 2 — extension à projects/
-    ======================================
+    Modification 2 — extension à projects/, best-effort
+    ===================================================
     Dans crates/config/src/watcher.rs, après le bloc qui watche
-    `company/` (lignes 92-95), ajouter le même bloc pour
-    `projects/` :
+    `company/` (lignes 92-95 actuelles), ajouter un bloc pour
+    `projects/` mais en best-effort (cf. F6) :
 
+      // Best-effort: projects/ peut ne pas exister sur un fresh
+      // checkout ou si tous les projets ont été archivés. L'absence
+      // n'est pas un échec ; un échec d'inotify_watch (par exemple
+      // limite max_user_watches atteinte) n'est pas non plus une
+      // raison de couler tout le watcher, car les autres dirs (zones
+      // protégées + company/) restent watchés.
       let projects_dir = root_path.join(constants::PROJECTS_DIR);
       if projects_dir.is_dir() {
-          watcher.watch(&projects_dir, RecursiveMode::Recursive)?;
+          if let Err(e) = watcher.watch(&projects_dir, RecursiveMode::Recursive) {
+              tracing::warn!(
+                  "Failed to watch projects/ (best-effort, other dirs still watched): {e}"
+              );
+          }
       }
 
-    Étendre `classify()` (lignes 34-54) pour qu'un YAML sous
-    `projects/<slug>/...` retourne `ConfigChangeKind::Artifacts` (les
-    artifacts projet sont indexés comme les autres). La logique
-    actuelle traite déjà tous les `.yml`/`.yaml` hors protected zones
-    comme `Artifacts`, donc la modification consiste juste à s'assurer
-    que projects/ n'est pas accidentellement classé comme zone
-    protégée (vérifier que `PROJECTS_DIR` n'apparaît pas dans
-    protected-zones.json — ce qui est déjà le cas).
+    Pour les autres dirs (zones protégées + company/), conserver la
+    propagation stricte (`?`) actuelle : leur absence ou un échec
+    d'inotify_watch est cohérent avec un repo malformé ou une limite
+    système, l'utilisateur DOIT être notifié bruyamment.
 
-    Si la constante `PROJECTS_DIR` n'existe pas encore dans
-    crates/config/src/constants.rs, l'ajouter (valeur `"projects"`).
+    Classification : `classify()` (lignes 34-54 actuelles) traite déjà
+    tout `.yml`/`.yaml` hors protected zones comme `Artifacts`, donc un
+    fichier sous `projects/<slug>/.../*.yml` sera bien classé sans
+    modification. Vérifier par tests d'unité que `projects/` n'est
+    accidentellement pas couvert par un prefix de protected-zones.json
+    (aujourd'hui ce n'est pas le cas, mais l'invariant doit être
+    documenté en commentaire).
 
-    Modification 3 — defensive observability
-    ========================================
-    Dans crates/config/src/watcher.rs, instrumenter `FileWatcherHandle`
-    avec un `impl Drop for FileWatcherHandle` qui appelle
-    `tracing::error!("FileWatcherHandle dropped — file watcher is now
-    DEAD; inotify watches released. Investigate immediately if this is
-    not a shutdown.")`. Couplé à un panic_handler dans la consumer task
-    (catch_unwind autour de la boucle `while let Some(change) = rx.recv()`)
-    qui logue `tracing::error!("Watcher consumer task panicked: {e:?}")`
-    avant de drop le guard. Le but est qu'aucun futur régression
-    silencieuse ne soit possible : si le watcher meurt pour QUELQUE
-    raison que ce soit, on le sait dans les logs.
+    Note F5 : la constante `PROJECTS_DIR` existe déjà dans
+    crates/config/src/constants.rs ligne 32 (valeur `"projects"`),
+    donc constants.rs N'EST PAS modifié. Le path reste mentionné dans
+    affected_files par asymétrie favorable (pattern bdee1af4 /
+    cdbfee72) pour que le permit couvre une éventuelle modification
+    mineure découverte pendant l'implémentation (par exemple ajouter
+    un constants::PROJECTS_DIR_TRIMMED ou réorganiser les commentaires
+    de section). Si aucune modification n'est nécessaire, le fichier
+    reste intact ; le permit non consommé sur ce path est inerte.
 
-    Renommer aussi le champ `_watcher` en `keep_alive_watcher` (sans
-    le préfixe `_`) avec un commentaire `/// HOLD this field alive...`
-    pour qu'un futur lecteur du code comprenne immédiatement que le
-    champ doit être tenu en vie.
+    Modification 3 — newtype WatcherGuard + Drop conditionnel
+    ==========================================================
+    Dans crates/config/src/watcher.rs, refactor en deux types
+    coordonnés.
+
+    (3.a) Newtype WatcherGuard
+    --------------------------
+    Encapsule le RecommendedWatcher dans un newtype interne qui porte
+    seul le Drop bruyant. FileWatcherHandle peut ainsi être
+    destructuré par move sans violer E0509 (cf. F1).
+
+      /// Sentinel: holds the OS-level inotify watch alive AND emits a
+      /// loud trace when dropped outside a clean shutdown. Always store
+      /// this in a binding that lives at least as long as the consumer
+      /// task that reads `FileWatcherHandle::rx`. Disjoint capture in
+      /// Rust 2024 async closures will NOT capture a field that is
+      /// never read textually — see diagnostic-report 9534dd33.
+      pub struct WatcherGuard {
+          // Option so Drop can take ownership and explicit-drop the
+          // RecommendedWatcher BEFORE deciding the log level (otherwise
+          // the drop trace would fire after the OS resources are
+          // already released, racing the thread exit).
+          watcher: Option<RecommendedWatcher>,
+          is_shutting_down: Arc<AtomicBool>,
+      }
+
+      impl WatcherGuard {
+          fn new(watcher: RecommendedWatcher, is_shutting_down: Arc<AtomicBool>) -> Self {
+              Self { watcher: Some(watcher), is_shutting_down }
+          }
+      }
+
+      impl Drop for WatcherGuard {
+          fn drop(&mut self) {
+              // Drop the inner watcher first so inotify fds are
+              // released before the log line, then trace at the right
+              // level. catch_unwind around the take() is paranoia in
+              // case the watcher's Drop itself panics.
+              let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                  self.watcher.take();
+              }));
+              if self.is_shutting_down.load(Ordering::Acquire) {
+                  tracing::info!(
+                      "WatcherGuard dropped during shutdown — inotify watches released cleanly."
+                  );
+              } else {
+                  tracing::error!(
+                      "WatcherGuard dropped OUTSIDE shutdown — file watcher is now DEAD; \
+                       inotify watches released. Investigate immediately (cf. diagnostic 9534dd33)."
+                  );
+              }
+          }
+      }
+
+    (3.b) FileWatcherHandle sans Drop
+    ---------------------------------
+    Le handle public reste un struct simple, destructurable. Le champ
+    qui tient le guard en vie est préfixé `_guard` (silence l'unused
+    warning) avec un doc-comment qui explique pourquoi (cf. F3).
+
+      pub struct FileWatcherHandle {
+          pub rx: mpsc::Receiver<ConfigChangeKind>,
+
+          /// HOLD this field alive for as long as you consume `rx`.
+          /// Dropping it releases the inotify watches and kills the
+          /// underlying file watcher. The leading underscore silences
+          /// the unused-field lint; capturing it via
+          /// `let _keep = _guard;` inside an `async move` block is
+          /// MANDATORY in Rust 2024 (disjoint capture). Cf. diagnostic
+          /// 9534dd33.
+          pub _guard: WatcherGuard,
+      }
+
+    (3.c) Signature de spawn_watcher
+    --------------------------------
+    Pour propager `is_shutting_down` depuis l'orchestrator vers le
+    WatcherGuard :
+
+      pub fn spawn_watcher(
+          root: &str,
+          debounce: Duration,
+          is_shutting_down: Arc<AtomicBool>,
+      ) -> anyhow::Result<FileWatcherHandle>;
+
+    Côté `crates/mcp-servers/orchestrator/src/main.rs`, créer le flag
+    AVANT spawn_watcher et l'armer dans les arms SIGTERM/SIGINT du
+    tokio::select! existant :
+
+      let is_shutting_down = Arc::new(AtomicBool::new(false));
+      // ... spawn_watcher(&root, ..., is_shutting_down.clone()) ...
+
+      tokio::select! {
+          result = service.waiting() => { ... }
+          _ = sigterm.recv() => {
+              is_shutting_down.store(true, Ordering::Release);
+              tracing::info!("SIGTERM received, initiating graceful shutdown");
+          }
+          _ = sigint.recv() => {
+              is_shutting_down.store(true, Ordering::Release);
+              tracing::info!("SIGINT received, initiating graceful shutdown");
+          }
+      }
+
+    L'ordre est important : le store(true) AVANT le tracing::info de
+    shutdown garantit qu'aucun drop concurrent du watcher (par exemple
+    si la consumer task termine au même instant à cause de la fermeture
+    du channel) ne loggera error par erreur. L'Ordering Release/Acquire
+    suffit (pas de SeqCst nécessaire car aucune autre dépendance
+    d'ordre que cette lecture/écriture).
+
+    (3.d) Panic handler dans la consumer task
+    -----------------------------------------
+    Dans la consumer task (main.rs:1222-1264), enrouler la boucle
+    `while let Some(change) = rx.recv()` dans un `AssertUnwindSafe +
+    catch_unwind` async-friendly. Comme `catch_unwind` natif ne
+    fonctionne pas trivialement à travers un `.await`, utiliser le
+    pattern d'isolation : la task tokio entière est résiliente parce
+    que tokio::spawn par défaut catch les panics dans le JoinError. On
+    expose juste explicitement le panic via un log error AVANT que la
+    task ne termine :
+
+      let task_handle = tokio::spawn(async move {
+          let _keep_guard = _guard;
+          let result = std::panic::AssertUnwindSafe(async {
+              watcher_alive.store(true, Ordering::Release);
+              // alive_guard scope ...
+              while let Some(change) = rx.recv().await { /* ... */ }
+          }).catch_unwind().await; // futures::FutureExt::catch_unwind
+          if let Err(panic) = result {
+              tracing::error!("Watcher consumer task panicked: {panic:?}");
+          }
+      });
+
+    Si `futures::FutureExt::catch_unwind` n'est pas déjà disponible
+    dans le crate (vérifier les deps), l'Implementer peut soit ajouter
+    `futures = "0.3"` aux dépendances soit s'appuyer sur le
+    `JoinHandle::await` côté shutdown qui retournera un Err(JoinError)
+    si la task panique, et logger error à ce moment-là (alternative
+    plus simple, sans dépendance supplémentaire). L'Architect ne
+    tranche pas la sous-question ici : c'est un détail d'implémentation,
+    pas une décision architecturale. L'invariant à respecter est
+    "tout panic dans la consumer task DOIT laisser une trace error
+    dans les logs serveur".
 
     Test de régression
     ==================
-    Ajouter dans crates/config/tests/ (ou crates/mcp-servers/orchestrator
-    /tests/, selon ce qui est le plus naturel pour l'Implementer) un
-    test d'intégration qui :
+    Ajouter `crates/config/tests/watcher_integration.rs` (test
+    d'intégration, pas test d'unité, pour pouvoir spawner un runtime
+    tokio complet). Spec enrichie suite à F4 :
 
-      (a) spawne le watcher sur un répertoire temporaire ayant les
-          mêmes sous-dirs que le repo (company/config, etc.),
-      (b) attend 200ms,
-      (c) écrit un fichier .yml sous le répertoire temporaire,
-      (d) attend debounce+200ms,
-      (e) vérifie que le receiver a bien produit un événement.
+      #[tokio::test]
+      async fn watcher_survives_async_move_destructure() {
+          use tempfile::TempDir;
+          // (F4.a) reset le cache statique de protected_zones AVANT
+          // de configurer un nouveau root, sinon un test précédent
+          // peut avoir mis en cache un autre PathBuf et load() le
+          // retournera au lieu de lire notre tempdir.
+          companyos_config::protected_zones::reload();
 
-    Ce test attrape immédiatement le retour du bug si une refonte
-    future re-déclenche la disjoint capture (par exemple en
-    re-supprimant le `let _keep_watcher = _watcher;`).
+          let tmp = TempDir::new().unwrap();
+          let root = tmp.path();
+          // (F4.b) créer les sous-dirs minimaux que spawn_watcher
+          // attend. Sans cela, les watch() failent par if !is_dir()
+          // (best-effort: pas d'erreur, mais le test ne valide rien
+          // non plus). Crée AUSSI projects/ pour exercer la branche
+          // best-effort de Modif 2.
+          for d in ["company", "company/config", "company/personas",
+                    "company/schemas", "company/plugins", "crates",
+                    "projects"] {
+              std::fs::create_dir_all(root.join(d)).unwrap();
+          }
+          // Écrire un protected-zones.json minimaliste cohérent avec
+          // les sous-dirs ci-dessus pour que protected_zones::load()
+          // retourne quelque chose de réaliste.
+          std::fs::write(
+              root.join("company/config/protected-zones.json"),
+              r#"{"prefixes": ["company/config/", "company/personas/",
+                                "company/schemas/", "company/plugins/",
+                                "crates/"], "files": []}"#,
+          ).unwrap();
+          companyos_config::protected_zones::reload();
+
+          let is_shutting_down = Arc::new(AtomicBool::new(false));
+          let handle = spawn_watcher(
+              root.to_str().unwrap(),
+              Duration::from_millis(500),
+              is_shutting_down.clone(),
+          ).expect("spawn_watcher ok");
+
+          // Reproduire EXACTEMENT le pattern main.rs (destructure +
+          // async move sans rebind intérieur).
+          let FileWatcherHandle { mut rx, _guard } = handle;
+          let task = tokio::spawn(async move {
+              let _keep = _guard;
+              rx.recv().await
+          });
+
+          // Laisser le watcher attacher inotify (en pratique < 50ms,
+          // mais 200ms de marge pour la CI lente).
+          tokio::time::sleep(Duration::from_millis(200)).await;
+
+          // Touch un YAML dans une zone qui produit ConfigChangeKind
+          // (company/config est watché et classifié Config).
+          let probe = root.join("company/config/__probe.yml");
+          std::fs::write(&probe, "x").unwrap();
+
+          // (F4.c) timeout 2.5s : debounce 500ms + propagation kernel
+          // (inotify queue + tokio scheduler) + marge confortable pour
+          // CI à charge variable. Au-delà de 2.5s on est en deadlock,
+          // pas en flake.
+          let received = tokio::time::timeout(
+              Duration::from_secs(2) + Duration::from_millis(500),
+              task,
+          ).await.expect("watcher did not deliver any event within 2.5s — \
+                          regression of the disjoint-capture bug \
+                          (cf. diagnostic 9534dd33)");
+          assert!(matches!(received, Ok(Some(_))));
+
+          // Désactiver le log error au drop du guard (le test termine
+          // proprement, pas un shutdown applicatif mais sémantiquement
+          // équivalent du point de vue "drop attendu, pas une régression").
+          is_shutting_down.store(true, Ordering::Release);
+      }
+
+    Le test attrape immédiatement le retour du bug si une refonte
+    future re-déclenche la disjoint capture (par exemple en supprimant
+    le `let _keep = _guard;`). Il valide aussi la Modif 2
+    (projects/ existe dans le tempdir, donc le best-effort watch
+    s'exerce) et la Modif 3 (le store(true) à la fin évite le log
+    error parasite en sortie de test).
 
     Critère d'acceptation au merge
     ==============================
@@ -187,7 +450,16 @@ spec:
       projects/company-os/diagnostic-reports/ produit une apparition
       du fichier dans artifacts/fts/vec en moins de 1s (500ms
       debounce + marge).
-    - Le test de régression ci-dessus passe en CI.
+    - Le test de régression `watcher_survives_async_move_destructure`
+      passe en CI.
+    - Un SIGTERM/SIGINT propre ne produit AUCUN `tracing::error` lié
+      au watcher dans les logs (test manuel : démarrer serveur,
+      attendre boot OK, envoyer SIGTERM, grep "DEAD" / "OUTSIDE
+      shutdown" dans stderr → 0 occurrence).
+    - Faire échouer artificiellement `watcher.watch(&projects_dir,
+      ...)` (par exemple en supprimant le dir entre le `is_dir()` et
+      le `watch()` via un test d'unité) produit un warning et le
+      watcher reste fonctionnel pour les autres dirs.
 
   impact: >
     Conséquences positives (recherchées) :
@@ -201,48 +473,73 @@ spec:
       de l'index sur les projets actifs.
     - Tout futur problème d'attachement inotify sera bruyant dans les
       logs (defensive observability), ce qui évite une régression
-      silencieuse comme celle d'aujourd'hui.
+      silencieuse comme celle d'aujourd'hui. Le Drop conditionnel
+      garantit aucun faux positif au shutdown propre.
 
     Conséquences neutres :
 
-    - Le fix lui-même est local : ~20-30 lignes de Rust modifiées dans
-      deux fichiers, plus le test de régression. Pas de changement
-      d'API, pas de breaking change.
+    - Le fix lui-même reste local : ~30-40 lignes de Rust modifiées
+      dans deux fichiers (légère augmentation depuis iteration 1 à
+      cause du newtype et du flag is_shutting_down), plus le test de
+      régression. Pas de breaking change d'API consommateur (le seul
+      caller de spawn_watcher est main.rs lui-même, qu'on modifie en
+      même temps). La signature de spawn_watcher gagne un paramètre
+      Arc<AtomicBool>.
     - L'extension à projects/ augmente légèrement la charge du watcher
-      (un dir supplémentaire à inotify_watch récursif), mais reste très
-      en-dessous des limites système (max_user_watches=524288).
+      (un dir supplémentaire à inotify_watch récursif), mais reste
+      très en-dessous des limites système (max_user_watches=524288).
+    - Le passage best-effort sur projects/ signifie qu'une régression
+      future qui casserait inotify sur projects/ sans toucher
+      company/ serait silencieuse (juste un warn, pas une error). Ce
+      compromis est volontaire (cf. F6 résolu) : un projet absent ne
+      doit pas couler tout le système.
 
     Risques :
 
-    - Le `let _keep_watcher = _watcher;` est une convention fragile.
-      Un futur clippy strict pourrait le signaler comme "unused
-      binding" et un developer pourrait le retirer. Le commentaire
-      en tête de la closure plus le renaming `_watcher` → `keep_alive_watcher`
-      doivent rendre ce risque négligeable, mais il existe.
-    - Le test de régression doit utiliser un répertoire temporaire (via
-      tempfile) pour ne pas polluer l'arbre du repo. Si l'Implementer
-      l'oublie et watche le repo lui-même, les events parasites
-      pourraient flaker le test.
-    - Le tracing::error! dans le Drop de FileWatcherHandle s'exécutera
-      aussi au shutdown propre (SIGTERM/SIGINT). Le message doit
-      mentionner explicitement "investigate immediately if this is not
-      a shutdown" pour ne pas générer des faux positifs paniqués. Une
-      alternative est de désarmer le drop dans le handler SIGTERM via
-      une AtomicBool "is_shutting_down".
+    - Le `let _keep = _guard;` est une convention fragile. Un futur
+      clippy strict pourrait le signaler comme "unused binding" et un
+      developer pourrait le retirer. Mitigation : le commentaire long
+      en tête de la closure + le doc-comment sur le champ _guard de
+      FileWatcherHandle + le test de régression qui crashe si le bug
+      revient.
+    - Le test de régression utilise un répertoire temporaire (via
+      tempfile). Si l'Implementer oublie et watche le repo lui-même,
+      les events parasites du repo réel pourraient flaker le test.
+      L'appel `protected_zones::reload()` au début du test est
+      obligatoire pour garantir que load() relit depuis le tempdir
+      et non depuis un cache d'une session précédente.
+    - Le Arc<AtomicBool> is_shutting_down est lu dans Drop sans
+      synchronisation forte (Acquire only). Si le shutdown handler
+      écrit Release puis le runtime appelle Drop, la lecture Acquire
+      voit bien le true. Si en revanche un drop concurrent survient
+      avant le store, le log sera error — c'est le comportement
+      souhaité (drop hors shutdown = anomalie). Aucun race connu.
 
-    Estimation de complexité : faible. Fichiers touchés :
-    - crates/mcp-servers/orchestrator/src/main.rs (lignes 1215-1271,
-      ~30 lignes modifiées y compris commentaires)
-    - crates/config/src/watcher.rs (~40 lignes modifiées : rename
-      `_watcher` → `keep_alive_watcher`, Drop instrumenté, extension à
-      projects/, doc inline)
-    - crates/config/src/constants.rs (~1 ligne ajoutée si PROJECTS_DIR
-      n'existe pas)
-    - crates/config/tests/watcher_integration.rs (nouveau, ~80 lignes
-      de test).
-    Temps de mise en œuvre estimé : 2 à 3 heures, dont la moitié sur
-    le test de régression et la validation manuelle bout en bout
-    (boot du serveur, lsof, touch d'un yml, search()).
+    Estimation de complexité : faible à modérée (légère augmentation
+    par rapport à iteration 1).
+
+    Fichiers touchés :
+    - crates/mcp-servers/orchestrator/src/main.rs (~40 lignes modifiées
+      lignes 1215-1300 environ : destructure, capture explicite,
+      création et propagation de is_shutting_down dans les arms
+      SIGTERM/SIGINT, panic handler simple sur la consumer task)
+    - crates/config/src/watcher.rs (~60 lignes : newtype WatcherGuard
+      avec Drop conditionnel, refonte FileWatcherHandle, nouvelle
+      signature spawn_watcher avec Arc<AtomicBool>, best-effort
+      projects/, doc-comments)
+    - crates/config/src/constants.rs : N'EST PAS MODIFIÉ (PROJECTS_DIR
+      existe déjà ligne 32). Conservé dans affected_files par asymétrie
+      favorable au cas où une modification mineure émerge.
+    - crates/config/tests/watcher_integration.rs (nouveau, ~100 lignes
+      avec la spec enrichie F4 et la mise en place du protected-zones.json
+      minimaliste).
+
+    Temps de mise en œuvre estimé : 3 à 4 heures (révisé à la hausse
+    depuis iteration 1 à cause du newtype + flag + panic handler),
+    dont la moitié sur le test de régression et la validation manuelle
+    bout en bout (boot serveur, lsof, touch yml, search(), SIGTERM
+    sans log error parasite, suppression artificielle de projects/
+    pendant le boot pour valider le best-effort).
 
   rollback_plan: >
     Le fix est localisé et sans effet sur la persistence (DB SQLite,
@@ -254,7 +551,11 @@ spec:
     2. Le rollback ne nécessite aucune migration DB ni aucun
        changement de schéma. La DB orchestrator.db et son contenu
        restent valides.
-    3. Réémettre une éventuelle communication PM aux agents pour
+    3. La signature de spawn_watcher change (nouveau paramètre
+       is_shutting_down). Comme le seul caller en-tree est
+       main.rs lui-même, le revert se fait en un seul commit
+       atomique. Aucun consumer externe à prévenir.
+    4. Réémettre une éventuelle communication PM aux agents pour
        leur rappeler le workaround temporaire (call index_now après
        chaque write critique).
 
