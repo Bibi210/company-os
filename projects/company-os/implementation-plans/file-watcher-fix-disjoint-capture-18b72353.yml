@@ -1,0 +1,695 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 18b72353-4d3f-4d90-90b4-cb2f0228dbc4
+  title: "Implementation plan : fix file watcher orchestrator (disjoint capture + WatcherGuard + projects/ best-effort)"
+  author: implementer
+  created_at: "2026-06-03"
+  project: company-os
+  description: >
+    Plan d'exécution du RFC 062ebaa8 (iteration 2 approved). Trois modifications
+    Rust coordonnées dans crates/config/src/watcher.rs et
+    crates/mcp-servers/orchestrator/src/main.rs, plus un test de régression
+    dans crates/config/tests/watcher_integration.rs. Le permit
+    05b33c22-7cc2-44cc-8631-428d96406137 est actif sur les 4 paths (dont
+    crates/config/src/constants.rs en asymétrie favorable, probablement non
+    consommé).
+
+    Ordre dicté par les dépendances : décisions tranchées d'abord (open
+    points laissés par le RFC), puis newtype WatcherGuard (base sur laquelle
+    repose tout le reste), puis refonte FileWatcherHandle et signature
+    spawn_watcher (impacte le seul caller main.rs), puis l'extension
+    projects/ qui réutilise le même watcher, puis l'adaptation de main.rs
+    (destructure + AtomicBool partagé), puis le test de régression, enfin
+    build/test verts et validation manuelle des 6 acceptance criteria.
+
+    Permit en WAL non checkpointé : checkpoint manuel via PRAGMA en début
+    de séquence pour figer le permit sur disque avant le commit de seal.
+    Modifs Rust appliquées via Edit AVANT cargo build pour ne pas perdre
+    le permit sur restart du binaire (cf. note opérationnelle utilisateur).
+  tags:
+    - watcher
+    - inotify
+    - rust-edition-2024
+    - disjoint-capture
+    - orchestrator
+    - bug-fix
+    - critical-infra
+  changelog:
+    - date: "2026-06-03"
+      author: implementer
+      description: >
+        Iteration 2 — adresse les 3 findings du round eda6659d.
+        F1 : option (b) retenue (commit .db SEUL, pattern historique
+        c456fec/5919adb vérifié). F2 : risque double-move JoinHandle::abort
+        clos (abort prend &self, vérifié docs.rs tokio 1.52.3). F3 :
+        chemin task-request corrigé (file-watcher-dead-at-boot-36ecb829.yml).
+        Note hors-finding : Étape 13 (RFC implemented) clarifiée — pas
+        de tool MCP existant, stratégie via agent-message au CEO pour
+        extension permit, fallback RFC follow-up systémique.
+    - date: "2026-06-03"
+      author: implementer
+      description: >
+        Iteration 1 — première rédaction du plan d'exécution du RFC
+        062ebaa8 iteration 2 approved.
+  related:
+    - id: 062ebaa8-8876-42e4-b1a7-8ed3655238e2
+      kind: rfc
+      relationship: input
+    - id: 9534dd33-313c-42d7-b6ac-3801ba97dbc7
+      kind: diagnostic-report
+      relationship: input
+    - id: 36ecb829-d884-4e17-848b-c0f7ee2fc171
+      kind: task-request
+      relationship: input
+    - id: d1dcdc4e-1a33-42c6-8037-1fa3e3eba0a8
+      kind: implementation-plan
+      relationship: related
+
+spec:
+  steps:
+    - description: >
+        Étape 0 — Décisions tranchées (laissées ouvertes par le RFC).
+
+        (0.a) Panic handler dans la consumer task : choix de l'option (b)
+        proposée par l'Architect, basée sur JoinError, SANS introduire la
+        dépendance `futures = "0.3"`. Le tokio::spawn retourne un JoinHandle
+        qui, sur abort() ou panic interne, retourne Err(JoinError) au .await.
+        Aujourd'hui main.rs:1298-1300 appelle h.abort() puis ne .await pas
+        le résultat — donc un panic dans la consumer task est invisible.
+        Décision : remplacer `h.abort()` par un fire-and-forget abort puis,
+        DANS la consumer task elle-même, encapsuler la boucle dans un
+        std::panic::AssertUnwindSafe non-async (impossible directement à
+        cause du .await), donc en pratique : laisser tokio capturer le
+        panic via JoinError au shutdown, et logger error juste après le
+        abort() avec un timeout court (200ms) sur .await du handle pour
+        récupérer le JoinError éventuel.
+
+        Implémentation concrète :
+          tokio::time::timeout(Duration::from_millis(200), h).await
+        Si Ok(Err(join_err)) et join_err.is_panic() → tracing::error!.
+        Si Err(_) (timeout) ou Ok(Ok(())) → silencieux (cas normal).
+
+        Pas de dépendance nouvelle. Invariant RFC respecté : un panic dans
+        la consumer task LAISSE une trace error dans les logs serveur.
+
+        (0.b) Valeurs de timeout test : confirmées du RFC.
+          - sleep post-spawn_watcher : 200ms (kernel inotify attach margin)
+          - timeout réception event : 2500ms (debounce 500ms + propagation
+            + scheduler + marge CI sous charge).
+
+        (0.c) Ordering AtomicBool is_shutting_down : Release sur store
+        (handlers SIGTERM/SIGINT), Acquire sur load (Drop de WatcherGuard).
+        Acquire/Release suffit, pas de SeqCst (pas de dépendance d'ordre
+        croisée avec d'autres atomics).
+
+        (0.d) protected-zones.json du test : prefixes minimaux mais
+        cohérents avec les sous-dirs créés (company/config/, company/personas/,
+        company/schemas/, company/plugins/, crates/). Le test classifie
+        l'écriture company/config/__probe.yml comme ConfigChangeKind::Config
+        (cf. classify() ligne 40-48 watcher.rs : starts_with company/config/
+        match le prefix protected zones).
+
+        Aucun fichier modifié à cette étape (pure documentation des choix
+        dans le plan).
+      files: []
+
+    - description: >
+        Étape 1 — Seal du permit (option b retenue suite à finding F1
+        iteration 1 du round eda6659d).
+
+        Choix d'option F1 : **(b) commit .db SEUL sans checkpoint forcé**,
+        cohérent avec le pattern historique (commits c456fec et 5919adb
+        vérifiés : `git show` confirme `company/data/orchestrator.db`
+        seul, pas de .db-wal ni .db-shm). Justification :
+
+        - L'option (a) checkpoint forcé via sqlite3 hors-tree est bloquée
+          par le flock OS (PILIER A du RFC cdbfee72) tenu par le serveur
+          courant.
+        - L'option (c) committer le triplet .db + .db-wal + .db-shm est
+          dangereuse : le .db-shm est de la mémoire partagée transitoire,
+          un snapshot triplé peut produire un état incohérent au git
+          checkout suivant, l'integrity_check échoue, le PILIER D
+          autorepair se déclenche, le permit est perdu.
+        - L'option (b) commit .db seul accepte que le permit reste en
+          WAL en l'état actuel. C'est OK tant que le serveur courant ne
+          meurt PAS entre maintenant et consume_write_permit (Étape 10).
+          Garantie procédurale : on évite cargo build / restart binaire
+          avant le commit + consume.
+
+        Procédure :
+          (1.a) git add -f company/data/orchestrator.db
+          (1.b) git commit -m "chore: seal write permit 05b33c22 for RFC 062ebaa8 (file watcher fix)"
+
+        Ce commit fige une partie de l'état permit (la portion du WAL
+        qui aurait été checkpointée naturellement avant le grant), le
+        reste reste en WAL. Le permit est en RAM dans le serveur courant
+        ET partiellement sur disque. Tant que le serveur courant vit
+        jusqu'à Étape 10 (consume), le permit reste utilisable.
+
+        Conforme à write_permit_full_sequence étape 2 (commit AVANT
+        modif des zones protégées) et au pattern historique éprouvé.
+      files:
+        - company/data/orchestrator.db
+
+    - description: >
+        Étape 2 — Introduire le newtype WatcherGuard dans
+        crates/config/src/watcher.rs.
+
+        (2.a) Ajouter en haut du fichier l'import nécessaire :
+          use std::sync::Arc;
+          use std::sync::atomic::{AtomicBool, Ordering};
+          (tracing déjà importé via le crate)
+
+        (2.b) Définir le struct WatcherGuard (après la définition de
+        ConfigChangeKind, avant FileWatcherHandle) :
+
+          pub struct WatcherGuard {
+              watcher: Option<RecommendedWatcher>,
+              is_shutting_down: Arc<AtomicBool>,
+          }
+
+          impl WatcherGuard {
+              fn new(watcher: RecommendedWatcher, is_shutting_down: Arc<AtomicBool>) -> Self {
+                  Self { watcher: Some(watcher), is_shutting_down }
+              }
+          }
+
+          impl Drop for WatcherGuard {
+              fn drop(&mut self) {
+                  // Drop le watcher en premier pour libérer les fds inotify
+                  // AVANT de loguer (le message reflète l'état post-drop).
+                  // catch_unwind paranoïaque au cas où le destructeur de
+                  // RecommendedWatcher panique (notify v7 ne devrait pas,
+                  // mais défense-en-profondeur).
+                  let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                      self.watcher.take();
+                  }));
+                  if self.is_shutting_down.load(Ordering::Acquire) {
+                      tracing::info!(
+                          "WatcherGuard dropped during shutdown — inotify watches released cleanly."
+                      );
+                  } else {
+                      tracing::error!(
+                          "WatcherGuard dropped OUTSIDE shutdown — file watcher is now DEAD; \
+                           inotify watches released. Investigate immediately (cf. diagnostic 9534dd33)."
+                      );
+                  }
+              }
+          }
+
+        Vérification LSP : get_diagnostics après ajout, attendu 0 erreur
+        (le type est self-contained, aucune dépendance sur le reste).
+      files:
+        - crates/config/src/watcher.rs
+
+    - description: >
+        Étape 3 — Refonte FileWatcherHandle (champ _guard) et signature
+        spawn_watcher.
+
+        (3.a) Modifier FileWatcherHandle :
+
+          /// Handle returned by [`spawn_watcher`]. Drop it (or its `_guard`
+          /// field, if you destructure) to stop watching.
+          pub struct FileWatcherHandle {
+              pub rx: mpsc::Receiver<ConfigChangeKind>,
+
+              /// HOLD this field alive for as long as you consume `rx`.
+              /// Dropping it releases the inotify watches and kills the
+              /// underlying file watcher. The leading underscore silences
+              /// the unused-field lint; capturing it via
+              /// `let _keep = _guard;` inside an `async move` block is
+              /// MANDATORY in Rust 2024 (disjoint capture for async
+              /// closures). Cf. diagnostic-report 9534dd33.
+              pub _guard: WatcherGuard,
+          }
+
+        (3.b) Modifier la signature de spawn_watcher :
+
+          pub fn spawn_watcher(
+              root: &str,
+              debounce: Duration,
+              is_shutting_down: Arc<AtomicBool>,
+          ) -> anyhow::Result<FileWatcherHandle>
+
+        (3.c) À la fin de spawn_watcher, remplacer :
+            Ok(FileWatcherHandle { rx: out_rx, _watcher: watcher })
+          par :
+            Ok(FileWatcherHandle {
+                rx: out_rx,
+                _guard: WatcherGuard::new(watcher, is_shutting_down),
+            })
+
+        Vérification LSP : get_diagnostics → main.rs aura une erreur de
+        signature (3ème arg manquant + _watcher renamed), normal, sera
+        corrigé Étape 5.
+      files:
+        - crates/config/src/watcher.rs
+
+    - description: >
+        Étape 4 — Extension à projects/ avec best-effort dans
+        crates/config/src/watcher.rs.
+
+        Après le bloc qui watche company/ (lignes 92-95 du fichier
+        original), insérer :
+
+          // Best-effort: projects/ peut ne pas exister sur un fresh
+          // checkout ou si tous les projets ont été archivés. L'absence
+          // n'est pas un échec ; un échec d'inotify_watch (par exemple
+          // limite max_user_watches atteinte) n'est pas non plus une
+          // raison de couler tout le watcher, car les autres dirs (zones
+          // protégées + company/) restent watchés.
+          let projects_dir = root_path.join(constants::PROJECTS_DIR);
+          if projects_dir.is_dir() {
+              if let Err(e) = watcher.watch(&projects_dir, RecursiveMode::Recursive) {
+                  tracing::warn!(
+                      "Failed to watch projects/ (best-effort, other dirs still watched): {e}"
+                  );
+              }
+          }
+
+        Note : constants::PROJECTS_DIR existe déjà ligne 32 de
+        constants.rs (vérifié), pas de modification de ce fichier. Le
+        permit le couvre par asymétrie favorable mais ne sera pas
+        consommé sur ce path (acceptable, le permit non consommé est
+        inerte selon CEO finding 5).
+
+        Vérification LSP : get_diagnostics → uniquement erreurs main.rs
+        attendues.
+      files:
+        - crates/config/src/watcher.rs
+
+    - description: >
+        Étape 5 — Adaptation de crates/mcp-servers/orchestrator/src/main.rs.
+
+        Toutes les modifications dans la fonction run_server (ligne 1061
+        approx).
+
+        (5.a) Créer is_shutting_down AVANT spawn_watcher (juste après la
+        création de watcher_alive ligne 1188 environ) :
+
+          let is_shutting_down = Arc::new(AtomicBool::new(false));
+
+        (5.b) Modifier l'appel spawn_watcher (ligne 1215) pour passer
+        is_shutting_down.clone() en 3ème argument :
+
+          let watcher_handle_opt = match watcher::spawn_watcher(
+              &root,
+              Duration::from_millis(500),
+              is_shutting_down.clone(),
+          ) {
+
+        (5.c) Restructurer le `Ok(mut handle) => { ... }` (lignes 1216-1266)
+        en `Ok(handle) => { ... }` avec destructure et capture explicite :
+
+          Ok(handle) => {
+              // Destructure pour casser la disjoint capture rule de
+              // l'edition 2024 : on bindge explicitement `_guard` et on
+              // l'embarque dans la closure async via un `let _keep = _guard;`
+              // à l'intérieur. FileWatcherHandle ne porte PAS Drop ; le
+              // Drop bruyant vit dans WatcherGuard.
+              let watcher::FileWatcherHandle { mut rx, _guard } = handle;
+              let engine = engine.clone();
+              let validator = validator.clone();
+              let root = root.clone();
+              let schemas_dir = schemas_dir.clone();
+              let watcher_alive = watcher_alive.clone();
+              let task_handle = tokio::spawn(async move {
+                  // Le guard (et donc le RecommendedWatcher qu'il porte)
+                  // doit vivre aussi longtemps que la consumer task. Sans
+                  // cette ligne, l'edition 2024 ne le capture pas (champ
+                  // jamais lu dans la closure) et il est dropé à la fin
+                  // du match arm, tuant le fd inotify (cf. diagnostic
+                  // 9534dd33). NE PAS SUPPRIMER ce binding même s'il a
+                  // l'air inutilisé.
+                  let _keep_guard = _guard;
+
+                  watcher_alive.store(true, Ordering::Release);
+                  struct AliveGuard(Arc<AtomicBool>);
+                  impl Drop for AliveGuard {
+                      fn drop(&mut self) {
+                          self.0.store(false, Ordering::Release);
+                      }
+                  }
+                  let _alive_guard = AliveGuard(watcher_alive.clone());
+
+                  while let Some(change) = rx.recv().await {
+                      // ... corps existant inchangé (match change { ... }) ...
+                  }
+              });
+              Some(task_handle)
+          }
+
+        Important : remplacer toutes les références `handle.rx.recv()`
+        par `rx.recv()` dans le corps de la closure (cf. nouveau binding
+        local après destructure).
+
+        (5.d) Modifier les arms SIGTERM/SIGINT du tokio::select! (lignes
+        1280-1293) pour armer is_shutting_down AVANT le tracing::info :
+
+          _ = sigterm.recv() => {
+              is_shutting_down.store(true, Ordering::Release);
+              tracing::info!("SIGTERM received, initiating graceful shutdown");
+          }
+          _ = sigint.recv() => {
+              is_shutting_down.store(true, Ordering::Release);
+              tracing::info!("SIGINT received, initiating graceful shutdown");
+          }
+
+        Pour le cas `result = service.waiting()` (MCP service termine
+        naturellement, ex: stdin closed), armer AUSSI is_shutting_down
+        car c'est sémantiquement un shutdown propre :
+
+          result = service.waiting() => {
+              is_shutting_down.store(true, Ordering::Release);
+              match result {
+                  Ok(_) => tracing::info!("MCP service ended normally"),
+                  Err(e) => tracing::warn!("MCP service ended with error: {e}"),
+              }
+          }
+
+        (5.e) Adapter la séquence shutdown (lignes 1298-1300) pour
+        détecter un panic via JoinError (décision 0.a) :
+
+          if let Some(h) = watcher_handle_opt {
+              h.abort();
+              // Récupérer un éventuel panic avec un timeout court.
+              // Au-delà de 200ms on n'attend pas — le shutdown doit
+              // rester ponctuel.
+              match tokio::time::timeout(Duration::from_millis(200), h).await {
+                  Ok(Err(join_err)) if join_err.is_panic() => {
+                      tracing::error!(
+                          "Watcher consumer task panicked at shutdown: {join_err}"
+                      );
+                  }
+                  _ => {} // cancelled, normal exit, or timeout: silent
+              }
+          }
+
+        Note : `h.abort()` prend `&self` (vérifié docs.rs tokio 1.52.3,
+        clos en finding F2 iteration 1). On peut donc enchaîner
+        `h.abort(); tokio::time::timeout(_, h).await` sans double move.
+
+        Vérification LSP : get_diagnostics après chaque sous-étape
+        (5.a → 5.e), attendu 0 erreur en fin de 5.e.
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+
+    - description: >
+        Étape 6 — Test de régression dans
+        crates/config/tests/watcher_integration.rs (nouveau fichier).
+
+        Contenu complet (copie fidèle de la spec RFC iteration 2 enrichie) :
+
+          use std::sync::Arc;
+          use std::sync::atomic::{AtomicBool, Ordering};
+          use std::time::Duration;
+
+          use companyos_config::watcher::{spawn_watcher, FileWatcherHandle};
+          use tempfile::TempDir;
+
+          #[tokio::test]
+          async fn watcher_survives_async_move_destructure() {
+              // (F4.a) Reset cache statique de protected_zones AVANT
+              // setup, sinon un test précédent peut avoir mis en cache
+              // un autre PathBuf.
+              companyos_config::protected_zones::reload();
+
+              let tmp = TempDir::new().expect("tempdir");
+              let root = tmp.path();
+
+              // (F4.b) Créer les sous-dirs minimaux. Inclut projects/
+              // pour exercer la branche best-effort de Modif 2.
+              for d in [
+                  "company",
+                  "company/config",
+                  "company/personas",
+                  "company/schemas",
+                  "company/plugins",
+                  "crates",
+                  "projects",
+              ] {
+                  std::fs::create_dir_all(root.join(d)).unwrap();
+              }
+              std::fs::write(
+                  root.join("company/config/protected-zones.json"),
+                  r#"{"prefixes":["company/config/","company/personas/","company/schemas/","company/plugins/","crates/"],"files":[]}"#,
+              ).unwrap();
+              companyos_config::protected_zones::reload();
+
+              let is_shutting_down = Arc::new(AtomicBool::new(false));
+              let handle = spawn_watcher(
+                  root.to_str().unwrap(),
+                  Duration::from_millis(500),
+                  is_shutting_down.clone(),
+              ).expect("spawn_watcher ok");
+
+              // Reproduire EXACTEMENT le pattern de main.rs : destructure
+              // + async move + let _keep = _guard.
+              let FileWatcherHandle { mut rx, _guard } = handle;
+              let task = tokio::spawn(async move {
+                  let _keep = _guard;
+                  rx.recv().await
+              });
+
+              // (F4.c) Laisser inotify s'attacher.
+              tokio::time::sleep(Duration::from_millis(200)).await;
+
+              // Touch un YAML dans company/config (classified Config).
+              let probe = root.join("company/config/__probe.yml");
+              std::fs::write(&probe, "x").unwrap();
+
+              // Timeout 2.5s.
+              let received = tokio::time::timeout(
+                  Duration::from_millis(2500),
+                  task,
+              ).await.expect(
+                  "watcher did not deliver any event within 2.5s — \
+                   regression of the disjoint-capture bug (cf. 9534dd33)"
+              );
+              assert!(matches!(received, Ok(Some(_))));
+
+              // Éviter le log error parasite en fin de test (drop du
+              // _keep en fin de scope).
+              is_shutting_down.store(true, Ordering::Release);
+          }
+
+        Notes :
+        - tempfile = "3" est déjà en dev-dep du crate (vérifié dans
+          crates/config/Cargo.toml ligne 19), pas besoin de modif Cargo.toml.
+        - companyos_config::protected_zones::reload() existe (vérifié
+          dans le module).
+        - Le test est `#[tokio::test]` qui requiert tokio macros. Le
+          workspace tokio = { features = ["full"] } les fournit déjà.
+
+        Vérification LSP : get_diagnostics sur le nouveau fichier,
+        attendu 0 erreur.
+      files:
+        - crates/config/tests/watcher_integration.rs
+
+    - description: >
+        Étape 7 — cargo build (sans --target-dir) et cargo test.
+
+        (7.a) `cargo build` à la racine du workspace. Doit passer en 0
+        erreur, 0 warning bloquant. Le build sans --target-dir déclenche
+        le hot-reload des MCP servers (note critique de la persona), donc
+        ATTENTION : pendant le build, le binaire orchestrator va être
+        recompilé puis le proxy mcp-proxy.mjs redémarrera le serveur.
+        Les tools MCP seront indisponibles ~5s.
+
+        (7.b) `cargo test -p companyos-config --test watcher_integration`
+        pour exécuter le test de régression isolément (rapide, ~3-4s).
+
+        (7.c) `cargo test` complet pour vérifier qu'aucun autre test n'a
+        régressé (signature changée de spawn_watcher impacte main.rs et
+        les éventuels autres callers, mais main.rs est le seul caller).
+
+        Critère 7 vert : build OK + tous les tests passent + 0 failed.
+      files: []
+
+    - description: >
+        Étape 8 — Validation manuelle bout en bout des 6 acceptance
+        criteria.
+
+        Après cargo build + test verts, le serveur MCP a été redémarré
+        par le proxy. Validation :
+
+        (8.a) AC1 — `index_status()` → `file_watcher_alive: true` en moins
+        de 3s post-boot. Vérification : appel MCP `index_status()` immédiat
+        et 2-3s après.
+
+        (8.b) AC2 — lsof PID serveur montre au moins un fd inotify :
+            ps aux | grep companyos-orchestrator-mcp | grep -v grep
+            puis lsof -p <PID> | grep inotify
+        Doit retourner au moins une ligne `anon_inode:inotify`.
+
+        (8.c) AC3 — Écrire un YAML dans company/ ou projects/, vérifier
+        apparition dans FTS+VEC en moins de 1s :
+            écrire un fichier YAML temporaire dans company/agent-messages/
+            puis search() sur son contenu
+            (debounce 500ms + indexation, < 1s total).
+
+        (8.d) AC4 — Test de régression passe en CI : déjà validé Étape
+        7.b/7.c.
+
+        (8.e) AC5 — Zéro tracing::error log watcher au SIGTERM propre :
+        envoyer SIGTERM au serveur, observer stderr du proxy, grep
+        "DEAD\|OUTSIDE shutdown" → 0 occurrence.
+
+        ATTENTION : si je tue le serveur courant, le proxy le redémarrera
+        mais je perds la session. Validation déférée à un test manuel
+        ultérieur OU substituée par : le code de WatcherGuard est lu en
+        review code, vérifier que store(true) précède bien l'abort/drop
+        dans tous les arms (audit statique).
+
+        (8.f) AC6 — Échec artificiel de watch(projects_dir) produit
+        warning sans tuer watcher : couvert par la branche `if let Err(e)`
+        dans Modif 2 (audit statique du code). Tester en runtime
+        nécessiterait de mock inotify, hors scope.
+
+        Au moins AC1, AC2, AC3, AC4 doivent passer en runtime. AC5 et
+        AC6 validés par audit statique du code committé.
+      files: []
+
+    - description: >
+        Étape 9 — Commit final des modifications Rust + test.
+
+        (9.a) git add crates/config/src/watcher.rs
+              crates/mcp-servers/orchestrator/src/main.rs
+              crates/config/tests/watcher_integration.rs
+        (9.b) git commit -m "fix(watcher): file watcher dead at boot — \
+              disjoint capture in Rust 2024 + extend scope to projects/ \
+              (RFC 062ebaa8)"
+
+        Le commit groupe les 3 fichiers : c'est un fix atomique qui ne
+        peut pas être splité (signature changée de spawn_watcher
+        couplée à la destructure côté main.rs + test qui exerce la
+        nouvelle signature).
+      files:
+        - crates/config/src/watcher.rs
+        - crates/mcp-servers/orchestrator/src/main.rs
+        - crates/config/tests/watcher_integration.rs
+
+    - description: >
+        Étape 10 — consume_write_permit.
+
+        Appel MCP `consume_write_permit(permit_id="05b33c22-7cc2-44cc-8631-428d96406137",
+        persona="implementer", token=<implementer_token>)` APRÈS le
+        commit Étape 9 (jamais avant, sinon le hook git rejet).
+
+        Marque le permit comme consommé en DB. Le permit couvre 4 paths
+        mais constants.rs n'a pas été touché (asymétrie favorable
+        documentée RFC iteration 2). Acceptable.
+      files: []
+
+    - description: >
+        Étape 11 — reload_config (DERNIÈRE étape sur le serveur).
+
+        Appel MCP `reload_config()`. Recharge la config in-memory du
+        serveur (flow-control.yml, etc.) et n'a normalement pas de
+        side-effect destructif. Selon la persona, cet appel peut
+        déclencher un restart du binaire si tracing-subscriber redémarre,
+        donc à faire UNIQUEMENT en dernier.
+
+        Conditions préalables (toutes remplies à ce stade) :
+        (a) permit consommé (Étape 10) ✓
+        (b) cargo build OK (Étape 7.a) ✓
+        (c) cargo test OK (Étape 7.b/7.c) ✓
+      files: []
+
+    - description: >
+        Étape 12 — Lesson-learned chainée.
+
+        search(query="file watcher disjoint capture rust 2024",
+        kind="lesson-learned") avant de créer pour éviter doublon.
+        Probablement aucune lesson existante sur ce sujet précis.
+
+        Créer une nouvelle lesson-learned avec :
+          context : reproduction du bug, séquence de causes (champ _,
+                    edition 2024, async move, drop fin match arm).
+          insight : la disjoint capture des async closures en edition
+                    2024 capture UNIQUEMENT les champs lus textuellement.
+                    Un champ préfixé `_` est par convention non lu et
+                    n'est PAS capturé. Conséquence : pour tenir un
+                    Drop guard alive dans une async closure, capturer
+                    explicitement via `let _keep = field;`.
+          recommendation : pour tout struct qui doit garder une
+                    ressource OS alive (fd, lock, handle), porter le
+                    Drop sur un NEWTYPE dédié (pattern "guard"), pas
+                    sur le struct agrégat. Documenter en doc-comment
+                    le champ avec une mention explicite "HOLD this
+                    field alive". Couvrir par un test de régression
+                    qui exerce le pattern `destructure → async move →
+                    capture` réel.
+
+        metadata.related : derived-from 600307a4 (refonte search) et
+        related vers 611fde3e (SQLite WAL multi-process — adjacence
+        thématique critical-infra). Aussi related vers 9534dd33
+        (diagnostic input) et 062ebaa8 (RFC implémenté).
+      files:
+        - company/lessons/<new-lesson-id>.yml
+
+    - description: >
+        Étape 13 — Marquer RFC 062ebaa8 → status: implemented.
+
+        Investigation menée en iteration 2 du plan :
+
+        - Le permit 05b33c22 ne couvre PAS company/rfcs/. Une écriture
+          directe via Edit serait rejetée par le hook defense-in-depth.
+        - Aucun tool MCP dédié pour passer un RFC à status "implemented"
+          n'existe (grep sur "implemented" dans crates → 0 match).
+          close_round_with_rfc_update (engine.rs:254) ne gère que
+          approved/rejected, pas implemented.
+        - Le RFC est déjà à status "draft" (changelog iteration 2
+          existe mais le status field n'a pas été remonté à approved
+          par le close du round — vérifier au moment T).
+
+        Plan retenu : envoyer un agent-message au CEO demandant une
+        mini-extension du permit 05b33c22 (ou un nouveau permit
+        atomique) couvrant l'unique path
+        company/rfcs/file-watcher-fix-disjoint-capture-and-projects-coverage-062ebaa8.yml,
+        pour faire l'edit YAML manuel (status: implemented + entrée
+        changelog). Justification : implementation terminée, transition
+        d'état documentaire.
+
+        Si le CEO refuse ou tarde (hors session), fallback : laisser le
+        RFC en status actuel et émettre une lesson-learned + un RFC
+        follow-up recommandant l'ajout d'un tool MCP
+        `rfc_set_implemented(id)` qui contournerait le permit (mécanisme
+        privilégié déjà utilisé par close_round_with_rfc_update). C'est
+        un point d'amélioration systémique (règle continuous_improvement).
+
+        Cette étape n'est PAS bloquante pour la clôture du task-request
+        (Étape 14) : le critère done est satisfait par l'implémentation
+        fonctionnelle + tests verts, pas par l'état documentaire du RFC.
+      files:
+        - company/rfcs/file-watcher-fix-disjoint-capture-and-projects-coverage-062ebaa8.yml
+        - company/agent-messages/<extension-request-id>.yml
+
+    - description: >
+        Étape 14 — Marquer task-request 36ecb829 → status: done.
+
+        Le task-request vit dans projects/company-os/task-requests/,
+        zone non protégée. Mise à jour directe via Edit du YAML pour
+        passer spec.status de "backlog" à "done".
+      files:
+        - projects/company-os/task-requests/file-watcher-dead-at-boot-36ecb829.yml
+
+  dependencies:
+    - "Étape 1 (seal permit) AVANT toute autre étape qui modifie des zones protégées (étapes 2-5)."
+    - "Étape 2 (WatcherGuard) AVANT Étape 3 (FileWatcherHandle utilise WatcherGuard) et Étape 5 (main.rs destructure _guard)."
+    - "Étape 3 (signature spawn_watcher 3 args) AVANT Étape 5 (main.rs passe le 3ème arg) et Étape 6 (test passe le 3ème arg)."
+    - "Étape 5 (main.rs adapté) AVANT Étape 7 (cargo build = compile-time check)."
+    - "Étape 7 (cargo build OK) AVANT Étape 8 (validation runtime) et Étape 10 (consume permit selon persona)."
+    - "Étape 9 (commit code) AVANT Étape 10 (consume permit selon write_permit_full_sequence)."
+    - "Étape 10 (consume permit) AVANT Étape 11 (reload_config selon hotreload_last)."
+    - "Étape 12 (lesson-learned) AVANT Étape 13 (RFC implemented) pour respecter lesson_after_every_artifact."
+
+  risks:
+    - "Perte du permit si le serveur courant meurt avant Étape 1 (seal). Mitigation : check_write_permit à chaque transition de phase ; si refusé, STOP et signaler."
+    - "h.abort() puis tokio::time::timeout(_, h).await : pas de double move. Vérifié via docs.rs tokio 1.52.3, JoinHandle::abort prend &self (et non self). Risque clos en revue iteration 1 du plan (cf. finding F2)."
+    - "Le test d'intégration partage le static CACHE de protected_zones avec d'autres tests du même integration binary. Mitigation : reload() en début de chaque test du fichier, ET aucun autre test dans ce fichier pour démarrer."
+    - "Flake potentiel du test sur CI lente : timeout 2.5s suffit pour la plupart des CI, mais runners très chargés peuvent dépasser. Mitigation : si flake observé, augmenter à 5s en suivi (lesson-learned séparée)."
+    - "Validation manuelle AC5 (zéro error log au SIGTERM) implique de tuer le serveur courant et de perdre la session opencode. Mitigation : audit statique du code via review LSP, complété par un test runtime déféré documenté."
+    - "Si reload_config (Étape 11) déclenche un restart du binaire qui réinitialise le state in-memory (TokenStore, watcher_alive), je peux perdre la session. Mitigation : reload_config en TOUTE FIN de séquence, après tous les commits."
+    - "constants.rs n'est pas modifié → permit non consommé sur ce path. Acceptable selon RFC iteration 2 + CEO finding 5, mais à mentionner dans le bilan final."
