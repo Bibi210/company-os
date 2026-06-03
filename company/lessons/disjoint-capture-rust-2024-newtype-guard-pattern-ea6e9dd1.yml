@@ -1,0 +1,226 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: ea6e9dd1-93dc-4b19-9854-103328203489
+  title: "Disjoint capture en Rust edition 2024 : un champ préfixé _ n'est PAS capturé par async move, et un newtype-guard est la bonne forme pour porter Drop"
+  author: implementer
+  created_at: "2026-06-03"
+  description: >
+    Capitalisation après l'implémentation du RFC 062ebaa8 (fix file watcher
+    orchestrator dead at boot). Trois enseignements distincts mais
+    indissociables : (a) le mécanisme exact de la disjoint capture des
+    async closures en edition 2024 et comment un champ préfixé `_` devient
+    une bombe à retardement, (b) le pattern newtype-guard pour porter
+    `Drop` sur une ressource OS sans casser la destructure du struct
+    agrégat (E0509), (c) l'observabilité defensive via Drop conditionnel
+    armé par un flag partagé avec les signal handlers, et la lesson
+    de workflow qui les chapeaute (lister exhaustivement les callers
+    d'une API avant de changer sa signature).
+  tags:
+    - rust
+    - rust-edition-2024
+    - disjoint-capture
+    - async-move
+    - drop-semantics
+    - newtype-guard
+    - inotify
+    - watcher
+    - observability
+    - critical-infra
+    - lessons-from-implementation
+  related:
+    - id: 062ebaa8-8876-42e4-b1a7-8ed3655238e2
+      kind: rfc
+      relationship: derived-from
+    - id: 9534dd33-313c-42d7-b6ac-3801ba97dbc7
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: 18b72353-4d3f-4d90-90b4-cb2f0228dbc4
+      kind: implementation-plan
+      relationship: derived-from
+    - id: 600307a4-74f6-43dd-95e1-4dee3d2326c1
+      kind: lesson-learned
+      relationship: related
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Le serveur MCP orchestrator (binaire critical-infra) avait son file
+    watcher inotify mort au boot depuis l'activation de l'edition 2024
+    dans le workspace Cargo. Le tool `index_status` retournait
+    `file_watcher_alive: false` en permanence, et `lsof -p <pid> | grep
+    inotify` confirmait 0 fd. L'auto-indexation des artifacts (FTS + VEC)
+    était cassée silencieusement : aucun log d'erreur, aucun warning,
+    juste l'absence d'événements. Le hook defense-in-depth qui délègue
+    --index au watcher devenait un no-op, et toute écriture YAML
+    dérivait l'index. Workaround : appel manuel à index_now après
+    chaque write.
+
+    La cause racine, vérifiée empiriquement par reproduction en isolation
+    (4 étapes dans le diagnostic 9534dd33), tient à un effet d'edition
+    Rust :
+
+    Le code `match watcher::spawn_watcher(...) { Ok(handle) => { tokio::spawn(async move { ... handle.rx.recv() ... }) } }`
+    ne capture dans le future généré que les champs de `handle`
+    réellement référencés textuellement. Le `FileWatcherHandle` agrégeait
+    `pub rx: mpsc::Receiver<...>` (utilisé) ET `_watcher: RecommendedWatcher`
+    (jamais lu, le `_` annonçant explicitement "ignoré"). La disjoint
+    capture rule stabilisée en edition 2021 et durcie en edition 2024
+    déplace dans le future UNIQUEMENT `handle.rx`. Le champ `_watcher`
+    reste dans le binding outer, et est dropé à la fin du match arm.
+    `RecommendedWatcher::drop` ferme le fd inotify et signale au thread
+    notify de terminer. Tout cela en silence absolu : aucun panic, aucun
+    error, aucun warning. Le seul indicateur observable était l'absence
+    de fd inotify dans `/proc/<pid>/fd`.
+
+    Le fix exige trois éléments couplés que ce RFC traite ensemble.
+
+  insight: >
+    Trois apprentissages techniques + un apprentissage de workflow.
+
+    (1) DISJOINT CAPTURE — le `_` est explicite, le compilateur en
+    profite. La règle est simple à énoncer mais facile à manquer en
+    pratique : un `async move { ... }` capture par move LES CHAMPS lus
+    dans le corps de la closure, pas le binding entier. Conséquence
+    sémantique : préfixer un champ par `_` (convention "intentionnellement
+    inutilisé") est interprété par le compilateur comme une déclaration
+    de non-usage, et le champ N'EST PAS déplacé dans le future. Si le
+    champ porte une ressource OS qui doit vivre aussi longtemps que la
+    task, c'est un bug silencieux garanti.
+
+    Pour forcer la capture, deux idiomes possibles :
+      (a) référence textuelle dans la closure : `let _keep = field;`
+          ou simplement `&field;` ;
+      (b) destructurer le struct AVANT le `async move` et binder chaque
+          champ dans le scope outer, puis utiliser tous les bindings
+          dans la closure.
+
+    Idiom (a) est plus lisible et plus facile à commenter. C'est celui
+    retenu : `let _keep_guard = _guard;` en première ligne du `async move`
+    avec un commentaire long pointant vers le diagnostic.
+
+    (2) DROP + DESTRUCTURE = E0509 → newtype-guard. Si le struct
+    agrégat porte `impl Drop`, on ne peut plus le destructurer par move
+    (`let FileWatcherHandle { rx, _watcher } = handle;` → erreur E0509
+    "cannot move out of type which implements the Drop trait"). Pour
+    cumuler les deux exigences (a) observabilité au drop ET (b)
+    destructure possible côté caller, séparer en deux types :
+
+      pub struct WatcherGuard { watcher: Option<RecommendedWatcher>, /* + flags */ }
+      impl Drop for WatcherGuard { /* logging conditionnel */ }
+
+      pub struct FileWatcherHandle {
+          pub rx: mpsc::Receiver<...>,
+          pub _guard: WatcherGuard,  // pas de Drop sur le struct agrégat
+      }
+
+    Le `WatcherGuard` porte seul le `Drop` ; `FileWatcherHandle` reste
+    destructurable. C'est la forme idiomatique pour "ressource OS +
+    handle utilisable + observabilité".
+
+    Sous-détail subtil dans le Drop : `Option<RecommendedWatcher>` permet
+    de `self.watcher.take()` AVANT de loguer, pour que le message
+    reflète l'état post-libération du fd. `catch_unwind` autour du
+    `take()` est paranoïaque, mais c'est de la défense-en-profondeur
+    bon marché pour une ressource critique.
+
+    (3) DROP CONDITIONNEL = AtomicBool partagé avec les signal handlers.
+    Un `tracing::error!` inconditionnel dans Drop génère un faux positif
+    à chaque shutdown propre (SIGTERM/SIGINT → abort de la consumer task
+    → drop du guard → log error parasite). Solution :
+    `Arc<AtomicBool> is_shutting_down` partagé entre le `Drop` du guard
+    et les arms `_ = sigterm.recv() => { is_shutting_down.store(true, Release); ... }`
+    du `tokio::select!`. Le `Drop` lit en `Acquire` ; si `true` → `info!`,
+    sinon → `error!`.
+
+    L'ordre est critique : le `store(true)` doit précéder le
+    `tracing::info!` de shutdown ET tout autre point d'observabilité
+    où un drop concurrent pourrait survenir. Acquire/Release suffit
+    (pas de SeqCst), pas de payload mémoire dépendant. Couvrir aussi
+    le cas `result = service.waiting()` (transport fermé proprement) et
+    le path `server.serve(...).await?` (erreur transport AVANT le select :
+    armer le flag AVANT de propager l'erreur).
+
+    (4) WORKFLOW — lister exhaustivement les callers d'une API AVANT de
+    changer sa signature. Le RFC iteration 2 listait 4 affected_files.
+    À l'exécution, `cargo build` a révélé un 5ème caller
+    (`crates/mcp-servers/yaml/src/main.rs`) avec exactement le même bug.
+    L'omission a coûté un round-trip CEO pour grant un permit
+    complémentaire (10d5eb41). Le piège est exactement celui de la
+    lesson 611fde3e ("affected_files doit lister TOUS les fichiers à
+    modifier") transposé à un caller indirect d'une API publique de
+    crate.
+
+    Anti-pattern : se fier au RFC seul pour déterminer les fichiers à
+    toucher. Pattern : `grep -rn "<symbol>" crates/` ou
+    `get_references` LSP sur le symbole modifié AVANT d'écrire
+    l'implementation-plan, et lister TOUS les hits comme affected_files
+    (avec asymétrie favorable au cas où certains n'ont finalement pas
+    besoin de modification — c'est explicitement acceptable selon les
+    RFC précédents bdee1af4 / cdbfee72).
+
+  recommendation: >
+    Pour tout futur changement de structure qui combine "garder une
+    ressource OS alive" + "destructure souhaitée côté caller" + "drop
+    observable" :
+
+    1. PORTER LE DROP SUR UN NEWTYPE DÉDIÉ, pas sur le struct agrégat.
+       Forme canonique :
+         struct Resource { /* fd/handle */ }
+         impl Drop for Resource { /* logging conditionnel */ }
+         struct Handle { pub channel: Receiver<...>, pub _guard: Resource }
+       Le `Handle` est destructurable, le `Resource` est observable au
+       drop. Le préfixe `_` du champ silence le warning unused-field
+       sans empêcher la capture quand le caller fait
+       `let _keep = _guard;`.
+
+    2. DOC-COMMENT EXPLICITE sur le champ `_guard` : "HOLD this field
+       alive for as long as you consume X. Capturing via
+       `let _keep = _guard;` inside an `async move` block is MANDATORY
+       in Rust 2024 (disjoint capture for async closures)."
+       Un futur lecteur du code (humain ou clippy) ne doit pas pouvoir
+       supprimer le champ ou la capture par accident. Un test de
+       régression qui exerce le pattern réel (destructure + async move
+       + capture) verrouille l'invariant à la CI.
+
+    3. DROP CONDITIONNEL si la ressource est critique : `Arc<AtomicBool>
+       is_shutting_down` armé dans les handlers de shutdown AVANT les
+       points où un drop concurrent peut survenir. `error!` hors
+       shutdown, `info!` en shutdown. Ne JAMAIS loguer error
+       inconditionnellement dans `Drop` : ça génère du bruit à chaque
+       arrêt propre et désensibilise les alertes.
+
+    4. AVANT DE CHANGER UNE SIGNATURE D'API PUBLIQUE DE CRATE,
+       exhauster les callers via `grep -rn "<symbol>"` ou
+       `get_references` LSP, et lister TOUS les fichiers concernés
+       dans `affected_files`. C'est moins cher qu'un round-trip CEO
+       pour un permit complémentaire en cours d'implémentation. Le
+       coût d'un permit large couvrant des fichiers finalement non
+       modifiés est négligeable comparé au coût d'un permit trop
+       étroit.
+
+    5. STRATÉGIE BEST-EFFORT POUR LES SOUS-SYSTÈMES SECONDAIRES.
+       Quand un sous-système nouveau étend la couverture (ex : ajout
+       de `projects/` au watcher en plus de `company/`), traiter son
+       attachement comme best-effort (`if let Err(e) = watch(...) {
+       warn!(...) }`) plutôt que strict (`watch(...)?`). Un échec sur
+       le sous-système secondaire ne doit pas couler tout le système
+       principal. Documenter explicitement la frontière strict/best-effort
+       en commentaire.
+
+    6. POUR LES TESTS D'INTÉGRATION QUI EXERCENT UN WATCHER, créer
+       l'arborescence minimale attendue (sous-dirs réels) DANS LE
+       TEMPDIR, écrire un `protected-zones.json` cohérent, et
+       `protected_zones::reload()` AVANT le `spawn_watcher` pour
+       invalider tout cache statique d'un test précédent. Marge de
+       timing : debounce_duration * 5 ≈ 2.5s pour 500ms de debounce
+       (kernel + scheduler + CI lente).
+
+    Empirique : ce fix a été validé runtime (inotify fd visible via
+    lsof, watcher.rs ré-indexe les modifs du repo en continu, message
+    "WatcherGuard dropped during shutdown" en INFO et non ERROR au
+    shutdown propre, test de régression vert en 0.70s). Le pattern
+    est généralisable à toute ressource OS portée par un struct dans
+    une closure async en edition 2024+.

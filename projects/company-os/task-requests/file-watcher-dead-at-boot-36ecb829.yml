@@ -39,7 +39,7 @@ metadata:
 
 spec:
   priority: high
-  status: backlog
+  status: done
   acceptance_criteria:
     - >
       Diagnostic produit avec root cause vérifiée par reproduction

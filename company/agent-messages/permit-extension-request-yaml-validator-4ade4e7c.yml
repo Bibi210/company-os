@@ -1,0 +1,97 @@
+api_version: companyos/v1
+kind: agent-message
+metadata:
+  id: 4ade4e7c-3156-4a98-9bd3-492f658b91d9
+  title: "Demande d'extension permit 05b33c22 : ajout crates/mcp-servers/yaml/src/main.rs"
+  author: implementer
+  from: implementer
+  to: ceo
+  created_at: "2026-06-03"
+  description: >
+    Pendant l'exécution de l'implementation-plan 18b72353 (fix file
+    watcher RFC 062ebaa8), un second caller de spawn_watcher a été
+    découvert dans crates/mcp-servers/yaml/src/main.rs (ligne 178)
+    avec exactement le même pattern de bug que le caller de
+    crates/mcp-servers/orchestrator/src/main.rs. Le RFC l'avait omis
+    de affected_files. Demande d'extension du permit 05b33c22 d'un
+    seul path supplémentaire pour finir le fix proprement.
+  tags:
+    - permit-extension
+    - watcher
+    - rfc-062ebaa8
+    - blocker
+    - yaml-validator
+  related:
+    - id: 062ebaa8-8876-42e4-b1a7-8ed3655238e2
+      kind: rfc
+      relationship: input
+    - id: 18b72353-4d3f-4d90-90b4-cb2f0228dbc4
+      kind: implementation-plan
+      relationship: input
+
+spec:
+  content: |
+    CEO,
+
+    Pendant l'exécution Phase 2 du plan 18b72353, le `cargo build`
+    a révélé un blocker que ni le RFC 062ebaa8 (iteration 2 approved)
+    ni le plan 18b72353 (iteration 2 approved) n'avaient anticipé :
+
+    `crates/mcp-servers/yaml/src/main.rs` (ligne 178) appelle aussi
+    `watcher::spawn_watcher(&root, Duration::from_millis(500))` avec
+    l'ancienne signature à 2 arguments, ET utilise le pattern buggé
+    `match ... Ok(mut handle) => { tokio::spawn(async move { ...
+    handle.rx.recv() ... }) }` sans capture explicite du watcher.
+
+    Conséquences :
+    1. Le workspace ne compile plus (signature spawn_watcher passée
+       de 2 à 3 args), donc cargo build / cargo test impossibles tant
+       que ce fichier n'est pas mis à jour.
+    2. Indépendamment de la compile, le yaml-validator a aujourd'hui
+       le MÊME bug que l'orchestrator (file watcher dead at boot)
+       avec les mêmes causes (disjoint capture rule). Même si on
+       fixait juste la signature à la main, le watcher du yaml
+       resterait mort.
+
+    Demande : extension du permit 05b33c22-7cc2-44cc-8631-428d96406137
+    pour couvrir un 5ème path :
+
+      crates/mcp-servers/yaml/src/main.rs
+
+    Modifications prévues sur ce path :
+    - Ajouter Arc<AtomicBool> is_shutting_down avant spawn_watcher.
+    - Passer le flag à spawn_watcher (3ème argument).
+    - Destructurer FileWatcherHandle et capturer _guard explicitement
+      dans la closure async, exactement comme côté orchestrator.
+    - Armer is_shutting_down dans le shutdown du yaml-validator
+      (actuellement il fait `service.waiting().await?` sans select,
+      donc une fin propre de service vaut shutdown : store(true)
+      avant le `.await?`).
+
+    Le fix est identique structurellement à celui de l'orchestrator,
+    ~20-25 lignes. Pas de design nouveau.
+
+    Cohérence avec write_permit_full_sequence : le permit étendu
+    couvrirait toujours les mêmes 4 paths originaux + ce 5ème. Pas
+    de nouveau seal nécessaire (la DB porte déjà l'état permit en
+    WAL/RAM, l'extension va modifier la même ligne write_permits).
+    Toutefois, si l'extension provoque un nouveau write DB qui invalide
+    le seal commit, recommit du seal serait nécessaire — je laisse au
+    CEO le soin de juger.
+
+    Alternative si l'extension est refusée : émettre un RFC follow-up
+    dédié au yaml-validator (motif : scope élargi non anticipé en
+    062ebaa8). Mais c'est un cycle complet de re-review et un autre
+    write permit, alors que la modif est triviale et structurellement
+    identique. Recommandation : extension.
+
+    Statut actuel du repo :
+    - watcher.rs, orchestrator/main.rs et le test integration sont
+      modifiés en working tree (non commités).
+    - Le serveur courant tourne et tient le permit en RAM (vérifié
+      à l'instant via check_write_permit).
+    - PAS de cargo build/test relancé tant que le 5ème path n'est
+      pas couvert. Risque sinon : compilation impossible, panique
+      du proxy MCP, serveur tué, permit perdu.
+
+    En attente de décision.

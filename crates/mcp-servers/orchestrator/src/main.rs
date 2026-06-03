@@ -1303,7 +1303,17 @@ async fn run_server() -> anyhow::Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
-    let service = server.serve((stdin, stdout)).await?;
+    // If `server.serve` fails (transport error, stdin closed, etc.), it
+    // is sémantiquement a clean shutdown of the service, NOT a watcher
+    // bug. Arm the flag BEFORE propagating the error so the
+    // `WatcherGuard` Drop emits info!, not error!.
+    let service = match server.serve((stdin, stdout)).await {
+        Ok(s) => s,
+        Err(e) => {
+            is_shutting_down.store(true, Ordering::Release);
+            return Err(e.into());
+        }
+    };
 
     tokio::select! {
         result = service.waiting() => {
