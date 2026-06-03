@@ -1,0 +1,83 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: dcb17b79-952b-403d-b8ed-c979aec8aad3
+  title: "Hook defense-in-depth : revert sélectif au lieu de nucléaire"
+  author: pm
+  created_at: "2026-06-03"
+  project: company-os
+  description: >
+    Le hook defense-in-depth, quand il détecte une altération non-MCP de
+    la table write_permits, peut réagir de manière nucléaire en wipant
+    TOUS les permits plutôt qu'en ciblant uniquement le ou les permits
+    suspects. Ce comportement amplifie le coût des incidents : deux
+    blockers documentés pendant la refonte search où des permits
+    parfaitement légitimes et scellés ont été perdus collatéralement
+    (agent-messages 4f000127, 05224964 ; lesson ed7776fb). L'objectif est
+    de rendre le revert SÉLECTIF : ne supprimer que le ou les permits
+    réellement non autorisés (non présents dans le snapshot baseline
+    légitime), en préservant les permits valides. NOTE : l'investigation
+    du sujet atomic-grant-permit a montré que revertPermitTampering a
+    DÉJÀ une branche sélective (DELETE WHERE id NOT IN before_ids) ET une
+    branche nucléaire. Le travail consiste à comprendre exactement quand
+    chaque branche se déclenche et à éliminer (ou borner strictement) le
+    comportement nucléaire au profit du sélectif.
+  tags:
+    - defense-in-depth
+    - write-permit
+    - selective-revert
+    - companyos-internals
+    - friction-permits
+  related:
+    - id: ed7776fb-d56d-4f61-9f48-807897c6325d
+      kind: lesson-learned
+      relationship: input
+    - id: 359f9162-18f2-4b72-85b0-7d0e44608959
+      kind: rfc
+      relationship: related
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: related
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: input
+
+spec:
+  priority: medium
+  status: backlog
+  acceptance_criteria:
+    - >
+      Le comportement du hook face à une altération de write_permits est
+      caractérisé précisément : dans quels cas le revert est aujourd'hui
+      sélectif (DELETE ciblé) et dans quels cas il est nucléaire (wipe
+      total). Le diagnostic distingue les deux branches et leurs
+      déclencheurs réels (vérifié sur le code de defense-in-depth*.mjs).
+    - >
+      Le revert nucléaire (wipe de TOUS les permits) est éliminé ou borné
+      à un cas résiduel strictement justifié et documenté (par exemple :
+      impossibilité technique de déterminer le baseline légitime). Dans le
+      cas nominal d'une altération détectée, seuls les permits réellement
+      non autorisés sont supprimés ; les permits légitimes (présents dans
+      le snapshot baseline, ou scellés en HEAD git) sont préservés.
+    - >
+      La garantie de sécurité d'origine est préservée : un permit injecté
+      frauduleusement hors du canal MCP est toujours détecté et supprimé.
+      Le revert sélectif ne doit pas ouvrir une faille permettant à un
+      permit illégitime de survivre.
+    - >
+      Tests couvrant les trois axes. Nominal : altération d'un permit
+      illégitime parmi plusieurs légitimes -> seul l'illégitime est
+      supprimé, les autres survivent. Négatif : tentative d'injection
+      frauduleuse d'un permit -> détecté et supprimé ; snapshot baseline
+      indisponible/corrompu -> comportement de repli documenté et sûr.
+      Edge : table vide, un seul permit, tous les permits illégitimes,
+      altérations concurrentes.
+    - >
+      Si une lesson (notamment ed7776fb) documentait le comportement
+      nucléaire comme attendu, elle est mise à jour ou supersedée pour
+      refléter le nouveau comportement sélectif (application be16dc46).
+    - >
+      Périmètre borné : ce chantier ne touche QUE la logique de revert du
+      hook face à une altération de permits. Il ne modifie pas le
+      mécanisme d'émission (atomic-grant-permit, déjà livré) ni la
+      sémantique des permits eux-mêmes.

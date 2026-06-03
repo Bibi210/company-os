@@ -1,0 +1,392 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: d45a769b-27fc-4530-b929-9d2286c0ee47
+  title: "Plan d'implémentation — grant_write_permit atomique avec auto-commit, checkpoint WAL, rollback et idempotence"
+  author: implementer
+  created_at: "2026-06-03"
+  description: >
+    Plan d'exécution dérivé du RFC 359f9162 (approuvé). Atomicise
+    grant_write_permit côté serveur MCP : après l'INSERT du permit,
+    le tool force un checkpoint WAL, exécute git add -f ciblé sur le
+    seul .db puis git commit, et en cas d'échec rollback le permit
+    inséré (DELETE) pour ne jamais laisser de permit fantôme. Intègre
+    les trois décisions d'arbitrage CEO : (1) durcissement git avec
+    erreur MCP distinguant la cause, (2) retrait de l'étape 2 (seal
+    manuel) de implementer.yml en préservant l'invariant consume-en-
+    dernier (lesson 8fd49300), (3) idempotence du grant par clé
+    rfc_id + granted_to + target_paths (rejeu = renvoi du permit
+    existant + hash de scellement, pas de doublon).
+  tags:
+    - write-permit
+    - defense-in-depth
+    - atomicity
+    - mcp
+    - companyos-internals
+    - rust
+    - implementation
+  related:
+    - id: 359f9162-18f2-4b72-85b0-7d0e44608959
+      kind: rfc
+      relationship: input
+    - id: 0b0e6c77-aaa3-4791-85aa-e6e1dcbd7bf0
+      kind: task-request
+      relationship: input
+    - id: 8fd49300-14e5-4e7c-b75f-e0e4bd461aac
+      kind: lesson-learned
+      relationship: input
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: input
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+    - id: f3fc4a5d-e9e6-43ef-86e9-49441fa84eaa
+      kind: lesson-learned
+      relationship: related
+    - id: 600307a4-74f6-43dd-95e1-4dee3d2326c1
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  steps:
+    - description: >
+        ÉTAPE 0 — DÉCISIONS DE CONCEPTION (à figer avant tout code).
+        (0.a) Localisation du sealing git : méthode privée sur
+        OrchestratorServer dans main.rs (qui possède déjà self.root_path,
+        cf. main.rs:55), PAS dans engine.rs. Rationale RFC : garder
+        l'engine focalisé sur la DB et ne pas y injecter de dépendance
+        git/process. Signature visée :
+        `fn seal_db_commit(&self, permit_id: Uuid, rfc_id: Uuid) -> Result<String, SealError>`
+        retournant le hash du commit en cas de succès.
+        (0.b) Répartition des responsabilités :
+          - engine.checkpoint_truncate() (engine.rs:462, EXISTE) appelé
+            AVANT le git add pour flusher le WAL (edge h).
+          - le rollback du permit utilise un DELETE ciblé par id. Décision :
+            NE PAS réutiliser restore_permits_from_snapshot (sémantique
+            "garde un set d'ids", inadaptée à "supprime un seul id" et
+            risque de wipe collatéral des autres permits actifs, edge e).
+            Ajouter une méthode db.delete_permit(id) + engine.delete_permit(id).
+          - l'idempotence utilise un nouveau lookup
+            db.find_permit_by_grant(rfc_id, granted_to, target_paths)
+            + engine.find_permit_by_grant(...).
+        (0.c) Dépendances impactées (lesson f3fc4a5d APPRENTISSAGE 1) :
+          - git invoqué via std::process::Command (std lib, AUCUNE crate
+            nouvelle). Vérifier qu'aucun Cargo.toml n'a besoin d'être
+            modifié → AUCUN ajout de dépendance, donc affected_files du
+            RFC (les 3 fichiers) suffit, pas d'amendement RFC requis.
+          - tests : crate orchestrator a déjà uuid, db.open_in_memory()
+            (db.rs:251) ; le git seal se teste côté main.rs avec un repo
+            git temporaire. Pattern LocalTempDir déjà présent dans
+            tests/test_helpers.rs (réutiliser, ne pas ajouter tempfile).
+        (0.d) Type d'erreur de sealing distinguant la cause (décision CEO 1).
+            Définir un enum SealError dans main.rs (ou OrchestratorError
+            étendu — décision : enum LOCAL à main.rs pour ne pas polluer
+            l'engine, mappé ensuite en Diagnostic MCP) avec au minimum
+            les variants : GitNotFound (binaire git absent / spawn échoue
+            avec ErrorKind::NotFound), IndexLocked (git add/commit retourne
+            un stderr contenant "index.lock" ou code de lock), NothingToCommit
+            (git commit retourne "nothing to commit"), GitFailed{stderr}
+            (autre échec). Chaque variant produit un message MCP distinct.
+      files:
+        - "crates/mcp-servers/orchestrator/src/main.rs"
+        - "crates/orchestrator/src/engine.rs"
+        - "crates/orchestrator/src/db.rs"
+
+    - description: >
+        ÉTAPE 1 — db.rs : méthode delete_permit(id) pour le rollback ciblé.
+        Ajouter après create_permit (db.rs:621) :
+        `pub fn delete_permit(&self, id: Uuid) -> Result<(), OrchestratorError>`
+        exécutant `DELETE FROM write_permits WHERE id = ?1` avec
+        params![id.to_string()]. N'affecte qu'une seule ligne, jamais les
+        autres permits actifs (préserve edge e : le scellement/rollback de
+        l'un ne touche pas les autres). Retourne Ok(()) même si 0 ligne
+        supprimée (idempotent défensif).
+        Critère de validation : test unitaire dans le mod tests de db.rs
+        (db.rs:1498) — create_permit(p1), create_permit(p2),
+        delete_permit(p1.id), vérifier que get_permit(p1.id) == None et
+        get_permit(p2.id) == Some.
+        Dépendance : ÉTAPE 0 figée. Ordre : avant l'étape 4.
+      files:
+        - "crates/orchestrator/src/db.rs"
+
+    - description: >
+        ÉTAPE 2 — db.rs : lookup d'idempotence find_permit_by_grant.
+        Ajouter :
+        `pub fn find_permit_by_grant(&self, rfc_id: Uuid, granted_to: &PersonaId, target_paths: &[PathPattern]) -> Result<Option<WritePermit>, OrchestratorError>`.
+        Implémentation : SELECT des permits WHERE rfc_id = ?1 AND
+        granted_to = ?2 AND status = 'active' (ne ré-utiliser qu'un permit
+        encore actif ; un permit consommé/révoqué ne doit pas court-circuiter
+        un nouveau grant légitime). Puis, côté Rust, comparer target_paths
+        par ÉGALITÉ D'ENSEMBLE NORMALISÉE : sérialiser les paths en set trié
+        (PathPattern.0 trié, dédupliqué) des deux côtés et comparer. Rationale :
+        l'ordre des paths dans la requête JSON ne doit pas casser l'idempotence
+        (la clé sémantique est l'ensemble des paths, pas leur ordre). PathPattern
+        est transparent sur String (types.rs:76), donc comparaison sur .0.
+        Retourner le premier permit actif dont l'ensemble de paths matche, sinon None.
+        Critère de validation : test unitaire — create_permit avec paths
+        ["a","b"], find_permit_by_grant(même rfc, même persona, ["b","a"])
+        retourne Some (ordre inversé matche), find avec ["a","c"] retourne None,
+        find avec un autre rfc_id retourne None, find sur un permit consommé
+        retourne None.
+        Dépendance : ÉTAPE 0. Ordre : avant l'étape 4.
+      files:
+        - "crates/orchestrator/src/db.rs"
+
+    - description: >
+        ÉTAPE 3 — engine.rs : exposer delete_permit et find_permit_by_grant
+        en délégation (mêmes signatures que db, retournant les mêmes types).
+        Ajouter après grant_permit (engine.rs:422), dans le bloc
+        "Write Permit Operations" :
+          `pub fn delete_permit(&self, id: Uuid) -> Result<(), OrchestratorError>`
+          → self.db.delete_permit(id)
+          `pub fn find_permit_by_grant(&self, rfc_id: Uuid, granted_to: &PersonaId, target_paths: &[PathPattern]) -> Result<Option<WritePermit>, OrchestratorError>`
+          → self.db.find_permit_by_grant(...).
+        NE PAS toucher grant_permit lui-même : il continue de faire
+        l'INSERT seul. L'orchestration (lookup idempotence → grant →
+        checkpoint → seal → rollback) vit dans main.rs, sous le lock,
+        car c'est là qu'est root_path et la logique git.
+        checkpoint_truncate (engine.rs:462) est déjà exposé, ne pas le
+        redéfinir.
+        Critère de validation : cargo build compile ; get_diagnostics LSP
+        sur engine.rs sans erreur.
+        Dépendance : ÉTAPES 1 et 2. Ordre : avant l'étape 5.
+      files:
+        - "crates/orchestrator/src/engine.rs"
+
+    - description: >
+        ÉTAPE 4 — main.rs : helper de scellement git seal_db_commit + enum
+        SealError. (DÉCISION CEO 1 : erreurs distinguées.)
+        (4.a) Définir près des params structs un enum SealError (variants
+        de l'étape 0.d) avec un Display ou une méthode .diagnostic_reason()
+        produisant un message distinct par cause.
+        (4.b) Implémenter sur OrchestratorServer :
+          `fn seal_db_commit(&self, permit_id: Uuid, rfc_id: Uuid) -> Result<String, SealError>`.
+          Construire db_path = format!("{}/{}/{}", self.root_path,
+          constants::DATA_DIR, constants::DB_FILENAME)
+          (constants::DATA_DIR = "company/data", DB_FILENAME =
+          "orchestrator.db", cf. constants.rs:38-39).
+          Étapes internes :
+            1. git add -f <db_path> via
+               std::process::Command::new("git").current_dir(&self.root_path)
+               .args(["add","-f", "company/data/orchestrator.db"]).
+               CIBLAGE STRICT sur le seul .db — JAMAIS "git add -A"
+               (sinon sort de la classe VOLATILE du hook core.mjs:41 et
+               déclenche la branche unauthorized commit core.mjs:424).
+            2. git commit -m
+               format!("chore: seal write permit {permit_id} for RFC {rfc_id}").
+            3. Distinguer les causes d'échec :
+               - spawn().err() de ErrorKind::NotFound → SealError::GitNotFound.
+               - status non-zéro avec stderr contenant "index.lock" ou
+                 "Unable to create" + ".lock" → SealError::IndexLocked.
+               - stdout/stderr du commit contenant "nothing to commit" →
+                 SealError::NothingToCommit (traitement décidé en étape 5).
+               - tout autre échec → SealError::GitFailed{stderr}.
+            4. Succès : récupérer le hash via
+               git rev-parse HEAD (current_dir root_path), retourner le hash trimé.
+        Critère de validation : test unitaire main.rs (#[cfg(test)]) avec un
+        repo git temporaire (LocalTempDir + git init + git config user) :
+        écrire un fichier company/data/orchestrator.db factice, appeler
+        seal_db_commit, vérifier Ok(hash) et que git log montre le commit ;
+        puis cas négatif en pointant root_path vers un dossier SANS .git →
+        SealError attendue.
+        Dépendance : ÉTAPE 0. Ordre : avant l'étape 5.
+      files:
+        - "crates/mcp-servers/orchestrator/src/main.rs"
+
+    - description: >
+        ÉTAPE 5 — main.rs : réécriture du corps de grant_write_permit
+        (main.rs:426-448) pour orchestrer idempotence + grant + checkpoint
+        + seal + rollback, le TOUT sous le même engine.lock().await (edge f :
+        sérialisation des grants concurrents ET du git commit sous un verrou
+        unique). Garder la vérification du token CEO inchangée (main.rs:432).
+        Séquence après acquisition du lock (let engine = self.engine.lock().await) :
+          (a) IDEMPOTENCE (DÉCISION CEO 3) : appeler
+              engine.find_permit_by_grant(rfc_id, &granted_to, &target_paths).
+              Si Some(permit_existant) : NE PAS créer de doublon. Re-sceller
+              de façon défensive (le permit est déjà en DB et déjà en HEAD
+              en principe) en appelant seal_db_commit ; si NothingToCommit
+              → succès attendu (déjà scellé). Retourner le permit existant
+              + le hash de scellement. Cela rend le rejeu MCP (edge b)
+              idempotent : même clé → même permit, jamais de second permit_id.
+          (b) GRANT : sinon, engine.grant_permit(rfc_id, granted_to,
+              target_paths) → permit inséré (INSERT, engine.rs:402).
+          (c) CHECKPOINT WAL (edge h) : engine.checkpoint_truncate() AVANT
+              le git add, pour garantir que le .db sur disque contient bien
+              le permit fraîchement inséré (le WAL est flushé dans le .db).
+              Si le checkpoint échoue : rollback (engine.delete_permit) +
+              erreur MCP. Le checkpoint vient TOUJOURS avant le seal.
+          (d) SEAL : self.seal_db_commit(permit.id, rfc_id).
+              - Ok(hash) : retourner au CEO une réponse JSON enrichie =
+                le permit sérialisé + champ additif "sealed_commit": <hash>
+                (rétro-compatible : mêmes champs permit + 1 champ en plus).
+              - Err(NothingToCommit) sur un grant NEUF (cas improbable, DB
+                identique à HEAD alors qu'on vient d'insérer) : traiter
+                comme une anomalie → rollback + erreur MCP explicite
+                (le permit n'a pas pu être matérialisé sur disque).
+              - Err(GitNotFound | IndexLocked | GitFailed) : ROLLBACK
+                via engine.delete_permit(permit.id), PUIS retourner une
+                erreur MCP dont le message DISTINGUE la cause (Diagnostic
+                avec .with_reason spécifique : "git introuvable", "index git
+                verrouillé par un autre process", "nothing to commit", ou
+                stderr brut). Invariant garanti : à la sortie, soit le permit
+                existe ET est scellé en HEAD, soit il n'existe pas du tout.
+          (e) EDGE d (rollback échoue) : si engine.delete_permit échoue
+              après un seal échoué, logguer (eprintln!) l'incident et
+              remonter une erreur MCP double (seal failed + rollback failed) ;
+              ne pas paniquer. Pas de régression vs l'état actuel (le permit
+              non scellé sera traité par hook/PILIER D).
+        Le lock engine est conservé pendant tout (a)-(e) puis relâché en fin
+        de fonction (drop implicite du guard).
+        Critère de validation : couvert par les tests d'intégration de
+        l'étape 7. cargo build + get_diagnostics LSP sans erreur sur main.rs.
+        Dépendance : ÉTAPES 3 et 4. Ordre : cœur du chantier, avant l'étape 6.
+      files:
+        - "crates/mcp-servers/orchestrator/src/main.rs"
+
+    - description: >
+        ÉTAPE 6 — company/personas/implementer.yml : retrait du contournement
+        (DÉCISION CEO 2 + cleanup be16dc46 + acceptance criterion 3).
+        Dans la règle write_permit_full_sequence (lignes 14-25) :
+          - SUPPRIMER l'actuelle étape 2 (ligne 19 : "git add -f
+            company/data/orchestrator.db && git commit ... scellement DB").
+          - RENUMÉROTER les étapes 3→2, 4→3, 5→4, 6→5, 7→6.
+          - REFORMULER la nouvelle étape 1 pour indiquer que
+            grant_write_permit() émet ET scelle automatiquement le permit
+            en git en une seule opération atomique (plus de seal manuel).
+          - PRÉSERVER STRICTEMENT (EXIGENCE FORTE CEO 2, lesson 8fd49300)
+            l'invariant : write → commit du code → consume, le consume
+            venant TOUJOURS en DERNIER, après le commit du code applicatif.
+            La nouvelle séquence devient :
+              1. grant_write_permit() — émet ET scelle automatiquement le
+                 permit en git (atomique, CEO).
+              2. modifier les fichiers protégés couverts par le permit.
+              3. git add <fichiers> && git commit (commit du code).
+              4. consume_write_permit() — APRÈS le commit du code, jamais avant.
+              5. cargo build && cargo test.
+              6. reload_config() — EN DERNIER.
+          - CONSERVER la phrase finale "Un permit consommé avant le commit
+            rend le commit impossible (hook rejet)" (invariant consume-last).
+        La règle hotreload_last (lignes 26-34) reste INCHANGÉE (toujours
+        valide).
+        Critère de validation : yaml-validator sur implementer.yml (kind
+        persona) → valide ; relecture manuelle : l'invariant consume-last
+        est bien présent et l'ordre write→commit→consume préservé.
+        Dépendance : indépendante du code, mais à committer dans la MÊME
+        unité de travail (be16dc46). Ordre : peut être faite en parallèle
+        des étapes code, committée avec le reste.
+      files:
+        - "company/personas/implementer.yml"
+
+    - description: >
+        ÉTAPE 7 — Tests triaxiaux (acceptance criterion 4).
+        Localisation : tests unitaires db/engine dans les mod tests
+        existants (db.rs:1498) ; tests du seal et de grant_write_permit
+        orchestré dans #[cfg(test)] de main.rs avec repo git temporaire
+        (LocalTempDir, git init + git config). Pas de nouveau fichier de
+        test (pas de path à ajouter à affected_files, cf. lesson 611fde3e).
+        AXE NOMINAL (happy path) :
+          - T1 : grant_write_permit neuf → permit inséré, checkpoint OK,
+            seal OK, réponse contient le permit + sealed_commit hash ;
+            vérifier que le commit existe en git (git log) et ne touche
+            QUE company/data/orchestrator.db (git show --stat).
+          - T2 : check_permit voit le permit comme active après le grant.
+        AXE NÉGATIF (erreurs, échecs) :
+          - T3 : seal échoue car pas de repo git (root_path sans .git) →
+            le permit est rollback (get_permit == None) ET erreur MCP
+            retournée distinguant la cause GitNotFound/GitFailed.
+          - T4 : simuler index.lock (créer .git/index.lock) → erreur MCP
+            IndexLocked distincte + rollback. (Si non simulable simplement,
+            documenter la couverture par inspection du mapping d'erreur.)
+          - T5 : rejeu idempotent (edge b / DÉCISION CEO 3) : appeler deux
+            fois grant_write_permit avec mêmes rfc_id + granted_to +
+            target_paths (ordre des paths inversé au 2e appel) → un SEUL
+            permit en DB, le 2e appel retourne le MÊME permit_id + hash,
+            PAS de doublon.
+        AXE EDGE (limites, concurrence) :
+          - T6 : émission d'un permit alors qu'un autre permit est déjà
+            actif (edge e) → le nouveau seal/commit ne supprime PAS l'ancien
+            permit (les deux restent en DB) ; le rollback éventuel ne touche
+            que le permit ciblé (delete_permit par id).
+          - T7 : checkpoint avant seal (edge h) — vérifier que delete_permit
+            partiel n'altère pas les autres et que le checkpoint est bien
+            appelé avant le git add (ordre testé via la séquence T1).
+          - T8 (régression acceptance criterion 5, lesson 8fd49300) : un
+            permit reste 'active' après grant+seal (il n'est PAS consommé
+            par l'auto-commit) ; consume n'intervient pas dans grant. Vérifie
+            que l'invariant consume-last n'est pas violé par le RFC.
+        FIXTURES : si des fixtures YAML sont nécessaires, NE PAS utiliser de
+        continuation backslash dans les littéraux Rust (lesson f3fc4a5d
+        APPRENTISSAGE 3) ; préférer push_str avec \n littéraux ou fichier
+        sur disque.
+        Critère de validation : cargo test → 0 failed sur les nouveaux tests
+        et aucune régression sur les 117+ tests existants.
+        Dépendance : ÉTAPES 1-6. Ordre : dernière étape de code.
+      files:
+        - "crates/orchestrator/src/db.rs"
+        - "crates/mcp-servers/orchestrator/src/main.rs"
+
+    - description: >
+        ÉTAPE 8 — SÉQUENCE DE LIVRAISON (write_permit_full_sequence, ordre
+        non-négociable, lesson 8fd49300). NOTE : tant que ce RFC n'est pas
+        mergé, le scellement de SON PROPRE permit suit encore l'ANCIENNE
+        procédure manuelle (seal manuel), conformément à la note d'auto-
+        amorçage du RFC. Séquence d'exécution prévue après approbation du
+        plan par l'Architect et émission du write permit par le CEO :
+          1. CEO grant_write_permit couvrant les 3 affected_files
+             (main.rs, engine.rs, implementer.yml). Vérifier via
+             check_write_permit que CHAQUE path est couvert AVANT d'écrire
+             (lesson 611fde3e). Aucun fichier à CRÉER → pas d'amendement RFC.
+          2. (ancien seal manuel encore requis pour CE permit) :
+             git add -f company/data/orchestrator.db && git commit
+             "chore: seal write permit <id>".
+          3. Implémenter étapes 1-7 (modifs des 3 fichiers protégés).
+          4. git add <les 3 fichiers + tests> && git commit.
+          5. consume_write_permit() APRÈS le commit du code, jamais avant.
+          6. cargo build (sans --target-dir) && cargo test → 0 failed.
+          7. reload_config() EN DERNIER, uniquement si build/test verts.
+        Cette étape n'est PAS exécutée maintenant : le présent artifact
+        s'arrête à la création du plan et au lancement du review round.
+        Critère de validation : la séquence est documentée pour la phase
+        d'exécution post-approbation.
+      files: []
+
+  dependencies:
+    - "RFC 359f9162 approuvé (consensus pm+ceo+implementer) — FAIT."
+    - "Approbation de CE plan par l'Architect (review round, ce chantier)."
+    - "Write permit émis par le CEO couvrant les 3 affected_files APRÈS approbation du plan (write_permit_gate)."
+    - "git disponible dans l'environnement du serveur (vérifié 2.54.0) — prérequis durci (décision CEO 1)."
+    - "Checkpoint WAL exposé par engine.checkpoint_truncate (PILIER C, RFC cdbfee72) — EXISTE."
+
+  risks:
+    - >
+      Edge h (WAL non checkpointé) : si checkpoint_truncate n'est pas appelé
+      AVANT git add, le .db committé pourrait ne pas contenir le permit.
+      Mitigation : étape 5.c rend le checkpoint obligatoire et précédant le
+      seal ; testé en T7. Risque le plus délicat du RFC.
+    - >
+      Concurrence (edge f) : deux grant_write_permit simultanés. Mitigation :
+      checkpoint + add + commit sérialisés sous le MÊME engine.lock().await
+      que l'INSERT (étape 5). Aucun git add/commit concurrent possible.
+    - >
+      git absent / index verrouillé (décision CEO 1) : durcissement volontaire,
+      le grant échoue avec rollback systématique et erreur MCP distinguant la
+      cause. Risque résiduel : environnement serveur sans git → tout grant
+      échoue. Documenté comme prérequis (RFC impact, risques résiduels).
+    - >
+      Idempotence (décision CEO 3) : la clé rfc_id+granted_to+target_paths
+      compare les paths par ensemble normalisé. Risque : deux grants légitimes
+      VOULUS distincts mais avec exactement les mêmes paths seraient fusionnés.
+      Mitigation : le lookup ne matche QUE les permits encore 'active' ; un
+      besoin réel de deuxième permit identique est un signal d'anomalie, pas un
+      cas légitime (mêmes paths, même RFC, même persona = même autorisation).
+    - >
+      Risque de sortie de la classe VOLATILE du hook (core.mjs:41/424) si le
+      git add n'est pas strictement ciblé sur le .db. Mitigation : add littéral
+      "company/data/orchestrator.db", JAMAIS git add -A ; testé en T1
+      (git show --stat ne montre que le .db).
+    - >
+      Pas de nouvelle dépendance Cargo (git via std::process::Command). Si
+      l'exécution révèle un besoin de dépendance (peu probable), suivre lesson
+      f3fc4a5d : workaround léger ou extension de permit sur Cargo.toml AVANT
+      d'écrire.

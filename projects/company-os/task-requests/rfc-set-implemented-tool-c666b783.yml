@@ -1,0 +1,73 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: c666b783-c427-4045-acad-3c1735625580
+  title: "Tool MCP rfc_set_implemented(id) pour clore les RFCs sans permit ad-hoc"
+  author: pm
+  created_at: "2026-06-03"
+  project: company-os
+  description: >
+    Aujourd'hui, passer un RFC à status: implemented nécessite d'éditer
+    le YAML du RFC à la main, ce qui demande un write permit sur
+    company/rfcs/ (zone protégée) alors que c'est une opération
+    administrative légitime de clôture de cycle de vie. Le système expose
+    déjà un précédent : close_review_round met automatiquement le RFC en
+    status: approved (rfc_auto_updated) sans permit, parce que c'est une
+    transition de cycle de vie pilotée par le workflow. La transition
+    approved -> implemented mérite le même traitement : un tool MCP dédié
+    rfc_set_implemented(id) qui effectue la transition de manière sûre et
+    auditée, sans grant de permit ad-hoc.
+  tags:
+    - rfc-lifecycle
+    - mcp
+    - tooling
+    - write-permit
+    - companyos-internals
+    - friction-permits
+  related:
+    - id: 3cd72740-1424-46ac-8ee6-96f714f3fa94
+      kind: rfc
+      relationship: related
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: input
+    - id: 359f9162-18f2-4b72-85b0-7d0e44608959
+      kind: rfc
+      relationship: related
+
+spec:
+  priority: medium
+  status: backlog
+  acceptance_criteria:
+    - >
+      Un tool MCP rfc_set_implemented(id) existe et fait passer un RFC de
+      status: approved à status: implemented sans nécessiter de write
+      permit sur company/rfcs/, de la même manière que close_review_round
+      met un RFC en approved.
+    - >
+      La transition est sûre et validée : le tool refuse de passer un RFC
+      en implemented s'il n'est pas d'abord en status: approved (un RFC
+      draft, rejected ou déjà implemented ne doit pas pouvoir transiter
+      arbitrairement). L'erreur retournée est explicite sur la raison du
+      refus.
+    - >
+      Le YAML du RFC est mis à jour de façon cohérente (status:
+      implemented) et la modification est scellée comme il se doit (par
+      le même mécanisme que les autres transitions de cycle de vie gérées
+      côté serveur). Pas de fenêtre où l'index et le fichier divergent.
+    - >
+      Tests couvrant les trois axes. Nominal : RFC approved -> implemented
+      réussit, l'index reflète le nouveau status. Négatif : RFC non
+      trouvé (id inexistant), RFC dans un mauvais status (draft/rejected/
+      déjà implemented) -> refus explicite. Edge : appel concurrent, RFC
+      dont le fichier a été modifié entre-temps, id mal formé.
+    - >
+      Si une règle ou une persona documentait le contournement "éditer le
+      YAML du RFC à la main avec un permit ad-hoc pour le passer en
+      implemented", ce contournement est retiré et la doc pointe vers le
+      nouveau tool (application de la lesson be16dc46). Si aucun endroit
+      normatif ne le documentait, le noter explicitement (cas zéro).
+    - >
+      Périmètre borné : ce chantier ne touche QUE la transition
+      approved -> implemented. Il ne modifie pas le mécanisme des write
+      permits lui-même ni le hook defense-in-depth.

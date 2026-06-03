@@ -1,0 +1,494 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 359f9162-18f2-4b72-85b0-7d0e44608959
+  title: "Atomiciser grant_write_permit + scellement DB côté MCP (auto-commit avec rollback)"
+  status: approved
+  approved_at: "2026-06-03T21:30:30.499103805+00:00"
+  author: architect
+  created_at: "2026-06-03"
+  description: >
+    Élimine la fenêtre non-atomique entre l'émission d'un write permit
+    par le CEO (grant_write_permit) et son scellement en git (commit de
+    company/data/orchestrator.db). Décision tranchée : le tool MCP
+    grant_write_permit effectue lui-même, dans la même opération, le
+    git add -f + git commit de la DB juste après l'INSERT du permit.
+    Si le commit échoue, le permit inséré est rollback (DELETE) pour ne
+    jamais laisser de permit fantôme. Le contournement manuel "le PM/
+    l'Implementer commit la DB pour sceller" (write_permit_full_sequence
+    étape 2 de la persona Implementer) est retiré dans le même scope, et
+    les lessons qui le décrivaient sont supersedées. Touche les zones
+    protégées crates/ et company/personas/ : approbation CEO + write
+    permit requis. Périmètre strictement borné à l'atomicité de
+    l'émission ; ne modifie PAS le revert nucléaire vs sélectif du hook
+    (sujet voisin defense-in-depth-selective).
+  tags:
+    - write-permit
+    - defense-in-depth
+    - atomicity
+    - mcp
+    - companyos-internals
+    - friction-permits
+    - critical-infra
+  related:
+    - id: 0b0e6c77-aaa3-4791-85aa-e6e1dcbd7bf0
+      kind: task-request
+      relationship: input
+    - id: 600307a4-74f6-43dd-95e1-4dee3d2326c1
+      kind: lesson-learned
+      relationship: input
+    - id: ed7776fb-d56d-4f61-9f48-807897c6325d
+      kind: lesson-learned
+      relationship: input
+    - id: 8fd49300-14e5-4e7c-b75f-e0e4bd461aac
+      kind: lesson-learned
+      relationship: input
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: input
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: related
+
+spec:
+  motivation: >
+    PROBLÈME OBSERVÉ. Trois occurrences documentées pendant la refonte
+    search (agent-messages 4f000127 et 05224964, lesson 600307a4) d'un
+    write permit perdu avant d'avoir pu être utilisé. Le scénario est
+    toujours le même : le CEO émet un permit via grant_write_permit, le
+    permit est écrit en mémoire SQLite (company/data/orchestrator.db),
+    mais il n'est pas encore reflété dans HEAD git. Pendant cette
+    fenêtre, un évènement (commande bash qui touche le WAL via
+    cargo build/info, ou un restart du binaire qui déclenche le PILIER D
+    autorepair du RFC cdbfee72) modifie ou reconstruit la table
+    write_permits, et le permit non scellé disparaît. L'Implementer se
+    retrouve bloqué (check_write_permit = false) et doit re-coordonner
+    PM puis CEO pour ré-émettre, coûtant un cycle complet à chaque fois.
+
+    DIAGNOSTIC TECHNIQUE PRÉCIS (investigation du code réel).
+
+    1. Émission. grant_write_permit (MCP) ne fait qu'un seul appel
+       métier : engine.grant_permit() puis db.create_permit() qui
+       exécute un INSERT dans write_permits
+       (crates/orchestrator/src/db.rs:603). Aucune écriture git n'est
+       faite à ce moment. Le tool dispose pourtant déjà de
+       self.root_path (crates/mcp-servers/orchestrator/src/main.rs:55),
+       donc il a tout ce qu'il faut pour committer la DB lui-même.
+
+    2. Scellement actuel = contournement manuel. La persona Implementer
+       porte la règle write_permit_full_sequence dont l'étape 2 dit
+       explicitement : "git add -f company/data/orchestrator.db &&
+       git commit -m 'chore: seal write permit <rfc_id>' (scellement DB
+       — AVANT toute modification de fichier protégé)". Le scellement
+       est donc une responsabilité humaine/agent, séparée de l'émission
+       dans le temps, exécutée via une commande bash brute. C'est
+       précisément cette séparation qui crée la fenêtre.
+
+    3. La DB est git-trackée malgré .gitignore. .gitignore ligne 3
+       contient "*.db*" mais company/data/orchestrator.db EST présent
+       dans HEAD (vérifié : git cat-file -e HEAD:company/data/orchestrator.db
+       réussit). Le fichier a été force-ajouté (git add -f). Le "seal"
+       fonctionne donc en pinnant le contenu binaire de la DB dans HEAD,
+       ce qui en fait la baseline durable. C'est pour ça que le commit
+       protège le permit.
+
+    4. DEUX mécanismes distincts tuent le permit non scellé. La
+       task-request les fusionne ; l'investigation montre qu'ils sont
+       séparés et que la solution proposée neutralise les deux en
+       fermant la fenêtre :
+       (a) Check de tampering in-session du hook
+           (defense-in-depth-core.mjs:216, revertPermitTampering).
+           Avant chaque bash, snapshotPermits capture
+           "count|id:status,...". Après le bash, re-snapshot ; si la
+           table a changé (par exemple un permit fraîchement émis mais
+           absent du snapshot d'avant, ou un WAL frame réécrit par
+           cargo build), la branche selective supprime les permits "non
+           présents avant" (DELETE WHERE id NOT IN (before_ids)). Un
+           permit émis ENTRE deux bash, non encore scellé, est vu comme
+           "nouveau" et donc supprimable.
+       (b) PILIER D autorepair (RFC cdbfee72). Au boot, si
+           integrity_check échoue, la DB est reconstruite depuis les
+           YAML. write_permits n'a pas de source de vérité YAML : la
+           table est perdue. Un permit non scellé en git ne survit pas
+           à ce rebuild. C'est la dette consciente et documentée du
+           PILIER D.
+       Dans les deux cas, la cause racine commune est l'existence d'une
+       fenêtre où le permit vit en SQLite sans être dans HEAD. Fermer
+       cette fenêtre côté serveur (le grant et le seal deviennent une
+       seule opération indivisible) élimine la classe de bug.
+
+    POURQUOI UN RFC. Le correctif modifie
+    crates/mcp-servers/orchestrator/src/main.rs et
+    crates/orchestrator/src/engine.rs (zone protégée crates/), et
+    company/personas/implementer.yml (zone protégée company/personas/,
+    modification de persona = changement structurel par shared-rules).
+    Tous les critères RFC de shared-rules sont réunis : zones protégées,
+    changement structurel d'un mécanisme d'enforcement, impact
+    transverse sur le workflow de tous les agents. Approbation CEO +
+    write permit requis.
+
+    Note méta sur l'auto-amorçage. Ce RFC, une fois approuvé,
+    nécessitera lui-même un write permit pour modifier les fichiers
+    ci-dessus, et donc un scellement. Tant qu'il n'est pas implémenté,
+    le scellement de SON permit suivra encore l'ancienne procédure
+    manuelle (write_permit_full_sequence étape 2). C'est attendu : on
+    retire le contournement dans le même commit que l'introduction de
+    la solution, pas avant. Après merge, plus aucun permit n'aura
+    besoin du seal manuel.
+
+  proposal: >
+    DÉCISION TECHNIQUE TRANCHÉE — grant_write_permit auto-commit avec
+    rollback. Le QUOI et le POURQUOI au niveau des invariants ;
+    l'implementation-plan dérivé décidera des noms exacts et de l'ordre.
+
+    --- DÉCISION CENTRALE : émission + scellement = une opération
+    indivisible côté serveur ---
+
+    Le tool MCP grant_write_permit, après que engine.grant_permit() a
+    réussi (INSERT du permit en DB), effectue lui-même, dans la même
+    invocation, le scellement git de la DB :
+
+      1. engine.grant_permit(...) produit le permit inséré en
+         write_permits.
+      2. Scellement : depuis self.root_path, exécuter l'équivalent de
+         "git add -f company/data/orchestrator.db" puis
+         "git commit -m 'chore: seal write permit <permit_id> for RFC
+         <rfc_id>'".
+      3. Arbitrage du résultat :
+         - Commit réussi : retourner le permit au CEO (réponse
+           inchangée du point de vue de l'appelant, enrichie d'un champ
+           indiquant que le scellement a eu lieu et le hash du commit).
+         - Commit échoué (git absent, rien à committer, index
+           verrouillé, etc.) : ROLLBACK du permit (DELETE de la ligne
+           insérée) pour ne jamais laisser un permit fantôme en DB sans
+           scellement, puis retourner une erreur MCP claire au CEO.
+           Invariant : à la sortie du tool, soit le permit existe ET est
+           scellé en HEAD, soit il n'existe pas du tout.
+
+    Cette indivisibilité supprime entièrement la fenêtre : il n'y a
+    plus d'instant observable où un permit est actif en SQLite mais
+    absent de HEAD. Le check de tampering du hook (qui compare l'état
+    avant/après bash) ne verra plus jamais de permit "nouveau et non
+    scellé" puisque tout permit émis est immédiatement dans HEAD ; et
+    le PILIER D ne perdra plus de permit non scellé puisqu'il n'en
+    existe plus.
+
+    --- POURQUOI L'AUTO-COMMIT PLUTÔT QU'UN seal_permit(id) SÉPARÉ ---
+
+    Alternative considérée puis REJETÉE comme décision primaire : un
+    tool MCP dédié seal_permit(permit_id) que l'agent appellerait après
+    grant_write_permit. Raisons du rejet :
+    - Deux appels équivalent à une fenêtre résiduelle entre grant et
+      seal (plus courte, mais non nulle). L'auto-commit donne
+      l'atomicité stricte visée par l'acceptance criterion 1.
+    - L'auto-commit retire complètement l'étape manuelle ; seal_permit
+      la déplace seulement du bash vers un tool MCP, sans éliminer la
+      séquence en deux temps que le contournement imposait.
+    L'auto-commit est donc retenu. seal_permit reste mentionné comme
+    évolution possible si un besoin de re-scellement explicite émerge
+    (par exemple après une extension de permit hors grant), mais il
+    n'est pas dans le scope de ce RFC.
+
+    --- INTERACTION AVEC write_permit_full_sequence (séquence consume) ---
+
+    La séquence canonique reste : write puis commit du code puis
+    consume, le consume venant toujours en DERNIER (lesson 8fd49300,
+    acceptance criterion 5). Ce RFC ne touche QUE l'étape de scellement
+    du permit (ancienne étape 2), qui devient automatique et disparaît
+    de la responsabilité de l'agent. Concrètement, la nouvelle séquence
+    vécue par l'Implementer devient :
+      1. grant_write_permit() émet ET scelle automatiquement le permit
+         en un seul appel (CEO).
+      2. (plus d'étape de seal manuel — supprimée).
+      3. modifier les fichiers protégés couverts par le permit.
+      4. git add <fichiers> && git commit (commit du code applicatif).
+      5. consume_write_permit() APRÈS le commit du code, jamais avant.
+      6. cargo build && cargo test.
+      7. reload_config() en dernier.
+    L'invariant "le permit reste active jusqu'au commit du code, le
+    consume vient en dernier" est strictement préservé : l'auto-commit
+    du grant scelle la DB AVANT toute modification de fichier protégé,
+    ce qui est exactement l'ordre que l'ancienne étape 2 imposait
+    manuellement. On automatise l'étape, on ne change pas l'ordre.
+
+    --- INTERACTION AVEC LE HOOK defense-in-depth (NON MODIFIÉ) ---
+
+    Le hook n'est pas modifié par ce RFC. C'est volontaire et c'est la
+    borne de périmètre exigée par l'acceptance criterion 6 : le
+    comportement du revert (nucléaire vs sélectif) reste tel quel et
+    relève du sujet voisin defense-in-depth-selective. Subtilité à
+    valider en implémentation : l'auto-commit du grant se produit
+    pendant l'appel MCP grant_write_permit, donc HORS d'une commande
+    bash interceptée par le hook. Le snapshot avant/après bash du hook
+    n'encadre pas l'appel MCP. En revanche, le commit créé par
+    l'auto-commit fait avancer HEAD ; il faut s'assurer que ce commit
+    ne touche QUE company/data/orchestrator.db (fichier volatile,
+    couvert par le pattern VOLATILE_PATTERNS sur .db du hook,
+    core.mjs:41) et ne déclenche donc pas la branche "unauthorized
+    commit touching protected zones" (core.mjs:424). L'implementation-
+    plan doit garantir que le git add est ciblé sur le seul fichier DB
+    (jamais "git add -A") pour rester dans la classe volatile.
+
+    --- CONTRAT DE LA MÉTHODE DE SCELLEMENT CÔTÉ MOTEUR ---
+
+    Le scellement git est encapsulé côté serveur ou côté engine (à
+    trancher dans l'implementation-plan ; recommandation : une méthode
+    sur le serveur qui a déjà root_path, ou une fonction utilitaire,
+    afin de garder l'engine focalisé sur la DB et de ne pas y injecter
+    de dépendance git). Contrat fonctionnel attendu :
+      - paramètre : le permit_id et le rfc_id (pour le message de
+        commit), le root_path.
+      - effet : git add -f sur le seul db_path, puis git commit avec un
+        message déterministe. Si rien n'a changé (DB identique à HEAD,
+        cas improbable mais possible si la transaction n'a pas flush),
+        l'implementation-plan tranchera le traitement du cas "nothing
+        to commit" (le considérer comme succès si le permit est déjà
+        reflété en HEAD, sinon erreur).
+      - rollback : en cas d'échec du commit, supprimer la ligne du
+        permit (un DELETE ciblé par id, ou la réutilisation du
+        mécanisme existant restore_permits_from_snapshot) avant de
+        remonter l'erreur.
+
+    --- CLEANUP DU CONTOURNEMENT (application directe de be16dc46) ---
+
+    Voir la section dédiée "cleanup_workaround" ci-dessous. Le retrait
+    du contournement manuel et la mise à jour de la persona Implementer
+    font partie du scope de CE RFC et de son implementation-plan, pas
+    d'un chantier ultérieur.
+
+    --- ANALYSE TRIAXIALE ---
+
+    Cas nominal (happy path). Le CEO appelle grant_write_permit. Le
+    permit est inséré, la DB est immédiatement committée en HEAD, le
+    tool retourne le permit plus le hash du commit de scellement.
+    Aucune fenêtre. L'Implementer enchaîne directement sur la
+    modification des fichiers protégés sans étape de seal manuel. Un
+    cargo build ou un restart binaire ultérieur ne perd pas le permit
+    (il est dans HEAD).
+
+    Cas négatif (erreurs, échecs).
+    (a) git commit échoue (binaire git absent, repo en état détaché,
+        index verrouillé par un autre process git). Le permit inséré
+        est rollback (DELETE), le tool retourne une erreur MCP
+        explicite. Pas de permit fantôme. Le CEO réessaie.
+    (b) Coupure MCP pendant grant_write_permit. Le proxy résilient
+        (RFC d9399863) bufferise et rejoue l'appel. Comme l'opération
+        crée un nouveau permit_id à chaque grant, un rejeu peut créer
+        un second permit : à arbitrer en implémentation (option :
+        rendre le grant idempotent par rfc_id + granted_to + paths, ou
+        accepter qu'un doublon de permit soit bénin car couvrant les
+        mêmes paths). Le risque de permit fantôme non scellé est nul :
+        tout permit qui survit est scellé.
+    (c) Le commit réussit mais le retour MCP est perdu (coupure après
+        commit). Le permit est scellé en HEAD ; check_write_permit le
+        verra. État cohérent même si le CEO ne reçoit pas la réponse.
+    (d) DELETE de rollback échoue (DB en erreur). Cas extrême : on
+        loggue l'incident et on remonte une erreur double. La DB est
+        peut-être dans un état avec un permit non scellé ; mais comme
+        le commit a échoué, ce permit sera de toute façon traité par
+        les mécanismes existants (hook tampering ou PILIER D). Pas de
+        régression par rapport à l'état actuel.
+
+    Edge cases (valeurs limites, concurrence).
+    (e) Émission d'un permit alors qu'un ou plusieurs autres permits
+        sont déjà actifs (acceptance criterion 4 edge). L'auto-commit
+        scelle l'état COMPLET de la table write_permits (le fichier DB
+        entier est committé), donc les permits préexistants restent
+        scellés et intacts. Le scellement de l'un ne wipe pas les
+        autres : c'est un commit du fichier, pas un DELETE.
+    (f) Deux grant_write_permit concurrents. Le Mutex tokio de l'engine
+        (engine.lock().await) sérialise les INSERT. Le git commit doit
+        lui aussi être sérialisé pour éviter deux git add/commit qui se
+        marchent dessus. Recommandation : effectuer le scellement sous
+        le même verrou que l'insertion (garder le lock engine pendant
+        l'add plus commit), de sorte que les deux grants soient
+        pleinement séquentiels. À confirmer en implémentation.
+    (g) Le commit de scellement et le file watcher / index. Le commit
+        ne touche que le .db (volatile, non indexé comme artifact YAML),
+        donc aucune interaction avec l'indexation. Pas de double
+        indexation, pas de trigger watcher sur un YAML.
+    (h) DB en WAL non checkpointé au moment du git add. Le contenu
+        binaire du .db sur disque peut être en retard sur le WAL. Le
+        permit est dans le WAL mais pas forcément dans le .db committé.
+        Risque réel à traiter en implémentation : forcer un checkpoint
+        (PRAGMA wal_checkpoint, mécanisme déjà exposé par le PILIER C du
+        RFC cdbfee72) AVANT le git add, pour garantir que le .db sur
+        disque contient bien le permit. C'est le point technique le
+        plus délicat du RFC et l'implementation-plan doit l'expliciter.
+
+  impact: >
+    CATÉGORISATION DES FICHIERS IMPACTÉS (lesson 611fde3e + note roadmap
+    rfc-affected-files-categorize). Le schéma RFC actuel ne fournit
+    qu'un champ plat spec.affected_files (array de string), donc la
+    liste autoritaire pour le write permit est plate ci-dessous. Pour
+    la lisibilité humaine et pour éviter le blocker "fichier à créer
+    oublié", on explicite ici la distinction :
+      - À MODIFIER (existants, présents dans HEAD) :
+        * crates/mcp-servers/orchestrator/src/main.rs
+        * crates/orchestrator/src/engine.rs
+        * company/personas/implementer.yml
+      - À CRÉER (nouveaux) : AUCUN. Ce RFC ne crée aucun fichier ; tous
+        les changements sont des modifications de fichiers existants. Si
+        l'implementation-plan découvre le besoin d'un fichier de test
+        nouveau (par exemple un test d'intégration du scellement), ce
+        path devra être ajouté à affected_files via un amendement RFC
+        AVANT l'émission du permit (sinon blocker hook, cf. 611fde3e).
+
+    Surface de modification estimée.
+    - crates/mcp-servers/orchestrator/src/main.rs : modification du
+      tool grant_write_permit pour enchaîner scellement plus rollback
+      après l'insertion. Enrichissement de la réponse (hash du commit).
+      Estimé +40 à +60 lignes.
+    - crates/orchestrator/src/engine.rs : éventuelle méthode helper de
+      scellement git (ou DELETE ciblé d'un permit par id pour le
+      rollback, si restore_permits_from_snapshot ne convient pas
+      directement). Possible checkpoint avant scellement. Estimé +20 à
+      +40 lignes.
+    - company/personas/implementer.yml : retrait de l'étape 2 (seal
+      manuel) de write_permit_full_sequence et renumérotation des
+      étapes. Mise à jour du texte pour refléter que le scellement est
+      automatique. Estimé -1 ligne, plus quelques lignes de
+      reformulation.
+
+    Impact runtime.
+    - grant_write_permit : +1 checkpoint WAL éventuel, +1 git add, +1
+      git commit. Coût estimé < 200ms, acceptable car c'est une
+      opération rare et administrative (CEO uniquement).
+    - Aucun overhead sur les autres tools ni sur le steady-state.
+
+    Impact compatibilité.
+    - Signature MCP de grant_write_permit inchangée (mêmes paramètres).
+      La réponse est enrichie d'un champ scellement, additif et
+      rétro-compatible.
+    - Aucun changement de schéma de table.
+    - Le comportement vécu par les agents change : plus de seal manuel.
+      C'est l'objet du cleanup (voir cleanup_workaround). Les agents
+      doivent lire la persona à jour.
+    - Le hook defense-in-depth n'est pas modifié.
+
+    Interactions avec autres composants.
+    - RFC cdbfee72 (résilience DB) : ce RFC s'appuie sur le checkpoint
+      WAL introduit par le PILIER C et reste compatible avec le
+      PILIER D (qui ne perdra plus de permit non scellé puisqu'il n'en
+      existe plus). Aucun conflit.
+    - RFC d9399863 (proxy résilient) : le buffering/replay protège
+      l'appel grant_write_permit comme tout autre appel MCP.
+    - Sujet voisin defense-in-depth-selective : explicitement HORS
+      scope. Ce RFC ne présume rien du futur revert sélectif et n'y
+      touche pas.
+
+    Risques résiduels.
+    - Si le checkpoint WAL n'est pas correctement forcé avant le git
+      add, le .db committé pourrait ne pas contenir le permit (edge h).
+      Mitigation : l'implementation-plan doit rendre le checkpoint
+      obligatoire et le tester explicitement.
+    - Si git n'est pas disponible dans l'environnement du serveur, tout
+      grant échoue (rollback systématique). C'est un durcissement
+      volontaire : sans git, aucun scellement durable n'est possible,
+      donc émettre un permit non scellé serait pire (retour au bug
+      actuel). Documenter ce prérequis.
+    - Doublons de permit en cas de rejeu MCP (edge b) : bénin
+      fonctionnellement (mêmes paths), à confirmer en implémentation.
+
+  rollback_plan: >
+    Le rollback s'effectue en deux temps indépendants.
+
+    (1) crates/ : git revert des changements appliqués à main.rs et
+        engine.rs. Le tool grant_write_permit reprend son comportement
+        actuel (INSERT seul, sans scellement git). La fenêtre
+        non-atomique réapparaît mais le système redevient exactement
+        l'état pré-RFC, connu et contourné manuellement.
+
+    (2) company/personas/implementer.yml : restaurer l'étape 2 (seal
+        manuel) dans write_permit_full_sequence et la renumérotation
+        d'origine. Les agents reprennent la procédure manuelle de
+        scellement.
+
+    Si des lessons ont été supersedées par l'implémentation (voir
+    cleanup_workaround), réactiver leur statut courant pour que la
+    procédure manuelle redevienne la procédure valide cohérente avec le
+    code revert. Aucune donnée n'est perdue par le rollback : aucun
+    permit existant n'est affecté par le revert du code (les permits
+    déjà scellés restent en HEAD).
+
+  cleanup_workaround: >
+    SECTION DÉDIÉE — application directe de la lesson be16dc46 (retrait
+    du contournement dans la même unité de travail que la solution) et
+    de l'acceptance criterion 3 de la task-request.
+
+    (a) Quel(s) contournement(s) cette solution rend obsolète(s).
+        Le contournement "le scellement de la DB est une étape manuelle
+        à la charge de l'agent (PM/Implementer) : git add -f
+        company/data/orchestrator.db && git commit, exécuté séparément
+        après l'émission du permit par le CEO". Ce contournement existe
+        uniquement parce que grant_write_permit ne scellait pas
+        lui-même. Une fois l'auto-commit en place, il n'a plus aucune
+        raison d'être et devient un faux chemin dangereux (un agent qui
+        le suit créerait un commit de seal redondant, voire viendrait
+        committer un état déjà scellé).
+
+    (b) Où vit le contournement.
+        - company/personas/implementer.yml, règle
+          write_permit_full_sequence, étape 2 :
+          "git add -f company/data/orchestrator.db && git commit -m
+          'chore: seal write permit <rfc_id>' (scellement DB — AVANT
+          toute modification de fichier protégé)". C'est l'unique
+          endroit normatif (règle de persona) qui prescrit le
+          contournement.
+        - Lessons qui documentent la procédure manuelle comme valide
+          et que le search remonte aujourd'hui :
+          * 8fd49300 (write_permit_full_sequence : consume après le
+            commit) décrit l'ordre write puis commit puis consume en
+            s'appuyant sur l'existence d'un commit de seal manuel.
+            À NE PAS superseder en entier : la partie "consume en
+            dernier" reste vraie et critique (acceptance criterion 5).
+            À METTRE À JOUR / superseder partiellement par une lesson
+            de capitalisation post-implémentation qui clarifie que le
+            seal est désormais automatique tout en conservant l'ordre
+            du consume.
+          * 600307a4 (lessons refonte search), RECOMMANDATION 3 :
+            décrit explicitement le pattern manuel et le propose comme
+            "candidat RFC futur". Ce RFC EST ce candidat. La lesson de
+            capitalisation post-implémentation devra pointer
+            (supersedes/derived-from) vers 600307a4 pour fermer le fil.
+        - Les agent-messages 4f000127 et 05224964 sont des incidents
+          datés (pas des règles) : ils n'ont pas à être modifiés, ils
+          restent une trace historique. Le search ne les remonte pas
+          comme "procédure valide" (ce sont des blockers, pas des
+          règles).
+
+    (c) Plan de retrait prévu pour chacun.
+        - implementer.yml : RETRAIT de l'étape 2 (seal manuel) et
+          renumérotation des étapes 3 à 7 en 2 à 6, avec une
+          reformulation indiquant que grant_write_permit scelle
+          automatiquement la DB. C'est dans affected_files et dans le
+          scope de l'implementation-plan.
+        - Lessons : APRÈS l'implémentation et son merge (pas
+          maintenant), création d'une lesson-learned de capitalisation
+          qui (i) documente la décision auto-commit et son rationale,
+          (ii) supersede ou met à jour 8fd49300 sur la partie
+          "scellement manuel" tout en préservant la règle "consume en
+          dernier", (iii) référence 600307a4 (derived-from) pour fermer
+          le fil de la RECOMMANDATION 3, (iv) chaîne vers be16dc46
+          (related, application de la discipline de cleanup). Cette
+          lesson est explicitement HORS du scope du présent RFC (elle
+          sera créée par l'Architect après approbation et merge, cf.
+          workflow) ; elle est listée ici comme engagement de
+          Definition of Done du chantier global, conformément à
+          be16dc46 PRATIQUE 3.
+
+        Definition of Done du chantier : le chantier n'est PAS terminé
+        tant que (1) le code auto-commit est mergé, (2) l'étape 2 du
+        write_permit_full_sequence est retirée de implementer.yml, et
+        (3) la lesson de capitalisation supersédant la procédure
+        manuelle est créée. Un reviewer qui constaterait la solution
+        sans le retrait de l'étape 2 doit voter request_changes
+        (be16dc46 PRATIQUE 1).
+
+  affected_files:
+    - "crates/mcp-servers/orchestrator/src/main.rs"
+    - "crates/orchestrator/src/engine.rs"
+    - "company/personas/implementer.yml"

@@ -1,0 +1,390 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 0e77b612-c0a7-41d0-b18b-b0034c83e6b0
+  title: "Implementation-plan : tool MCP rfc_set_implemented(id) — transition approved -> implemented pilotée serveur"
+  author: implementer
+  created_at: "2026-06-04"
+  description: >
+    Plan d'implémentation du RFC 1c0f2570 (approuvé). Ajoute un tool MCP
+    rfc_set_implemented(id) qui fait passer un RFC de status: approved à
+    status: implemented sans write permit, sur le modèle exact de
+    close_review_round (écriture serveur via std::fs::write, hors canal bash
+    surveillé). Le plan étend update_rfc_status_in_file pour le timestamp
+    implemented_at, ajoute une méthode moteur set_rfc_implemented (résolution
+    par id via l'index, vérification stricte du status, délégation de
+    l'écriture), expose le tool dans main.rs sur le pattern Parameters<...> +
+    engine.lock().await, et couvre les trois axes de test (nominal, négatif,
+    edge) dont l'idempotence already-implemented. Intègre les deux décisions
+    CEO tranchées au review : (1) RFC déjà implemented = succès idempotent,
+    timestamp d'origine préservé ; (2) tool ouvert à tout agent, aucun token.
+  tags:
+    - rfc-lifecycle
+    - mcp
+    - tooling
+    - orchestrator
+    - write-permit
+    - friction-permits
+    - companyos-internals
+  related:
+    - id: 1c0f2570-71e2-4f02-ac4f-81e406b22568
+      kind: rfc
+      relationship: input
+    - id: c666b783-c427-4045-acad-3c1735625580
+      kind: task-request
+      relationship: input
+    - id: f3fc4a5d-e9e6-43ef-86e9-49441fa84eaa
+      kind: lesson-learned
+      relationship: input
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: input
+    - id: d5c9c933-2955-41e1-b2ae-73c9f307f09f
+      kind: lesson-learned
+      relationship: input
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: input
+
+spec:
+  dependencies:
+    - >
+      RFC 1c0f2570 APPROUVÉ (status: approved, approved_at 2026-06-03). Ce
+      plan en dérive directement ; aucune décision architecturale n'est
+      remise en question. Si une décision du RFC s'avère insuffisante en
+      exécution, escalade à l'Architect (jamais de redesign en implémentation).
+    - >
+      Write permit CEO requis AVANT toute écriture des fichiers protégés.
+      Zones touchées : crates/orchestrator/ et crates/mcp-servers/orchestrator/.
+      Paths littéraux à couvrir par le permit (cf. RFC affected_files, tous
+      EXISTANTS, aucun fichier à créer) :
+        - crates/orchestrator/src/engine.rs
+        - crates/mcp-servers/orchestrator/src/main.rs
+      Avant de commencer la phase exécution (hors scope de ce plan), vérifier
+      via check_write_permit que CHACUN de ces deux paths est couvert
+      (lesson 611fde3e APPRENTISSAGE 3 / RECOMMANDATION 3 : un path oublié =
+      blocage hook au moment de l'écriture).
+    - >
+      Décision CEO 1 (tranchée au review) INTÉGRÉE : un RFC déjà en
+      status: implemented est un SUCCÈS IDEMPOTENT, jamais une erreur. Le
+      timestamp implemented_at d'origine est PRÉSERVÉ (pas de réécriture).
+      Comportement aligné sur RfcUpdateResult::AlreadyUpToDate
+      (engine.rs:334).
+    - >
+      Décision CEO 2 (tranchée au review) INTÉGRÉE : le tool rfc_set_implemented
+      n'exige AUCUN token. C'est une transition de cycle de vie, pas une
+      opération privilégiée (à la différence de grant_write_permit qui exige
+      le token CEO). Aucun appel à self.tokens.verify(...) dans le tool.
+
+  steps:
+    - description: >
+        ÉTAPE 0 — DÉCISIONS STRUCTURELLES (à figer avant d'écrire du code).
+        D0.1 — UNE SEULE VOIE D'ÉCRITURE SERVEUR (invariant RFC §3.a, lesson
+          d5c9c933 « engine focalisé sur la DB »). On ÉTEND la méthode privée
+          existante update_rfc_status_in_file (engine.rs:301) plutôt que de
+          créer une voie jumelle. C'est l'unique fonction qui lit le YAML,
+          remplace la ligne status et écrit via std::fs::write (engine.rs:378).
+          On y ajoute la branche timestamp implemented_at.
+        D0.2 — MÉTHODE PUBLIQUE DE HAUT NIVEAU. On ajoute
+          pub fn set_rfc_implemented(&self, root: &str, rfc_id: Uuid)
+          sur OrchestratorEngine. Elle : (1) résout le RFC par id via
+          self.db.get_artifact(&rfc_id.to_string()) (db.rs:1246), (2) vérifie
+          kind == "rfc" et file_path sous company/rfcs/, (3) lit le status
+          courant et applique la matrice de transition (D0.4), (4) délègue
+          l'écriture à update_rfc_status_in_file. Modèle de résolution calqué
+          sur summarize_roadmap (résolution par id + vérif kind + erreur typée,
+          engine.rs ~1846 test_summarize_id_points_to_non_roadmap_kind).
+        D0.3 — TYPE DE RETOUR de set_rfc_implemented. Retourner un struct
+          SetImplementedOutcome { rfc_id, previous_status, new_status,
+          implemented_at, file_path, already_implemented: bool } (ou une
+          variante d'enum équivalente) afin que main.rs construise le JSON de
+          réponse du RFC §1 sans relire le fichier. Le champ already_implemented
+          porte la décision CEO 1 (succès idempotent distingué d'une vraie
+          transition). Pas de nouveau type public exposé HORS de la crate
+          (le retour est sérialisé en JSON côté MCP), donc PAS de modif lib.rs
+          (RFC impact « note sur lib.rs » : OrchestratorEngine déjà ré-exporté
+          lib.rs:13).
+        D0.4 — MATRICE DE TRANSITION (RFC §2, AC2). approved -> autorisé ;
+          implemented -> succès idempotent (already_implemented=true, timestamp
+          préservé) ; draft / review / rejected -> ValidationFailed nommant le
+          status courant (D0.5) ; kind != rfc -> ValidationFailed nommant le
+          kind réel (D0.5) ; id absent de l'index -> ArtifactNotFound (D0.5).
+        D0.5 — ERREURS TYPÉES (décision Architect : error.rs N'EST PAS touché).
+          Réutilisation EXCLUSIVE des variants OrchestratorError EXISTANTS,
+          AUCUN nouveau variant n'est ajouté. Mapping figé :
+            - id absent de l'index -> ArtifactNotFound { id } (error.rs:23).
+            - lecture / parsing du YAML -> FileRead (error.rs:26) / Yaml
+              (error.rs:41), tels que déjà produits par
+              update_rfc_status_in_file (engine.rs:317 / 324).
+            - kind != rfc -> ValidationFailed { id, errors } (error.rs:33), le
+              kind réel étant porté dans le vecteur errors (ex. errors =
+              [format!("expected kind 'rfc', found '{actual_kind}'")]).
+            - refus de transition (status courant draft / review / rejected)
+              -> ValidationFailed { id, errors }, le status courant étant porté
+              dans errors (ex. errors = [format!("cannot mark as implemented:
+              current status is '{current_status}', only 'approved' allowed")]).
+          ValidationFailed est un variant générique à message libre, déjà
+          utilisé dans l'engine (engine.rs:520, 527) ; il satisfait AC2
+          (« l'erreur retournée est explicite sur la raison ») car chaque
+          message nomme explicitement la raison du refus. AUCUNE modification
+          de crates/orchestrator/src/error.rs n'est requise ni autorisée par ce
+          plan : error.rs ne figure ni dans les affected_files du RFC ni dans
+          les files de ce plan.
+      files:
+        - crates/orchestrator/src/engine.rs
+    - description: >
+        ÉTAPE 1 — ÉTENDRE update_rfc_status_in_file POUR implemented_at
+        (engine.rs:301-384). Aujourd'hui la branche timestamp (engine.rs:344-348)
+        ne couvre que approved_at (new_status=="approved") et rejected_at
+        (sinon). L'étendre pour produire implemented_at quand
+        new_status == "implemented" :
+          let timestamp_field = match new_status {
+              "approved"    => format!("  approved_at: \"{now_iso}\""),
+              "implemented" => format!("  implemented_at: \"{now_iso}\""),
+              _             => format!("  rejected_at: \"{now_iso}\""),
+          };
+        Le reste de la fonction (idempotence AlreadyUpToDate engine.rs:334,
+        stratégie de remplacement de la ligne status engine.rs:351-376,
+        std::fs::write engine.rs:378, chemins d'erreur read/parse engine.rs:317
+        et 324) est INCHANGÉ et reste l'unique voie d'écriture. L'idempotence
+        existante (current_status == new_status -> AlreadyUpToDate SANS
+        réécriture) matérialise directement la décision CEO 1 : un RFC déjà
+        implemented ne voit pas son implemented_at réécrit.
+      files:
+        - crates/orchestrator/src/engine.rs
+    - description: >
+        ÉTAPE 2 — AJOUTER set_rfc_implemented SUR OrchestratorEngine
+        (engine.rs, dans le bloc impl, à proximité de close_round_with_rfc_update
+        engine.rs:254 pour cohérence de lecture). Comportement :
+          1. Résolution : self.db.get_artifact(&rfc_id.to_string())? ;
+             None -> ArtifactNotFound { id } (D0.5).
+          2. Vérification kind : si artifact.kind != "rfc" ->
+             ValidationFailed { id, errors } portant le kind réel (D0.5).
+          3. Cohérence file_path : le file_path de l'index doit pointer sous
+             company/rfcs/ ; sinon erreur diagnostic (incohérence d'index,
+             RFC §3.b). Vérification par préfixe de chemin relatif.
+          4. Lecture du status courant : lire le YAML (ou réutiliser le parse
+             déjà fait par update_rfc_status_in_file). Décision d'implémentation :
+             pour éviter une double lecture, lire et parser une fois ici pour
+             obtenir previous_status, appliquer la matrice D0.4, puis :
+               - previous_status == "implemented" -> retour
+                 already_implemented=true, implemented_at = la valeur EXISTANTE
+                 lue dans le YAML (préservation, décision CEO 1), AUCUNE écriture.
+               - previous_status == "approved" -> appel
+                 update_rfc_status_in_file(root, file_path, id, "implemented") ;
+                 mapper RfcUpdateResult::Updated -> outcome success avec
+                 implemented_at = now ; RfcUpdateResult::Failed -> propager en
+                 FileRead / Yaml pointant le file_path (réutilise les messages
+                 read/parse/write de la méthode, D0.5).
+               - draft / review / rejected -> ValidationFailed nommant le
+                 status courant (D0.4 / D0.5).
+          5. Retour SetImplementedOutcome (D0.3).
+        Le verrou de sérialisation des appels concurrents est pris côté MCP
+        (engine.lock().await, étape 3), pas dans la méthode : l'engine reste
+        sync comme close_round_with_rfc_update. Invariant RFC §3.a respecté :
+        l'écriture passe par l'unique update_rfc_status_in_file.
+      files:
+        - crates/orchestrator/src/engine.rs
+    - description: >
+        ÉTAPE 3 — EXPOSER LE TOOL MCP rfc_set_implemented (main.rs, calqué sur
+        close_review_round main.rs:573).
+        3.a — Struct de params (près des autres *Params) :
+          #[derive(Deserialize, schemars::JsonSchema)]
+          struct RfcSetImplementedParams {
+              #[schemars(description = "metadata.id (UUID) of the approved RFC to mark as implemented", with = "String")]
+              id: Uuid,
+          }
+          Le pattern id: Uuid + #[schemars(with = "String")] gère le parsing du
+          UUID au niveau du désérialiseur MCP : un id mal formé est rejeté avant
+          d'atteindre l'engine (couvre l'edge « id malformé », RFC §7.a).
+        3.b — Tool :
+          #[tool(description = "Mark an approved RFC as implemented. Transitions metadata.status from 'approved' to 'implemented' and stamps implemented_at. Server-side lifecycle transition: requires NO write permit (same model as close_review_round auto-approving an RFC). Refuses any RFC not currently in 'approved' status with an explicit error. Already-implemented RFCs return an idempotent success.")]
+          async fn rfc_set_implemented(&self, params: Parameters<RfcSetImplementedParams>)
+              -> Result<CallToolResult, McpError>
+          Corps :
+            - let params = params.0;
+            - AUCUNE vérification de token (décision CEO 2) — ne PAS appeler
+              self.tokens.verify.
+            - let engine = self.engine.lock().await;  // sérialise les appels
+              concurrents (edge concurrence) comme les autres ops d'état.
+            - match engine.set_rfc_implemented(params.id, &self.root_path) :
+              * Ok(outcome) -> ok(JSON) avec les champs du RFC §1 :
+                { "rfc_id", "previous_status", "new_status": "implemented",
+                  "implemented_at", "file_path" } ; si
+                outcome.already_implemented, ajouter un champ note explicite
+                (ex. "note": "RFC was already implemented (idempotent), original
+                implemented_at preserved") et new_status reste "implemented".
+              * Err(e) -> err(Diagnostic::error(C, "...").with_context(...)
+                .with_reason(format!("{e}")).with_fix(...)) sur le modèle des
+                autres tools (un fix actionnable par cas : id introuvable ->
+                « vérifier l'id / utiliser search » ; mauvais status -> « seuls
+                les RFC en approved peuvent être implémentés »).
+        3.c — Vérifier que les imports nécessaires (Uuid, Deserialize,
+          schemars, RfcUpdateResult déjà importé via close_review_round) sont
+          présents ; sinon les ajouter (modif d'imports dans le même fichier
+          protégé, déjà couvert par le permit).
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+    - description: >
+        ÉTAPE 4 — TESTS UNITAIRES MOTEUR (engine.rs, module #[cfg(test)]
+        engine.rs:1189). Réutiliser le pattern RoadmapTestRoot (engine.rs:1417)
+        en l'adaptant : créer un répertoire company/rfcs/ et un helper
+        write_rfc(id, status[, implemented_at]) qui matérialise un YAML RFC
+        minimal valide. CONTRAINTE FIXTURES (lesson f3fc4a5d APPRENTISSAGE 3) :
+        construire les fixtures avec String::push_str et \n littéraux + espaces
+        d'indentation explicites ; NE JAMAIS utiliser la continuation backslash
+        de Rust qui collapse l'indentation YAML. Modèle exact :
+        RoadmapTestRoot::write_roadmap (engine.rs:1462-1481). Le helper
+        RoadmapTestRoot évite déjà tempfile (lesson f3fc4a5d APPRENTISSAGE 2) ;
+        réutiliser le même pattern Drop, aucune nouvelle dep Cargo.toml requise
+        (lesson f3fc4a5d APPRENTISSAGE 1 — aucun tracing/tempfile à ajouter).
+        La résolution par index utilise db.get_artifact, donc les tests doivent
+        indexer la fixture via db.upsert_artifact (cf. helper d'indexation
+        direct engine.rs:1509) pour que set_rfc_implemented trouve le file_path.
+        NOMINAL :
+          - test_set_implemented_from_approved_succeeds : RFC approved ->
+            implemented ; relire le YAML : contient « status: implemented » et
+            « implemented_at: » ; outcome.previous_status == "approved",
+            already_implemented == false.
+          - test_set_implemented_reflects_new_status_after_write : après
+            l'opération, relire le fichier (ou re-get) confirme implemented
+            (valide l'invariant cohérence §4 ; l'index lui-même est rafraîchi
+            par le file watcher en prod, hors test — cf. étape 5).
+        NÉGATIF :
+          - test_set_implemented_rfc_not_found : id absent de l'index ->
+            ArtifactNotFound (D0.5).
+          - test_set_implemented_from_draft_refused : ValidationFailed dont le
+            message nomme le status courant "draft".
+          - test_set_implemented_from_review_refused : ValidationFailed dont le
+            message nomme le status courant "review".
+          - test_set_implemented_from_rejected_refused : ValidationFailed dont
+            le message nomme le status courant "rejected".
+          - test_set_implemented_on_non_rfc_kind_refused : id pointe un artifact
+            kind != rfc -> ValidationFailed dont le message nomme le kind réel.
+        EDGE :
+          - test_set_implemented_already_implemented_is_idempotent : RFC déjà
+            implemented avec un implemented_at d'origine connu -> succès,
+            already_implemented == true, le YAML relu contient TOUJOURS le
+            timestamp d'origine (PAS de réécriture). MATÉRIALISE décision CEO 1.
+          - test_set_implemented_corrupt_yaml : RFC dont le YAML est illisible /
+            non parsable -> FileRead / Yaml pointant le file_path (réutilise
+            le chemin d'erreur de update_rfc_status_in_file engine.rs:317/324,
+            D0.5).
+          - Concurrence : documenter dans un commentaire de test que le Mutex
+            tokio côté MCP (engine.lock().await) sérialise deux appels sur le
+            même id, le second observant previous_status == "implemented" et
+            retournant le succès idempotent. Test direct optionnel : appeler
+            set_rfc_implemented deux fois de suite sur le même id et vérifier
+            que le second renvoie already_implemented == true (la sérialisation
+            réelle est garantie par le Mutex MCP, pas par l'engine sync ;
+            même posture que grant_write_permit edge f, RFC 359f9162).
+          - id malformé : couvert au niveau du désérialiseur MCP (params id: Uuid
+            + with="String", étape 3.a). Pas de test unitaire moteur possible
+            (la méthode reçoit déjà un Uuid valide) ; le noter en commentaire.
+      files:
+        - crates/orchestrator/src/engine.rs
+    - description: >
+        ÉTAPE 5 — COHÉRENCE INDEX (RFC §4, AC3) : OPTION A confirmée. On
+        s'appuie sur le file watcher serveur exactement comme close_review_round,
+        AUCUNE voie d'indexation parallèle ni index_now explicite n'est ajoutée
+        (invariant RFC §4 « ne PAS introduire de voie d'indexation parallèle »).
+        Justification reprise du RFC : le status n'est pas un champ FTS critique
+        (l'index indexe titre/description/tags/kind, pas le status), donc la
+        latence du debounce 500ms du watcher n'affecte ni la recherche ni
+        aucune divergence DURABLE. Cette étape n'ajoute PAS de code : elle
+        documente le choix et vérifie qu'aucun appel d'indexation n'a été
+        introduit dans set_rfc_implemented ni dans le tool. Note lesson 611fde3e
+        ENSEIGNEMENT 2 : le transport MCP stdio interdit de toute façon un appel
+        index_now cross-process ; ici le tool tourne dans le binaire serveur,
+        mais on reste sur le watcher pour stricte parité avec le précédent.
+      files: []
+    - description: >
+        ÉTAPE 6 — TEST DE FORME CÔTÉ SERVEUR MCP (RFC §7.b) : valider la
+        sérialisation JSON du retour rfc_set_implemented (champs rfc_id,
+        previous_status, new_status, implemented_at, file_path, et le champ note
+        en cas idempotent) sans nécessairement passer par rmcp, sur le modèle du
+        test de forme de summarize_roadmap (RFC 3cd72740 §7.b). Si la
+        construction du JSON est inline dans le tool async (difficile à tester
+        sans rmcp), extraire la construction de la réponse dans une petite
+        fonction pure (fn build_set_implemented_response(outcome) -> serde_json::Value)
+        testable directement. Décision laissée à l'exécution selon la
+        testabilité ; l'invariant est qu'au moins un test vérifie la forme du
+        JosN de succès ET la forme du JSON idempotent.
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+    - description: >
+        ÉTAPE 7 — VALIDATION CI INTERNE (séquence write_permit_full_sequence,
+        cas 3 = CompanyOS lui-même). APRÈS consume du permit : cargo build
+        (SANS --target-dir, déclenche le hot-reload) puis cargo test, tous deux
+        verts (0 failed). Cible minimale : cargo test -p companyos-orchestrator
+        et -p companyos-orchestrator-mcp, puis cargo test complet du workspace
+        pour non-régression (les 117 tests existants + les nouveaux doivent
+        passer). reload_config() EN DERNIER, uniquement si build + test verts.
+        NOTE : cette étape appartient à la phase EXÉCUTION (post-approbation +
+        post-permit), elle est listée ici pour compléter la Definition of Done,
+        pas pour être exécutée maintenant.
+      files: []
+    - description: >
+        ÉTAPE 8 — CLEANUP WORKAROUND (lesson be16dc46, AC5) : CAS ZÉRO confirmé
+        par le RFC §cleanup_workaround (b)/(c). Aucun texte normatif ne documente
+        le contournement « éditer le YAML du RFC à la main avec un permit ad-hoc
+        pour le passer en implemented » (vérifié : shared-rules.yml,
+        implementer.yml write_permit_full_sequence, review-protocol.yml,
+        human-review-triggers.yml, flow-control.yml). Il n'y a donc AUCUNE
+        modification de règle ni de persona au titre du cleanup dans ce plan,
+        et c'est noté explicitement ici (AC5 « si aucun endroit normatif ne le
+        documentait, le noter explicitement »). La lesson de capitalisation
+        post-merge est produite par l'Architect APRÈS merge (RFC §cleanup (c)),
+        HORS scope de ce plan.
+      files: []
+
+  risks:
+    - >
+      RISQUE 1 — Élargissement de la surface d'écriture serveur sans permit.
+      Mitigation (RFC risque 1) : validation stricte approved -> implemented
+      uniquement (matrice D0.4) ; réutilisation de l'UNIQUE
+      update_rfc_status_in_file (étape 1) ; le tool ne peut écrire QUE status
+      et implemented_at, jamais d'autres champs. Surface aussi étroite que
+      close_review_round.
+    - >
+      RISQUE 2 — Absence de contrôle d'identité (décision CEO 2 : aucun token).
+      Mitigation (RFC risque 2) : opération réversible (repasser à approved ou
+      git revert), bornée (status + timestamp), tracée (YAML versionné git,
+      watcher ré-indexe). Le tool ne crée aucune capacité destructrice.
+    - >
+      RISQUE 3 — Double lecture du YAML (parse dans set_rfc_implemented pour
+      previous_status, puis re-parse dans update_rfc_status_in_file). Bénin
+      (fichier petit, lecture disque). Mitigation : acceptable tel quel ;
+      ne PAS refactorer la signature de update_rfc_status_in_file pour passer
+      le parse en argument si cela complexifie l'unique voie d'écriture
+      (priorité à l'invariant RFC §3.a sur la micro-optimisation).
+    - >
+      RISQUE 4 — Cargo.toml : aucune nouvelle dépendance attendue (lesson
+      f3fc4a5d APPRENTISSAGE 1). chrono::Utc, uuid::Uuid, serde_yaml, serde_json
+      sont déjà utilisés par update_rfc_status_in_file et l'engine. Le helper
+      de test réutilise le pattern RoadmapTestRoot (pas de tempfile). Si en
+      exécution un besoin de dépendance émerge (improbable), NE PAS ajouter
+      Cargo.toml hors permit : escalader pour extension du permit (lesson
+      611fde3e). Préférer le workaround idiomatique (struct locale, eprintln!).
+    - >
+      RISQUE 5 — Fixtures YAML de test corrompues silencieusement par la
+      continuation backslash Rust (lesson f3fc4a5d APPRENTISSAGE 3). Mitigation :
+      String::push_str + \n littéraux + indentation explicite, calqué sur
+      write_roadmap (engine.rs:1462). Valider mentalement la fixture corrompue
+      du test edge comme RÉELLEMENT non parsable (pas juste mal indentée).
+    - >
+      RISQUE 6 — Périmètre des fichiers écrits borné aux affected_files du RFC.
+      error.rs N'EST PAS touché (décision Architect, D0.5) : les variants
+      OrchestratorError EXISTANTS suffisent (ArtifactNotFound pour l'id absent,
+      ValidationFailed pour le kind mismatch et le refus de transition, FileRead
+      / Yaml pour la lecture/parsing). ValidationFailed est générique à message
+      libre (déjà utilisé engine.rs:520, 527) et satisfait AC2. En conséquence,
+      les SEULS fichiers écrits par ce plan sont les DEUX affected_files du RFC,
+      tous EXISTANTS, aucun à créer (RFC impact « À CRÉER : AUCUN ») :
+        - crates/orchestrator/src/engine.rs
+        - crates/mcp-servers/orchestrator/src/main.rs
+      Le write permit ne doit couvrir QUE ces deux paths. Aucun amendement du
+      RFC affected_files n'est nécessaire. Mitigation oubli de path (lesson
+      611fde3e : path oublié = blocage hook) : avant la phase exécution,
+      vérifier via check_write_permit que CHACUN des deux paths est couvert
+      (cf. spec.dependencies).

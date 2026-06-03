@@ -1,0 +1,76 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 0b0e6c77-aaa3-4791-85aa-e6e1dcbd7bf0
+  title: "Rendre grant_write_permit + scellement DB atomique côté MCP"
+  author: pm
+  created_at: "2026-06-03"
+  project: company-os
+  description: >
+    Éliminer la fenêtre non-atomique entre l'émission d'un write permit
+    par le CEO (grant_write_permit via MCP) et son scellement en git
+    (commit de company/data/orchestrator.db par le PM). Pendant cette
+    fenêtre, le permit existe en mémoire SQLite mais pas en HEAD git ;
+    le hook defense-in-depth compare la DB courante au snapshot baseline
+    (HEAD git), détecte le mismatch et wipe le permit. Trois occurrences
+    documentées pendant la refonte search.
+  tags:
+    - write-permit
+    - defense-in-depth
+    - atomicity
+    - mcp
+    - companyos-internals
+    - friction-permits
+  related:
+    - id: 600307a4-74f6-43dd-95e1-4dee3d2326c1
+      kind: lesson-learned
+      relationship: input
+    - id: ed7776fb-d56d-4f61-9f48-807897c6325d
+      kind: lesson-learned
+      relationship: input
+    - id: 8fd49300-14e5-4e7c-b75f-e0e4bd461aac
+      kind: lesson-learned
+      relationship: input
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: input
+
+spec:
+  priority: medium
+  status: backlog
+  acceptance_criteria:
+    - >
+      Il n'existe plus de fenêtre temporelle où un write permit est actif
+      en DB SQLite mais absent de HEAD git. L'émission et le scellement
+      sont atomiques du point de vue de l'agent qui les déclenche.
+    - >
+      Le pattern actuel "CEO grant via MCP, puis PM commit la DB
+      séparément en git" est éliminé ou rendu structurellement sûr (par
+      exemple : le tool MCP grant_write_permit effectue lui-même le commit
+      git de la DB, ou expose une opération seal couplée indissociable).
+    - >
+      Le contournement manuel "le PM commit la DB après le grant pour
+      sceller" est explicitement retiré des règles (shared-rules.yml),
+      des personas et de toute doc qui le décrivait. La ou les lessons qui
+      documentaient cette procédure manuelle (notamment ed7776fb,
+      8fd49300) sont mises à jour ou supersedées pour que le search ne
+      remonte plus l'ancienne procédure comme valide. Application directe
+      de la lesson be16dc46 (cleanup du contournement dans le scope de la
+      solution).
+    - >
+      Tests couvrant les trois axes. Nominal : grant suivi du scellement
+      réussi, permit actif et reflété en git. Négatif : échec du commit
+      git pendant l'opération, coupure MCP pendant l'opération, le système
+      ne laisse pas un état incohérent (permit fantôme ou DB non scellée).
+      Edge : émission d'un permit alors qu'un ou plusieurs autres permits
+      sont déjà actifs, opérations concurrentes, le scellement de l'un ne
+      wipe pas les autres.
+    - >
+      Aucune régression sur la séquence write -> commit -> consume
+      (lesson 8fd49300) : un permit doit rester 'active' jusqu'au commit
+      du code applicatif, le consume vient toujours en dernier.
+    - >
+      Périmètre borné : ce chantier traite l'atomicité de l'émission du
+      permit. Il ne modifie PAS le comportement du revert du hook
+      defense-in-depth (nucléaire vs sélectif), qui fait l'objet du sujet
+      voisin defense-in-depth-selective. Ne pas pré-empter ce design.

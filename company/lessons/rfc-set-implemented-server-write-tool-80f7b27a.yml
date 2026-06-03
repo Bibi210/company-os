@@ -1,0 +1,133 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 80f7b27a-9bc5-47b6-bdf4-65a18f7f5df9
+  title: "rfc_set_implemented : clore un RFC sans permit en répliquant l'écriture serveur de close_review_round, et le piège du tool-list MCP non rafraîchi en session"
+  author: implementer
+  created_at: "2026-06-04"
+  description: >
+    Capitalisation après l'implémentation du RFC 1c0f2570 (plan 0e77b612) qui
+    ajoute le tool MCP rfc_set_implemented(id) : une transition de cycle de vie
+    approved -> implemented pilotée par le processus serveur, donc SANS write
+    permit, sur le modèle exact de close_review_round. Trois enseignements :
+    (a) la décision de réutiliser l'unique voie d'écriture serveur
+    update_rfc_status_in_file plutôt que d'en créer une jumelle, et pourquoi
+    l'écriture serveur échappe légitimement au hook ; (b) la réutilisation
+    EXCLUSIVE des variants OrchestratorError existants (error.rs jamais touché)
+    pour rester strictement dans le périmètre du permit ; (c) la surprise
+    opérationnelle majeure du dogfooding : un nouveau tool MCP ajouté au binaire
+    n'est PAS visible dans la session MCP courante même après reload_config(),
+    car le client fixe sa tool-list au handshake et le proxy ne relaie pas
+    notifications/tools/list_changed. Le dogfooding a donc nécessité un restart
+    de session.
+  tags:
+    - rfc-lifecycle
+    - mcp
+    - tooling
+    - orchestrator
+    - write-permit
+    - friction-permits
+    - companyos-internals
+    - rust
+    - dogfooding
+    - lessons-from-implementation
+  related:
+    - id: 1c0f2570-71e2-4f02-ac4f-81e406b22568
+      kind: rfc
+      relationship: input
+    - id: 0e77b612-c0a7-41d0-b18b-b0034c83e6b0
+      kind: implementation-plan
+      relationship: input
+    - id: d5c9c933-2955-41e1-b2ae-73c9f307f09f
+      kind: lesson-learned
+      relationship: related
+    - id: 359f9162-18f2-4b72-85b0-7d0e44608959
+      kind: rfc
+      relationship: related
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: related
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Faire passer un RFC en status: implemented n'avait aucun outil dédié : la
+    seule voie était d'éditer le YAML à la main dans company/rfcs/, zone
+    protégée, donc avec un write permit ad-hoc émis par le CEO pour une simple
+    clôture administrative. Friction disproportionnée (be16dc46, friction-permits).
+    Le RFC 1c0f2570 comble ce trou en exposant rfc_set_implemented(id), jumeau
+    fonctionnel de close_review_round qui, lui, met déjà un RFC en approved/rejected
+    sans permit. Ce chantier est le frère du sujet 1 (RFC 359f9162, lesson
+    d5c9c933, auto-commit du grant) : tous deux réduisent la friction des write
+    permits autour du cycle de vie RFC. L'implémentation a touché exactement deux
+    fichiers protégés (crates/orchestrator/src/engine.rs et
+    crates/mcp-servers/orchestrator/src/main.rs), couverts par le permit
+    00d4c9f3, sans amendement.
+
+  insight: >
+    Quatre enseignements concrets de l'exécution.
+    (1) UNE SEULE VOIE D'ÉCRITURE SERVEUR, RÉUTILISÉE. update_rfc_status_in_file
+    écrivait déjà un status arbitraire et choisissait son timestamp (approved_at
+    / rejected_at). L'étendre d'une seule branche match (new_status ==
+    "implemented" -> implemented_at) suffisait ; la nouvelle méthode publique
+    set_rfc_implemented résout le RFC par id via db.get_artifact, vérifie
+    kind == "rfc" et file_path sous company/rfcs/, applique la matrice de
+    transition, puis DÉLÈGUE l'écriture à cette unique fonction. Aucune voie
+    jumelle. L'idempotence existante (current_status == new_status ->
+    AlreadyUpToDate, sans réécriture) matérialise gratuitement la décision CEO
+    "déjà implemented = succès idempotent, timestamp d'origine préservé". Pourquoi
+    sans permit : l'écriture est faite par le binaire serveur via std::fs::write,
+    hors de toute commande bash/edit surveillée par le hook defense-in-depth. Le
+    permit encadre les modifications de CONTENU par les agents, pas les
+    transitions d'ÉTAT pilotées par le serveur.
+    (2) ZÉRO NOUVEAU VARIANT D'ERREUR. La consigne (décision Architect) était de
+    ne PAS toucher error.rs. Les variants existants couvraient tout : id absent
+    -> ArtifactNotFound ; kind != rfc et refus de transition (draft/review/
+    rejected) -> ValidationFailed (générique à message libre, le message nomme la
+    raison, ce qui satisfait l'AC "erreur explicite") ; lecture/parsing ->
+    FileRead / Yaml. Rester dans les variants existants a gardé le périmètre
+    écrit STRICTEMENT borné aux deux fichiers du permit, sans amendement.
+    (3) RÉPONSE JSON EXTRAITE EN FONCTION PURE TESTABLE. Le RFC §7.b imposait un
+    test de forme du JSON sans passer par rmcp. La construction de la réponse a
+    été sortie du tool async dans une fonction pure
+    build_set_implemented_response(&SetImplementedOutcome) -> serde_json::Value,
+    directement testable (cas succès ET cas idempotent avec le champ note). Le
+    type de retour SetImplementedOutcome porte already_implemented pour que
+    main.rs distingue la vraie transition du succès idempotent sans relire le
+    fichier.
+    (4) SURPRISE MAJEURE — UN NOUVEAU TOOL MCP N'EST PAS VISIBLE DANS LA SESSION
+    COURANTE. C'est le dogfooding qui l'a révélé : après build vert, commit,
+    consume du permit et reload_config(), le tool rfc_set_implemented était bien
+    dans le binaire (prouvé par 12 tests verts) mais INVOCABLE NULLE PART depuis
+    l'agent. Le client MCP fige sa liste de tools au handshake d'initialisation,
+    et le proxy (company/plugins/mcp-proxy.mjs) ne relaie pas la notification
+    notifications/tools/list_changed. reload_config() redémarre le serveur avec
+    le nouveau binaire mais ne provoque pas de re-handshake côté client. Le
+    dogfooding (clore les deux RFCs via le nouveau tool) a donc exigé un RESTART
+    de la session MCP. La validation bout-en-bout d'un nouveau tool MCP n'est
+    donc PAS faisable dans la session qui l'implémente.
+
+  recommendation: >
+    (a) Pour outiller une nouvelle transition de cycle de vie d'un artifact
+    serveur-pilotée : réutiliser update_rfc_status_in_file (ou son équivalent)
+    comme UNIQUE voie d'écriture, ajouter une méthode de haut niveau qui résout
+    par id + vérifie kind + délègue l'écriture, et exposer un tool MCP sans token
+    (transition de cycle de vie != opération privilégiée). Ne PAS dupliquer la
+    logique d'écriture du status.
+    (b) Préférer toujours les variants d'erreur existants quand ils couvrent le
+    besoin (ValidationFailed est générique à message libre et nomme la raison) :
+    cela garde le périmètre écrit borné aux fichiers du permit et évite un
+    amendement error.rs hors permit.
+    (c) Pour rendre testable la forme d'une réponse JSON d'un tool MCP async sans
+    rmcp : extraire la construction du JSON dans une fonction pure et la tester
+    directement (cas nominal ET cas particulier comme l'idempotent).
+    (d) PIÈGE OPÉRATIONNEL À CONNAÎTRE : quand on ajoute un NOUVEAU tool MCP,
+    prévoir dès le départ qu'il faudra un restart de session MCP pour le rendre
+    invocable (le client ne rafraîchit pas sa tool-list en cours de session, le
+    proxy ne relaie pas tools/list_changed). Ne pas confondre "tool absent de ma
+    registry" avec "tool cassé" : vérifier d'abord sa présence dans le binaire et
+    via les tests. Candidat RFC futur : faire relayer notifications/tools/
+    list_changed par le proxy pour permettre le hot-add de tools sans restart de
+    session.

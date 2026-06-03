@@ -215,36 +215,47 @@ spec:
     - key: atomic-grant-permit
       title: "Rendre grant_write_permit + scellement DB atomique côté MCP"
       ref:
-        type: external
-        label: "Pattern identifié dans lessons 600307a4 et ea6e9dd1, candidat RFC"
-      timeframe: future
-      status: planned
+        type: rfc
+        id: 359f9162-18f2-4b72-85b0-7d0e44608959
+      timeframe: past
+      status: done
+      target_date: "2026-Q2"
       rationale: >
-        Le pattern actuel (CEO grant via MCP, puis PM commit la DB
-        séparément en git) crée une fenêtre où le permit existe en
-        mémoire SQLite mais pas en HEAD git. Le hook
-        defense-in-depth peut wiper le permit pendant cette
-        fenêtre. Trois occurrences observées pendant la session
-        refonte search. Solution candidate : le tool MCP
-        grant_write_permit fait lui-même le commit git ou expose
-        un seal_permit(id) couplé. Priorité moyenne (workaround
-        connu, mais frictionnel).
+        RÉSOLU (RFC 359f9162, commit 09757aa). grant_write_permit
+        effectue désormais lui-même, dans la même opération MCP, le
+        checkpoint WAL + git add -f ciblé + git commit du .db, avec
+        rollback du permit si le commit échoue. Invariant : à la
+        sortie du tool, soit le permit existe ET est scellé en HEAD,
+        soit il n'existe pas. La fenêtre non-atomique est fermée à la
+        source, neutralisant les deux mécanismes qui tuaient le permit
+        (check tampering du hook, PILIER D autorepair). Grant rendu
+        idempotent par clé (rfc_id + granted_to + target_paths) sur
+        décision CEO. Contournement manuel (seal step) retiré de la
+        persona Implementer. Lesson de capitalisation d5c9c933.
 
     - key: rfc-set-implemented-tool
       title: "Tool MCP rfc_set_implemented(id) pour clore les RFCs sans permit ad-hoc"
       ref:
-        type: external
-        label: "Pattern identifié dans lessons 600307a4 et ea6e9dd1, candidat RFC"
-      timeframe: future
-      status: planned
+        type: rfc
+        id: 1c0f2570-71e2-4f02-ac4f-81e406b22568
+      timeframe: past
+      status: done
+      target_date: "2026-Q2"
       rationale: >
-        Aujourd'hui, passer un RFC à status: implemented nécessite
-        d'éditer le YAML, ce qui demande un write permit sur
-        company/rfcs/ alors que c'est une opération
-        administrative légitime. Un tool MCP dédié qui contourne
-        le permit (comme close_round_with_rfc_update le fait déjà
-        pour approved) serait cohérent et évite le grant ad-hoc à
-        chaque clôture.
+        RÉSOLU (RFC 1c0f2570, commit 3c25889). Le tool MCP
+        rfc_set_implemented(id) fait passer un RFC de approved à
+        implemented par écriture serveur (std::fs::write via
+        update_rfc_status_in_file étendu avec implemented_at), sans
+        write permit, exactement comme close_review_round met un RFC
+        en approved. Validation stricte (transition autorisée
+        uniquement depuis approved), idempotence sur déjà-implemented
+        (décision CEO), ouvert à tout agent sans token (décision CEO).
+        12 tests triaxiaux verts. Lesson 80f7b27a. NOTE : le dogfooding
+        (utiliser le tool pour clore les RFCs du chantier) est en
+        attente d'un redémarrage de session opencode car le proxy MCP
+        ne relaye pas notifications/tools/list_changed (limitation
+        découverte, candidate RFC future). Les RFCs 359f9162 et
+        1c0f2570 restent en approved jusqu'au prochain boot session.
 
     - key: defense-in-depth-selective
       title: "Hook defense-in-depth selective revert (vs nuclear actuel)"
@@ -315,12 +326,14 @@ spec:
         type: external
         label: "Sujet jamais ouvert formellement, à scoper"
       timeframe: future
-      status: planned
+      status: cancelled
       rationale: >
-        Les YAML sont la source de vérité (PILIER D du RFC
-        cdbfee72), versionnés en git. Mais le repo git lui-même
-        est sur un seul disque local. Aucune réplication, aucun
-        backup hors-machine. Pour un système qui mémorise toute
-        la connaissance organisationnelle, c'est un risque non
-        adressé. Scope à définir : backup git remote ? snapshot
-        de la DB SQLite ? les deux ?
+        Annulé sur décision utilisateur (2026-06-03). Les YAML sont
+        la source de vérité (PILIER D du RFC cdbfee72) et la DB
+        SQLite n'est qu'un index reconstructible via reindex_all.
+        Tant que les artifacts existent, la mémoire est récupérable
+        intégralement. Le repo est versionné en git avec un remote
+        (github.com/Bibi210/company-os) : le push git normal couvre
+        de fait la réplication hors-machine. Le besoin initial (un
+        seul disque local sans réplication) est donc adressé par le
+        workflow git existant. Sujet fermé, pas de chantier dédié.

@@ -1,0 +1,133 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+  title: "Quand on introduit une vraie solution, on retire le contournement qu'elle remplace dans la même unité de travail"
+  author: pm
+  created_at: "2026-06-03"
+  description: >
+    Un contournement (workaround) est une dette assumée temporairement en
+    attendant une vraie solution. Quand cette vraie solution arrive (dans
+    le code de CompanyOS, dans un projet, ou dans une règle de process),
+    le contournement qu'elle rend obsolète doit être retiré dans la MÊME
+    unité de travail (même RFC, même implementation-plan, même PR). Sinon
+    le contournement survit, devient un faux chemin que les agents
+    continuent d'emprunter, et la mémoire collective porte deux vérités
+    contradictoires. Cette lesson pose le cleanup des contournements
+    obsolètes comme une étape de Definition of Done, pas comme une
+    intention pour plus tard.
+  tags:
+    - workflow
+    - technical-debt
+    - cleanup
+    - workaround
+    - definition-of-done
+    - process-improvement
+    - companyos-internals
+  related:
+    - id: ed7776fb-d56d-4f61-9f48-807897c6325d
+      kind: lesson-learned
+      relationship: related
+    - id: e8be5814-8e94-4561-ac6d-27a1785809c7
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    CompanyOS accumule des contournements par construction : c'est un
+    système qui se construit en s'utilisant lui-même, donc chaque friction
+    rencontrée pendant un chantier est souvent absorbée par un workaround
+    temporaire plutôt que de bloquer toute la chaîne. Exemples observés et
+    documentés dans la mémoire collective :
+
+    - Le pattern "CEO grant_write_permit via MCP, puis PM commit la DB
+      séparément en git" est un contournement de l'absence d'atomicité
+      côté tool MCP (cf. roadmap item atomic-grant-permit, lessons 600307a4
+      et ed7776fb).
+    - Passer un RFC à status: implemented en éditant le YAML à la main avec
+      un write permit ad-hoc est un contournement de l'absence d'un tool
+      rfc_set_implemented dédié (cf. roadmap item rfc-set-implemented-tool).
+    - Les hotfix chirurgicaux appliqués hors RFC (ex. db.rs CREATE INDEX vs
+      ALTER TABLE, commit 57019e7) sont des contournements de l'absence
+      d'une discipline générale de migration de schéma.
+
+    Le risque commun : quand la vraie solution est enfin construite (le
+    tool atomique, le tool dédié, la discipline formalisée), si on ne
+    retire pas explicitement le contournement qu'elle remplace, ce dernier
+    reste documenté dans les règles, les personas, ou le code. Les agents
+    continuent alors d'emprunter l'ancien chemin parce qu'il est toujours
+    présent et toujours "valide" en apparence. La mémoire collective se
+    retrouve à porter deux instructions pour le même besoin : l'ancienne
+    (le workaround) et la nouvelle (la solution). C'est une source de
+    confusion durable, et c'est exactement ce que la mémoire collective
+    est censée éviter.
+
+  insight: >
+    Un contournement et la solution qui le remplace ne doivent jamais
+    coexister. Trois points à retenir.
+
+    POINT 1 — LE CONTOURNEMENT EST UNE DETTE DATÉE, PAS UN ÉTAT STABLE.
+    Au moment où on introduit un workaround, on accepte une dette en pariant
+    qu'une vraie solution viendra. Le cleanup n'est pas une tâche optionnelle
+    de fin de projet : c'est le remboursement de cette dette, et il est dû
+    au moment précis où la solution est livrée. Reporter le cleanup, c'est
+    transformer une dette temporaire en dette permanente silencieuse.
+
+    POINT 2 — LE COÛT DU CONTOURNEMENT SURVIVANT EST INVISIBLE MAIS RÉEL.
+    Un workaround obsolète ne génère pas d'erreur. Il ne casse rien. C'est
+    précisément ce qui le rend dangereux : il continue de fonctionner, donc
+    personne ne le remarque, et les agents l'empruntent par habitude. Le
+    coût se paie en confusion (deux chemins pour la même chose), en reviews
+    qui doivent trancher lequel est canonique, et en lessons contradictoires
+    qui polluent le search.
+
+    POINT 3 — LE CLEANUP FAIT PARTIE DU SCOPE DE LA SOLUTION.
+    Quand un RFC ou un implementation-plan introduit une vraie solution, le
+    retrait des contournements qu'elle rend obsolètes appartient au scope de
+    ce même RFC / plan. Les affected_files doivent inclure les fichiers où
+    le contournement vit (règles, personas, code mort, docs). Si le cleanup
+    est laissé "pour plus tard", il n'arrive jamais, parce qu'aucun futur
+    chantier n'aura ce nettoyage dans son scope.
+
+    Ce principe vaut aussi bien pour le code de CompanyOS lui-même que pour
+    les projets métier qu'il héberge : retirer le vieux code mort quand on
+    introduit son remplaçant, supprimer le flag de feature quand la feature
+    est généralisée, abroger la règle de process quand l'outil qui la rendait
+    nécessaire est livré.
+
+  recommendation: >
+    Trois pratiques à adopter.
+
+    PRATIQUE 1 — INVENTORIER LE CONTOURNEMENT DANS LA SOLUTION.
+    Tout RFC ou implementation-plan qui introduit une solution remplaçant un
+    contournement existant DOIT, dans une section dédiée, lister
+    explicitement : (a) quel(s) contournement(s) cette solution rend
+    obsolète(s), (b) où ils vivent (fichiers, règles shared-rules, personas,
+    code), (c) l'action de retrait prévue pour chacun. Cette section fait
+    partie de la review : un reviewer qui voit une solution sans plan de
+    cleanup du contournement associé vote request_changes.
+
+    PRATIQUE 2 — LE CLEANUP EST DANS LA DEFINITION OF DONE.
+    Un chantier qui introduit une solution n'est PAS terminé tant que le
+    contournement qu'elle remplace est encore présent et empruntable. Le
+    retrait du workaround et la mise à jour des règles / personas qui le
+    décrivaient sont des étapes du plan au même titre que le code de la
+    solution. La task-request de la solution gagne un acceptance criterion
+    explicite : "le contournement X est retiré et ne figure plus dans les
+    règles / le code".
+
+    PRATIQUE 3 — TRACER LE LIEN SOLUTION → CONTOURNEMENT RETIRÉ.
+    Quand une solution retire un contournement, les artifacts liés (RFC,
+    lesson-learned de capitalisation) doivent expliciter ce lien. Si une
+    lesson documentait la procédure du contournement (ex. "voici comment
+    sceller manuellement le permit"), elle doit être supersedée par une
+    nouvelle lesson qui pointe vers la solution, pour que le search ne
+    remonte plus l'ancienne procédure comme valide. La mémoire collective
+    reste cohérente uniquement si on ferme activement les fils obsolètes.
+
+    Application immédiate : le chantier en cours sur les frictions permits
+    (atomic-grant-permit, rfc-set-implemented-tool, defense-in-depth-selective)
+    est le premier test de cette discipline. Chacun de ces RFC introduit une
+    solution qui rend obsolète un contournement documenté ; chacun doit donc
+    inventorier et retirer ce contournement dans son scope, et superseder les
+    lessons qui décrivaient l'ancienne procédure.

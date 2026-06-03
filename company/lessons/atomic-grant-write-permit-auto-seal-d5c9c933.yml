@@ -1,0 +1,107 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: d5c9c933-2955-41e1-b2ae-73c9f307f09f
+  title: "grant_write_permit scelle désormais la DB automatiquement : le seal manuel disparaît, le consume-en-dernier reste"
+  author: implementer
+  created_at: "2026-06-03"
+  description: >
+    Capitalisation après l'implémentation du RFC 359f9162 (plan d45a769b) qui
+    atomicise grant_write_permit côté serveur MCP. Le tool exécute désormais,
+    sous un seul engine.lock, la séquence idempotence -> grant -> checkpoint WAL
+    -> git add -f ciblé sur le seul .db -> git commit -> rollback en cas d'échec.
+    Conséquence sur le workflow : l'étape de scellement manuel (git add -f
+    company/data/orchestrator.db && git commit) que l'Implementer faisait à la
+    main APRÈS le grant n'existe plus, elle est absorbée par le tool. Cette
+    lesson documente la décision auto-commit, la surprise majeure rencontrée en
+    exécution (sortie git localisée en français qui cassait silencieusement la
+    détection "nothing to commit"), et rappelle que l'invariant consume-en-
+    dernier de la lesson 8fd49300 reste entièrement valide.
+  tags:
+    - write-permit
+    - defense-in-depth
+    - atomicity
+    - mcp
+    - git
+    - locale
+    - companyos-internals
+    - rust
+    - lessons-from-implementation
+  related:
+    - id: 8fd49300-14e5-4e7c-b75f-e0e4bd461aac
+      kind: lesson-learned
+      relationship: supersedes
+    - id: 600307a4-74f6-43dd-95e1-4dee3d2326c1
+      kind: lesson-learned
+      relationship: derived-from
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: related
+    - id: 359f9162-18f2-4b72-85b0-7d0e44608959
+      kind: rfc
+      relationship: input
+    - id: d45a769b-27fc-4530-b929-9d2286c0ee47
+      kind: implementation-plan
+      relationship: input
+
+spec:
+  context: >
+    Avant ce RFC, l'émission d'un permit laissait un état non scellé en DB : le
+    plugin defense-in-depth pouvait wiper la table write_permits à la moindre
+    altération détectée (lesson ed7776fb), et l'Implementer devait sceller la DB
+    à la main par un git add -f + git commit immédiatement après le grant. Cette
+    étape manuelle était une source d'erreurs (oubli, mauvais ordre vis-à-vis du
+    commit du code) et un contournement assumé (la RECOMMANDATION 3 de la lesson
+    600307a4 pointait justement les frictions répétées de re-émission de permits
+    pendant une session). Le RFC 359f9162 supprime le contournement en rendant le
+    grant atomique : grant + checkpoint WAL + git seal + rollback se font côté
+    serveur, sous un seul lock, en une opération. Le retrait du seal manuel de la
+    persona implementer.yml a été fait dans la MÊME unité de travail que le code
+    (discipline de cleanup, lesson be16dc46).
+
+  insight: >
+    Trois enseignements concrets de l'exécution.
+    (1) DÉCISION AUTO-COMMIT QUI MARCHE : sceller dans le tool MCP, pas dans
+    l'engine. seal_db_commit vit sur OrchestratorServer (main.rs) car c'est là
+    qu'est root_path et la logique git (std::process::Command, aucune crate
+    nouvelle) ; l'engine reste focalisé sur la DB. Le checkpoint WAL
+    (checkpoint_truncate) DOIT précéder le git add, sinon le permit fraîchement
+    inséré vit encore dans le -wal et le .db committé ne le contient pas (edge h,
+    le risque le plus délicat du RFC). Le rollback utilise un DELETE ciblé par id
+    (delete_permit), JAMAIS restore_permits_from_snapshot, pour ne pas wiper
+    collatéralement les autres permits actifs (edge e). L'idempotence compare les
+    target_paths par ensemble normalisé trié+dédupliqué : un rejeu du même grant
+    (même rfc + persona + set de paths, ordre indifférent) renvoie le permit
+    existant, jamais un doublon.
+    (2) SURPRISE MAJEURE — LA LOCALE GIT : la détection de "nothing to commit"
+    par matching de texte est FRAGILE car git localise sa sortie. Dans cet
+    environnement git parle français ("rien à valider, la copie de travail est
+    propre"), ce qui faisait tomber le re-seal idempotent dans la branche
+    GitFailed avec un stderr vide, totalement opaque. De plus, les sidecars
+    -wal/-shm non suivis changent encore le message ("no changes added to
+    commit" au lieu de "nothing to commit"). Correctif : forcer LC_ALL=C + LANG=C
+    sur CHAQUE invocation git pour une sortie stable en anglais, ET matcher
+    plusieurs phrasings ("nothing to commit", "no changes added to commit",
+    "nothing added to commit"). Leçon transférable : tout code qui parse la
+    sortie texte d'un binaire externe doit neutraliser la locale.
+    (3) L'INVARIANT CONSUME-EN-DERNIER SURVIT : l'auto-commit scelle le permit
+    mais ne le consomme PAS — il reste 'active' après le grant. La séquence
+    write -> commit du code -> consume reste non-négociable (lesson 8fd49300) ;
+    seul le seal manuel disparaît de la séquence. Un test de régression (T8)
+    vérifie que grant+seal laisse le permit active et consumed_at=null.
+
+  recommendation: >
+    (a) Workflow Implementer : après grant_write_permit, ne PAS faire de git add
+    -f company/data/orchestrator.db && git commit — c'est désormais automatique.
+    La prochaine action est directement la modification des fichiers protégés,
+    puis git add <fichiers> && git commit du code, puis consume EN DERNIER. La
+    règle write_permit_full_sequence d'implementer.yml a été mise à jour en ce
+    sens.
+    (b) Parsing de binaires externes : toujours forcer LC_ALL=C/LANG=C avant de
+    matcher des marqueurs texte (git, et tout autre outil dont la sortie est
+    traduisible). Ne jamais supposer la locale de l'environnement serveur.
+    (c) Atomicité d'une opération DB + effet de bord externe (ici git) : tenir le
+    même lock du début à la fin (insert -> checkpoint -> seal -> rollback) pour
+    sérialiser concurrence ET effet de bord ; checkpointer le WAL avant tout
+    snapshot disque ; et garantir l'invariant "soit l'état existe ET est scellé,
+    soit il n'existe pas du tout" via un rollback ciblé par id.

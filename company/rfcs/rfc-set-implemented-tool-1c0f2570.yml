@@ -1,0 +1,508 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 1c0f2570-71e2-4f02-ac4f-81e406b22568
+  title: "Tool MCP rfc_set_implemented(id) — transition approved -> implemented pilotée serveur, sans permit ad-hoc"
+  status: approved
+  approved_at: "2026-06-03T22:02:26.406521061+00:00"
+  author: architect
+  created_at: "2026-06-03"
+  description: >
+    Ajoute un tool MCP rfc_set_implemented(id) côté orchestrator qui fait
+    passer un RFC de status: approved à status: implemented sans
+    nécessiter de write permit sur company/rfcs/ (zone protégée). Le tool
+    réplique EXACTEMENT le pattern déjà éprouvé de close_review_round, qui
+    met automatiquement un RFC en status: approved (champ rfc_auto_updated)
+    sans permit : l'écriture du YAML est faite par le PROCESSUS SERVEUR
+    lui-même via std::fs::write (engine.update_rfc_status_in_file), donc
+    en dehors de toute commande bash interceptée par le hook
+    defense-in-depth. Le hook ne garde QUE les écritures faites par les
+    agents via bash/edit ; les transitions de cycle de vie pilotées par le
+    serveur échappent légitimement au permit car elles ne passent jamais
+    par le canal surveillé. Le tool valide strictement la transition
+    (refus si le RFC n'est pas en approved), met à jour le YAML de manière
+    cohérente, et retourne des erreurs explicites. Touche les zones
+    protégées crates/ (crates/orchestrator/ et
+    crates/mcp-servers/orchestrator/) : approbation CEO + write permit
+    requis. Périmètre strictement borné à la transition
+    approved -> implemented ; ne touche NI le mécanisme des write permits,
+    NI le hook defense-in-depth.
+  tags:
+    - rfc-lifecycle
+    - mcp
+    - tooling
+    - orchestrator
+    - write-permit
+    - friction-permits
+    - companyos-internals
+  related:
+    - id: c666b783-c427-4045-acad-3c1735625580
+      kind: task-request
+      relationship: input
+    - id: 3cd72740-1424-46ac-8ee6-96f714f3fa94
+      kind: rfc
+      relationship: related
+    - id: 359f9162-18f2-4b72-85b0-7d0e44608959
+      kind: rfc
+      relationship: related
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: input
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: input
+
+spec:
+  motivation: >
+    PROBLÈME OBSERVÉ. Aujourd'hui, faire passer un RFC à status:
+    implemented est une opération sans tool dédié. La seule façon de le
+    faire est d'éditer le YAML du RFC à la main. Or company/rfcs/ est une
+    zone protégée (defense-in-depth-core.mjs, ARTIFACT_NAMING_PREFIXES
+    ligne 48 et la garde générale des zones protégées), donc toute édition
+    par un agent requiert un write permit émis par le CEO. Émettre un
+    permit pour une simple clôture administrative de cycle de vie est une
+    friction disproportionnée : ce n'est pas un changement de contenu
+    substantiel, c'est une transition d'état déterministe et bornée
+    (approved -> implemented), exactement de la même nature que la
+    transition approved/rejected déjà gérée automatiquement par
+    close_review_round.
+
+    LE PRÉCÉDENT EXACT EXISTE DÉJÀ DANS LE CODE (investigation du code
+    réel). Le tool MCP close_review_round met un RFC en status: approved
+    SANS write permit, et c'est volontaire et documenté
+    (rfc-auto-approve-001). Voici le mécanisme précis, qui est le pattern
+    que ce RFC réplique :
+
+    1. Tool MCP. close_review_round
+       (crates/mcp-servers/orchestrator/src/main.rs:573) appelle
+       engine.close_round_with_rfc_update(round_id, &self.root_path) et
+       enrichit sa réponse JSON d'un champ rfc_auto_updated (lignes
+       582 à 598) selon le RfcUpdateResult retourné.
+
+    2. Moteur. engine.close_round_with_rfc_update
+       (crates/orchestrator/src/engine.rs:254) ferme le round, calcule le
+       consensus, en déduit le nouveau status ("approved" si consensus
+       atteint), localise le fichier YAML du RFC via round.artifact_path,
+       puis appelle update_rfc_status_in_file.
+
+    3. Écriture serveur sans permit. update_rfc_status_in_file
+       (crates/orchestrator/src/engine.rs:301) lit le YAML
+       (std::fs::read_to_string), vérifie le status courant pour
+       l'idempotence (ligne 334 : si déjà au bon status, retourne
+       AlreadyUpToDate), remplace la ligne `  status: <old>` par
+       `  status: <new>` plus un champ timestamp (approved_at /
+       rejected_at, lignes 344 à 348), et écrit le fichier via
+       std::fs::write (ligne 378).
+
+    POURQUOI CETTE ÉCRITURE CONTOURNE LÉGITIMEMENT LE PERMIT (le coeur du
+    pattern à répliquer). Le hook defense-in-depth n'intercepte QUE les
+    écritures faites par les agents via les outils bash / edit / write
+    surveillés. L'écriture de update_rfc_status_in_file est faite par le
+    PROCESSUS SERVEUR orchestrator lui-même, via un appel std::fs::write
+    direct dans le binaire Rust, en réponse à un tool MCP. Elle ne
+    transite jamais par une commande bash ni par un outil d'édition
+    surveillé, donc le hook ne la voit pas et n'a aucun permit à exiger.
+    Ce n'est pas un contournement clandestin : c'est l'architecture
+    assumée du système. Les transitions de cycle de vie déterministes et
+    bornées sont la responsabilité du serveur, qui en est l'autorité ; le
+    permit sert à encadrer les modifications de CONTENU faites par les
+    agents, pas les transitions d'ÉTAT pilotées par le workflow serveur.
+    La preuve que c'est intentionnel : RFC 062ebaa8 a vu son status passé
+    approved -> implemented (changelog ligne 43 à 44) et le système
+    fonctionne sur ce modèle d'écriture serveur pour le statut RFC.
+
+    LE TROU DANS LE PRÉCÉDENT. close_review_round ne gère QUE
+    approved/rejected. La transition approved -> implemented n'a aucun
+    déclencheur serveur : il n'existe pas de "round" à clore pour
+    matérialiser la fin de l'implémentation. C'est précisément ce trou que
+    ce RFC comble, en exposant un tool dédié rfc_set_implemented(id) qui
+    réutilise la même infrastructure d'écriture serveur
+    (update_rfc_status_in_file, déjà conçue pour écrire un status
+    arbitraire et son timestamp) pour la transition manquante.
+
+    POURQUOI UN RFC. Le correctif ajoute un tool MCP
+    (crates/mcp-servers/orchestrator/src/main.rs) et une méthode moteur
+    (crates/orchestrator/src/engine.rs), tous deux en zone protégée
+    crates/. Tous les critères RFC de shared-rules sont réunis : zones
+    protégées, ajout d'un tool d'infrastructure qui écrit un artifact sans
+    permit. Approbation CEO + write permit requis.
+
+  proposal: >
+    DÉCISION TECHNIQUE — un tool MCP rfc_set_implemented(id) qui réplique
+    le pattern d'écriture serveur de close_review_round, restreint à la
+    transition approved -> implemented. Le QUOI et le POURQUOI au niveau
+    des invariants ; l'implementation-plan dérivé décidera des noms exacts
+    et de l'ordre des étapes.
+
+    === 1. NOUVEAU TOOL MCP : rfc_set_implemented ===
+
+    Contrat fonctionnel :
+      Nom MCP        : rfc_set_implemented
+      Paramètres :
+        - id : String — metadata.id du RFC (UUID v4) à passer en
+               implemented. Paramètre unique, obligatoire.
+      Retour (JSON), cas succès :
+        {
+          "rfc_id": "<uuid>",
+          "previous_status": "approved",
+          "new_status": "implemented",
+          "implemented_at": "<RFC3339>",
+          "file_path": "<chemin relatif du YAML>"
+        }
+      Retour, cas erreur : Diagnostic MCP standard (context / reason / fix)
+      comme tous les autres tools de l'orchestrator.
+
+    Sémantique : opération de clôture de cycle de vie. Le tool localise le
+    RFC par son id via l'index, vérifie qu'il est bien en status:
+    approved, écrit status: implemented dans le YAML par le PROCESSUS
+    SERVEUR (même mécanisme std::fs::write que update_rfc_status_in_file,
+    donc sans permit), ajoute le timestamp implemented_at, et retourne le
+    résultat. Aucun write permit requis, par construction (écriture
+    serveur, hors canal bash surveillé).
+
+    === 2. VALIDATION STRICTE DE LA TRANSITION (acceptance criterion 2) ===
+
+    La transition n'est autorisée QUE depuis approved. Le tool refuse
+    explicitement tous les autres status de départ, avec une erreur qui
+    nomme le status courant et la raison du refus :
+
+      - status courant = "approved"     -> transition autorisée.
+      - status courant = "draft"        -> refus : un RFC non encore
+        approuvé ne peut pas être déclaré implémenté.
+      - status courant = "review"       -> refus : RFC encore en review.
+      - status courant = "rejected"     -> refus : un RFC rejeté ne peut
+        pas être implémenté.
+      - status courant = "implemented"  -> IDEMPOTENCE : déjà au status
+        cible. Voir décision ci-dessous.
+
+    Décision sur le cas "déjà implemented" : par cohérence avec le
+    précédent (update_rfc_status_in_file retourne AlreadyUpToDate quand le
+    status est déjà correct, engine.rs:334), un RFC déjà en implemented
+    est traité comme un SUCCÈS IDEMPOTENT et NON comme une erreur. Le tool
+    retourne alors un succès signalant que le RFC était déjà implemented
+    (champ note explicite, pas de réécriture du timestamp existant).
+    Rationale : l'idempotence est la sémantique attendue d'une transition
+    de cycle de vie pilotée serveur (un rejeu d'appel MCP via le proxy
+    résilient ne doit pas échouer), et c'est exactement le comportement du
+    précédent. La task-request (acceptance criterion 2) demande que "déjà
+    implemented" ne puisse pas "transiter arbitrairement" : l'idempotence
+    respecte cette exigence puisqu'aucune transition n'a lieu (le status
+    ne change pas, le timestamp d'origine est préservé). Ce point est
+    signalé comme arbitrage CEO possible (cf. section escalade) si le CEO
+    préfère un refus dur plutôt qu'un succès idempotent.
+
+    === 3. RÉUTILISATION DE L'INFRASTRUCTURE D'ÉCRITURE SERVEUR ===
+
+    Le RFC impose la réutilisation de l'infrastructure éprouvée plutôt
+    qu'une nouvelle voie d'écriture. Deux invariants :
+
+    3.a. L'écriture du YAML doit passer par le même mécanisme serveur que
+         close_review_round : une méthode du moteur (engine.rs) qui lit le
+         fichier, modifie le status et ajoute le timestamp, puis écrit via
+         std::fs::write. La méthode update_rfc_status_in_file existante
+         écrit DÉJÀ un status arbitraire et choisit son champ timestamp
+         selon la valeur (engine.rs:344). Recommandation forte (à
+         confirmer en implementation-plan) : étendre
+         update_rfc_status_in_file pour qu'elle gère le timestamp
+         implemented_at quand new_status == "implemented" (aujourd'hui la
+         branche ne couvre que approved_at / rejected_at), et exposer une
+         méthode publique de plus haut niveau set_rfc_implemented(root,
+         rfc_id) qui : (1) résout le RFC par id, (2) vérifie le status de
+         départ, (3) délègue l'écriture à update_rfc_status_in_file. Cela
+         garantit qu'il n'existe qu'UNE seule voie d'écriture du status
+         RFC dans le serveur, donc un seul comportement à maintenir et
+         tester. Le choix structurel (étendre la méthode existante vs en
+         créer une jumelle) est laissé à l'implementation-plan, du moment
+         que l'invariant "une seule voie d'écriture serveur" tient.
+
+    3.b. Résolution du RFC par id. Le tool reçoit un id (UUID), pas un
+         round_id. La résolution se fait via l'index : db.get_artifact(id)
+         (db.rs:1246) retourne l'IndexedArtifact dont on lit le file_path
+         et le kind. Invariants de résolution :
+           - id introuvable dans l'index -> erreur "RFC not found" avec
+             fix (vérifier l'id, utiliser search).
+           - artifact trouvé mais kind != "rfc" -> erreur typée "not an
+             RFC" (on ne transite que des RFC).
+           - le file_path doit pointer dans company/rfcs/ ; sinon erreur
+             diagnostic (incohérence d'index).
+
+    === 4. COHÉRENCE INDEX / FICHIER (acceptance criterion 3) ===
+
+    Après l'écriture du YAML par le serveur, l'index doit refléter le
+    nouveau status sans fenêtre de divergence. Le mécanisme existant est
+    le file watcher (auto-indexation à chaque écriture YAML, déjà en place
+    et corrigé par RFC 062ebaa8). Invariant imposé : ne PAS introduire de
+    voie d'indexation parallèle ou de cache concurrent. Deux options à
+    trancher en implementation-plan, sans préférence imposée par ce RFC du
+    moment que l'invariant "pas de fenêtre durable où index et fichier
+    divergent" tient :
+      (option A) S'appuyer sur le file watcher comme le fait déjà
+        close_review_round : le serveur écrit le YAML, le watcher
+        ré-indexe avec son debounce. C'est le comportement actuel du
+        précédent ; aucune divergence durable, juste la latence du
+        debounce (cohérent avec l'existant).
+      (option B) Forcer une ré-indexation immédiate après l'écriture
+        (équivalent index_now sur le file_path) pour supprimer même la
+        latence du debounce.
+    Note : le status du RFC n'est PAS un champ FTS critique (l'index
+    indexe titre/description/tags/kind, pas le status), donc la divergence
+    transitoire de debounce n'affecte pas la recherche. L'important est
+    qu'il n'existe pas de divergence DURABLE. Recommandation : option A
+    (cohérence stricte avec le précédent close_review_round), sauf si
+    l'implementation-plan démontre un besoin de latence nulle.
+
+    === 5. EXPOSITION MCP (crates/mcp-servers/orchestrator/src/main.rs) ===
+
+    Une nouvelle entrée de tool_router sur le pattern existant
+    (Parameters<...> + ok/err Diagnostic), calquée sur close_review_round :
+
+    5.a. Params :
+         #[derive(Deserialize, schemars::JsonSchema)]
+         struct RfcSetImplementedParams {
+             #[schemars(description = "metadata.id (UUID) of the approved RFC to mark as implemented", with = "String")]
+             id: Uuid,
+         }
+
+    5.b. Tool :
+         #[tool(description = "Mark an approved RFC as implemented. Transitions metadata.status from 'approved' to 'implemented' and stamps implemented_at. Server-side lifecycle transition: requires NO write permit (same model as close_review_round auto-approving an RFC). Refuses any RFC not currently in 'approved' status with an explicit error.")]
+         async fn rfc_set_implemented(...) { ... }
+
+         Le tool prend le verrou engine (engine.lock().await) comme les
+         autres opérations qui touchent l'état, pour sérialiser les appels
+         concurrents (cf. edge cases). Il n'exige AUCUN token : c'est une
+         transition de cycle de vie, pas une opération privilégiée
+         réservée à une persona (à la différence de grant_write_permit qui
+         exige le token CEO). Tout agent peut clore un RFC qu'il a mené à
+         terme. Ce point est signalé comme arbitrage CEO possible (cf.
+         section escalade) si le CEO souhaite restreindre l'appel à
+         certaines personas.
+
+    === 6. PAS DE CHANGEMENT DE CONFIG, DE PERSONA, NI DE SCHÉMA ===
+
+    - shared-rules.yml : aucun changement. Le cycle de vie
+      draft -> review -> approved | rejected -> implemented est déjà
+      documenté (shared-rules.yml ligne 58) ; ce RFC ne fait qu'outiller
+      la dernière flèche, il ne change pas le cycle.
+    - personas/*.yml : aucun changement. Voir section cleanup_workaround
+      (cas zéro : aucune persona ne documente le contournement manuel).
+    - review-protocol.yml : aucun changement (un tool est une
+      infrastructure, pas un kind d'artifact).
+    - schemas/rfc.schema.json : aucun changement. Le status "implemented"
+      et le champ implemented_at sont déjà acceptés (status enum ligne 13,
+      metadata additif). Aucune extension de l'enum ArtifactKind n'est
+      nécessaire (lesson 3f507271 ne s'applique pas : pas de nouveau
+      kind).
+
+    === 7. TESTS (acceptance criterion 4, analyse triaxiale) ===
+
+    Plan de tests imposé par ce RFC (l'implementation-plan détaillera
+    l'ordre et les fixtures). Réutiliser db.open_in_memory() et des
+    fixtures RFC YAML dans un tmpdir pointé par `root`, comme les tests de
+    update_rfc_status_in_file / list_roadmaps existants.
+
+    7.a. Tests unitaires moteur (crates/orchestrator/src/engine.rs) :
+         - NOMINAL :
+           * test_set_implemented_from_approved_succeeds : RFC en approved
+             -> implemented, le YAML contient status: implemented et
+             implemented_at, le retour porte previous_status=approved.
+           * test_set_implemented_reindex_reflects_new_status : après
+             l'opération, l'index (ou le YAML relu) reflète implemented
+             (valide l'invariant cohérence de la section 4).
+         - NÉGATIF :
+           * test_set_implemented_rfc_not_found : id inexistant -> erreur
+             typée "not found".
+           * test_set_implemented_from_draft_refused : refus explicite.
+           * test_set_implemented_from_review_refused : refus explicite.
+           * test_set_implemented_from_rejected_refused : refus explicite.
+           * test_set_implemented_on_non_rfc_kind_refused : id pointe un
+             artifact qui n'est pas un RFC -> erreur typée.
+         - EDGE :
+           * test_set_implemented_already_implemented_is_idempotent : RFC
+             déjà implemented -> succès idempotent, timestamp d'origine
+             préservé (PAS de réécriture).
+           * test_set_implemented_malformed_id : id mal formé (pas un
+             UUID) -> erreur de parsing claire (gérée au niveau du
+             désérialiseur MCP Uuid, à vérifier).
+           * test_set_implemented_corrupt_yaml : RFC dont le YAML est
+             illisible/corrompu -> erreur diagnostic qui pointe le
+             file_path (réutilise le chemin d'erreur de
+             update_rfc_status_in_file, engine.rs:317 et 324).
+           * Concurrence : deux appels rfc_set_implemented sur le même id.
+             Le verrou engine sérialise ; le second voit le status déjà
+             implemented et retourne le succès idempotent. À couvrir par
+             un test qui exerce la sérialisation (ou, a minima, à
+             documenter que le Mutex tokio garantit l'ordre, comme pour
+             grant_write_permit edge f du RFC 359f9162).
+
+    7.b. Test de forme côté serveur MCP : valider la sérialisation JSON du
+         retour rfc_set_implemented (champs rfc_id, previous_status,
+         new_status, implemented_at, file_path) sans nécessairement passer
+         par rmcp, comme pour summarize_roadmap (RFC 3cd72740 section 7.b).
+
+    7.c. Validation manuelle bout-en-bout après merge : prendre un RFC
+         approuvé réel (ce RFC lui-même, une fois mergé), appeler
+         rfc_set_implemented(id) et vérifier que le YAML passe en
+         implemented avec implemented_at, et qu'un second appel est
+         idempotent.
+
+  impact: >
+    CATÉGORISATION DES FICHIERS IMPACTÉS (lesson 611fde3e + note roadmap
+    rfc-affected-files-categorize). Le schéma RFC ne fournit qu'un champ
+    plat spec.affected_files (array de string), donc la liste autoritaire
+    pour le write permit est plate plus bas. Pour la lisibilité humaine et
+    pour éviter le blocker "fichier à créer oublié" (611fde3e), on
+    explicite ici la distinction modified vs created :
+
+      - À MODIFIER (existants, présents dans HEAD) :
+        * crates/orchestrator/src/engine.rs
+          (méthode set_rfc_implemented + extension du timestamp
+          implemented_at dans update_rfc_status_in_file ; tests
+          unitaires triaxiaux).
+        * crates/mcp-servers/orchestrator/src/main.rs
+          (struct RfcSetImplementedParams + tool rfc_set_implemented).
+      - À CRÉER (nouveaux) : AUCUN. Ce RFC ne crée aucun fichier source ;
+        tous les changements sont des modifications de fichiers existants,
+        et les tests s'ajoutent dans les modules de test déjà présents des
+        deux fichiers ci-dessus. Si l'implementation-plan découvre le
+        besoin d'un fichier de test nouveau, ce path devra être ajouté à
+        affected_files via un amendement RFC AVANT l'émission du permit
+        (sinon blocker hook, 611fde3e).
+
+    Note sur lib.rs : l'extension d'une méthode publique sur l'engine ne
+    devrait pas nécessiter de nouveau re-export si OrchestratorEngine est
+    déjà exporté (comme c'est le cas pour les méthodes existantes). Si
+    l'implementation-plan introduit un nouveau TYPE public (peu probable,
+    le retour est sérialisé en JSON côté MCP), crates/orchestrator/src/lib.rs
+    devra être ajouté à affected_files par amendement avant permit.
+
+    ZONES PROTÉGÉES TOUCHÉES (write permit requis après approbation) :
+    crates/orchestrator/ et crates/mcp-servers/orchestrator/. AUCUNE zone
+    protégée config (company/) n'est touchée : pas de personas, pas de
+    shared-rules, pas de schemas.
+
+    CATÉGORIE D'ESCALADE (ceo_cannot_approve_alone). Ce RFC ne touche pas
+    la matrice access_level (ArtifactKind n'est pas étendu), ne modifie
+    pas la persona CEO, n'introduit pas de breaking schema change, ne
+    supprime aucune persona. Aucune des catégories de
+    ceo_cannot_approve_alone n'est concernée. Le RFC reste soumis au
+    protocole standard rfc: [all] (PM + Architect + Implementer + CEO)
+    pour préserver la pluralité d'analyse.
+
+    IMPACT COMPORTEMENTAL.
+    - Tout agent qui mène un RFC à terme dispose désormais d'un appel
+      unique pour clore son cycle de vie, sans solliciter le CEO pour un
+      permit administratif. La friction permits documentée (be16dc46,
+      task-request) disparaît pour ce cas.
+    - Aucun impact sur close_review_round (transition approved/rejected),
+      qui reste l'unique voie pour ces deux status. Les deux tools sont
+      complémentaires et couvrent des flèches différentes du cycle de vie.
+    - Signature MCP additive : un nouveau tool, aucun tool existant
+      modifié.
+
+    RISQUES IDENTIFIÉS.
+    - Risque 1 : ÉLARGISSEMENT DE LA SURFACE D'ÉCRITURE SERVEUR SANS
+      PERMIT. Le tool ajoute une seconde voie d'écriture du status RFC par
+      le serveur. Mitigation : validation stricte (approved -> implemented
+      uniquement), réutilisation de l'UNIQUE infrastructure d'écriture
+      (update_rfc_status_in_file), aucune écriture de contenu arbitraire.
+      Le tool ne peut écrire QUE le status et son timestamp, jamais
+      d'autres champs. La surface reste aussi étroite que celle de
+      close_review_round.
+    - Risque 2 : ABSENCE DE CONTRÔLE D'IDENTITÉ. Le tool n'exige pas de
+      token (cf. proposal 5.b). Un agent pourrait clore prématurément un
+      RFC dont l'implémentation n'est pas réellement terminée. Mitigation :
+      l'opération est réversible (rollback : repasser à approved, ou git
+      revert du commit YAML), bornée (ne touche que le status), et tracée
+      (le YAML change, le watcher ré-indexe, git historise). Le RFC ne
+      crée pas de capacité destructrice. Si le CEO juge le risque trop
+      élevé, l'arbitrage "restreindre aux personas X" est ouvert (section
+      escalade).
+    - Risque 3 : COHÉRENCE INDEX. Cf. section 4. Aligné sur le
+      comportement existant de close_review_round ; pas de régression.
+    - Risque 4 : YAML CORROMPU / NON PARSABLE. Géré par le chemin d'erreur
+      existant de update_rfc_status_in_file (read/parse -> Failed avec
+      message pointant le fichier). Pas de réécriture partielle : la
+      stratégie de remplacement de chaîne de la méthode existante n'écrit
+      que si le marqueur status est trouvé, sinon retourne une erreur sans
+      toucher le fichier (engine.rs:351 à 376).
+
+  rollback_plan: >
+    Rollback réversible par git revert sur le commit qui matérialise ce
+    RFC. Procédure manuelle équivalente, dans un ordre qui maintient la
+    compilation à chaque étape :
+
+    1. CODE MCP : retirer le #[tool] rfc_set_implemented et la struct
+       RfcSetImplementedParams dans
+       crates/mcp-servers/orchestrator/src/main.rs.
+    2. CODE ENGINE : retirer la méthode publique set_rfc_implemented et
+       l'extension du timestamp implemented_at dans
+       update_rfc_status_in_file (revenir à la branche approved_at /
+       rejected_at seule) dans crates/orchestrator/src/engine.rs.
+    3. TESTS : retirer les tests unitaires ajoutés en section 7.
+    4. BUILD : cargo check -p companyos-orchestrator
+       -p companyos-orchestrator-mcp doit passer ; cargo test complet doit
+       passer.
+
+    PAS DE DONNÉES À MIGRER NI À PURGER. Le tool n'écrit que le status et
+    le timestamp dans des YAML existants. Un rollback du CODE ne réécrit
+    PAS les YAML déjà passés en implemented par le tool : ces RFC restent
+    en implemented (état valide du schéma). Le rollback ne fait que retirer
+    la capacité d'effectuer la transition via MCP ; il faudrait alors
+    revenir à l'édition manuelle (avec permit) pour de futures clôtures.
+
+    DÉPENDANCES SORTANTES. Si après merge les agents commencent à appeler
+    rfc_set_implemented dans leur workflow de clôture, un rollback les
+    forcerait à revenir à l'édition manuelle sous permit. Pas de risque de
+    corruption : seul le canal de transition change, pas les données.
+
+  cleanup_workaround: >
+    SECTION DÉDIÉE — application de la lesson be16dc46 (retrait du
+    contournement dans la même unité de travail que la solution) et de
+    l'acceptance criterion 5 de la task-request.
+
+    (a) Quel contournement cette solution rend obsolète.
+        Le contournement "passer un RFC à status: implemented en éditant le
+        YAML à la main avec un write permit ad-hoc". Une fois
+        rfc_set_implemented en place, ce contournement n'a plus de raison
+        d'être : la transition se fait par le tool, sans permit.
+
+    (b) Où vit le contournement — RÉSULTAT DE L'INVESTIGATION : CAS ZÉRO.
+        Le contournement n'est documenté dans AUCUN endroit NORMATIF du
+        système. Vérifications effectuées :
+        - company/config/shared-rules.yml : ne décrit que le cycle de vie
+          abstrait (ligne 58, "draft -> review -> approved | rejected ->
+          implemented") sans prescrire de procédure manuelle pour la
+          dernière flèche. Aucune règle write_permit ne mentionne la
+          clôture en implemented.
+        - company/personas/implementer.yml : la règle
+          write_permit_full_sequence (lignes 14 à 28) couvre la séquence
+          grant -> write code -> consume pour MODIFIER des fichiers
+          protégés ; elle ne dit RIEN sur le passage d'un RFC en
+          implemented. Aucune autre persona ne le documente non plus.
+        - company/config/review-protocol.yml, human-review-triggers.yml,
+          flow-control.yml : aucune mention.
+        Les SEULES traces du contournement sont NON NORMATIVES :
+        - lesson be16dc46 : le cite comme EXEMPLE de contournement à
+          retirer (c'est la lesson qui motive ce cleanup, pas une règle
+          qui prescrit le contournement). Elle n'a pas à être modifiée par
+          ce RFC : elle restera valide comme principe général, et la
+          lesson de capitalisation post-implémentation (hors scope de ce
+          RFC) pourra y chaîner pour fermer le fil de l'exemple précis.
+        - la task-request c666b783 et la roadmap companyos-system : décrivent
+          le besoin, pas une procédure valide.
+
+    (c) Action de retrait. CAS ZÉRO confirmé : il n'y a AUCUN texte
+        normatif à retirer ni à réécrire. C'est noté explicitement ici
+        conformément à l'acceptance criterion 5 ("Si aucun endroit normatif
+        ne le documentait, le noter explicitement (cas zéro)"). Le scope de
+        ce RFC ne comporte donc PAS de modification de règle ou de persona
+        au titre du cleanup. La seule action de capitalisation
+        (création/chaînage d'une lesson documentant que le tool remplace le
+        contournement) est explicitement HORS scope de ce RFC : elle sera
+        produite par l'Architect APRÈS approbation et merge, conformément à
+        la Definition of Done de be16dc46 (PRATIQUE 3), et n'est pas une
+        modification de zone protégée.
+
+  affected_files:
+    - "crates/orchestrator/src/engine.rs"
+    - "crates/mcp-servers/orchestrator/src/main.rs"
