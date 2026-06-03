@@ -1187,6 +1187,11 @@ async fn run_server() -> anyhow::Result<()> {
     // task, read by the `index_status` tool.
     let watcher_alive = Arc::new(AtomicBool::new(false));
 
+    // RFC 062ebaa8 — shared flag set by the signal handlers below so the
+    // `WatcherGuard` Drop impl can distinguish a clean shutdown (info!)
+    // from an unexpected death (error!). Cf. diagnostic 9534dd33.
+    let is_shutting_down = Arc::new(AtomicBool::new(false));
+
     let server = OrchestratorServer::new(
         engine.clone(),
         validator.clone(),
@@ -1211,64 +1216,87 @@ async fn run_server() -> anyhow::Result<()> {
         }
     });
 
-    // File watcher: auto-reload config/schemas/artifacts on disk changes
-    let watcher_handle_opt = match watcher::spawn_watcher(&root, Duration::from_millis(500)) {
-        Ok(mut handle) => {
-            let engine = engine.clone();
-            let validator = validator.clone();
-            let root = root.clone();
-            let schemas_dir = schemas_dir.clone();
-            let watcher_alive = watcher_alive.clone();
-            let task_handle = tokio::spawn(async move {
-                // Mark alive at task entry. The corresponding `false`
-                // write happens in a drop guard so SIGKILL of the
-                // process does not leave a stale `true` flag (the
-                // process is gone with it anyway).
-                watcher_alive.store(true, Ordering::Release);
-                struct AliveGuard(Arc<AtomicBool>);
-                impl Drop for AliveGuard {
-                    fn drop(&mut self) {
-                        self.0.store(false, Ordering::Release);
-                    }
-                }
-                let _alive_guard = AliveGuard(watcher_alive.clone());
+    // File watcher: auto-reload config/schemas/artifacts on disk changes.
+    //
+    // RFC 062ebaa8 — the `handle` is destructured here (NOT passed by
+    // move into the closure) so that the `_guard` field can be captured
+    // explicitly inside the `async move` block via `let _keep = _guard;`.
+    // Without this, Rust 2024 disjoint capture for async closures would
+    // leave `_guard` outside the future, dropping the RecommendedWatcher
+    // at the end of this match arm and killing the inotify fd (cf.
+    // diagnostic 9534dd33).
+    let watcher_handle_opt =
+        match watcher::spawn_watcher(&root, Duration::from_millis(500), is_shutting_down.clone()) {
+            Ok(handle) => {
+                let watcher::FileWatcherHandle { mut rx, _guard } = handle;
+                let engine = engine.clone();
+                let validator = validator.clone();
+                let root = root.clone();
+                let schemas_dir = schemas_dir.clone();
+                let watcher_alive = watcher_alive.clone();
+                let task_handle = tokio::spawn(async move {
+                    // The guard (and the RecommendedWatcher it owns) MUST
+                    // live as long as this consumer task. Without this
+                    // binding, Rust 2024 does not capture `_guard` (the
+                    // field is never read textually in the closure), it is
+                    // dropped at the end of the outer match arm, and the
+                    // inotify fd dies (cf. diagnostic 9534dd33). DO NOT
+                    // remove this binding even if it looks unused.
+                    let _keep_guard = _guard;
 
-                while let Some(change) = handle.rx.recv().await {
-                    match change {
-                        ConfigChangeKind::Config => match CompanyConfig::load(&root) {
-                            Ok(config) => {
-                                let new_max = config.flow_control.max_review_iterations;
-                                engine.lock().await.set_max_iterations(new_max);
-                                tracing::info!("Auto-reloaded config (max_iterations={new_max})");
-                            }
-                            Err(e) => tracing::warn!("Auto-reload config failed: {e}"),
-                        },
-                        ConfigChangeKind::Schemas => match SchemaRegistry::load(&schemas_dir) {
-                            Ok(registry) => {
-                                let count = registry.kinds().len();
-                                *validator.write().await = ArtifactValidator::new(registry);
-                                tracing::info!("Auto-reloaded {count} schema(s)");
-                            }
-                            Err(e) => tracing::warn!("Auto-reload schemas failed: {e}"),
-                        },
-                        ConfigChangeKind::Artifacts => {
-                            let mut engine = engine.lock().await;
-                            let validator = validator.read().await;
-                            match engine.reindex_all(&root, &validator) {
-                                Ok(count) => tracing::info!("Auto-reindexed {count} artifact(s)"),
-                                Err(e) => tracing::warn!("Auto-reindex failed: {e}"),
+                    // Mark alive at task entry. The corresponding `false`
+                    // write happens in a drop guard so SIGKILL of the
+                    // process does not leave a stale `true` flag (the
+                    // process is gone with it anyway).
+                    watcher_alive.store(true, Ordering::Release);
+                    struct AliveGuard(Arc<AtomicBool>);
+                    impl Drop for AliveGuard {
+                        fn drop(&mut self) {
+                            self.0.store(false, Ordering::Release);
+                        }
+                    }
+                    let _alive_guard = AliveGuard(watcher_alive.clone());
+
+                    while let Some(change) = rx.recv().await {
+                        match change {
+                            ConfigChangeKind::Config => match CompanyConfig::load(&root) {
+                                Ok(config) => {
+                                    let new_max = config.flow_control.max_review_iterations;
+                                    engine.lock().await.set_max_iterations(new_max);
+                                    tracing::info!(
+                                        "Auto-reloaded config (max_iterations={new_max})"
+                                    );
+                                }
+                                Err(e) => tracing::warn!("Auto-reload config failed: {e}"),
+                            },
+                            ConfigChangeKind::Schemas => match SchemaRegistry::load(&schemas_dir) {
+                                Ok(registry) => {
+                                    let count = registry.kinds().len();
+                                    *validator.write().await = ArtifactValidator::new(registry);
+                                    tracing::info!("Auto-reloaded {count} schema(s)");
+                                }
+                                Err(e) => tracing::warn!("Auto-reload schemas failed: {e}"),
+                            },
+                            ConfigChangeKind::Artifacts => {
+                                let mut engine = engine.lock().await;
+                                let validator = validator.read().await;
+                                match engine.reindex_all(&root, &validator) {
+                                    Ok(count) => {
+                                        tracing::info!("Auto-reindexed {count} artifact(s)")
+                                    }
+                                    Err(e) => tracing::warn!("Auto-reindex failed: {e}"),
+                                }
                             }
                         }
                     }
-                }
-            });
-            Some(task_handle)
-        }
-        Err(e) => {
-            tracing::warn!("File watcher unavailable, manual reload_config still works: {e}");
-            None
-        }
-    };
+                });
+                Some(task_handle)
+            }
+            Err(e) => {
+                tracing::warn!("File watcher unavailable, manual reload_config still works: {e}");
+                None
+            }
+        };
 
     // PILIER C — graceful shutdown signal-driven. Install SIGTERM and
     // SIGINT handlers, then race them with the MCP service.
@@ -1279,15 +1307,24 @@ async fn run_server() -> anyhow::Result<()> {
 
     tokio::select! {
         result = service.waiting() => {
+            // Service stopped on its own (stdin closed, transport error,
+            // etc.). Sémantiquement c'est un shutdown propre : arm the
+            // flag so the WatcherGuard Drop emits info!, not error!.
+            is_shutting_down.store(true, Ordering::Release);
             match result {
                 Ok(_) => tracing::info!("MCP service ended normally"),
                 Err(e) => tracing::warn!("MCP service ended with error: {e}"),
             }
         }
         _ = sigterm.recv() => {
+            // RFC 062ebaa8 — store BEFORE the info!() so a concurrent
+            // drop of the watcher (e.g. consumer task ending at the
+            // same instant) sees `true` and downgrades the log level.
+            is_shutting_down.store(true, Ordering::Release);
             tracing::info!("SIGTERM received, initiating graceful shutdown");
         }
         _ = sigint.recv() => {
+            is_shutting_down.store(true, Ordering::Release);
             tracing::info!("SIGINT received, initiating graceful shutdown");
         }
     }
@@ -1295,8 +1332,17 @@ async fn run_server() -> anyhow::Result<()> {
     // Shutdown sequence (PILIER C):
     // (1) Drop the watcher handle: the notify thread shuts down on FD
     //     close and the consumer task exits when the channel closes.
+    //     RFC 062ebaa8 — also await a brief moment to surface any panic
+    //     that happened inside the consumer task (JoinHandle::abort
+    //     takes &self in tokio 1.x, so we can both abort and await it).
     if let Some(h) = watcher_handle_opt {
         h.abort();
+        match tokio::time::timeout(Duration::from_millis(200), h).await {
+            Ok(Err(join_err)) if join_err.is_panic() => {
+                tracing::error!("Watcher consumer task panicked at shutdown: {join_err}");
+            }
+            _ => {} // cancelled, normal exit, or timeout: silent
+        }
     }
     // (2) Await reindex background with a bounded timeout. If it doesn't
     //     finish in time, abort and continue (data loss acceptable: a

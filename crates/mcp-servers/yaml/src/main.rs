@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use companyos_config::watcher::{self, ConfigChangeKind};
@@ -174,13 +175,32 @@ async fn run_server() -> anyhow::Result<()> {
     let validator = Arc::new(RwLock::new(ArtifactValidator::new(registry)));
     let server = YamlValidatorServer::new(validator.clone(), schemas_dir.clone());
 
-    // File watcher: auto-reload schemas on disk changes
-    match watcher::spawn_watcher(&root, Duration::from_millis(500)) {
-        Ok(mut handle) => {
+    // RFC 062ebaa8 — shared flag set right before the service exits so
+    // the `WatcherGuard` Drop impl emits info!, not error!, on a clean
+    // shutdown. Cf. diagnostic 9534dd33.
+    let is_shutting_down = Arc::new(AtomicBool::new(false));
+
+    // File watcher: auto-reload schemas on disk changes.
+    //
+    // RFC 062ebaa8 — the `handle` is destructured here (NOT passed by
+    // move into the closure) so that the `_guard` field can be captured
+    // explicitly inside the `async move` block via `let _keep = _guard;`.
+    // Without this, Rust 2024 disjoint capture for async closures would
+    // leave `_guard` outside the future, dropping the RecommendedWatcher
+    // at the end of this match arm and killing the inotify fd (cf.
+    // diagnostic 9534dd33).
+    match watcher::spawn_watcher(&root, Duration::from_millis(500), is_shutting_down.clone()) {
+        Ok(handle) => {
+            let watcher::FileWatcherHandle { mut rx, _guard } = handle;
             let validator = validator.clone();
             let schemas_dir = schemas_dir.clone();
             tokio::spawn(async move {
-                while let Some(change) = handle.rx.recv().await {
+                // MUST keep the guard alive for as long as `rx` is
+                // consumed. DO NOT remove this binding even if it looks
+                // unused — see diagnostic 9534dd33.
+                let _keep_guard = _guard;
+
+                while let Some(change) = rx.recv().await {
                     if matches!(change, ConfigChangeKind::Schemas) {
                         match SchemaRegistry::load(&schemas_dir) {
                             Ok(registry) => {
@@ -201,7 +221,12 @@ async fn run_server() -> anyhow::Result<()> {
 
     let (stdin, stdout) = rmcp::transport::io::stdio();
     let service = server.serve((stdin, stdout)).await?;
-    service.waiting().await?;
+    let result = service.waiting().await;
+    // Service finished (stdin closed, transport error, etc.). Mark the
+    // shutdown flag BEFORE returning so any drop of the watcher guard
+    // that races us logs info!, not error!.
+    is_shutting_down.store(true, Ordering::Release);
+    result?;
 
     Ok(())
 }
