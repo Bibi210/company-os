@@ -1,0 +1,326 @@
+api_version: companyos/v1
+kind: roadmap
+metadata:
+  id: 329da45f-e24f-4200-9e18-e2e47b5a4f27
+  title: "Roadmap CompanyOS système"
+  author: pm
+  created_at: "2026-06-03"
+  description: >
+    Première roadmap du domaine companyos-system. Trace l'évolution
+    structurelle de CompanyOS lui-même : les RFCs qui ont façonné
+    l'infrastructure (mémoire collective, persistence, résilience,
+    indexation), ce qui est en cours, et les chantiers identifiés
+    comme candidats à formaliser. Cette roadmap est vivante et
+    maintenue manuellement par le PM. Elle ne se synchronise PAS
+    automatiquement avec les artifacts référencés (le status que
+    porte un item ici est la vérité PM, pas le status courant de
+    l'artifact).
+  tags:
+    - roadmap
+    - companyos-system
+    - infrastructure
+    - meta
+
+spec:
+  domain: companyos-system
+  status: active
+
+  narrative: >
+    CompanyOS est un système qui se construit en s'utilisant lui-même.
+    Chaque évolution structurelle passe par le même processus que
+    n'importe quel projet métier : task-request, design-doc / RFC,
+    review, implementation-plan, exécution, lesson-learned. La
+    spécificité du domaine companyos-system, c'est que les sujets
+    qu'il tracke sont les FONDATIONS sur lesquelles tout le reste
+    repose. Quand la mémoire collective dérive ou que la persistence
+    SQLite se corrompt, ce n'est pas un bug projet, c'est un bug qui
+    cassera silencieusement tous les workflows d'agents jusqu'à ce
+    qu'on s'en rende compte (souvent trop tard).
+
+    Le fil conducteur de cette roadmap est la fiabilité opérationnelle
+    de la mémoire collective. Trois piliers se sont construits dans
+    l'ordre logique suivant.
+
+    D'abord, la coordination inter-process. Le proxy MCP doit survivre
+    aux restarts du binaire serveur (RFC d9399863), la persistence
+    SQLite doit survivre aux ouvertures concurrentes et aux SIGKILL
+    (RFC cdbfee72), et le file watcher tokio doit effectivement
+    démarrer plutôt que mourir silencieusement à cause d'un piège de
+    capture asynchrone (RFC 062ebaa8). Sans ces trois fondations,
+    aucune écriture n'est durable et aucun search n'est fiable.
+
+    Ensuite, la mémoire elle-même. Le lookup obligatoire avant
+    production d'artifact (RFC f4fe8a04) impose à tous les agents
+    d'aller consulter la mémoire collective avant d'agir, et de
+    capitaliser systématiquement après. Mais cette règle était une
+    promesse non tenue tant que search() retournait massivement zéro
+    résultat. La refonte search en hybrid retrieval (RFC bdee1af4) a
+    transformé cette règle de rituel en pratique réellement utile,
+    avec un recall@10 mesuré à 0.895 et une latence p95 sous 5ms.
+
+    Enfin, le kind roadmap lui-même (RFC a49801aa, outillage MCP
+    3cd72740) qui permet au PM de raconter cette histoire et de
+    suivre les sujets sans parcourir manuellement le repo. La
+    présente roadmap en est le premier exemple.
+
+    Côté présent, on a une dette opérationnelle bien identifiée : le
+    pattern grant_write_permit + scellement DB n'est pas atomique
+    côté MCP tool, ce qui a causé deux blockers répétés pendant la
+    refonte search. Le hook defense-in-depth a un comportement
+    nucléaire (revert TOUS les permits sur tampering détecté)
+    plutôt que sélectif. Plusieurs RFCs candidats sont identifiés
+    pour réduire ces frictions.
+
+    Côté futur, plusieurs sujets candidats à formaliser : un tool
+    MCP `rfc_set_implemented(id)` pour éviter les permits ad-hoc à
+    chaque clôture de RFC, un mécanisme de migration de schéma SQL
+    plus robuste, et l'investigation des autres bugs latents
+    similaires au file watcher (par exemple le `db.rs` ALTER TABLE
+    ordering qui a déjà été fixé en hotfix mais qui est typique
+    d'une classe de bugs schema-migration à anticiper).
+
+    Le PM met à jour cette roadmap au fil de l'eau quand un item
+    change d'état. Pas de bot, pas de synchronisation automatique.
+    Le status d'un item ici est la vérité que le PM affirme à
+    l'instant t, pas une lecture en temps réel de l'artifact source.
+
+  items:
+    # PAST - chantiers structurels majeurs livrés
+
+    - key: proxy-resilient
+      title: "Proxy MCP résilient aux restarts du binaire"
+      ref:
+        type: rfc
+        id: d9399863-254e-42f5-a485-ea019ce56a93
+      timeframe: past
+      status: done
+      target_date: "2026-Q2"
+      rationale: >
+        Première fondation de la résilience opérationnelle. Sans ce
+        RFC, un simple cargo build pendant une session opencode
+        cassait la connexion MCP de manière irrécupérable. Tous les
+        chantiers infra suivants en dépendent.
+
+    - key: db-resilience
+      title: "Résilience persistence SQLite orchestrator (4 piliers)"
+      ref:
+        type: rfc
+        id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      timeframe: past
+      status: done
+      target_date: "2026-Q2"
+      depends_on: [proxy-resilient]
+      rationale: >
+        Le proxy résilient envoyait SIGKILL au binaire en cas de
+        timeout, ce qui a fait apparaître une classe de corruptions
+        SQLite jamais vue avant. Les 4 piliers (file lock POSIX,
+        PRAGMA défensifs, graceful shutdown, autorepair PILIER D)
+        ferment cette classe de bugs.
+
+    - key: memory-lookup-rule
+      title: "Lookup mémoire obligatoire et lessons systématiques"
+      ref:
+        type: rfc
+        id: f4fe8a04-b654-42a1-b055-bf0b991bbb3a
+      timeframe: past
+      status: done
+      rationale: >
+        Pose la règle que tous les agents doivent consulter la
+        mémoire collective avant chaque artifact et capitaliser
+        après. Règle indispensable mais qui n'avait de sens que si
+        search() marchait. Le sujet search a donc immédiatement
+        suivi.
+
+    - key: roadmap-kind
+      title: "Introduction du kind roadmap"
+      ref:
+        type: rfc
+        id: a49801aa-911e-45d7-95a3-b21d6ea2bd2d
+      timeframe: past
+      status: done
+      target_date: "2026-Q2"
+      rationale: >
+        Schéma JSON + extension de l'enum ArtifactKind Rust + mise à
+        jour des personas. Permet au PM de tracker les sujets.
+
+    - key: roadmap-tooling
+      title: "Outillage MCP list_roadmaps + summarize_roadmap"
+      ref:
+        type: rfc
+        id: 3cd72740-1424-46ac-8ee6-96f714f3fa94
+      timeframe: past
+      status: done
+      target_date: "2026-Q2"
+      depends_on: [roadmap-kind]
+      rationale: >
+        Donne au PM les tools MCP pour répondre vite à "où en sont
+        mes sujets ?" sans parcourir company/roadmaps/ à la main.
+        Ce qui rend la présente roadmap utilisable au lieu d'être
+        un document statique.
+
+    - key: hybrid-search
+      title: "Refonte search() en hybrid retrieval (BM25 + embeddings + RRF)"
+      ref:
+        type: rfc
+        id: bdee1af4-4944-4bee-b7c0-18efd6c7961f
+      timeframe: past
+      status: done
+      target_date: "2026-Q2"
+      depends_on: [memory-lookup-rule, db-resilience]
+      rationale: >
+        Sans cette refonte, search() retournait massivement zéro
+        résultat sur des queries pertinentes. La règle
+        memory_lookup_before_acting était une promesse non tenue.
+        Recall@10 mesuré à 0.895, p95 < 5ms. Sept queries de
+        référence dont 3/3 du symptôme initial passent.
+
+    - key: file-watcher-fix
+      title: "Fix file watcher disjoint capture Rust edition 2024"
+      ref:
+        type: rfc
+        id: 062ebaa8-8876-42e4-b1a7-8ed3655238e2
+      timeframe: past
+      status: done
+      target_date: "2026-Q2"
+      depends_on: [hybrid-search]
+      rationale: >
+        Bug critique découvert après la refonte search : le watcher
+        tokio mourait silencieusement au boot à cause d'un piège
+        edition 2024 (champ _watcher préfixé underscore non
+        capturé par async move). Newtype WatcherGuard avec Drop
+        conditionnel + extension à projects/ + test de régression.
+        Sans ce fix, toute écriture YAML pendant une session était
+        ignorée par l'index, dégradant silencieusement la mémoire.
+
+    # PRESENT - chantiers en cours ou à enchaîner immédiatement
+
+    - key: db-schema-migration-hotfix
+      title: "Hotfix ordre CREATE INDEX vs ALTER TABLE (db.rs)"
+      ref:
+        type: external
+        label: "Hotfix appliqué hors RFC (commit 57019e7), à généraliser comme pattern migration"
+      timeframe: present
+      status: done
+      rationale: >
+        Bug d'ordre SQL dans db.rs : les CREATE INDEX sur les
+        colonnes ajoutées par ALTER TABLE étaient exécutés AVANT
+        les ALTER TABLE eux-mêmes, crashant la migration sur toute
+        DB pré-existante. Hotfix appliqué chirurgicalement, test
+        de régression ajouté. Le sujet général "comment éviter
+        cette classe de bugs schema-migration à l'avenir" reste
+        ouvert (cf. future schema-migration-discipline).
+
+    # FUTURE - candidats identifiés à formaliser en RFC
+
+    - key: atomic-grant-permit
+      title: "Rendre grant_write_permit + scellement DB atomique côté MCP"
+      ref:
+        type: external
+        label: "Pattern identifié dans lessons 600307a4 et ea6e9dd1, candidat RFC"
+      timeframe: future
+      status: planned
+      rationale: >
+        Le pattern actuel (CEO grant via MCP, puis PM commit la DB
+        séparément en git) crée une fenêtre où le permit existe en
+        mémoire SQLite mais pas en HEAD git. Le hook
+        defense-in-depth peut wiper le permit pendant cette
+        fenêtre. Trois occurrences observées pendant la session
+        refonte search. Solution candidate : le tool MCP
+        grant_write_permit fait lui-même le commit git ou expose
+        un seal_permit(id) couplé. Priorité moyenne (workaround
+        connu, mais frictionnel).
+
+    - key: rfc-set-implemented-tool
+      title: "Tool MCP rfc_set_implemented(id) pour clore les RFCs sans permit ad-hoc"
+      ref:
+        type: external
+        label: "Pattern identifié dans lessons 600307a4 et ea6e9dd1, candidat RFC"
+      timeframe: future
+      status: planned
+      rationale: >
+        Aujourd'hui, passer un RFC à status: implemented nécessite
+        d'éditer le YAML, ce qui demande un write permit sur
+        company/rfcs/ alors que c'est une opération
+        administrative légitime. Un tool MCP dédié qui contourne
+        le permit (comme close_round_with_rfc_update le fait déjà
+        pour approved) serait cohérent et évite le grant ad-hoc à
+        chaque clôture.
+
+    - key: defense-in-depth-selective
+      title: "Hook defense-in-depth selective revert (vs nuclear actuel)"
+      ref:
+        type: external
+        label: "Pattern identifié dans blockers répétés sur RFC bdee1af4, candidat RFC"
+      timeframe: future
+      status: planned
+      rationale: >
+        Le hook revert TOUS les permits dès qu'il en détecte un
+        non snapshotté, plutôt que de cibler uniquement le ou les
+        permits suspects. Comportement nucléaire qui amplifie le
+        coût des incidents (deux blockers documentés sur la
+        refonte search à cause de ça). RFC candidat pour rendre le
+        revert sélectif.
+
+    - key: rfc-affected-files-categorize
+      title: "RFC schema : distinguer affected_files.modified vs created"
+      ref:
+        type: external
+        label: "Note CEO sur la refonte search, candidat RFC schema"
+      timeframe: future
+      status: planned
+      rationale: >
+        Le pattern actuel "affected_files" liste tout sans
+        distinguer les fichiers à modifier (déjà existants) des
+        fichiers à créer (nouveaux). Deux blockers permits
+        documentés à cause de ça (Cargo.toml et types.rs oubliés
+        sur le RFC bdee1af4). Une catégorisation explicite dans
+        le schema RFC réduit cette classe d'oublis.
+
+    - key: schema-migration-discipline
+      title: "Discipline de migration de schéma SQL côté orchestrator"
+      ref:
+        type: external
+        label: "Pattern identifié post-hotfix db.rs, candidat task-request ou RFC"
+      timeframe: future
+      status: planned
+      rationale: >
+        Le hotfix sur db.rs (CREATE INDEX après ALTER TABLE) est
+        symptomatique d'une absence de discipline générale sur les
+        migrations SQL. Pas de mécanisme de versionning de schéma,
+        pas de tests qui exercent toutes les transitions (DB
+        vierge, DB legacy v1, DB legacy v2, etc.). Investigation
+        pour formaliser une approche : table schema_version,
+        migrations idempotentes, tests de transition.
+
+    - key: api-callers-discoverability
+      title: "Discipline 'lister les callers avant changer une signature d'API'"
+      ref:
+        type: external
+        label: "Lesson ea6e9dd1, formaliser comme checklist plan ou via tooling LSP"
+      timeframe: future
+      status: planned
+      rationale: >
+        Deux occurrences observées de callers oubliés dans un RFC
+        (types.rs côté refonte search, yaml/src/main.rs côté
+        watcher fix), causant chaque fois un cycle d'extension
+        permit. Ajouter une étape 0.x obligatoire dans tout
+        implementation-plan qui change une signature d'API
+        publique de crate : grep / get_references LSP exhaustif
+        des callers, validation par l'Architect au review du
+        plan.
+
+    - key: backup-strategy
+      title: "Stratégie de sauvegarde mémoire collective"
+      ref:
+        type: external
+        label: "Sujet jamais ouvert formellement, à scoper"
+      timeframe: future
+      status: planned
+      rationale: >
+        Les YAML sont la source de vérité (PILIER D du RFC
+        cdbfee72), versionnés en git. Mais le repo git lui-même
+        est sur un seul disque local. Aucune réplication, aucun
+        backup hors-machine. Pour un système qui mémorise toute
+        la connaissance organisationnelle, c'est un risque non
+        adressé. Scope à définir : backup git remote ? snapshot
+        de la DB SQLite ? les deux ?
