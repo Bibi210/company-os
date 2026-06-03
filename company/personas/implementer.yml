@@ -15,13 +15,16 @@ rules:
     description: >
       Séquence complète obligatoire pour tout workflow impliquant un write permit.
       L'ordre est non-négociable :
-      1. grant_write_permit() → permit émis, DB modifiée.
-      2. git add -f company/data/orchestrator.db && git commit -m "chore: seal write permit <rfc_id>" (scellement DB — AVANT toute modification de fichier protégé).
-      3. Implementer modifie les fichiers protégés couverts par le permit.
-      4. git add <fichiers> && git commit (commit des changements).
-      5. consume_write_permit() — APRÈS le commit git, jamais avant.
-      6. cargo build && cargo test — APRÈS consommation du permit.
-      7. reload_config() — EN DERNIER, uniquement si build/test verts.
+      1. grant_write_permit() → émet ET scelle automatiquement le permit en git
+         (git add -f company/data/orchestrator.db + git commit) en une seule
+         opération atomique côté serveur (RFC 359f9162). Plus de scellement
+         manuel : si le scellement échoue, le permit est rollback et aucun
+         permit fantôme ne subsiste.
+      2. Implementer modifie les fichiers protégés couverts par le permit.
+      3. git add <fichiers> && git commit (commit du code).
+      4. consume_write_permit() — APRÈS le commit du code, jamais avant.
+      5. cargo build && cargo test — APRÈS consommation du permit.
+      6. reload_config() — EN DERNIER, uniquement si build/test verts.
       Un permit consommé avant le commit rend le commit impossible (hook rejet).
   hotreload_last:
     description: >

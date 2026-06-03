@@ -250,12 +250,205 @@ struct SummarizeRoadmapParams {
     domain: Option<String>,
 }
 
+/// Failure causes for the atomic DB seal performed by
+/// [`OrchestratorServer::seal_db_commit`] (RFC 359f9162, decision CEO 1).
+/// Each variant maps to a distinct MCP diagnostic reason so the CEO can
+/// tell *why* a grant could not be materialized on disk.
+#[derive(Debug)]
+enum SealError {
+    /// The `git` binary could not be spawned (absent from PATH, etc.).
+    GitNotFound,
+    /// `git add`/`commit` failed because the index is locked by another
+    /// process (`.git/index.lock` present).
+    IndexLocked,
+    /// `git commit` reported "nothing to commit" — the working tree was
+    /// already clean. Interpreted by the caller depending on context.
+    NothingToCommit,
+    /// Any other git failure; carries the captured stderr for diagnosis.
+    GitFailed { stderr: String },
+}
+
+impl SealError {
+    /// Human-readable cause used as the MCP diagnostic reason.
+    fn diagnostic_reason(&self) -> String {
+        match self {
+            Self::GitNotFound => {
+                "git binary not found — the orchestrator server cannot seal the permit on disk \
+                 (git is a hard prerequisite, see RFC 359f9162)"
+                    .to_string()
+            }
+            Self::IndexLocked => {
+                "git index is locked by another process (.git/index.lock present) — retry once \
+                 the other git operation completes"
+                    .to_string()
+            }
+            Self::NothingToCommit => {
+                "git reported nothing to commit — the DB on disk was unexpectedly identical to \
+                 HEAD after inserting the permit"
+                    .to_string()
+            }
+            Self::GitFailed { stderr } => {
+                format!("git command failed while sealing the permit: {stderr}")
+            }
+        }
+    }
+}
+
+/// Detect a git index-lock failure from a captured stderr. Matches both
+/// the "index.lock" filename and the "Unable to create ... .lock"
+/// phrasing git emits when another process holds the lock.
+fn is_index_locked(stderr: &str) -> bool {
+    stderr.contains("index.lock")
+        || (stderr.contains("Unable to create") && stderr.contains(".lock"))
+}
+
+/// Detect a "nothing to commit" outcome from a git commit output (locale
+/// forced to C by the caller). Covers the clean-tree phrasing as well as
+/// the "no/nothing changes added to commit" phrasing git uses when only
+/// untracked files (e.g. the -wal/-shm sidecars) are present.
+fn is_nothing_to_commit(out: &str) -> bool {
+    out.contains("nothing to commit")
+        || out.contains("no changes added to commit")
+        || out.contains("nothing added to commit")
+}
+
+/// Serialize a permit into the MCP response JSON, optionally adding the
+/// additive `sealed_commit` field (RFC 359f9162). Backwards-compatible:
+/// every original permit field is preserved; `sealed_commit` is the only
+/// addition when present.
+fn permit_response_json(
+    permit: &companyos_orchestrator::WritePermit,
+    sealed_commit: Option<&str>,
+) -> String {
+    let mut value = serde_json::to_value(permit).unwrap_or(serde_json::Value::Null);
+    if let (Some(hash), serde_json::Value::Object(map)) = (sealed_commit, &mut value) {
+        map.insert(
+            "sealed_commit".to_string(),
+            serde_json::Value::String(hash.to_string()),
+        );
+    }
+    serde_json::to_string_pretty(&value).unwrap_or_default()
+}
+
+/// Best-effort rollback of a freshly-inserted permit. Logs (eprintln) on
+/// failure but never panics — the defense-in-depth hook is the backstop.
+fn rollback_permit(engine: &OrchestratorEngine, permit_id: Uuid, context: &str) {
+    if let Err(e) = engine.delete_permit(permit_id) {
+        eprintln!(
+            "[orchestrator] WARNING: rollback (delete_permit) failed for permit {permit_id} \
+             after {context}: {e}"
+        );
+    }
+}
+
 fn ok(json: String) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![Content::text(json)]))
 }
 
 fn err(msg: String) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::error(vec![Content::text(msg)]))
+}
+
+impl OrchestratorServer {
+    /// Atomically seal the orchestrator DB into git after a permit
+    /// insert (RFC 359f9162). Runs `git add -f` strictly scoped to the
+    /// single `.db` file (NEVER `git add -A`, which would leave the
+    /// VOLATILE class of the defense-in-depth hook), then `git commit`,
+    /// and returns the resulting commit hash on success. Distinguishes
+    /// failure causes via [`SealError`] so the caller can rollback and
+    /// surface a precise diagnostic.
+    fn seal_db_commit(&self, permit_id: Uuid, rfc_id: Uuid) -> Result<String, SealError> {
+        use std::process::Command;
+
+        // Path of the DB *relative to the repo root* — the literal,
+        // strictly-scoped target. constants::DATA_DIR already includes
+        // the "company/data" prefix.
+        let db_rel_path = format!("{}/{}", constants::DATA_DIR, constants::DB_FILENAME);
+
+        // Force the C locale on every git invocation so the stdout/stderr
+        // markers we match on ("nothing to commit", "index.lock", …) are
+        // stable English regardless of the server's configured locale
+        // (the environment here defaults to French, which silently broke
+        // the NothingToCommit detection).
+        let git = || {
+            let mut c = Command::new("git");
+            c.current_dir(&self.root_path)
+                .env("LC_ALL", "C")
+                .env("LANG", "C");
+            c
+        };
+
+        // (1) git add -f <db>
+        let add = git().args(["add", "-f", &db_rel_path]).output();
+        let add = match add {
+            Ok(o) => o,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(SealError::GitNotFound);
+            }
+            Err(e) => {
+                return Err(SealError::GitFailed {
+                    stderr: format!("git add spawn failed: {e}"),
+                });
+            }
+        };
+        if !add.status.success() {
+            let stderr = String::from_utf8_lossy(&add.stderr).to_string();
+            if is_index_locked(&stderr) {
+                return Err(SealError::IndexLocked);
+            }
+            return Err(SealError::GitFailed { stderr });
+        }
+
+        // (2) git commit -m "chore: seal write permit <id> for RFC <rfc>"
+        let msg = format!("chore: seal write permit {permit_id} for RFC {rfc_id}");
+        let commit = git().args(["commit", "-m", &msg]).output();
+        let commit = match commit {
+            Ok(o) => o,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(SealError::GitNotFound);
+            }
+            Err(e) => {
+                return Err(SealError::GitFailed {
+                    stderr: format!("git commit spawn failed: {e}"),
+                });
+            }
+        };
+        if !commit.status.success() {
+            let stdout = String::from_utf8_lossy(&commit.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&commit.stderr).to_string();
+            if is_index_locked(&stderr) {
+                return Err(SealError::IndexLocked);
+            }
+            // git emits one of several locale-C phrasings when there is
+            // nothing staged: "nothing to commit" (clean tree),
+            // "no changes added to commit" / "nothing added to commit"
+            // (untracked files present — e.g. the -wal/-shm sidecars).
+            if is_nothing_to_commit(&stdout) || is_nothing_to_commit(&stderr) {
+                return Err(SealError::NothingToCommit);
+            }
+            return Err(SealError::GitFailed { stderr });
+        }
+
+        // (3) git rev-parse HEAD → commit hash
+        let rev = git().args(["rev-parse", "HEAD"]).output();
+        let rev = match rev {
+            Ok(o) => o,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(SealError::GitNotFound);
+            }
+            Err(e) => {
+                return Err(SealError::GitFailed {
+                    stderr: format!("git rev-parse spawn failed: {e}"),
+                });
+            }
+        };
+        if !rev.status.success() {
+            return Err(SealError::GitFailed {
+                stderr: String::from_utf8_lossy(&rev.stderr).to_string(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&rev.stdout).trim().to_string())
+    }
 }
 
 #[tool_router]
@@ -436,14 +629,117 @@ impl OrchestratorServer {
                 .with_fix("The CEO must call authenticate(persona='ceo') first, then pass the token here")
                 .to_string());
         }
+        // Hold the engine lock across the WHOLE sequence — idempotency
+        // lookup, grant, WAL checkpoint, git seal, and any rollback — so
+        // concurrent grants AND their git commits are serialized under a
+        // single mutex (edge f, RFC 359f9162).
         let engine = self.engine.lock().await;
-        match engine.grant_permit(params.rfc_id, params.granted_to, params.target_paths) {
-            Ok(permit) => ok(serde_json::to_string_pretty(&permit).unwrap_or_default()),
-            Err(e) => err(Diagnostic::error(C, "Failed to grant write permit")
+
+        // (a) IDEMPOTENCE (decision CEO 3): replaying the same grant key
+        //     (rfc_id + granted_to + normalized target_paths) returns the
+        //     existing active permit instead of creating a duplicate.
+        match engine.find_permit_by_grant(params.rfc_id, &params.granted_to, &params.target_paths) {
+            Ok(Some(existing)) => {
+                // Permit already exists and is active. Re-seal defensively:
+                // it should already be in HEAD, so NothingToCommit is the
+                // expected success path here.
+                match self.seal_db_commit(existing.id, params.rfc_id) {
+                    Ok(hash) => return ok(permit_response_json(&existing, Some(&hash))),
+                    Err(SealError::NothingToCommit) => {
+                        return ok(permit_response_json(&existing, None));
+                    }
+                    Err(seal_err) => {
+                        // Do NOT rollback — the existing permit predates
+                        // this call and must survive. Surface the cause.
+                        return err(Diagnostic::error(
+                            C,
+                            "Existing permit found but re-seal failed",
+                        )
+                        .with_context(format!(
+                            "grant_write_permit(rfc_id={}) [idempotent replay]",
+                            params.rfc_id
+                        ))
+                        .with_reason(seal_err.diagnostic_reason())
+                        .with_fix(
+                            "The permit already exists; resolve the git issue then retry. No \
+                             duplicate was created.",
+                        )
+                        .to_string());
+                    }
+                }
+            }
+            Ok(None) => { /* fall through to the new grant */ }
+            Err(e) => {
+                return err(Diagnostic::error(C, "Idempotency lookup failed")
+                    .with_context(format!("grant_write_permit(rfc_id={})", params.rfc_id))
+                    .with_reason(format!("{e}"))
+                    .with_fix("Check database connectivity and DB integrity")
+                    .to_string());
+            }
+        }
+
+        // (b) GRANT: insert the new permit.
+        let permit =
+            match engine.grant_permit(params.rfc_id, params.granted_to, params.target_paths) {
+                Ok(p) => p,
+                Err(e) => {
+                    return err(Diagnostic::error(C, "Failed to grant write permit")
+                        .with_context(format!("grant_write_permit(rfc_id={})", params.rfc_id))
+                        .with_reason(format!("{e}"))
+                        .with_fix(
+                            "Only the CEO can grant permits. Ensure an approved RFC exists first",
+                        )
+                        .to_string());
+                }
+            };
+
+        // (c) CHECKPOINT WAL (edge h): flush the WAL into the .db on disk
+        //     BEFORE git add, so the committed file actually contains the
+        //     freshly-inserted permit. On failure: rollback + error.
+        if let Err(e) = engine.checkpoint_truncate() {
+            rollback_permit(&engine, permit.id, "checkpoint failed");
+            return err(Diagnostic::error(C, "WAL checkpoint failed before seal")
                 .with_context(format!("grant_write_permit(rfc_id={})", params.rfc_id))
                 .with_reason(format!("{e}"))
-                .with_fix("Only the CEO can grant permits. Ensure an approved RFC exists first")
-                .to_string()),
+                .with_fix("Check DB integrity; the permit was rolled back, retry the grant")
+                .to_string());
+        }
+
+        // (d) SEAL: git add -f <db> + git commit.
+        match self.seal_db_commit(permit.id, params.rfc_id) {
+            Ok(hash) => ok(permit_response_json(&permit, Some(&hash))),
+            Err(seal_err) => {
+                // (d') A brand-new grant that yields NothingToCommit is an
+                //      anomaly: the insert did not materialize on disk.
+                //      Treat like any seal failure → rollback + error.
+                let reason = seal_err.diagnostic_reason();
+                let rollback_note = match engine.delete_permit(permit.id) {
+                    Ok(()) => String::new(),
+                    Err(re) => {
+                        // (e) edge d: rollback itself failed. Log and
+                        //     surface a double error; do not panic.
+                        eprintln!(
+                            "[orchestrator] CRITICAL: seal failed AND rollback failed for permit \
+                             {} (rfc {}): seal={reason} rollback={re}",
+                            permit.id, params.rfc_id
+                        );
+                        format!(
+                            " ADDITIONALLY the rollback (delete_permit) failed: {re} — a \
+                             non-sealed permit may remain in the DB (will be handled by the \
+                             defense-in-depth hook)."
+                        )
+                    }
+                };
+                err(Diagnostic::error(C, "Failed to seal write permit on disk")
+                    .with_context(format!("grant_write_permit(rfc_id={})", params.rfc_id))
+                    .with_reason(format!("{reason}{rollback_note}"))
+                    .with_fix(
+                        "git is a hard prerequisite. Resolve the git issue (binary present, \
+                         index unlocked) then retry. The permit was rolled back unless noted \
+                         otherwise above.",
+                    )
+                    .to_string())
+            }
         }
     }
 
@@ -1372,4 +1668,363 @@ async fn run_server() -> anyhow::Result<()> {
     // (4) Drop the engine + lock_guard happens at scope exit.
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use companyos_orchestrator::{OrchestratorDb, OrchestratorEngine, PathPattern};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// RAII tempdir for tests (lesson f3fc4a5d: a 10-line struct beats a
+    /// tempfile dev-dependency). Removed on drop.
+    struct LocalTempDir {
+        path: PathBuf,
+    }
+
+    impl LocalTempDir {
+        fn new(prefix: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&path).expect("create_dir_all");
+            Self { path }
+        }
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for LocalTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .expect("git spawn");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Initialize a git repo at `root` with a committed README so that
+    /// the working tree has a HEAD to compare against.
+    fn init_git_repo(root: &Path) {
+        git(root, &["init", "-q"]);
+        git(root, &["config", "user.email", "test@companyos.local"]);
+        git(root, &["config", "user.name", "Test"]);
+        std::fs::write(root.join("README.md"), "test\n").unwrap();
+        git(root, &["add", "README.md"]);
+        git(root, &["commit", "-q", "-m", "init"]);
+    }
+
+    /// Build a test server rooted at `root`, with an on-disk DB at
+    /// company/data/orchestrator.db and the CEO already authenticated.
+    /// Returns (server, ceo_token).
+    async fn setup_server(root: &Path) -> (OrchestratorServer, String) {
+        let db_dir = root.join(constants::DATA_DIR);
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db_path = db_dir.join(constants::DB_FILENAME);
+        let db = OrchestratorDb::open(&db_path).unwrap();
+        db.migrate().unwrap();
+        let engine = OrchestratorEngine::new_without_embedder(db, 3);
+        // Validator points at an empty schemas dir (never exercised by the
+        // permit path).
+        let registry = SchemaRegistry::load(root.join("no-schemas")).unwrap();
+        let validator = ArtifactValidator::new(registry);
+        let server = OrchestratorServer::new(
+            Arc::new(Mutex::new(engine)),
+            Arc::new(RwLock::new(validator)),
+            root.to_string_lossy().to_string(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let token = server.tokens.authenticate("ceo").await;
+        (server, token)
+    }
+
+    fn result_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .unwrap_or_default()
+    }
+
+    fn grant_params(token: &str, rfc: Uuid, paths: Vec<&str>) -> Parameters<GrantPermitParams> {
+        Parameters(GrantPermitParams {
+            token: token.to_string(),
+            rfc_id: rfc,
+            granted_to: PersonaId::Implementer,
+            target_paths: paths.into_iter().map(|p| PathPattern(p.into())).collect(),
+        })
+    }
+
+    // --- seal_db_commit unit tests (étape 4) ---
+
+    #[test]
+    fn test_seal_db_commit_ok_returns_hash() {
+        let tmp = LocalTempDir::new("seal-ok");
+        init_git_repo(tmp.path());
+        let db_dir = tmp.path().join(constants::DATA_DIR);
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::write(db_dir.join(constants::DB_FILENAME), b"fakedb").unwrap();
+
+        let server = OrchestratorServer::new(
+            Arc::new(Mutex::new(OrchestratorEngine::new_without_embedder(
+                OrchestratorDb::open_in_memory().unwrap(),
+                3,
+            ))),
+            Arc::new(RwLock::new(ArtifactValidator::new(
+                SchemaRegistry::load(tmp.path().join("none")).unwrap(),
+            ))),
+            tmp.path().to_string_lossy().to_string(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let hash = server
+            .seal_db_commit(Uuid::new_v4(), Uuid::new_v4())
+            .expect("seal should succeed");
+        assert_eq!(hash.len(), 40, "expected a 40-char git sha, got '{hash}'");
+
+        // The commit must touch ONLY the .db file (VOLATILE class).
+        let stat = Command::new("git")
+            .current_dir(tmp.path())
+            .args(["show", "--stat", "--name-only", "--format=", "HEAD"])
+            .output()
+            .unwrap();
+        let files = String::from_utf8_lossy(&stat.stdout);
+        assert!(
+            files.contains("orchestrator.db"),
+            "commit should include the db: {files}"
+        );
+        assert!(
+            !files.contains("README"),
+            "commit must NOT touch other files: {files}"
+        );
+    }
+
+    #[test]
+    fn test_seal_db_commit_no_git_repo_errors() {
+        let tmp = LocalTempDir::new("seal-nogit");
+        // No git init → not a repo.
+        let db_dir = tmp.path().join(constants::DATA_DIR);
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::write(db_dir.join(constants::DB_FILENAME), b"fakedb").unwrap();
+
+        let server = OrchestratorServer::new(
+            Arc::new(Mutex::new(OrchestratorEngine::new_without_embedder(
+                OrchestratorDb::open_in_memory().unwrap(),
+                3,
+            ))),
+            Arc::new(RwLock::new(ArtifactValidator::new(
+                SchemaRegistry::load(tmp.path().join("none")).unwrap(),
+            ))),
+            tmp.path().to_string_lossy().to_string(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let res = server.seal_db_commit(Uuid::new_v4(), Uuid::new_v4());
+        assert!(res.is_err(), "sealing outside a git repo must fail");
+    }
+
+    #[test]
+    fn test_is_index_locked_matches() {
+        assert!(is_index_locked(
+            "fatal: Unable to create '/x/.git/index.lock': File exists."
+        ));
+        assert!(is_index_locked("another error mentioning index.lock here"));
+        assert!(!is_index_locked("some unrelated git error"));
+    }
+
+    // --- grant_write_permit orchestration tests (étapes 5 & 7) ---
+
+    // T1 (nominal): new grant → permit inserted, sealed, response carries
+    // sealed_commit; commit touches only the .db.
+    #[tokio::test]
+    async fn test_grant_write_permit_nominal_seals() {
+        let tmp = LocalTempDir::new("grant-nominal");
+        init_git_repo(tmp.path());
+        let (server, token) = setup_server(tmp.path()).await;
+        let rfc = Uuid::new_v4();
+
+        let res = server
+            .grant_write_permit(grant_params(&token, rfc, vec!["crates/x/src/a.rs"]))
+            .await
+            .unwrap();
+        assert_ne!(
+            res.is_error,
+            Some(true),
+            "grant should succeed: {}",
+            result_text(&res)
+        );
+
+        let text = result_text(&res);
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            value
+                .get("sealed_commit")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "response must carry sealed_commit: {text}"
+        );
+
+        // T2: the permit is active right after the grant.
+        let permit_id = Uuid::parse_str(value.get("id").unwrap().as_str().unwrap()).unwrap();
+        let engine = server.engine.lock().await;
+        let fetched = engine
+            .check_permit(PersonaId::Implementer, "crates/x/src/a.rs")
+            .unwrap();
+        assert!(fetched.is_some(), "permit must be active after grant");
+        assert_eq!(fetched.unwrap().id, permit_id);
+        drop(engine);
+
+        // The seal commit must touch ONLY the .db.
+        let stat = Command::new("git")
+            .current_dir(tmp.path())
+            .args(["show", "--stat", "--name-only", "--format=", "HEAD"])
+            .output()
+            .unwrap();
+        let files = String::from_utf8_lossy(&stat.stdout);
+        assert!(
+            files.contains("orchestrator.db"),
+            "seal must commit the db: {files}"
+        );
+        assert!(
+            !files.contains("README"),
+            "seal must not touch other files: {files}"
+        );
+    }
+
+    // T3 (negative): seal fails (no git repo) → permit rolled back + error.
+    #[tokio::test]
+    async fn test_grant_write_permit_seal_failure_rolls_back() {
+        let tmp = LocalTempDir::new("grant-nogit");
+        // No git init.
+        let (server, token) = setup_server(tmp.path()).await;
+        let rfc = Uuid::new_v4();
+
+        let res = server
+            .grant_write_permit(grant_params(&token, rfc, vec!["crates/x/src/a.rs"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.is_error,
+            Some(true),
+            "grant must fail without a git repo"
+        );
+
+        // No permit must remain (rolled back).
+        let engine = server.engine.lock().await;
+        let still = engine
+            .find_permit_by_grant(
+                rfc,
+                &PersonaId::Implementer,
+                &[PathPattern("crates/x/src/a.rs".into())],
+            )
+            .unwrap();
+        assert!(
+            still.is_none(),
+            "failed seal must roll back the permit (T3)"
+        );
+    }
+
+    // T5 (edge/idempotence): replaying the same grant (reversed path order)
+    // returns the SAME permit, no duplicate.
+    #[tokio::test]
+    async fn test_grant_write_permit_idempotent_replay() {
+        let tmp = LocalTempDir::new("grant-idem");
+        init_git_repo(tmp.path());
+        let (server, token) = setup_server(tmp.path()).await;
+        let rfc = Uuid::new_v4();
+
+        let r1 = server
+            .grant_write_permit(grant_params(&token, rfc, vec!["a.rs", "b.rs"]))
+            .await
+            .unwrap();
+        let v1: serde_json::Value = serde_json::from_str(&result_text(&r1)).unwrap();
+        let id1 = v1.get("id").unwrap().as_str().unwrap().to_string();
+
+        // Replay with reversed path order.
+        let r2 = server
+            .grant_write_permit(grant_params(&token, rfc, vec!["b.rs", "a.rs"]))
+            .await
+            .unwrap();
+        assert_ne!(
+            r2.is_error,
+            Some(true),
+            "replay should succeed: {}",
+            result_text(&r2)
+        );
+        let v2: serde_json::Value = serde_json::from_str(&result_text(&r2)).unwrap();
+        let id2 = v2.get("id").unwrap().as_str().unwrap().to_string();
+
+        assert_eq!(id1, id2, "idempotent replay must return the same permit id");
+
+        // Exactly one permit in the DB.
+        let engine = server.engine.lock().await;
+        let snap = engine.snapshot_permits().unwrap();
+        let count = snap.split('|').next().unwrap();
+        assert_eq!(
+            count, "1",
+            "replay must not create a duplicate (snapshot={snap})"
+        );
+    }
+
+    // T6 (edge): granting a second distinct permit does not remove the
+    // first; a later rollback only touches the targeted id.
+    #[tokio::test]
+    async fn test_grant_write_permit_coexisting_permits() {
+        let tmp = LocalTempDir::new("grant-coexist");
+        init_git_repo(tmp.path());
+        let (server, token) = setup_server(tmp.path()).await;
+
+        let rfc_a = Uuid::new_v4();
+        let rfc_b = Uuid::new_v4();
+        server
+            .grant_write_permit(grant_params(&token, rfc_a, vec!["a.rs"]))
+            .await
+            .unwrap();
+        server
+            .grant_write_permit(grant_params(&token, rfc_b, vec!["b.rs"]))
+            .await
+            .unwrap();
+
+        let engine = server.engine.lock().await;
+        let snap = engine.snapshot_permits().unwrap();
+        let count = snap.split('|').next().unwrap();
+        assert_eq!(count, "2", "both permits must coexist (edge e): {snap}");
+    }
+
+    // T8 (regression, lesson 8fd49300): the permit stays 'active' after
+    // grant+seal — the auto-commit must NOT consume it (consume-last
+    // invariant preserved).
+    #[tokio::test]
+    async fn test_grant_does_not_consume_permit() {
+        let tmp = LocalTempDir::new("grant-active");
+        init_git_repo(tmp.path());
+        let (server, token) = setup_server(tmp.path()).await;
+        let rfc = Uuid::new_v4();
+
+        let res = server
+            .grant_write_permit(grant_params(&token, rfc, vec!["a.rs"]))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        assert_eq!(
+            v.get("status").unwrap().as_str().unwrap(),
+            "active",
+            "grant+seal must leave the permit active (T8, consume-last)"
+        );
+        assert!(
+            v.get("consumed_at").map(|c| c.is_null()).unwrap_or(true),
+            "permit must not be consumed by the grant"
+        );
+    }
 }

@@ -620,6 +620,75 @@ impl OrchestratorDb {
         Ok(())
     }
 
+    /// Delete a single permit by id. Used for the targeted rollback of a
+    /// freshly-inserted permit when the atomic seal (checkpoint + git
+    /// commit) fails in `grant_write_permit` (RFC 359f9162). Only ever
+    /// touches the one row identified by `id`, so the rollback of one
+    /// grant never collaterally wipes other active permits (edge e).
+    /// Returns `Ok(())` even when no row matched (defensively idempotent).
+    pub fn delete_permit(&self, id: Uuid) -> Result<(), OrchestratorError> {
+        self.conn.execute(
+            "DELETE FROM write_permits WHERE id = ?1",
+            params![id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Idempotency lookup for `grant_write_permit` (RFC 359f9162,
+    /// decision CEO 3). Returns the first **active** permit whose
+    /// `(rfc_id, granted_to)` match and whose `target_paths` form the
+    /// same normalized set (order-insensitive, deduplicated) as the
+    /// requested paths. A consumed or revoked permit never matches, so a
+    /// legitimate new grant after consumption is not short-circuited.
+    /// Returns `None` when no active permit matches the grant key.
+    pub fn find_permit_by_grant(
+        &self,
+        rfc_id: Uuid,
+        granted_to: &PersonaId,
+        target_paths: &[PathPattern],
+    ) -> Result<Option<WritePermit>, OrchestratorError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, rfc_id, granted_to, target_paths, status, granted_by, granted_at, consumed_at \
+             FROM write_permits WHERE rfc_id = ?1 AND granted_to = ?2 AND status = ?3",
+        )?;
+
+        let rows: Vec<PermitRow> = stmt
+            .query_map(
+                params![
+                    rfc_id.to_string(),
+                    granted_to.as_str(),
+                    PermitStatus::Active.to_string(),
+                ],
+                |row| {
+                    Ok(PermitRow {
+                        id: row.get(0)?,
+                        rfc_id: row.get(1)?,
+                        granted_to: row.get(2)?,
+                        target_paths: row.get(3)?,
+                        status: row.get(4)?,
+                        granted_by: row.get(5)?,
+                        granted_at: row.get(6)?,
+                        consumed_at: row.get(7)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Normalize the requested paths into a sorted, deduplicated set so
+        // that the order of paths in the request JSON never breaks
+        // idempotence (the semantic key is the *set* of paths).
+        let wanted = normalized_path_set(target_paths);
+
+        for row in rows {
+            let permit = row.into_permit()?;
+            if normalized_path_set(&permit.target_paths) == wanted {
+                return Ok(Some(permit));
+            }
+        }
+
+        Ok(None)
+    }
+
     pub fn get_permit(&self, id: Uuid) -> Result<Option<WritePermit>, OrchestratorError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, rfc_id, granted_to, target_paths, status, granted_by, granted_at, consumed_at FROM write_permits WHERE id = ?1"
@@ -1356,6 +1425,17 @@ fn encode_embedding_as_json(embedding: &[f32]) -> String {
 }
 
 /// Simple glob-like path matching (supports prefix matching with trailing /).
+/// Normalize a list of `PathPattern` into a sorted, deduplicated set of
+/// the underlying strings. Used by `find_permit_by_grant` so that the
+/// idempotency key compares path *sets* rather than ordered lists
+/// (RFC 359f9162, decision CEO 3).
+fn normalized_path_set(paths: &[PathPattern]) -> Vec<String> {
+    let mut set: Vec<String> = paths.iter().map(|p| p.0.clone()).collect();
+    set.sort();
+    set.dedup();
+    set
+}
+
 fn path_matches(pattern: &PathPattern, path: &str) -> bool {
     let pat = &pattern.0;
     if pat == path {
@@ -1891,6 +1971,141 @@ mod tests {
         let db = setup_db();
         let result = db.consume_permit(Uuid::new_v4());
         assert!(result.is_err());
+    }
+
+    // --- delete_permit (targeted rollback, RFC 359f9162 étape 1) ---
+
+    #[test]
+    fn test_delete_permit_removes_only_target() {
+        let db = setup_db();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let p1 = make_permit(id1, vec!["a"]);
+        let p2 = make_permit(id2, vec!["b"]);
+        db.create_permit(&p1).unwrap();
+        db.create_permit(&p2).unwrap();
+
+        db.delete_permit(id1).unwrap();
+
+        assert!(
+            db.get_permit(id1).unwrap().is_none(),
+            "deleted permit must be gone"
+        );
+        assert!(
+            db.get_permit(id2).unwrap().is_some(),
+            "other permit must survive (edge e)"
+        );
+    }
+
+    #[test]
+    fn test_delete_permit_idempotent_when_absent() {
+        let db = setup_db();
+        // Deleting a non-existent id is a no-op Ok (defensively idempotent).
+        assert!(db.delete_permit(Uuid::new_v4()).is_ok());
+    }
+
+    // --- find_permit_by_grant (idempotency lookup, RFC 359f9162 étape 2) ---
+
+    /// Build a permit with explicit rfc_id and status for the idempotency
+    /// lookup tests.
+    fn make_permit_full(
+        id: Uuid,
+        rfc_id: Uuid,
+        status: PermitStatus,
+        paths: Vec<&str>,
+    ) -> WritePermit {
+        WritePermit {
+            id,
+            rfc_id,
+            granted_to: PersonaId::Implementer,
+            target_paths: paths.into_iter().map(|s| PathPattern(s.into())).collect(),
+            status,
+            granted_by: PersonaId::Ceo,
+            granted_at: Utc::now(),
+            consumed_at: None,
+        }
+    }
+
+    #[test]
+    fn test_find_permit_by_grant_order_insensitive_match() {
+        let db = setup_db();
+        let rfc = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let permit = make_permit_full(id, rfc, PermitStatus::Active, vec!["a", "b"]);
+        db.create_permit(&permit).unwrap();
+
+        // Same rfc + persona, paths in reversed order → matches.
+        let reversed = vec![PathPattern("b".into()), PathPattern("a".into())];
+        let found = db
+            .find_permit_by_grant(rfc, &PersonaId::Implementer, &reversed)
+            .unwrap();
+        assert!(found.is_some(), "reversed path order should still match");
+        assert_eq!(found.unwrap().id, id);
+    }
+
+    #[test]
+    fn test_find_permit_by_grant_different_paths_no_match() {
+        let db = setup_db();
+        let rfc = Uuid::new_v4();
+        let permit = make_permit_full(Uuid::new_v4(), rfc, PermitStatus::Active, vec!["a", "b"]);
+        db.create_permit(&permit).unwrap();
+
+        let other = vec![PathPattern("a".into()), PathPattern("c".into())];
+        let found = db
+            .find_permit_by_grant(rfc, &PersonaId::Implementer, &other)
+            .unwrap();
+        assert!(found.is_none(), "different path set must not match");
+    }
+
+    #[test]
+    fn test_find_permit_by_grant_different_rfc_no_match() {
+        let db = setup_db();
+        let rfc = Uuid::new_v4();
+        let permit = make_permit_full(Uuid::new_v4(), rfc, PermitStatus::Active, vec!["a", "b"]);
+        db.create_permit(&permit).unwrap();
+
+        let paths = vec![PathPattern("a".into()), PathPattern("b".into())];
+        let found = db
+            .find_permit_by_grant(Uuid::new_v4(), &PersonaId::Implementer, &paths)
+            .unwrap();
+        assert!(found.is_none(), "different rfc_id must not match");
+    }
+
+    #[test]
+    fn test_find_permit_by_grant_consumed_no_match() {
+        let db = setup_db();
+        let rfc = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        let permit = make_permit_full(id, rfc, PermitStatus::Active, vec!["a", "b"]);
+        db.create_permit(&permit).unwrap();
+        db.consume_permit(id).unwrap();
+
+        let paths = vec![PathPattern("a".into()), PathPattern("b".into())];
+        let found = db
+            .find_permit_by_grant(rfc, &PersonaId::Implementer, &paths)
+            .unwrap();
+        assert!(
+            found.is_none(),
+            "a consumed permit must not short-circuit a new legitimate grant"
+        );
+    }
+
+    #[test]
+    fn test_find_permit_by_grant_dedup_normalization() {
+        let db = setup_db();
+        let rfc = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        // Stored with a duplicate path; lookup with the deduplicated set
+        // should still match (normalization dedups both sides).
+        let permit = make_permit_full(id, rfc, PermitStatus::Active, vec!["a", "a", "b"]);
+        db.create_permit(&permit).unwrap();
+
+        let paths = vec![PathPattern("b".into()), PathPattern("a".into())];
+        let found = db
+            .find_permit_by_grant(rfc, &PersonaId::Implementer, &paths)
+            .unwrap();
+        assert!(found.is_some(), "dedup-normalized set should match");
+        assert_eq!(found.unwrap().id, id);
     }
 
     // --- Snapshot / Restore permits (backing the defense-in-depth hook

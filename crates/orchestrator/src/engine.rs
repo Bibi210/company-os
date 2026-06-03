@@ -429,6 +429,26 @@ impl OrchestratorEngine {
         self.db.check_permit(persona, path)
     }
 
+    /// Delete a single permit by id (targeted rollback). Delegates to
+    /// [`OrchestratorDb::delete_permit`]. Used by the atomic
+    /// `grant_write_permit` path (RFC 359f9162) to remove a permit whose
+    /// seal failed, without touching other active permits.
+    pub fn delete_permit(&self, id: Uuid) -> Result<(), OrchestratorError> {
+        self.db.delete_permit(id)
+    }
+
+    /// Idempotency lookup for the atomic grant (RFC 359f9162). Delegates
+    /// to [`OrchestratorDb::find_permit_by_grant`].
+    pub fn find_permit_by_grant(
+        &self,
+        rfc_id: Uuid,
+        granted_to: &PersonaId,
+        target_paths: &[PathPattern],
+    ) -> Result<Option<WritePermit>, OrchestratorError> {
+        self.db
+            .find_permit_by_grant(rfc_id, granted_to, target_paths)
+    }
+
     pub fn consume_permit(&self, permit_id: Uuid) -> Result<(), OrchestratorError> {
         self.db.consume_permit(permit_id)
     }
