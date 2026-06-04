@@ -22,8 +22,30 @@
             "impact": { "type": "string" },
             "rollback_plan": { "type": "string" },
             "affected_files": {
-              "type": "array",
-              "items": { "type": "string" }
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "Legacy flat form: a single list of file paths (modified or created indistinctly). Kept for backward compatibility."
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "modified": {
+                      "type": "array",
+                      "items": { "type": "string" },
+                      "description": "Files that already exist in HEAD and will be edited."
+                    },
+                    "created": {
+                      "type": "array",
+                      "items": { "type": "string" },
+                      "description": "New files that do not yet exist and will be created."
+                    }
+                  },
+                  "additionalProperties": false,
+                  "description": "Structured form distinguishing files to modify from files to create. Both keys optional; either may be empty or absent."
+                }
+              ]
             }
           },
           "required": ["motivation", "proposal", "impact"]

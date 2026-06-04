@@ -378,3 +378,33 @@ spec:
         Les auteurs ont besoin de reviews honnêtes. Voter approve sur un artifact qu'on sait
         perfectible (au sens des acceptance criteria), c'est faire passer la diplomatie avant
         la qualité.
+    affected_files_categorization:
+      description: >
+        Recommandation (non imposée) sur le remplissage de spec.affected_files dans un RFC.
+        Le schema RFC accepte deux formes pour affected_files (RFC a4eb3ee7, anyOf
+        rétro-compatible) :
+
+        - FORME B structurée — objet { modified, created } : RECOMMANDÉE pour tout RFC qui
+          touche du code ou crée des fichiers. Renseigner affected_files.modified avec les
+          fichiers DÉJÀ PRÉSENTS dans HEAD qui seront édités, et affected_files.created avec
+          les fichiers NOUVEAUX qui seront créés. Les deux clés sont optionnelles : un RFC
+          qui ne fait que créer renseigne seulement created, un RFC qui ne fait que modifier
+          renseigne seulement modified.
+
+        - FORME A legacy — array plat de strings : reste VALIDE et acceptée (rétro-compatibilité).
+          À privilégier pour les RFCs ne touchant que des artifacts YAML sans création de fichier,
+          où la distinction modified/created n'apporte rien.
+
+        POURQUOI cette recommandation. Distinguer explicitement created de modified évite le
+        blocage hook documenté par la lesson 611fde3e : un fichier à CRÉER oublié dans le permit
+        CEO provoque un refus du hook defense-in-depth au moment de l'écriture, imposant un
+        round-trip Implementer → PM → CEO et un permit complémentaire. En rendant la distinction
+        explicite et machine-readable, la FORME B permet à un futur outillage de pré-vérification
+        de calculer l'union modified+created comme target_paths candidats et de signaler les oublis
+        AVANT le blocage.
+
+        REMPLACE LE CONTOURNEMENT DE PROSE. Cette règle ferme, pour les FUTURS auteurs, le chemin
+        du contournement qui consistait à expliciter la distinction modified/created EN PROSE dans
+        la section impact (cf. RFCs 359f9162, 1c0f2570, bde023e2, cdbfee72). La distinction relève
+        désormais du champ structuré affected_files, pas de la prose. Les RFCs déjà mergés ne sont
+        PAS réécrits : leur prose est un artefact historique figé.
