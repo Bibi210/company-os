@@ -1,0 +1,196 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 23de8594-5071-4923-979d-c18763a98846
+  title: "affected_files distingue modified/created via anyOf rétro-compatible : le champ structuré remplace la pratique 'imaginer le diff'"
+  author: implementer
+  created_at: "2026-06-04"
+  description: >
+    Capitalisation après l'implémentation du RFC a4eb3ee7 (plan 00b46372) qui
+    étend spec.affected_files du schema RFC pour distinguer les fichiers à
+    MODIFIER (existants) des fichiers à CRÉER (nouveaux), via une forme
+    structurée objet {modified, created} ajoutée en anyOf à côté de la forme
+    legacy array plat. Trois enseignements : (a) la technique JSON Schema qui
+    rend un changement de champ strictement rétro-compatible (anyOf gardant la
+    branche legacy identique au caractère près + additionalProperties:false sur
+    la branche objet pour rejeter les typos) ; (b) le fait que ce champ est
+    PUREMENT DOCUMENTAIRE (zéro ligne de Rust ne le lit, le mécanisme de permit
+    repose sur target_paths fourni par le CEO), donc l'extension ne touche aucune
+    crate ; (c) la mise à jour de workflow : la RECOMMANDATION 3 de la lesson
+    611fde3e ('l'Architect SE FORCE à imaginer le commit diff') est désormais
+    remplacée par le champ structuré affected_files.created comme moyen canonique.
+  tags:
+    - rfc-schema
+    - affected-files
+    - schema
+    - json-schema
+    - anyof
+    - backward-compatible
+    - friction-permits
+    - companyos-internals
+    - lessons-from-implementation
+  related:
+    - id: a4eb3ee7-45c1-4422-a43a-fbbc07d686f0
+      kind: rfc
+      relationship: derived-from
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: supersedes
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: related
+    - id: d5c9c933-2955-41e1-b2ae-73c9f307f09f
+      kind: lesson-learned
+      relationship: related
+    - id: 80f7b27a-9bc5-47b6-bdf4-65a18f7f5df9
+      kind: lesson-learned
+      relationship: related
+    - id: 85ad44d3-e0a5-49e3-93f7-6a384cd161b7
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    La lesson 611fde3e (ENSEIGNEMENT 3) avait documenté un coût de friction
+    concret : pendant l'implémentation du RFC cdbfee72, le permit CEO couvrait
+    les 11 paths existants à modifier mais PAS les 3 fichiers à créer
+    (lock.rs, tests/integration_lock.rs, tests/test_helpers.rs). Le hook
+    defense-in-depth a refusé la création de lock.rs, imposant un round-trip
+    Implementer -> PM -> CEO et un permit complémentaire b4f09f5d. Cause racine
+    identifiée : le champ spec.affected_files du schema RFC était un array plat
+    de strings, sans distinction modified vs created ; l'auteur du RFC pense
+    implicitement 'fichiers qu'on va toucher' et oublie souvent les créations.
+    Le CEO avait recommandé un futur RFC pour distinguer les deux. Faute de
+    champ structuré, les RFCs récents (359f9162, 1c0f2570, bde023e2, cdbfee72)
+    ont dû expliciter la distinction EN PROSE dans leur section impact :
+    un contournement (au sens be16dc46) redondant, non exploitable par
+    l'outillage, et fragile.
+
+    Le RFC a4eb3ee7 est cette amélioration. Le plan 00b46372 l'a implémenté en
+    deux écritures de zone protégée (permit f4669d7c) : (1) le patch du schema
+    company/schemas/rfc.schema.json, (2) l'ajout d'une règle de recommandation
+    affected_files_categorization dans company/config/shared-rules.yml. Aucune
+    ligne de Rust touchée. 13 cas de validation exécutés via le serveur MCP
+    yaml-validator (validate_yaml sur des RFCs en mémoire + validate_file sur
+    des RFCs réels), tous au verdict attendu ; cargo build + cargo test verts
+    en non-régression (0 failed).
+
+  insight: >
+    Trois enseignements.
+
+    ENSEIGNEMENT 1 — RENDRE UN CHANGEMENT DE CHAMP STRICTEMENT
+    RÉTRO-COMPATIBLE EN JSON SCHEMA : anyOf + branche legacy à l'identique.
+
+    Pour élargir la forme acceptée d'un champ existant sans casser les
+    artifacts déjà écrits, la construction est : remplacer le sous-schema du
+    champ par un anyOf à deux branches, où LA PREMIÈRE BRANCHE EST IDENTIQUE
+    AU CARACTÈRE PRÈS à l'ancien schema. Ici la branche A reste
+    { type: array, items: { type: string } } (l'ancienne définition exacte),
+    et la branche B ajoute la forme objet { modified, created }. Comme un
+    array n'est jamais un objet, les deux branches sont mutuellement exclusives
+    par construction : anyOf et oneOf accepteraient le même ensemble. anyOf est
+    retenu pour la robustesse aux évolutions futures (si deux branches devenaient
+    un jour non strictement disjointes, oneOf rejetterait à tort une valeur
+    matchant les deux, anyOf non).
+
+    Détail critique pour l'axe NÉGATIF : additionalProperties:false sur la
+    branche objet. Sans lui, une faute de frappe ('modifeid' au lieu de
+    'modified') serait silencieusement ignorée plutôt que rejetée. Avec lui,
+    le validator rejette la typo. C'est ce qui transforme la règle d'un simple
+    contrôle de type en garde-fou réel. Empiriquement confirmé : le cas G1
+    (clé 'modifeid') est bien rejeté, message d'erreur agrégeant l'échec des
+    deux branches au pointeur /spec/affected_files.
+
+    modified ET created sont OPTIONNELS (pas de required) : un RFC peut ne
+    faire que des créations, ou que des modifications. L'objet vide {} et les
+    listes vides [] sont tolérés au niveau schema, comme rollback_plan reste
+    optionnel. La discipline de remplissage relève de la règle de process, pas
+    de la contrainte structurelle.
+
+    ENSEIGNEMENT 2 — UN CHAMP DOCUMENTAIRE N'EST PAS LU PAR LE RUST :
+    L'EXTENSION NE TOUCHE AUCUNE CRATE.
+
+    Vérifié empiriquement au review du RFC (grep 'affected_files' sur crates/
+    = 0 occurrence) : aucun code Rust ne lit affected_files. Le mécanisme de
+    write permit repose sur target_paths, une liste fournie INDÉPENDAMMENT par
+    le CEO au moment du grant_write_permit, pas sur affected_files. Le champ
+    est donc purement documentaire dans le YAML du RFC. Conséquence : ce
+    changement de schema (un fichier de données chargé au runtime par le
+    SchemaRegistry schema-driven du serveur yaml-validator) ne change AUCUNE
+    ligne de Rust, ne crée aucune dépendance, ne touche aucune crate. Le
+    contraste avec d'autres chantiers est net : ajouter un KIND impose de
+    toucher types.rs (lesson 3f507271) ; ici on élargit la FORME d'un champ
+    existant via une construction JSON Schema standard (anyOf), nativement
+    supportée par le crate jsonschema. La CI interne (cargo build + cargo test)
+    n'a servi qu'à prouver la NON-RÉGRESSION, pas à tester du code nouveau.
+
+    Implication méthodologique pour tester un changement de schema JSON : on
+    ne le teste PAS par des tests Rust (il n'y a pas de code à tester), on le
+    teste en soumettant des artifacts au validator et en observant accept/reject.
+    Le serveur MCP yaml-validator (validate_yaml sur des chaînes en mémoire,
+    validate_file sur des fichiers réels) est l'outil adéquat, sur trois axes :
+    nominal (formes valides), négatif (typo, item non-string, scalaire nu tous
+    rejetés), edge (objet vide, listes vides, only-created, only-modified, array
+    vide tous valides ; RFCs réels existants tous valides = preuve directe de
+    rétro-compatibilité). reload_schemas() recharge le schema patché si le
+    watcher n'a pas encore pris.
+
+    ENSEIGNEMENT 3 — LE CHAMP STRUCTURÉ REMPLACE LA PRATIQUE 'IMAGINER LE DIFF'.
+
+    La RECOMMANDATION 3 de la lesson 611fde3e disait : 'En attendant qu'un RFC
+    schema upgrade distingue les deux champs, pratique à adopter : l'Architect
+    rédacteur du RFC SE FORCE à imaginer le commit diff que l'implémentation
+    produira.' Cette attente est désormais levée : le RFC schema upgrade existe
+    (a4eb3ee7, mergé). Le moyen CANONIQUE de distinguer modifications et
+    créations n'est plus une discipline mentale fragile, c'est le champ
+    structuré affected_files.created, validable et machine-readable. La pratique
+    manuelle 'imaginer le diff' reste une heuristique UTILE pour REMPLIR
+    correctement affected_files.created, mais elle n'est plus le mécanisme : le
+    mécanisme est le champ. Conformément à be16dc46, le contournement de prose
+    (distinction explicitée à la main dans la section impact) est fermé pour
+    les FUTURS auteurs par la nouvelle règle affected_files_categorization de
+    shared-rules.yml ; les RFCs déjà mergés ne sont pas réécrits (artefact
+    historique figé).
+
+  recommendation: >
+    RECOMMANDATION 1 — POUR ÉLARGIR LA FORME D'UN CHAMP DE SCHEMA SANS CASSER
+    L'EXISTANT.
+    Utiliser anyOf avec la branche legacy COPIÉE AU CARACTÈRE PRÈS depuis
+    l'ancien schema en première position, et la nouvelle forme en seconde.
+    Sur toute branche objet à clés fermées, mettre additionalProperties:false
+    pour que les typos soient rejetées et non ignorées (c'est ce qui donne un
+    axe négatif testable). Après le patch, vérifier le parse JSON immédiatement
+    (un schema malformé casse TOUTE validation du kind), puis valider la
+    rétro-compatibilité empiriquement en passant 2-3 artifacts RÉELS existants
+    à validate_file : s'ils restent valides, la branche legacy est intacte.
+
+    RECOMMANDATION 2 — TESTER UN CHANGEMENT DE SCHEMA PAR LE VALIDATOR, PAS PAR
+    LE CODE.
+    Quand un champ est documentaire (aucun code ne le lit, à vérifier par grep
+    sur les crates), le changement de schema ne nécessite aucun test Rust : la
+    CI interne (cargo build + cargo test) ne prouve que la NON-RÉGRESSION du
+    chargement des schemas. La couverture réelle vient des cas yaml-validator
+    sur trois axes (nominal/négatif/edge), exécutés en mémoire (validate_yaml)
+    sans rien écrire sur disque, donc hors zone protégée et sans permit. Pour
+    un anyOf, le critère de succès du test négatif est BINAIRE (rejeté oui/non) ;
+    le message agrège les échecs des branches, sa lisibilité exacte est
+    secondaire.
+
+    RECOMMANDATION 3 (REMPLACE LA RECOMMANDATION 3 DE 611fde3e) — UTILISER LE
+    CHAMP STRUCTURÉ affected_files.{modified, created}.
+    Pour les RFCs qui touchent du code ou créent des fichiers, RECOMMANDÉ
+    (cf. règle affected_files_categorization de shared-rules.yml) : renseigner
+    affected_files.modified avec les fichiers déjà présents dans HEAD à éditer,
+    et affected_files.created avec les fichiers nouveaux à créer. La forme
+    legacy array plat reste valide pour les RFCs ne touchant que des artifacts
+    YAML sans création. La pratique mentale 'imaginer le commit diff' (ancienne
+    RECOMMANDATION 3 de 611fde3e) reste une heuristique d'aide au remplissage de
+    created, mais n'est plus le mécanisme canonique : le champ l'est. Côté
+    Implementer, l'invariant de 611fde3e demeure ENTIÈREMENT valide : avant
+    d'écrire en zone protégée, vérifier via check_write_permit que CHAQUE path
+    prévu (modifications ET créations) est couvert par le permit ; si un path
+    manque, agent-message au PM pour extension, JAMAIS de SQL direct ni
+    d'écriture forcée (lesson ed7776fb / 85ad44d3 : le hook revert). Un futur
+    outillage pourra lire affected_files.modified + created, calculer leur union
+    comme target_paths candidats, et signaler les oublis AVANT le blocage hook ;
+    ce RFC pose la structure, pas l'outillage.

@@ -1,0 +1,80 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 1554764d-1836-4705-84f6-2171b5caa727
+  title: "Discipline de migration de schéma SQL côté orchestrator"
+  author: pm
+  created_at: "2026-06-04"
+  project: company-os
+  description: >
+    Le hotfix appliqué à db.rs (CREATE INDEX exécuté AVANT les ALTER TABLE
+    qui ajoutaient les colonnes, crashant la migration sur toute DB
+    pré-existante, commit 57019e7) est symptomatique d'une absence de
+    discipline générale sur les migrations de schéma SQL de l'orchestrator.
+    Aujourd'hui il n'y a pas de mécanisme de versionning de schéma, et pas
+    de tests qui exercent toutes les transitions possibles (DB vierge, DB
+    legacy avec ancien schéma, DB déjà à jour). Une migration mal ordonnée
+    ou non idempotente casse silencieusement au boot sur les DB existantes.
+    L'objectif est de formaliser une approche robuste : un suivi de version
+    de schéma, des migrations idempotentes et ordonnées, et des tests qui
+    exercent les transitions. NOTE : la DB SQLite est un index
+    reconstructible depuis les YAML (PILIER D autorepair, RFC cdbfee72),
+    donc l'enjeu n'est pas la perte de données mais la robustesse du boot
+    et l'évitement des crashs de migration.
+  tags:
+    - sqlite
+    - schema-migration
+    - orchestrator
+    - robustness
+    - companyos-internals
+  related:
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: input
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: input
+    - id: b04f8838-84b5-4332-b3a4-5782a943d766
+      kind: lesson-learned
+      relationship: input
+
+spec:
+  priority: medium
+  status: backlog
+  acceptance_criteria:
+    - >
+      L'état actuel de la gestion du schéma SQL de l'orchestrator est
+      caractérisé : comment le schéma est créé/migré au boot aujourd'hui
+      (CREATE TABLE IF NOT EXISTS, ALTER TABLE, CREATE INDEX), dans quel
+      ordre, et quelles fragilités existent (ordre, idempotence, absence de
+      versionning). Diagnostic vérifié sur db.rs.
+    - >
+      Un mécanisme de suivi de version de schéma est introduit (par exemple
+      une table schema_version, ou PRAGMA user_version, ou un système de
+      migrations ordonnées numérotées). Le choix du mécanisme est une
+      décision d'architecture à trancher. Le boot applique les migrations
+      manquantes dans l'ordre, de manière idempotente (relancer le boot sur
+      une DB déjà à jour ne fait rien et ne crashe pas).
+    - >
+      Les migrations sont ordonnées correctement : toute colonne ajoutée
+      par ALTER TABLE existe avant qu'un CREATE INDEX ne la référence (la
+      classe de bug du hotfix 57019e7 est structurellement évitée, pas
+      seulement corrigée ponctuellement).
+    - >
+      Tests couvrant les transitions, entérinés dans la suite de tests
+      automatisée (PAS seulement validés à la main, cf. lesson b04f8838).
+      Nominal : boot sur DB vierge -> schéma complet créé. Transition : boot
+      sur DB legacy (schéma antérieur) -> migrée sans perte ni crash. Edge :
+      boot sur DB déjà à jour -> no-op idempotent ; boot interrompu puis
+      relancé -> reprise correcte ; DB avec version inconnue/future ->
+      comportement défini (refus propre plutôt que corruption).
+    - >
+      Si le hotfix 57019e7 (réordonnancement ponctuel CREATE INDEX/ALTER
+      TABLE) est rendu obsolète par le mécanisme général, le code du hotfix
+      est nettoyé/intégré dans le nouveau système plutôt que laissé en
+      double (application be16dc46).
+    - >
+      Périmètre borné : ce chantier traite la discipline de migration du
+      schéma SQL. Il ne modifie pas la sémantique des données ni le PILIER D
+      autorepair (qui reste le filet de sécurité si une migration échoue
+      malgré tout).

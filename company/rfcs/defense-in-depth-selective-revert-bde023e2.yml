@@ -1,0 +1,520 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: bde023e2-8633-42c9-911a-80dcd5157c62
+  title: "Hook defense-in-depth : revert sélectif par défaut, nucléaire borné au seul cas baseline-indisponible"
+  status: approved
+  approved_at: "2026-06-04T08:18:00.982890770+00:00"
+  author: architect
+  created_at: "2026-06-04"
+  description: >
+    Le hook defense-in-depth, quand il détecte une altération non-MCP de
+    write_permits après une commande bash (revertPermitTampering,
+    defense-in-depth-core.mjs L216), bascule entre une branche SÉLECTIVE
+    (DELETE WHERE id NOT IN before_ids) et une branche NUCLÉAIRE (DELETE
+    FROM write_permits, wipe total). Le diagnostic montre que le nucléaire
+    se déclenche sur le seul critère `before === null` (la DB n'existait
+    pas avant le bash), ce qui amalgame deux situations distinctes : une
+    vraie absence de baseline légitime, et une simple recréation/réouverture
+    de fichier DB par un binaire. Ce RFC fait du revert sélectif le
+    comportement par défaut et borne strictement le wipe total au seul cas
+    résiduel où aucune baseline légitime ne peut être déterminée (snapshot
+    baseline absent ET aucun permit scellé en HEAD git récupérable). La
+    garantie de sécurité d'origine est préservée : tout permit injecté hors
+    du canal MCP, absent de la baseline et non scellé en HEAD git, est
+    toujours supprimé. La sélectivité signifie « ne pas toucher aux permits
+    légitimes », pas « laisser survivre des permits illégitimes ». Touche la
+    zone protégée company/plugins/ : approbation CEO + write permit requis.
+    Périmètre strictement borné à la logique de revert du hook ; ne modifie
+    pas l'émission (atomic-grant-permit RFC 359f9162, déjà livré) ni la
+    sémantique des permits.
+  tags:
+    - defense-in-depth
+    - write-permit
+    - selective-revert
+    - companyos-internals
+    - friction-permits
+    - security
+    - critical-infra
+  related:
+    - id: dcb17b79-952b-403d-b8ed-c979aec8aad3
+      kind: task-request
+      relationship: input
+    - id: ed7776fb-d56d-4f61-9f48-807897c6325d
+      kind: lesson-learned
+      relationship: input
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: input
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: input
+    - id: 359f9162-18f2-4b72-85b0-7d0e44608959
+      kind: rfc
+      relationship: related
+
+spec:
+  motivation: >
+    PROBLÈME OBSERVÉ. La lesson ed7776fb documente un incident pendant le
+    PHASE 2 outillage roadmaps : l'Implementer a contourné une coupure MCP
+    par un UPDATE direct sqlite3 sur write_permits, et le hook
+    defense-in-depth a réagi en remettant la table à "0 permits" — perte
+    GLOBALE de l'état alors qu'un seul permit était visé. Deux blockers
+    supplémentaires (agent-messages 4f000127, 05224964) ont vu des permits
+    légitimes et scellés perdus collatéralement pendant la refonte search.
+    Le coût d'un incident est ainsi amplifié : une altération locale d'un
+    permit devient une perte de tous les permits actifs, forçant le CEO à
+    tout ré-émettre.
+
+    DIAGNOSTIC TECHNIQUE PRÉCIS (investigation du code réel, vérifié sur
+    defense-in-depth-core.mjs, crates/orchestrator/src/db.rs et
+    crates/mcp-servers/orchestrator/src/main.rs au commit courant).
+
+    1. POINT D'ENTRÉE ET ORCHESTRATION. Le hook capture un snapshot des
+       permits AVANT chaque commande bash (tool.execute.before, L312 :
+       `state.permitSnapshot = snapshotPermits(rootDir)`) et appelle
+       revertPermitTampering APRÈS le bash (tool.execute.after, L389).
+
+    2. FORMAT DU SNAPSHOT (snapshotPermits, L203-214). La fonction exécute
+       `SELECT COUNT(*), GROUP_CONCAT(id || ':' || status) FROM
+       write_permits` via sqlite3 CLI. Elle retourne null si le fichier DB
+       n'existe pas (L205 : `if (!existsSync(dbPath)) return null`). Le blob
+       a donc la forme `"<count>|<id1>:<status1>,<id2>:<status2>,..."` côté
+       Rust (db.rs snapshot_permits, ORDER BY id pour stabilité byte-à-byte),
+       OU est `null` quand la DB est absente. Le hook actuel n'appelle PAS
+       le tool MCP snapshot_permits_state (voir POINT 6) : il exécute sqlite3
+       directement, wrappé dans runSqliteWithTimeout (`.timeout 5000`).
+
+    3. revertPermitTampering — LES DEUX BRANCHES ET LEUR DÉCLENCHEUR EXACT
+       (L216-239). La fonction re-snapshot (`after`), puis :
+         - L218 : `before === null && after === null` -> pas de DB des deux
+           côtés -> return false (pas d'altération).
+         - L219 : `before === after` -> état byte-identique -> return false.
+         - Sinon altération détectée, et le SEUL critère qui sépare les deux
+           branches est `before === null` :
+           * BRANCHE NUCLÉAIRE (L223-225). Condition : `before === null`,
+             c'est-à-dire la DB N'EXISTAIT PAS avant le bash mais existe
+             après. Action : `DELETE FROM write_permits` — wipe TOTAL,
+             inconditionnel. Aucune préservation possible : tout est effacé.
+           * BRANCHE SÉLECTIVE (L226-237). Condition : `before !== null`,
+             c'est-à-dire la DB existait avant. Action : extraire les ids du
+             snapshot before, puis `DELETE FROM write_permits WHERE id NOT IN
+             (<before_ids>)`. Préserve tout ce qui était présent avant,
+             supprime tout ce qui est apparu pendant le bash. SOUS-CAS
+             SILENCIEUX (L230) : si `placeholders` est vide (le before
+             listait 0 id, blob `"0|"`), AUCUN DELETE n'est émis — la branche
+             sélective ne fait alors rien et un permit apparu pendant le bash
+             SURVIT. C'est une faille de la branche sélective actuelle qu'il
+             faut fermer (cf. ANALYSE SÉCURITÉ).
+
+    4. POURQUOI LE NUCLÉAIRE EXISTE (ed7776fb POINT 2). Le wipe total est un
+       choix VOLONTAIRE et non un bug : face à une DB jugée compromise, il
+       vaut mieux perdre l'état courant et forcer la reconstruction du
+       journal d'autorisations par les canaux officiels (grant_write_permit
+       côté CEO) que laisser persister un état qui ne reflète plus les canaux
+       officiels. La friction visible décourage le pattern « je modifie la DB
+       en direct, ça passe ». Le but de ce RFC n'est PAS de supprimer cette
+       garantie défensive mais de la rendre CHIRURGICALE : ne purger que ce
+       qui est réellement illégitime, sans punir collatéralement les permits
+       valides.
+
+    5. POURQUOI LE NUCLÉAIRE SE DÉCLENCHE TROP SOUVENT. Le critère unique
+       `before === null` amalgame deux situations très différentes :
+         (i) Vraie absence de baseline : aucun permit n'existait, la DB est
+             créée de zéro pendant le bash. Là, un wipe est sans dommage (rien
+             de légitime à préserver).
+         (ii) Recréation/réouverture du FICHIER DB : un binaire (cargo build
+             qui réécrit le WAL, un restart serveur, le PILIER D autorepair de
+             cdbfee72 qui rebuild la DB depuis les YAML) fait passer
+             `existsSync` de false à true OU réécrit le fichier de telle sorte
+             que le snapshot before était null alors que des permits
+             légitimes existaient juste avant en mémoire/HEAD. Dans ce cas (ii),
+             le nucléaire détruit des permits parfaitement légitimes. C'est
+             exactement le mécanisme amplificateur décrit par ed7776fb et les
+             blockers 4f000127 / 05224964 : la baseline légitime EXISTE
+             (scellée en HEAD git, cf. RFC 359f9162 qui établit que
+             company/data/orchestrator.db est force-trackée dans HEAD et sert
+             de baseline durable), mais le hook l'ignore et wipe sur le seul
+             critère `before === null`.
+
+    6. ÉTAT RÉEL DU REFACTOR MCP (cdbfee72, amendement iteration 5). Le RFC
+       cdbfee72 PROPOSITION 5 prévoyait de router les quatre call sites
+       sqlite3 du hook vers des tools MCP. L'amendement iteration 5 (changelog
+       cdbfee72) acte que ce refactor était TECHNIQUEMENT IRRÉALISABLE : le
+       runtime opencode des plugins n'expose pas de client MCP (seul un client
+       SDK opencode est injecté), et le transport du serveur orchestrator est
+       stdio-only. Conséquence concrète vérifiée dans le code courant : les
+       quatre call sites sqlite3 sont CONSERVÉS (hasActivePermit L117,
+       snapshotPermits L203, revertPermitTampering nucléaire L225, sélectif
+       L233), wrappés dans runSqliteWithTimeout. Les tools MCP
+       snapshot_permits_state et revert_permits_to_snapshot ONT été créés
+       côté serveur (main.rs L862, L880) et fonctionnent (restore
+       sélectif/nucléaire dans db.rs L819-862), mais le HOOK NE PEUT PAS LES
+       APPELER. Ce RFC doit donc trancher sa solution CÔTÉ HOOK (sqlite3
+       inline), pas en déléguant au serveur. Note de cohérence : la logique
+       Rust restore_permits_from_snapshot (db.rs) a déjà la bonne structure
+       (None => wipe ; Some(blob) => DELETE WHERE id NOT IN ids ; ids vides
+       => wipe), mais elle est inatteignable par le hook tel que le système
+       est câblé. Toute mention « le hook appelle revert_permits_to_snapshot »
+       dans cdbfee72 décrit une cible non réalisée.
+
+    POURQUOI UN RFC. Le correctif modifie
+    company/plugins/defense-in-depth-core.mjs, zone protégée
+    company/plugins/. C'est un changement structurel d'un mécanisme
+    d'enforcement de sécurité (la réaction du hook à une altération de la
+    table d'autorisations), avec impact transverse sur tous les agents qui
+    détiennent des permits. Tous les critères RFC de shared-rules sont
+    réunis : zone protégée, changement structurel, mécanisme d'enforcement.
+    Approbation CEO + write permit requis.
+
+  proposal: >
+    DÉCISION TECHNIQUE TRANCHÉE — le revert sélectif devient le comportement
+    par défaut ; le wipe total est borné au seul cas résiduel
+    « baseline-indisponible » et durci pour ne jamais laisser survivre un
+    permit illégitime. Le QUOI et le POURQUOI au niveau des invariants ;
+    l'implementation-plan dérivé décidera des noms exacts et de l'ordre.
+
+    --- INVARIANT CENTRAL VISÉ ---
+
+    À la sortie de revertPermitTampering, après détection d'une altération :
+      (1) tout permit présent dans la baseline légitime est PRÉSERVÉ ;
+      (2) tout permit absent de la baseline légitime est SUPPRIMÉ ;
+      (3) il n'existe AUCUN chemin où un permit apparu hors canal MCP, absent
+          de la baseline et non scellé en HEAD git, survive.
+    La sélectivité porte uniquement sur (1) : ne pas punir les permits
+    légitimes. Elle ne relâche jamais (2)+(3).
+
+    --- DÉFINITION DE LA BASELINE LÉGITIME ---
+
+    La baseline est l'ensemble des ids de permits considérés comme autorisés
+    au moment du contrôle. Elle se construit par UNION de deux sources, dans
+    l'ordre de fiabilité :
+
+      Source A — le snapshot before du hook (state.permitSnapshot capturé
+        avant le bash). C'est la source primaire quand elle est disponible
+        (before !== null). Elle reflète l'état immédiatement antérieur à la
+        commande suspecte.
+
+      Source B — les permits SCELLÉS EN HEAD git. company/data/orchestrator.db
+        est force-trackée dans HEAD (établi par RFC 359f9162 ; vérifiable par
+        `git cat-file -e HEAD:company/data/orchestrator.db`). Les ids de
+        permits présents dans cette version committée sont, par construction,
+        passés par le canal officiel grant_write_permit (qui auto-commit la DB
+        depuis 359f9162). Ils constituent une baseline durable même quand le
+        snapshot before est null. L'implementation-plan tranchera le moyen
+        technique d'extraire ces ids (par exemple `git show
+        HEAD:company/data/orchestrator.db` vers un fichier temporaire hors
+        zone protégée puis SELECT des ids, ou tout équivalent en lecture
+        seule ; aucune écriture dans la zone protégée n'est requise pour une
+        lecture de HEAD).
+
+    La baseline = union(Source A si non nulle, Source B). Un id est légitime
+    s'il appartient à cette union.
+
+    --- COMPORTEMENT CIBLE DE revertPermitTampering ---
+
+    Après re-snapshot (after) et détection d'une divergence (logique L218-219
+    inchangée : pas de divergence => return false) :
+
+      CAS NOMINAL — baseline déterminable (Source A non nulle OU Source B
+        récupérable). Comportement SÉLECTIF :
+          DELETE FROM write_permits WHERE id NOT IN (<baseline_ids>)
+        Les permits légitimes (dans la baseline) survivent ; les nouveaux
+        (hors baseline) sont supprimés. Ceci remplace ET la branche nucléaire
+        actuelle (L223-225) ET le sous-cas silencieux de la branche sélective
+        (L230, qui ne supprimait rien quand before listait 0 id). Désormais,
+        si la baseline est connue mais VIDE (0 permit légitime), le DELETE est
+        bien émis sur tout permit apparu — fermeture de la faille du POINT 3
+        sous-cas silencieux.
+
+      CAS RÉSIDUEL — baseline INDÉTERMINABLE. C'est l'unique cas où le wipe
+        total subsiste. Il se déclenche quand ET SEULEMENT QUAND :
+          - le snapshot before est null (Source A absente), ET
+          - HEAD ne contient aucune version exploitable de la DB, ou son
+            extraction échoue (Source B indisponible : DB jamais scellée,
+            HEAD détaché, git absent, lecture corrompue).
+        Dans ce cas, aucune baseline légitime ne peut être affirmée, donc tout
+        permit présent est potentiellement illégitime. Le wipe total
+        (`DELETE FROM write_permits`) est alors la seule posture sûre :
+        préserver dans le doute reviendrait à laisser survivre un permit
+        possiblement injecté. Ce repli est conservateur, documenté et borné ;
+        il n'est plus le comportement par défaut sur le simple critère
+        `before === null`.
+
+    --- POURQUOI CONSERVER UN NUCLÉAIRE RÉSIDUEL PLUTÔT QUE L'ÉLIMINER ---
+
+    Alternative considérée puis REJETÉE : supprimer toute branche nucléaire et
+    toujours préserver l'état quand on ne sait pas. Raison du rejet : cela
+    viole l'invariant (3). Si aucune baseline n'est connue, « préserver » =
+    « laisser survivre un permit potentiellement frauduleux ». Le hook est un
+    mécanisme de SÉCURITÉ : en l'absence de référence de confiance, la posture
+    fail-safe est de purger, pas de tolérer. Le nucléaire résiduel n'est donc
+    pas une régression mais la conséquence directe de l'invariant de sécurité,
+    désormais cantonné à un cas rare et explicite au lieu d'un critère
+    grossier.
+
+    --- POURQUOI CE RFC NE PEUT PAS DÉLÉGUER AU SERVEUR MCP ---
+
+    Le tool MCP revert_permits_to_snapshot côté serveur (main.rs L880, db.rs
+    L819) implémente déjà la bascule None=>wipe / Some=>sélectif. Il serait
+    tentant de « simplement » faire appeler ce tool par le hook. C'est
+    IMPOSSIBLE dans l'état actuel du système (cf. motivation POINT 6 :
+    transport stdio-only, pas de client MCP dans le runtime des plugins,
+    constat acté par l'amendement iteration 5 de cdbfee72). Ce RFC corrige
+    donc la logique CÔTÉ HOOK (sqlite3 inline via runSqliteWithTimeout, qui
+    reste le seul canal d'accès DB dont dispose le hook). Le code Rust
+    restore_permits_from_snapshot n'est pas modifié par ce RFC ; il reste
+    exposé pour des appelants futurs (tests, CLI dédié) et sa sémantique sert
+    de référence conceptuelle alignée avec le comportement cible du hook.
+    Une convergence hook->MCP reste un sujet futur conditionné à
+    l'introduction d'un transport non-stdio (cf. cdbfee72 AMÉLIORATIONS
+    FUTURES), explicitement hors scope ici.
+
+    --- PÉRIMÈTRE STRICTEMENT BORNÉ (acceptance criterion 6) ---
+
+    Ce RFC ne touche QUE revertPermitTampering et ses helpers d'appui
+    (extraction de la baseline). Il ne modifie PAS :
+      - le mécanisme d'émission grant_write_permit (RFC 359f9162, livré) ;
+      - la sémantique des permits (status, target_paths, consume) ;
+      - les autres call sites du hook (hasActivePermit, le contrôle de commit
+        non autorisé L424, la validation YAML, l'auto-index).
+
+    --- ANALYSE TRIAXIALE ---
+
+    Cas nominal (happy path). Plusieurs permits légitimes actifs (baseline
+    Source A non nulle). Une commande bash réécrit le WAL (cargo build) ou
+    altère un permit hors MCP. revertPermitTampering détecte la divergence,
+    construit la baseline, émet `DELETE WHERE id NOT IN (baseline_ids)`. Les
+    permits légitimes survivent ; seul l'éventuel intrus est supprimé. Plus de
+    wipe global. C'est l'inverse exact de l'incident ed7776fb.
+
+    Cas négatif (erreurs, échecs).
+    (a) Injection frauduleuse d'un permit hors MCP alors que des permits
+        légitimes existent (Source A non nulle). Le permit injecté n'est ni
+        dans before ni dans HEAD -> hors baseline -> SUPPRIMÉ. Invariant (3)
+        tenu. Les légitimes survivent. C'est la garantie de sécurité d'origine,
+        préservée.
+    (b) Injection frauduleuse alors qu'AUCUN permit légitime n'existait
+        (baseline connue mais VIDE : before = `"0|"`, HEAD = 0 permit). La
+        baseline_ids est vide, le DELETE porte sur tout -> le permit injecté
+        est SUPPRIMÉ. Ferme la faille du sous-cas silencieux L230 de l'ancienne
+        branche sélective. Invariant (3) tenu.
+    (c) Snapshot baseline indisponible/corrompu (before null ET HEAD
+        inexploitable). Repli sûr : wipe total documenté (CAS RÉSIDUEL). Aucun
+        permit ne survit dans le doute. Comportement conservateur explicite.
+    (d) Extraction de la Source B (lecture HEAD) échoue partiellement (git
+        présent mais `git show` retourne une erreur, ou DB de HEAD illisible).
+        Source B est considérée indisponible. Si Source A est présente, on
+        reste sélectif sur la seule Source A (jamais moins sûr que
+        l'existant). Si Source A est aussi absente, on tombe en CAS RÉSIDUEL
+        (wipe). Jamais de préservation à l'aveugle.
+
+    Edge cases (valeurs limites, concurrence).
+    (e) Table vide avant et après, aucune altération réelle : L218/L219
+        retournent false, aucun DELETE. Inchangé.
+    (f) Un seul permit, légitime, inchangé par le bash : before === after,
+        return false. Préservé.
+    (g) Tous les permits présents sont illégitimes (aucun dans la baseline) :
+        le DELETE sélectif les supprime tous. Résultat identique à un wipe,
+        mais atteint par la voie sélective et JUSTIFIÉ par l'absence des ids
+        dans la baseline, pas par un critère grossier. Invariant (3) tenu.
+    (h) Altérations concurrentes : le hook bash d'opencode est sérialisé (un
+        bash à la fois). Le snapshot before/after encadre une seule commande.
+        Le busy_timeout 5000 de runSqliteWithTimeout (cdbfee72 PILIER B)
+        absorbe la contention SQLite brève avec le serveur. Pas de race
+        nouvelle introduite par ce RFC.
+    (i) before non nul mais HEAD plus récent contient des permits
+        supplémentaires légitimes (grant émis et auto-commité entre deux bash,
+        RFC 359f9162). L'UNION Source A + Source B garantit que ces permits
+        fraîchement scellés en HEAD sont dans la baseline -> préservés. Sans
+        l'union, ils auraient été vus comme « nouveaux » et supprimés à tort.
+        C'est précisément le scénario amplificateur des blockers 4f000127 /
+        05224964, neutralisé ici.
+
+  impact: >
+    CATÉGORISATION DES FICHIERS IMPACTÉS (lesson 611fde3e, discipline
+    affected_files). Le schéma RFC ne fournit qu'un champ plat
+    spec.affected_files ; pour la lisibilité et pour éviter le blocker
+    « fichier à créer oublié », la distinction est explicitée ici :
+      - À MODIFIER (existants, présents dans HEAD) :
+        * company/plugins/defense-in-depth-core.mjs — coeur du correctif :
+          réécriture de revertPermitTampering (logique baseline + sélectif par
+          défaut + nucléaire résiduel borné), ajout d'un helper d'extraction
+          des ids de permits scellés en HEAD (Source B). Estimé +40 à +70
+          lignes, -10 lignes (suppression de la branche nucléaire
+          inconditionnelle et du sous-cas silencieux).
+        * company/plugins/tests/defense-in-depth-core.test.mjs — fichier de
+          test EXISTANT à modifier : ajout des tests des trois axes
+          (nominal/négatif/edge de l'acceptance criterion 4) pour la nouvelle
+          logique de revertPermitTampering. Ce path tombe en zone protégée
+          (prefix company/plugins/) et DOIT donc être couvert par le write
+          permit. [AMENDEMENT POST-APPROBATION — l'implementation-plan
+          655fb3fb a déterminé que les tests triaxiaux iront dans ce fichier
+          existant plutôt que dans un nouveau fichier ; ajouté à affected_files
+          avant émission du permit, validé par le CEO au review round
+          23d9901f, conformément à la discipline 611fde3e.]
+      - À CRÉER (nouveaux) : AUCUN fichier de code. Le correctif est une
+        modification de defense-in-depth-core.mjs.
+      - TESTS. Le repo porte des tests du hook (bridge globalThis
+        __defenseInDepthTest dans defense-in-depth.mjs). L'implementation-plan
+        655fb3fb a tranché : les tests des trois axes (nominal/négatif/edge de
+        l'acceptance criterion 4) s'ajoutent au fichier de test EXISTANT
+        company/plugins/tests/defense-in-depth-core.test.mjs. Ce fichier tombe
+        en zone protégée (prefix company/plugins/) ; son path est donc ajouté à
+        affected_files par le présent amendement AVANT l'émission du permit
+        (sinon blocker hook, cf. 611fde3e). Aucun nouveau fichier de test n'est
+        requis. Les tests hors zone protégée (par exemple sous un répertoire de
+        tests non listé dans protected-zones.json) ne nécessiteraient pas de
+        couverture par le permit, mais ce n'est pas le cas ici.
+
+    NOTE — défense-en-profondeur côté serveur (snapshot_permits_state /
+    revert_permits_to_snapshot). Ce RFC ne modifie PAS le code Rust. Mais le
+    serveur expose un outil dont le hook tamper-revert s'appuie indirectement
+    sur la table que le hook va lire/écrire en sqlite3. L'implementation-plan
+    devra vérifier que la lecture de la baseline (Source B) et le DELETE
+    sélectif émis par le hook restent compatibles avec le contrôle
+    anti-tampering du plugin lui-même (le DELETE émis par le hook ne doit pas
+    être interprété comme une nouvelle altération par un contrôle ultérieur).
+    Le DELETE est émis DANS revertPermitTampering, après la capture du
+    snapshot before de la commande courante, donc il ne crée pas de boucle :
+    l'état post-revert devient la référence implicite pour le prochain bash.
+
+    Impact runtime.
+    - revertPermitTampering n'est appelé qu'en aftermath de bash, et ne fait
+      du travail que lorsqu'une divergence est détectée (chemin rare). Le
+      surcoût en CAS NOMINAL d'altération : +1 lecture HEAD de la DB (Source B)
+      quand le snapshot before est null ou pour enrichir la baseline. Estimé
+      < 100ms (un `git show` + parsing d'ids), uniquement sur le chemin de
+      détection d'altération, jamais en steady-state.
+    - Aucun overhead sur les writes/edits ni sur les bash sans altération.
+
+    Impact compatibilité.
+    - Aucun changement de contrat MCP, de schéma de table, ni de format
+      d'artifact YAML.
+    - Le comportement vécu par les agents change uniquement en cas
+      d'altération détectée : on ne perd plus tous les permits, seulement les
+      illégitimes. C'est une amélioration pure pour le cas (ii) du diagnostic.
+    - La règle ed7776fb PRATIQUE 1 (« jamais de SQL direct sur les tables
+      sensibles ») reste VALIDE : ce RFC réduit le COÛT d'une violation, il ne
+      la légitime pas. Un UPDATE direct reste détecté et l'intrus reste
+      supprimé.
+
+    Interactions avec autres composants.
+    - RFC 359f9162 (atomic grant + seal HEAD) : ce RFC s'appuie directement sur
+      l'invariant qu'il établit (tout permit légitime est scellé en HEAD via
+      l'auto-commit du grant). La Source B de la baseline n'est fiable QUE
+      parce que 359f9162 garantit que les permits légitimes sont en HEAD.
+      Synergie forte, aucun conflit. Sans 359f9162, la Source B serait moins
+      complète (permits non scellés invisibles), mais ce RFC reste correct :
+      il retomberait sur la Source A ou, à défaut, sur le repli sûr.
+    - RFC cdbfee72 (résilience DB) : le PILIER D autorepair (rebuild depuis
+      YAML) perd write_permits — c'est l'un des déclencheurs du `before ===
+      null` parasite. Ce RFC ne corrige pas cette perte (hors scope) mais en
+      atténue l'amplification : après un rebuild PILIER D, si un permit
+      légitime survit en HEAD, la Source B le reconnaît. Le busy_timeout PILIER
+      B est réutilisé tel quel par runSqliteWithTimeout.
+    - Hook lui-même : la branche « unauthorized commit touching protected
+      zones » (L424) et hasActivePermit (L117) ne sont PAS modifiés.
+
+    Risques résiduels.
+    - Extraction de la Source B (lecture HEAD de la DB) : implique de
+      matérialiser une copie de la DB committée pour la lire en SELECT. Si
+      cette copie est écrite dans une zone protégée, le hook se mordrait la
+      queue. Mitigation : l'implementation-plan DOIT écrire toute copie
+      temporaire hors zone protégée (par exemple /tmp) et la nettoyer. Risque
+      identifié, traitement délégué au plan.
+    - Le wipe résiduel (CAS RÉSIDUEL) reste un coût élevé quand il se
+      déclenche, mais sa fréquence chute drastiquement (de « tout before null »
+      à « before null ET HEAD inexploitable »). Acceptable : c'est la posture
+      fail-safe.
+    - Si `git` est indisponible dans l'environnement du hook, Source B est
+      toujours indisponible ; le système retombe sur Source A (snapshot
+      before) quand elle existe, et sur le wipe résiduel sinon. Pas de
+      régression par rapport à l'existant (qui ne consultait pas HEAD du tout).
+
+  rollback_plan: >
+    Le rollback s'effectue en un seul temps.
+
+    (1) company/plugins/defense-in-depth-core.mjs : `git revert` du commit du
+        correctif. revertPermitTampering reprend son comportement actuel
+        (nucléaire sur `before === null`, sélectif sinon, sous-cas silencieux
+        L230 inclus). Le helper d'extraction de la baseline HEAD (Source B)
+        disparaît. Le hook retrouve exactement son état pré-RFC, connu et
+        contourné en pratique par la discipline « jamais de SQL direct »
+        (ed7776fb).
+
+    (2) Si la lesson ed7776fb a été supersédée par la lesson de capitalisation
+        post-implémentation (cf. cleanup_workaround), réactiver son statut
+        courant pour que sa description du comportement nucléaire redevienne
+        cohérente avec le code reverté.
+
+    Aucune donnée n'est perdue par le rollback : aucun permit existant n'est
+    affecté par le revert du code du hook (les permits scellés restent en
+    HEAD). Le seul effet du rollback est de restaurer le comportement de
+    revert plus agressif.
+
+  cleanup_workaround: >
+    SECTION DÉDIÉE — application directe de la lesson be16dc46 (retrait /
+    mise à jour du contournement dans la même unité de travail que la
+    solution) et de l'acceptance criterion 5 de la task-request.
+
+    (a) Quel contournement / quelle vérité obsolète cette solution remplace.
+        La lesson ed7776fb documente le comportement NUCLÉAIRE comme « juste
+        sur le principe » et « préférable au log » (POINT 2), et présente le
+        revert sélectif uniquement comme un « RFC potentiel » à considérer
+        (PRATIQUE 3). Une fois ce RFC implémenté, le nucléaire n'est plus le
+        comportement par défaut : la description d'ed7776fb décrit alors un
+        état du système qui n'existe plus, ce qui en fait une vérité obsolète
+        que le search remonterait comme « comportement attendu » alors qu'il
+        ne l'est plus. Ce n'est pas un contournement dans du code (le code EST
+        le comportement), mais une vérité de la mémoire collective à mettre à
+        jour.
+
+    (b) Où vit cette vérité obsolète.
+        - Lesson ed7776fb-d56d-4f61-9f48-807897c6325d : POINT 2 (« LA
+          STRATÉGIE WIPE EST PRÉFÉRABLE AU LOG »), qui présente le wipe global
+          comme le bon comportement, et PRATIQUE 3 (« RFC POTENTIEL :
+          ASSOUPLISSEMENT DU WIPE »), qui propose le sélectif comme un futur
+          candidat. Après merge, PRATIQUE 3 est RÉALISÉE et POINT 2 ne décrit
+          plus le défaut. À NE PAS superseder en entier : les POINT 1, POINT 3
+          et PRATIQUE 1/2 (« jamais de SQL direct », « diagnostic-report plutôt
+          que workaround ») RESTENT vrais et critiques — ce RFC ne légitime
+          pas l'accès SQL direct, il en réduit seulement le coût.
+        - Les agent-messages 4f000127 et 05224964 sont des incidents datés,
+          pas des règles : ils ne sont pas modifiés, ils restent une trace
+          historique. Le search ne les remonte pas comme « comportement
+          attendu ».
+
+    (c) Plan de mise à jour prévu.
+        APRÈS l'implémentation et son merge (PAS maintenant, et hors scope du
+        présent RFC), l'Architect crée une lesson-learned de capitalisation
+        qui :
+          (i) documente la décision « sélectif par défaut, nucléaire borné au
+              cas baseline-indisponible » et son rationale (invariant de
+              sécurité 1/2/3, baseline = union snapshot before + permits scellés
+              HEAD) ;
+          (ii) MET À JOUR / superséde PARTIELLEMENT ed7776fb sur POINT 2 et
+               PRATIQUE 3 (le wipe n'est plus le défaut ; le sélectif est livré),
+               via metadata.related relationship: supersedes vers ed7776fb,
+               tout en préservant explicitement la validité des POINT 1/3 et
+               PRATIQUE 1/2 ;
+          (iii) chaîne vers be16dc46 (related, application de la discipline de
+                cleanup) et vers 359f9162 (related, dépendance sur le scellement
+                HEAD qui fonde la Source B) ;
+          (iv) référence ce RFC (derived-from).
+        Cette lesson est explicitement HORS du scope du présent RFC ; elle sera
+        créée par l'Architect après approbation et merge, conformément au
+        workflow et à la règle lesson_after_every_artifact. Elle est listée ici
+        comme engagement de Definition of Done du chantier, conformément à
+        be16dc46 PRATIQUE 1.
+
+        Definition of Done du chantier : le chantier n'est PAS terminé tant que
+        (1) le revert sélectif est mergé et le nucléaire borné au cas résiduel,
+        (2) les tests des trois axes passent, et (3) la lesson de capitalisation
+        supersédant partiellement ed7776fb (POINT 2 / PRATIQUE 3) est créée. Un
+        reviewer qui constaterait la solution sans la mise à jour planifiée
+        d'ed7776fb doit en tenir compte (be16dc46 PRATIQUE 1).
+
+  affected_files:
+    - "company/plugins/defense-in-depth-core.mjs"
+    - "company/plugins/tests/defense-in-depth-core.test.mjs"

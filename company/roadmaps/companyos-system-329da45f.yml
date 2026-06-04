@@ -260,17 +260,26 @@ spec:
     - key: defense-in-depth-selective
       title: "Hook defense-in-depth selective revert (vs nuclear actuel)"
       ref:
-        type: external
-        label: "Pattern identifié dans blockers répétés sur RFC bdee1af4, candidat RFC"
-      timeframe: future
-      status: planned
+        type: rfc
+        id: bde023e2-8633-42c9-911a-80dcd5157c62
+      timeframe: past
+      status: done
+      target_date: "2026-Q2"
       rationale: >
-        Le hook revert TOUS les permits dès qu'il en détecte un
-        non snapshotté, plutôt que de cibler uniquement le ou les
-        permits suspects. Comportement nucléaire qui amplifie le
-        coût des incidents (deux blockers documentés sur la
-        refonte search à cause de ça). RFC candidat pour rendre le
-        revert sélectif.
+        RÉSOLU (RFC bde023e2, commit 4f803b6). Le revert sélectif est
+        désormais le comportement par défaut : DELETE WHERE id NOT IN
+        (baseline), où baseline = union du snapshot before (Source A) et
+        des permits scellés en HEAD git (Source B, fondée sur le
+        scellement du RFC 359f9162). Le wipe nucléaire est borné au seul
+        cas résiduel où la baseline est indéterminable (Source A null ET
+        Source B inexploitable). Diagnostic clé : l'ancien critère
+        nucléaire before===null amalgamait vraie absence de baseline et
+        simple recréation du fichier DB, d'où les permits légitimes
+        détruits. La faille préexistante du sous-cas silencieux L230 (un
+        permit injecté survivait quand before listait 0 id) est aussi
+        fermée. Invariant de sécurité validé par le CEO : aucun permit
+        frauduleux ne survit. 46 tests JS verts. Lesson 85ad44d3
+        (supersede partiellement ed7776fb).
 
     - key: rfc-affected-files-categorize
       title: "RFC schema : distinguer affected_files.modified vs created"

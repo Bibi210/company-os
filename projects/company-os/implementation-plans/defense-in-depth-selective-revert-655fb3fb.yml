@@ -1,0 +1,350 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 655fb3fb-394a-4751-8968-c2d3a27f1903
+  title: "Implementation-plan : hook defense-in-depth — revert sélectif par défaut, nucléaire borné, fermeture de la faille L230"
+  author: implementer
+  created_at: "2026-06-04"
+  description: >
+    Plan d'exécution dérivé du RFC bde023e2 (approuvé). Réécrit
+    revertPermitTampering dans company/plugins/defense-in-depth-core.mjs
+    pour rendre le revert SÉLECTIF le comportement par défaut, fermer le
+    sous-cas silencieux L230 (baseline connue mais vide => DELETE quand
+    même), et borner le wipe nucléaire au SEUL cas résiduel « Source A
+    null ET Source B inexploitable » (décision CEO 1). Introduit la
+    Source B : lecture des ids de permits scellés en HEAD git via
+    `git show HEAD:company/data/orchestrator.db` matérialisé dans /tmp
+    (hors zone protégée, dans BASH_SAFE_PATHS), SELECT des ids, cleanup
+    try/finally (décision CEO 2). La baseline est l'UNION des ids de
+    Source A (snapshot before si non null) et Source B (HEAD). Le hook
+    reste en sqlite3 inline via runSqliteWithTimeout (pas de client MCP
+    dans le runtime des plugins, code Rust non touché). Les commandes
+    internes du hook passent par execSync, donc ne sont pas interceptées
+    par le guard anti-sqlite3 L293. Tests triaxiaux ajoutés au fichier
+    EXISTANT company/plugins/tests/defense-in-depth-core.test.mjs.
+    PRÉREQUIS BLOQUANT : le fichier de test est en zone protégée
+    (prefix company/plugins/) et n'est PAS dans affected_files du RFC ;
+    un amendement RFC ajoutant ce path est requis AVANT l'émission du
+    write permit (décision CEO 3 + lesson 611fde3e).
+  tags:
+    - defense-in-depth
+    - write-permit
+    - selective-revert
+    - companyos-internals
+    - friction-permits
+    - security
+    - critical-infra
+    - implementation
+  related:
+    - id: bde023e2-8633-42c9-911a-80dcd5157c62
+      kind: rfc
+      relationship: input
+    - id: dcb17b79-952b-403d-b8ed-c979aec8aad3
+      kind: task-request
+      relationship: input
+    - id: ed7776fb-d56d-4f61-9f48-807897c6325d
+      kind: lesson-learned
+      relationship: input
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: input
+    - id: 359f9162-18f2-4b72-85b0-7d0e44608959
+      kind: rfc
+      relationship: related
+
+spec:
+  dependencies:
+    - >
+      AMENDEMENT RFC bde023e2 OBLIGATOIRE AVANT WRITE PERMIT. Le fichier
+      de test company/plugins/tests/defense-in-depth-core.test.mjs est en
+      zone protégée (prefix company/plugins/ dans protected-zones.json) et
+      n'est PAS listé dans spec.affected_files du RFC (qui ne contient que
+      company/plugins/defense-in-depth-core.mjs). Pour écrire les tests, le
+      write permit devra couvrir CE fichier ; or un permit ne peut couvrir
+      qu'un path présent dans affected_files sans déclencher le blocker hook
+      (lesson 611fde3e). Donc : l'Architect doit amender le RFC pour ajouter
+      "company/plugins/tests/defense-in-depth-core.test.mjs" à affected_files,
+      PUIS le CEO émet le permit bornant les DEUX paths. Décision CEO 3.
+    - >
+      RFC 359f9162 (atomic grant + seal HEAD) est livré : il garantit que
+      tout permit légitime est scellé dans HEAD:company/data/orchestrator.db.
+      La fiabilité de la Source B repose entièrement sur cet invariant. Si
+      359f9162 n'était pas livré, la Source B serait incomplète mais le plan
+      resterait correct (fallback Source A puis wipe résiduel).
+    - >
+      git doit être disponible dans l'environnement du hook (déjà supposé :
+      le hook appelle déjà git rev-parse / git diff / git cat-file via run()).
+      Si git est absent, Source B est indisponible -> fallback Source A ou
+      wipe résiduel. Pas de régression par rapport à l'existant.
+
+  steps:
+    - description: >
+        ÉTAPE 0 — PRÉREQUIS NON-CODE (bloquant). Confirmer que l'amendement
+        RFC bde023e2 a ajouté company/plugins/tests/defense-in-depth-core.test.mjs
+        à spec.affected_files, et que le write permit émis par le CEO borne
+        EXACTEMENT les deux paths :
+          - company/plugins/defense-in-depth-core.mjs
+          - company/plugins/tests/defense-in-depth-core.test.mjs
+        Aucune écriture de code ne démarre tant que ce permit n'est pas actif
+        (check_write_permit sur les deux paths). Cette étape précède toute
+        modification ; elle matérialise la décision CEO 3 et le write_permit_gate
+        de la persona Implementer.
+      files: []
+
+    - description: >
+        ÉTAPE 1 — Helper `permitIdsFromHeadDb(rootDir)` : extraction des ids
+        de permits scellés en HEAD git (SOURCE B, décision CEO 2). Logique :
+        (1) Vérifier l'existence de la DB en HEAD via
+            `git cat-file -e HEAD:<db_path>` (run() renvoie "" si présent,
+            null si absent ou git en échec). Si null -> retourner null
+            (Source B indisponible).
+        (2) Matérialiser une copie temporaire de la DB committée HORS zone
+            protégée : choisir un chemin dans /tmp (couvert par BASH_SAFE_PATHS
+            L38, donc jamais traité comme protégé), unique par PID/timestamp
+            (ex. `/tmp/companyos-headdb-<pid>-<ts>.db`). Écrire via
+            `git show HEAD:<db_path> > "<tmpPath>"` exécuté par execSync.
+            IMPORTANT : la commande référence <db_path> (company/data/orchestrator.db) ;
+            comme elle passe par execSync (et NON par le tool bash d'opencode),
+            le guard anti-DB L283 et le guard anti-sqlite3 L293 ne l'interceptent
+            pas — ces guards ne filtrent que les input.tool === "bash". Vérifié
+            avec l'utilisateur (contrainte technique confirmée live).
+        (3) Lire les ids : `sqlite3 "<tmpPath>" ".timeout 5000" "SELECT id FROM write_permits"`
+            via runSqliteWithTimeout(tmpPath, ...). tmpPath étant dans /tmp,
+            il n'est PAS en zone protégée, donc l'usage de sqlite3 dessus est
+            légitime (et de toute façon en execSync, non intercepté).
+        (4) Parser : split sur "\n", filter(Boolean) -> Set d'ids.
+        (5) CLEANUP try/finally : supprimer le fichier temporaire
+            (`rm -f "<tmpPath>"` ou unlinkSync dans un catch tolérant) dans le
+            bloc finally, qu'il y ait eu erreur ou non. Aucune fuite de fichier
+            temporaire. Ne JAMAIS écrire la copie ailleurs que dans /tmp.
+        (6) Gestion d'échec : si `git show` échoue, si le SELECT échoue, ou si
+            la DB de HEAD est illisible/corrompue -> retourner null (Source B
+            inexploitable). Toute exception est capturée et convertie en null ;
+            le finally garantit le cleanup même en cas d'exception.
+        Contrat : retourne un Set<string> d'ids (éventuellement vide si HEAD a
+        0 permit) si Source B exploitable, ou null si inexploitable. La
+        distinction « Set vide » vs « null » est CRITIQUE : Set vide = HEAD
+        lisible avec 0 permit (Source B exploitable, contribue 0 id à l'union) ;
+        null = Source B indisponible (déclencheur partiel du cas résiduel).
+      files:
+        - company/plugins/defense-in-depth-core.mjs
+
+    - description: >
+        ÉTAPE 2 — Helper `parsePermitIds(snapshot)` : extraction des ids depuis
+        un blob de snapshot (SOURCE A). Réutilise EXACTEMENT la logique de split
+        de l'actuel beforeIds L228 :
+          snapshot.split(",").map(s => s.split(":")[0]).filter(Boolean)
+        Subtilité du format : le blob a la forme "<count>|<id1>:<status1>,<id2>:<status2>,...".
+        Le premier segment après split(",") est "<count>|<id1>", dont split(":")[0]
+        donne "<count>|<id1>" — le préfixe "<count>|" pollue le premier id.
+        L'actuel code L228 a ce même comportement et fonctionne car le DELETE
+        WHERE id NOT IN compare des ids littéraux : un id pollué "2|abc..." ne
+        matche jamais un vrai id, donc il n'élargit pas faussement la baseline
+        (au pire il ajoute un id fantôme qui ne protège rien). Pour être PLUS
+        correct et robuste, ce helper strippe le préfixe "<count>|" : si un
+        segment contient "|", ne garder que la partie après le dernier "|"
+        avant le split(":"). Documenter ce choix en commentaire. Le SET d'ids
+        importe, pas l'ordre (confirmé). Retourne un Set<string>.
+        Contrat : snapshot === null -> retourne null (Source A absente).
+        snapshot non null -> Set d'ids (vide si "0|").
+      files:
+        - company/plugins/defense-in-depth-core.mjs
+
+    - description: >
+        ÉTAPE 3 — Helper `buildBaseline(rootDir, before)` : construction de la
+        baseline légitime par UNION des deux sources (RFC : baseline =
+        union(Source A si non nulle, Source B si exploitable)).
+        Logique :
+          - sourceA = parsePermitIds(before)            // Set | null
+          - sourceB = permitIdsFromHeadDb(rootDir)       // Set | null
+          - Si sourceA === null ET sourceB === null  -> retourner null
+            (baseline INDÉTERMINABLE = cas résiduel).
+          - Sinon -> retourner l'UNION : new Set([...(sourceA ?? []), ...(sourceB ?? [])]).
+            Cette union peut être un Set VIDE (ex. Source A = "0|" et Source B
+            HEAD = 0 permit) : c'est une baseline DÉTERMINABLE mais vide, qui
+            mène à un DELETE sur tout (fermeture de la faille L230), PAS au wipe
+            résiduel. La distinction est portée par null (indéterminable) vs
+            Set vide (déterminable, vide).
+        Contrat : retourne Set<string> (la baseline, éventuellement vide) si
+        déterminable, ou null si indéterminable. C'est la fonction qui encode
+        l'invariant « sélectif si baseline connue, nucléaire seulement si
+        baseline inconnue ».
+      files:
+        - company/plugins/defense-in-depth-core.mjs
+
+    - description: >
+        ÉTAPE 4 — Réécriture de `revertPermitTampering(rootDir, before)` (coeur
+        du correctif, remplace L216-239). Préserver INCHANGÉE la détection de
+        divergence L217-219 :
+          const after = snapshotPermits(rootDir);
+          if (before === null && after === null) return false;  // pas de DB
+          if (before === after) return false;                   // identique
+        Puis, divergence détectée — NOUVELLE logique remplaçant les deux branches
+        actuelles (nucléaire L223-225 ET sélectif L226-237 avec son sous-cas
+        silencieux L230) :
+          const dbPath = resolve(rootDir, _zones.db_path);
+          const baseline = buildBaseline(rootDir, before);   // Set | null
+          if (baseline === null) {
+            // CAS RÉSIDUEL : Source A null ET Source B inexploitable.
+            // Aucune baseline légitime affirmable -> wipe total (fail-safe).
+            // SEUL chemin nucléaire restant (décision CEO 1).
+            runSqliteWithTimeout(dbPath, "DELETE FROM write_permits", rootDir);
+          } else {
+            // CAS NOMINAL : baseline déterminable (même si vide).
+            // DELETE sélectif : supprime tout id HORS baseline.
+            const placeholders = [...baseline].map(id => `'${id}'`).join(",");
+            if (placeholders) {
+              runSqliteWithTimeout(dbPath,
+                `DELETE FROM write_permits WHERE id NOT IN (${placeholders})`, rootDir);
+            } else {
+              // Baseline déterminable mais VIDE -> aucun id légitime ->
+              // DELETE sur TOUT (ferme la faille L230 : avant, placeholders
+              // vide => aucun DELETE => permit injecté survivait).
+              runSqliteWithTimeout(dbPath, "DELETE FROM write_permits", rootDir);
+            }
+          }
+          return true;
+        Note de non-régression du quoting : les ids sont des UUID v4 (générés par
+        generate_id), sans quote simple ni caractère SQL spécial, donc l'interpolation
+        `'${id}'` reste sûre dans ce contexte fermé (même hypothèse que le code
+        actuel L229). Documenter en commentaire que la source des ids est HEAD git
+        et le snapshot, tous deux produits par le canal MCP.
+        Invariants RFC satisfaits : (1) permit dans baseline préservé ; (2) permit
+        hors baseline supprimé ; (3) aucun permit hors-canal, absent de baseline et
+        non scellé en HEAD, ne survit (le DELETE sélectif le supprime, ou le wipe
+        résiduel si baseline indéterminable).
+      files:
+        - company/plugins/defense-in-depth-core.mjs
+
+    - description: >
+        ÉTAPE 5 — Exporter les fonctions testables. revertPermitTampering,
+        snapshotPermits, buildBaseline, parsePermitIds et permitIdsFromHeadDb
+        ne sont actuellement PAS exportées (seul un sous-ensemble de helpers
+        purs l'est, L241). Pour permettre les tests unitaires directs, ajouter
+        ces fonctions à l'export nommé existant (L241). Choix : exporter au
+        minimum revertPermitTampering, buildBaseline et parsePermitIds (les
+        plus testables sans I/O git/sqlite réel). Pour permitIdsFromHeadDb et
+        revertPermitTampering qui font de l'I/O, les tests les exerceront sur
+        une DB sqlite temporaire dans /tmp et un faux repo git temporaire (cf.
+        étape 6). L'export est une modification de defense-in-depth-core.mjs
+        (déjà couvert par le permit). Ne PAS modifier la signature des fonctions
+        existantes utilisées par le wrapper defense-in-depth.mjs.
+      files:
+        - company/plugins/defense-in-depth-core.mjs
+
+    - description: >
+        ÉTAPE 6 — Tests triaxiaux (acceptance criterion 4) ajoutés au fichier
+        EXISTANT company/plugins/tests/defense-in-depth-core.test.mjs (décision
+        utilisateur : étendre l'existant, pas de nouveau fichier). Infrastructure
+        de test : pour chaque cas nécessitant une vraie DB, créer une DB sqlite
+        temporaire dans /tmp (via mkdtempSync + sqlite3 CREATE TABLE write_permits)
+        et, pour les cas Source B, un repo git temporaire dans /tmp avec un commit
+        de la DB (git init + add -f + commit dans le tmp). Cleanup en fin de test.
+        Couverture exigée :
+        NOMINAL (happy path) :
+          - n1: Plusieurs permits légitimes (Source A non nulle), un intrus apparaît
+            pendant le bash. revertPermitTampering -> seul l'intrus supprimé, les
+            légitimes survivent. (inverse exact de l'incident ed7776fb)
+          - n2: parsePermitIds sur un blob "3|id1:active,id2:consumed,id3:active"
+            -> Set {id1,id2,id3} (vérifie le strip du préfixe count|).
+          - n3: buildBaseline avec Source A {a,b} et Source B {b,c} -> union {a,b,c}.
+        NÉGATIF (erreurs, échecs) :
+          - g1: Injection frauduleuse alors que des légitimes existent (Source A
+            non nulle) : l'intrus n'est ni dans before ni dans HEAD -> SUPPRIMÉ,
+            légitimes préservés. (invariant 3, acceptance criterion 3)
+          - g2: Injection alors qu'AUCUN permit légitime n'existait — baseline
+            connue mais VIDE (before "0|", HEAD 0 permit) : DELETE porte sur tout
+            -> intrus SUPPRIMÉ. FERME LA FAILLE L230 (sous-cas silencieux).
+          - g3: Source A null ET Source B inexploitable (pas de DB en HEAD, ou
+            git show échoue) -> buildBaseline retourne null -> WIPE résiduel.
+            (cas résiduel borné, décision CEO 1)
+          - g4: Source B échoue partiellement (git show erreur) mais Source A
+            présente -> baseline = Source A seule -> sélectif sur Source A,
+            jamais moins sûr que l'existant.
+        EDGE (valeurs limites, concurrence) :
+          - e1: Table vide avant ET après, aucune altération -> before===after
+            ou both-null -> return false, aucun DELETE.
+          - e2: Un seul permit, légitime, inchangé -> before===after -> false.
+          - e3: TOUS les permits présents illégitimes (aucun dans baseline) ->
+            DELETE sélectif les supprime tous (résultat = wipe mais par voie
+            sélective justifiée, invariant 3).
+          - e4: before non null ET HEAD contient un permit supplémentaire scellé
+            (grant émis et auto-commité entre deux bash, scénario 359f9162) ->
+            union le préserve -> non supprimé à tort (neutralise blockers
+            4f000127/05224964).
+          - e5: permitIdsFromHeadDb nettoie bien son fichier /tmp (vérifier que
+            le fichier temporaire n'existe plus après l'appel, succès ou échec).
+        Chaque test doit nettoyer ses ressources temporaires (DB et repo git
+        dans /tmp).
+      files:
+        - company/plugins/tests/defense-in-depth-core.test.mjs
+
+    - description: >
+        ÉTAPE 7 — Vérification de non-bouclage (note RFC impact). Confirmer par
+        revue de code (et un test si pertinent) que le DELETE émis DANS
+        revertPermitTampering ne se fait PAS interpréter comme une nouvelle
+        altération : il est exécuté APRÈS la capture du snapshot before de la
+        commande bash courante (tool.execute.before L312) et DANS le post-bash
+        (L389), donc l'état post-revert devient la référence implicite du
+        PROCHAIN bash. Aucune boucle. De même, vérifier que la matérialisation
+        /tmp de la Source B et son SELECT ne déclenchent aucun guard : ces
+        commandes passent par execSync (run / runSqliteWithTimeout), pas par
+        input.tool === "bash", donc ni L283 ni L293 ne s'appliquent. Cette étape
+        est une vérification, pas une écriture de code supplémentaire.
+      files: []
+
+    - description: >
+        ÉTAPE 8 — CI interne (règle persona : cargo build + cargo test = CI de
+        CompanyOS pour la zone Rust ; ici la modification est JS, donc la CI
+        pertinente est `make test-js` qui exécute
+        node --test company/plugins/tests/*.test.mjs). Séquence de clôture
+        respectant write_permit_full_sequence :
+          1. (permit déjà actif depuis étape 0)
+          2. Modifs appliquées (étapes 1-6).
+          3. git add company/plugins/defense-in-depth-core.mjs
+             company/plugins/tests/defense-in-depth-core.test.mjs && git commit.
+          4. consume_write_permit() APRÈS le commit du code.
+          5. make test-js (tous les tests verts, 0 failed) ; en complément
+             `cargo build` puis `cargo test` pour confirmer que le binaire et
+             la suite Rust restent verts (aucune modification Rust attendue,
+             mais la séquence l'exige et cargo build sans --target-dir déclenche
+             le hot-reload des MCP servers).
+          6. reload_config() EN DERNIER, uniquement si build/test verts.
+        NOTE : cette étape décrit la séquence d'exécution future (phase code),
+        elle n'est pas exécutée dans la phase de planification courante.
+      files: []
+
+  risks:
+    - >
+      AMENDEMENT RFC NON FAIT = BLOCKER. Si le permit est émis sans que
+      company/plugins/tests/defense-in-depth-core.test.mjs soit dans
+      affected_files, l'écriture du fichier de test sera revertée par le hook
+      (write blocked in protected zone) ou le permit refusé. Mitigation :
+      étape 0 + dépendance explicite ; ne pas démarrer le code avant amendement
+      + permit couvrant les DEUX paths. Décision CEO 3, lesson 611fde3e.
+    - >
+      Fuite de fichier temporaire /tmp si le cleanup try/finally est mal écrit.
+      Mitigation : finally inconditionnel dans permitIdsFromHeadDb (étape 1),
+      test e5 qui vérifie l'absence du fichier après l'appel.
+    - >
+      Confusion null vs Set vide dans buildBaseline. Si « baseline vide » était
+      traité comme « baseline indéterminable », on wiperait au lieu de fermer la
+      faille L230 (régression inverse). Mitigation : contrat strict (null =
+      indéterminable, Set vide = déterminable-vide -> DELETE sur tout), tests
+      g2 (vide -> DELETE total) et g3 (indéterminable -> wipe résiduel) qui
+      distinguent les deux chemins.
+    - >
+      Interpolation SQL des ids. Les ids sont des UUID v4 sans caractère
+      spécial ; l'interpolation `'${id}'` reste sûre dans ce contexte fermé
+      (même hypothèse que le code actuel). Pas de durcissement supplémentaire
+      requis, documenté en commentaire.
+    - >
+      Source B trompeuse si 359f9162 régressait (permits légitimes non scellés
+      en HEAD). Hors scope ici ; le fallback Source A puis wipe résiduel garde
+      le comportement correct. Documenté comme dépendance.
+    - >
+      Pollution du premier id par le préfixe "<count>|" du blob snapshot.
+      L'actuel code L228 vit avec ; ce plan strippe le préfixe dans
+      parsePermitIds (étape 2) et le couvre par le test n2. Sans ce strip, un
+      id fantôme "2|<uuid>" élargirait la baseline d'un id qui ne matche jamais
+      rien (bénin), mais le strip évite tout doute.

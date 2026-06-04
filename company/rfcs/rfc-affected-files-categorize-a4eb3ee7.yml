@@ -1,0 +1,331 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: a4eb3ee7-45c1-4422-a43a-fbbc07d686f0
+  title: "Schema RFC : distinguer affected_files modified vs created (rétro-compatible via anyOf)"
+  status: approved
+  approved_at: "2026-06-04T08:43:35.008268632+00:00"
+  author: architect
+  created_at: "2026-06-04"
+  description: >
+    Étend spec.affected_files du schema RFC pour permettre de distinguer
+    explicitement les fichiers à MODIFIER (existants) des fichiers à CRÉER
+    (nouveaux), via une forme structurée objet {modified, created}. Le
+    changement est strictement RÉTRO-COMPATIBLE : le format legacy (array
+    plat de strings) reste accepté en plus du nouveau format, grâce à un
+    anyOf dans le JSON Schema. Aucun RFC existant ne devient invalide.
+    Aucun code Rust n'est touché car affected_files n'est lu par aucun code
+    (champ purement documentaire dans le YAML, indépendant du mécanisme de
+    permit qui repose sur target_paths fourni par le CEO).
+  tags:
+    - rfc-schema
+    - affected-files
+    - schema
+    - companyos-internals
+    - friction-permits
+    - backward-compatible
+  related:
+    - id: 08d5b9a2-2dc6-4b73-8e6a-c7799367b04d
+      kind: task-request
+      relationship: input
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: input
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: input
+    - id: 3f507271-70ba-49ac-9a08-eeb833fb6063
+      kind: lesson-learned
+      relationship: related
+    - id: 359f9162-18f2-4b72-85b0-7d0e44608959
+      kind: rfc
+      relationship: related
+
+spec:
+  motivation: >
+    LE BESOIN. Le champ spec.affected_files du schema RFC est aujourd'hui
+    un array plat de strings (company/schemas/rfc.schema.json lignes 24-27).
+    Il ne distingue pas les fichiers à MODIFIER (déjà présents dans HEAD)
+    des fichiers à CRÉER (nouveaux). Cette absence de distinction a un coût
+    concret, documenté dans la mémoire collective.
+
+    LE COÛT OBSERVÉ. La lesson 611fde3e (enseignement 3) raconte le cas
+    précis : pendant l'implémentation du RFC cdbfee72, le permit émis par
+    le CEO couvrait les 11 paths existants à modifier mais PAS les 3
+    nouveaux fichiers à créer (lock.rs, tests/integration_lock.rs,
+    tests/test_helpers.rs). Le hook defense-in-depth a refusé la création
+    de lock.rs ; il a fallu un round-trip Implementer -> PM -> CEO et un
+    permit complémentaire b4f09f5d pour débloquer. Cause racine identifiée
+    par la lesson : "l'auteur du RFC pense implicitement 'fichiers qu'on va
+    toucher' et liste souvent seulement les modifications. Les fichiers à
+    créer sont parfois oubliés." Le CEO lui-même (note relayée par le PM
+    dans 611fde3e) a recommandé : "Le RFC schema gagnerait à distinguer
+    affected_files.modified et affected_files.created. Pattern actuel
+    ambigu, candidat à un futur RFC d'amélioration du schéma." Ce RFC est
+    cette amélioration.
+
+    LE CONSTAT DE PROSE REDONDANTE (contournement actuel). Faute de champ
+    structuré, les RFCs récents ont dû expliciter la distinction EN PROSE
+    dans la section impact. Vérifié empiriquement dans le code :
+    - 359f9162 (lignes 324-337) : prose distinguant les paths existants des
+      paths à créer, avec mention explicite "Le schéma RFC actuel ne
+      fournit qu'un champ plat spec.affected_files (array de string)".
+    - 1c0f2570 (lignes 350-376) : même prose, même justification, référence
+      explicite au présent chantier (rfc-affected-files-categorize).
+    - bde023e2 (lignes 336-364) : même prose, "Le schéma RFC ne fournit
+      qu'un champ plat spec.affected_files".
+    - cdbfee72 (lignes 196-217) : prose distinguant le fichier ajouté pour
+      traçabilité des fichiers à modifier.
+    Cette distinction en prose est le CONTOURNEMENT (au sens de la lesson
+    be16dc46) de l'absence d'un champ structuré. Elle est redondante (chaque
+    auteur la réinvente), non exploitable par l'outillage, et fragile (rien
+    ne force la cohérence entre la prose et la liste affected_files réelle).
+
+    L'OBJECTIF. Introduire dans le schema une forme structurée
+    {modified, created} qui rend la distinction explicite, validable, et
+    exploitable par un futur outillage (par exemple une pré-vérification de
+    permit qui calculerait l'union modified+created comme target_paths
+    candidats). Sans casser aucun RFC existant.
+
+  proposal: >
+    APPROCHE RETENUE : RÉTRO-COMPATIBILITÉ PAR anyOf. Le champ
+    spec.affected_files accepte DEUX formes alternatives, validées par un
+    anyOf dans le JSON Schema :
+
+    FORME A (legacy, inchangée) - array plat de strings :
+        affected_files:
+          - "crates/orchestrator/src/db.rs"
+          - "company/schemas/rfc.schema.json"
+
+    FORME B (nouvelle, structurée) - objet avec deux sous-listes optionnelles :
+        affected_files:
+          modified:
+            - "company/schemas/rfc.schema.json"
+          created:
+            - "crates/orchestrator/src/lock.rs"
+
+    POURQUOI anyOf ET PAS oneOf. anyOf est correct ici car les deux schémas
+    branches sont mutuellement exclusifs par construction (un array n'est
+    jamais un objet), donc anyOf et oneOf accepteraient exactement le même
+    ensemble de valeurs. anyOf est préféré pour la robustesse : si une
+    future évolution rendait deux branches non strictement disjointes, oneOf
+    rejetterait une valeur matchant les deux branches alors qu'anyOf
+    l'accepterait. anyOf exprime l'intention réelle ("au moins une forme
+    valide convient") sans la contrainte fragile d'exclusivité de oneOf.
+
+    POURQUOI modified ET created SONT OPTIONNELS (pas de required). Un RFC
+    peut ne modifier aucun fichier existant (que des créations), ou ne créer
+    aucun fichier (que des modifications). Forcer les deux clés casserait
+    ces cas légitimes. L'objet vide {} et les listes vides [] sont donc
+    tolérés au niveau schema. La discipline de remplissage relève de la
+    règle de process (cf. cleanup_workaround), pas de la contrainte
+    structurelle, exactement comme rollback_plan reste optionnel.
+
+    JSON SCHEMA EXACT (nouveau contenu de company/schemas/rfc.schema.json) :
+        {
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "$id": "https://companyos.dev/schemas/rfc.schema.json",
+          "allOf": [
+            { "$ref": "_base.schema.json" },
+            {
+              "properties": {
+                "kind": { "const": "rfc" },
+                "metadata": {
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": ["draft", "review", "approved", "rejected", "implemented"]
+                    }
+                  }
+                },
+                "spec": {
+                  "type": "object",
+                  "properties": {
+                    "motivation": { "type": "string" },
+                    "proposal": { "type": "string" },
+                    "impact": { "type": "string" },
+                    "rollback_plan": { "type": "string" },
+                    "affected_files": {
+                      "anyOf": [
+                        {
+                          "type": "array",
+                          "items": { "type": "string" },
+                          "description": "Legacy flat form: a single list of file paths (modified or created indistinctly). Kept for backward compatibility."
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "modified": {
+                              "type": "array",
+                              "items": { "type": "string" },
+                              "description": "Files that already exist in HEAD and will be edited."
+                            },
+                            "created": {
+                              "type": "array",
+                              "items": { "type": "string" },
+                              "description": "New files that do not yet exist and will be created."
+                            }
+                          },
+                          "additionalProperties": false,
+                          "description": "Structured form distinguishing files to modify from files to create. Both keys optional; either may be empty or absent."
+                        }
+                      ]
+                    }
+                  },
+                  "required": ["motivation", "proposal", "impact"]
+                }
+              },
+              "required": ["spec"]
+            }
+          ]
+        }
+
+    Le seul changement par rapport au schema actuel est le remplacement du
+    bloc affected_files (anciennement type array simple) par le bloc anyOf
+    ci-dessus. Tout le reste du schema est identique au caractère près.
+
+    additionalProperties: false sur la branche objet garantit qu'une faute
+    de frappe (ex. "modifeid" au lieu de "modified") est rejetée plutôt que
+    silencieusement ignorée. C'est ce qui donne l'axe NÉGATIF testable.
+
+    NOTE BOOTSTRAP (ironie assumée). Ce RFC propose la FORME B mais utilise
+    lui-même la FORME A dans son propre champ affected_files ci-dessous.
+    Raison : le schema vivant au moment de l'écriture de ce RFC n'accepte
+    encore que la FORME A ; le validator defense-in-depth rejette toute
+    écriture d'un RFC en FORME B tant que le schema n'a pas été patché par
+    ce même RFC (problème de bootstrap classique : on ne peut pas utiliser
+    le nouveau format avant que le changement qui l'introduit soit mergé).
+    Les RFCs ultérieurs, eux, pourront adopter la FORME B.
+
+  impact: >
+    1. RÉTRO-COMPATIBILITÉ : TOTALE. Le changement est purement additif.
+       Les 22 RFCs existants (vérifiés par glob company/rfcs/*.yml) utilisent
+       tous la FORME A (array plat de strings) ou n'ont pas de affected_files.
+       La branche A de l'anyOf est strictement identique à l'ancien schema,
+       donc tous restent valides. AUCUNE migration n'est nécessaire. AUCUN
+       RFC ne casse.
+
+    2. CODE RUST TOUCHÉ : AUCUN. Vérifié empiriquement par grep "affected_files"
+       et grep "affected" sur crates/ : ZÉRO occurrence dans le code Rust.
+       Le champ affected_files n'est lu par aucun code. Le mécanisme de write
+       permit ne repose PAS sur affected_files : il repose sur target_paths,
+       une liste fournie indépendamment par le CEO au moment du
+       grant_write_permit (cf. crates/orchestrator/src/types.rs ligne 217,
+       db.rs, engine.rs, main.rs). affected_files est donc purement
+       documentaire dans le YAML du RFC. Conséquence directe : ce RFC ne
+       change AUCUNE ligne de Rust, ne crée aucune dépendance, ne touche
+       aucune crate. Le seul fichier de code modifié est le JSON Schema.
+
+    3. VALIDATOR YAML : aucun changement de code. Le validator
+       (crates/validation, serveur yaml-validator) est piloté par schema :
+       SchemaRegistry::load charge les .schema.json et valide via le crate
+       jsonschema standard. anyOf est une construction JSON Schema standard
+       supportée nativement. Le watcher recharge automatiquement les schemas
+       à chaque écriture dans company/schemas/ (crates/mcp-servers/yaml/src/main.rs
+       lignes 183-218) ; un reload_schemas() manuel reste disponible en
+       fallback. Aucune adaptation du moteur de validation.
+
+    4. EXPLOITABILITÉ FUTURE : la FORME B rend la distinction
+       machine-readable. Un futur outillage de pré-vérification de permit
+       (mentionné dans le task-request comme finalité) pourra lire
+       affected_files.modified et affected_files.created, calculer leur union
+       comme target_paths candidats, et signaler les oublis AVANT le blocage
+       hook. Ce RFC ne construit PAS cet outillage (hors scope) ; il pose la
+       structure qui le rendra possible. Tant que ce code n'existe pas, le
+       champ reste documentaire comme aujourd'hui.
+
+    5. PÉRIMÈTRE D'ÉCRITURE : un seul fichier de zone protégée modifié
+       (company/schemas/rfc.schema.json). Le write permit du CEO devra
+       couvrir ce seul path en MODIFICATION (le fichier existe déjà).
+       Le fichier de cleanup shared-rules.yml (company/config/) est aussi en
+       zone protégée et devra figurer dans le permit ; la lesson de
+       capitalisation (company/lessons/) est hors zone protégée code.
+
+    6. VERDICT ESCALADE : ce changement N'EST PAS un breaking-schema-change.
+       Un breaking change rendrait invalides des artifacts existants ; ici,
+       par construction (anyOf gardant la branche legacy à l'identique), zéro
+       artifact existant ne devient invalide. Donc ce RFC NE relève PAS de
+       ceo_cannot_approve_alone (catégorie breaking-schema-change), et NE
+       déclenche PAS le human-review-trigger "rfc introduces breaking schema
+       change". Approbation CEO standard suffisante, sans escalade
+       utilisateur obligatoire au titre du breaking change. (L'escalade
+       utilisateur reste à la discrétion du CEO comme pour tout RFC.)
+
+  rollback_plan: >
+    Rollback trivial et sans risque de perte de données, car le changement
+    est purement additif sur le schema.
+
+    PROCÉDURE : restaurer le bloc affected_files antérieur dans
+    company/schemas/rfc.schema.json (remplacer le bloc anyOf par
+    { "type": "array", "items": { "type": "string" } }), puis laisser le
+    watcher recharger le schema (ou appeler reload_schemas()).
+
+    EFFET DE BORD DU ROLLBACK : tout RFC qui aurait entre-temps adopté la
+    FORME B (objet {modified, created}) deviendrait invalide après rollback,
+    puisque le schema ré-imposerait l'array plat. Au moment de ce rollback,
+    aucun RFC n'utilise encore la FORME B (le présent RFC lui-même reste en
+    FORME A par contrainte de bootstrap, cf. proposal). Si des RFCs futurs
+    avaient adopté la FORME B, il faudrait les reconvertir à la FORME A avant
+    rollback. Comme les deux formes encodent la même information (une union
+    de paths), la reconversion est mécanique et sans perte.
+
+    PROBABILITÉ DE ROLLBACK : faible. Le changement n'altère aucun
+    comportement runtime (aucun code ne lit le champ), donc il ne peut pas
+    introduire de régression fonctionnelle. Le seul risque serait un schema
+    JSON mal formé ; il est éliminé par la validation du schema patché avant
+    merge.
+
+  cleanup_workaround: >
+    CONTOURNEMENT RENDU OBSOLÈTE (application de la lesson be16dc46). La
+    vraie solution introduite ici (le champ structuré {modified, created})
+    rend obsolète le contournement actuel : la distinction faite EN PROSE
+    dans la section impact des RFCs récents (359f9162, 1c0f2570, bde023e2,
+    cdbfee72). Conformément à be16dc46, le retrait du contournement fait
+    partie du scope, mais avec une nuance importante détaillée ci-dessous.
+
+    OÙ VIT LE CONTOURNEMENT : (a) dans la prose impact des RFCs DÉJÀ MERGÉS
+    listés ci-dessus ; (b) dans la pratique recommandée par la lesson
+    611fde3e (recommandation 3) qui dit "en attendant qu'un RFC schema
+    upgrade distingue les deux champs, pratique à adopter : l'Architect SE
+    FORCE à imaginer le commit diff..." ; (c) dans la description du kind rfc
+    de shared-rules.yml qui mentionne "la liste des affected_files" sans
+    parler de la distinction.
+
+    ACTIONS DE RETRAIT PRÉVUES (à exécuter dans l'implementation-plan dérivé
+    et la phase de capitalisation, PAS dans ce RFC qui ne fait que les
+    planifier) :
+
+    - ACTION 1 (lesson 611fde3e) : superseder ou amender la recommandation 3
+      de la lesson 611fde3e pour qu'elle pointe vers le champ structuré
+      affected_files.created comme moyen canonique, au lieu de la pratique
+      manuelle "se forcer à imaginer le diff". Conformément à be16dc46
+      pratique 3 (tracer le lien solution -> contournement retiré) et à la
+      règle lesson_chaining : créer une nouvelle lesson qui supersede l'ancien
+      enseignement de workflow, OU amender 611fde3e en place. La recherche
+      préalable (search kind=lesson-learned sur "affected_files created
+      modified") déterminera créer-vs-amender au moment de la capitalisation.
+
+    - ACTION 2 (shared-rules.yml) : ajouter/ajuster une règle qui RECOMMANDE
+      (sans imposer) la FORME B structurée pour les RFCs touchant du code, et
+      qui pointe vers affected_files.modified / affected_files.created comme
+      mécanisme. Vérifié : AUCUNE règle dédiée n'existe aujourd'hui dans
+      shared-rules.yml sur la catégorisation de affected_files ; seule la
+      description du kind rfc (ligne 57) mentionne "la liste des affected_files".
+      L'ajout d'une règle de recommandation est donc nécessaire pour que la
+      solution remplace effectivement le contournement de prose. C'est cette
+      action qui ferme le chemin du contournement pour les FUTURS auteurs.
+
+    - PAS D'ACTION sur les RFCs déjà mergés : leur prose est un artefact
+      historique figé. La réécrire n'apporte rien (ils sont implémentés ou
+      clos) et risquerait d'invalider la traçabilité. La règle be16dc46 vise
+      à empêcher que le contournement reste un CHEMIN EMPRUNTABLE pour les
+      FUTURS auteurs ; c'est l'action 2 (règle de recommandation) qui ferme ce
+      chemin, pas la réécriture du passé.
+
+    NOTE : ces actions de cleanup sont planifiées ici (exigence be16dc46 +
+    AC5 du task-request) mais leur exécution appartient à l'implementation-plan
+    et à la phase de capitalisation, hors du présent artifact RFC.
+
+  affected_files:
+    - "company/schemas/rfc.schema.json"
+    - "company/config/shared-rules.yml"

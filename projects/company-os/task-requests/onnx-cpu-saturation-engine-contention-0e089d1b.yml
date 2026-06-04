@@ -1,0 +1,87 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 0e089d1b-ffb4-4011-b755-7da70bb6b514
+  title: "Brider le pool ONNX fastembed et réduire la contention engine (freeze reload_config)"
+  author: pm
+  created_at: "2026-06-04"
+  project: company-os
+  description: >
+    Le diagnostic-report fa9bd072 a identifié la cause d'un freeze de la
+    session MCP après reload_config(). reload_config n'est que le
+    révélateur. La cause racine est double : (1) le thread-pool ONNX de
+    fastembed (embedding.rs) tourne en busy-spin permanent, saturant le CPU
+    du serveur orchestrator (~600% CPU en continu, signature de spin-wait
+    confirmée par les context switches), parce que le pool intra-op est
+    dimensionné au nombre de cœurs (16) et n'est pas bridé ni mis en mode
+    blocking ; (2) reload_config, le reindex_all de boot, et le reindex
+    déclenché par le file-watcher partagent l'unique tokio::Mutex de
+    l'engine, donc un reindex_all (delete_all + ré-embed des 123 artifacts)
+    retient le lock et, sous CPU déjà saturé, fait attendre reload_config
+    assez longtemps pour qu'opencode perçoive un freeze. C'est l'angle mort
+    PISTE B laissé ouvert par le RFC d9399863 (proxy résilient) : un serveur
+    non-répondant SANS exit, que le proxy ne sait pas détecter.
+  tags:
+    - onnx
+    - fastembed
+    - cpu-saturation
+    - engine-contention
+    - orchestrator
+    - reload-config
+    - critical-infra
+    - companyos-internals
+  related:
+    - id: fa9bd072-a132-4a37-8163-1895f531f723
+      kind: diagnostic-report
+      relationship: input
+    - id: d9399863-254e-42f5-a485-ea019ce56a93
+      kind: rfc
+      relationship: related
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: related
+    - id: b04f8838-84b5-4332-b3a4-5782a943d766
+      kind: lesson-learned
+      relationship: input
+
+spec:
+  priority: high
+  status: backlog
+  acceptance_criteria:
+    - >
+      Le serveur orchestrator au repos (aucune requête en cours) consomme
+      une CPU négligeable (ordre de grandeur : proche de 0%, pas ~600%). Le
+      busy-spin permanent du pool ONNX/fastembed est éliminé. Mesure avant
+      (saturation confirmée par le diagnostic) et après (idle) documentée.
+    - >
+      Le pool de threads ONNX/fastembed est bridé : nombre de threads
+      intra-op limité (par exemple 2 à 4 au lieu du nombre de cœurs) et
+      spin-wait désactivé (pool en mode blocking). Le choix exact des
+      paramètres est une décision d'architecture, mais l'objectif idle
+      proche de 0% prime.
+    - >
+      reload_config() reste répondant même pendant qu'un reindex est en
+      cours. La contention sur le mutex unique de l'engine est réduite de
+      sorte qu'une opération administrative légère (reload_config) ne soit
+      pas bloquée par une opération lourde (reindex_all). L'approche
+      (reindex incrémental ciblé sur événement watcher au lieu de
+      reindex_all complet, et/ou découplage lecture/réindexation) est à
+      trancher par l'Architect.
+    - >
+      Aucune régression sur la qualité de l'embedding ni sur le déterminisme
+      (le bridage du pool ne doit pas changer les vecteurs produits, juste
+      le nombre de threads et le comportement d'attente). Le recall de search
+      reste équivalent.
+    - >
+      Tests entérinés dans la suite automatisée (lesson b04f8838, PAS de
+      validation manuelle). Nominal : embedding d'un artifact produit le
+      vecteur attendu avec le pool bridé. Performance : une mesure
+      automatisable ou au minimum documentée de la CPU idle. Edge :
+      reindex en cours + opération concurrente (reload_config ou search)
+      qui doit rester répondante ; déterminisme du vecteur identique avant/
+      après bridage.
+    - >
+      Périmètre : ce chantier traite la saturation CPU ONNX et la contention
+      engine. Il ne modifie pas le proxy MCP (d9399863, qui reste correct
+      pour les restarts de binaire) ni la sémantique de search. Il ferme la
+      PISTE B identifiée par le diagnostic fa9bd072.

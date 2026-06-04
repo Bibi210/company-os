@@ -1,0 +1,504 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 973a5569-ec7e-4ee0-a868-2314e3cd5bd4
+  title: "Discipline de migration de schéma SQL : PRAGMA user_version + migrations numérotées ordonnées idempotentes + tests de transition entérinés"
+  status: approved
+  approved_at: "2026-06-04T09:05:20.430831785+00:00"
+  author: architect
+  created_at: "2026-06-04"
+  description: >
+    Formalise une discipline générale de migration du schéma SQLite de
+    l'orchestrator. Aujourd'hui migrate() (crates/orchestrator/src/db.rs)
+    applique le schéma par "étapes" implicites non versionnées : un bloc
+    SCHEMA_SQL/FTS_SQL/VEC_TABLE_SQL transactionnel, puis une boucle
+    ALTER TABLE ADD COLUMN hors transaction avec matching de string sur
+    "duplicate column", puis un step 2bis (le hotfix 57019e7) qui crée des
+    index APRÈS les ALTER, puis un step 3 de détection de drift FTS. Il n'y
+    a aucun PRAGMA user_version ni table schema_version : l'ordre correct
+    repose entièrement sur la mémoire de l'auteur (la classe de bug du
+    hotfix). Ce RFC introduit un registre de migrations numérotées,
+    ordonnées et idempotentes, piloté par PRAGMA user_version, applique
+    seulement les migrations manquantes au boot, refuse proprement une DB
+    de version future, intègre le hotfix 57019e7 dans le registre (cleanup
+    du contournement), et exige des tests de transition ENTÉRINÉS dans la
+    suite cargo test (DB vierge / legacy / à jour / reprise / version
+    future). Touche la zone protégée crates/ : approbation CEO + write
+    permit requis.
+  tags:
+    - sqlite
+    - schema-migration
+    - user-version
+    - orchestrator
+    - robustness
+    - idempotence
+    - testing
+    - companyos-internals
+    - critical-infra
+  related:
+    - id: 1554764d-1836-4705-84f6-2171b5caa727
+      kind: task-request
+      relationship: input
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: related
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: related
+    - id: b04f8838-84b5-4332-b3a4-5782a943d766
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  motivation: >
+    DIAGNOSTIC DE L'ÉTAT ACTUEL (vérifié sur crates/orchestrator/src/db.rs
+    et crates/mcp-servers/orchestrator/src/main.rs).
+
+    La fonction unique de migration est OrchestratorDb::migrate()
+    (db.rs:353). Elle est appelée à QUATRE sites : run_server (main.rs:1448),
+    run_index (main.rs:1385), le chemin de rebuild PILIER D (main.rs:1504),
+    et les tests (db.rs setup_db, integration). Sa structure actuelle est
+    une séquence d'"étapes" implicites, repérées seulement par des
+    commentaires "Step 1 / Step 2 / Step 2bis / Step 3" :
+
+    - Step 1 : un format!("BEGIN IMMEDIATE;{SCHEMA_SQL}{FTS_SQL}{VEC_TABLE_SQL}COMMIT;")
+      exécuté en bloc. Tous les objets sont en CREATE ... IF NOT EXISTS,
+      donc relançables. C'est la partie déclarative et transactionnelle.
+
+    - Step 2 : une boucle Rust sur trois ALTER TABLE artifacts ADD COLUMN
+      (author, project, created_at), HORS de la transaction du Step 1.
+      SQLite n'ayant pas d'ADD COLUMN IF NOT EXISTS, l'idempotence est
+      obtenue en exécutant l'ALTER puis en attrapant l'erreur et en
+      matchant la sous-chaîne "duplicate column" sur le message d'erreur
+      (db.rs:371-379). Toute autre erreur est propagée.
+
+    - Step 2bis : trois CREATE INDEX IF NOT EXISTS sur les colonnes
+      ajoutées au Step 2, exécutés APRÈS la boucle ALTER (db.rs:389-393).
+      C'est précisément le hotfix 57019e7 : ces trois CREATE INDEX étaient
+      auparavant inline dans SCHEMA_SQL (donc au Step 1, AVANT les ALTER),
+      ce qui faisait échouer migrate() sur "no such column: author" pour
+      toute DB legacy dont la table artifacts précédait ces colonnes. Le
+      hotfix a déplacé les index hors de SCHEMA_SQL vers un step ad-hoc
+      placé manuellement après les ALTER.
+
+    - Step 3 : détection de drift du tokenizer FTS5 (fts_tokenizer_needs_upgrade),
+      avec DROP + recreate conditionnel de artifacts_fts.
+
+    ABSENCE DE VERSIONNING. Une recherche sur tout crates/ ne trouve AUCUN
+    PRAGMA user_version ni table schema_version. Le seul marqueur persistant
+    est index_metadata.model_version (db.rs:455-492), qui concerne la
+    version du MODÈLE D'EMBEDDING, pas le schéma SQL. Conséquence : migrate()
+    rejoue intégralement TOUTES les étapes à CHAQUE boot, et il n'existe
+    aucun moyen de savoir dans quel état de schéma se trouve une DB donnée
+    autrement qu'en inspectant sqlite_master.
+
+    LA CLASSE DE BUG. Le bug du hotfix 57019e7 n'est pas un accident isolé,
+    c'est le symptôme d'un défaut structurel : l'ordre des opérations DDL
+    n'est encodé NULLE PART de façon vérifiable. Il existe seulement dans
+    la juxtaposition textuelle des lignes de migrate() et dans la mémoire
+    de l'auteur. Rien n'empêche un futur contributeur de rajouter un
+    CREATE INDEX dans SCHEMA_SQL (Step 1) sur une colonne ajoutée par un
+    ALTER (Step 2), reproduisant exactement le même crash sur les DB
+    pré-existantes. De même, l'idempotence du Step 2 repose sur le matching
+    fragile d'un message d'erreur SQLite localisé/versionné ("duplicate
+    column"), pattern que la lesson ed7776fb et les frictions documentées
+    ailleurs ont déjà montré comme cassable (sortie localisée, évolution
+    upstream).
+
+    POURQUOI UN RFC. La correction modifie crates/orchestrator/src/db.rs
+    (et potentiellement error.rs / lib.rs), tous dans la zone protégée
+    crates/. C'est un changement structurel de la stratégie de persistence
+    d'un service infrastructurel critique (l'orchestrator porte la mémoire
+    collective). Tous les critères shared-rules.yml pour un RFC sont réunis :
+    zone protégée touchée + changement structurel. Approbation CEO + write
+    permit ciblant les affected_files ci-dessous requis.
+
+    PÉRIMÈTRE ET FILET DE SÉCURITÉ. La DB SQLite est un index reconstructible
+    depuis les YAML (PILIER D autorepair, RFC cdbfee72). L'enjeu de ce RFC
+    n'est donc PAS la perte de données mais la ROBUSTESSE DU BOOT : éviter
+    qu'une migration mal ordonnée ou non idempotente crashe le serveur au
+    démarrage sur une DB pré-existante. Le PILIER D reste le filet de
+    sécurité ultime : si une migration échoue malgré la discipline, le
+    rebuild depuis YAML répare. Ce RFC ne modifie ni la sémantique des
+    données ni le PILIER D.
+
+  proposal: >
+    DÉCISION D'ARCHITECTURE TRANCHÉE : PRAGMA user_version + REGISTRE DE
+    MIGRATIONS NUMÉROTÉES ORDONNÉES IDEMPOTENTES.
+
+    Trois mécanismes étaient candidats. Arbitrage ci-dessous, puis
+    description du mécanisme retenu. Ce RFC documente le QUOI et le POURQUOI
+    au niveau des invariants ; l'implementation-plan dérivé décidera des
+    noms exacts de fonctions/fichiers et de l'ordre fin des étapes.
+
+    --- ARBITRAGE DES TROIS MÉCANISMES CANDIDATS ---
+
+    OPTION 1 — Table schema_version dédiée (une row par migration appliquée).
+    Avantage : journal d'audit lisible (quelles migrations, quand).
+    Inconvénient : ajoute une table au schéma (donc... un problème de
+    migration récursif : il faut créer schema_version avant de pouvoir
+    s'en servir), et duplique une capacité que SQLite offre déjà nativement.
+    REJETÉE comme over-engineering pour un index reconstructible.
+
+    OPTION 2 — PRAGMA user_version (entier 32 bits stocké dans l'en-tête
+    SQLite, lecture/écriture O(1), zéro table, zéro DDL pour le porter).
+    Avantage : natif SQLite, atomique avec la transaction de migration,
+    aucun objet de schéma à créer pour l'amorcer, lisible par un sqlite3
+    hors-ligne (PRAGMA user_version). Inconvénient : un seul entier, pas
+    de journal d'audit par migration. Acceptable : l'audit n'est pas un
+    besoin pour un index reconstructible ; l'historique des migrations
+    vit déjà dans le code versionné (git) et les RFCs.
+
+    OPTION 3 — Système de fichiers de migrations SQL externes numérotés
+    (style sqlx/refinery, 0001_init.sql, 0002_add_columns.sql).
+    Avantage : séparation données/code. Inconvénient : introduit une
+    dépendance (refinery/sqlx-migrate) ou un loader maison, des fichiers
+    embarqués, et une complexité disproportionnée pour un schéma de 6
+    tables. REJETÉE : le coût d'outillage dépasse le bénéfice à cette
+    échelle.
+
+    RETENU : OPTION 2 (PRAGMA user_version) comme COMPTEUR DE VERSION, plus
+    un REGISTRE DE MIGRATIONS numérotées DÉFINIES EN CODE RUST. C'est le
+    meilleur compromis : zéro table d'amorçage, atomicité native, et la
+    liste ordonnée des migrations vit dans le code (donc reviewée,
+    versionnée, testée). On évite à la fois le problème récursif de
+    l'OPTION 1 et le sur-outillage de l'OPTION 3.
+
+    --- MÉCANISME RETENU ---
+
+    Un registre ORDONNÉ de migrations est défini en code : une suite de
+    fonctions (ou de closures) numérotées de 1 à N, chacune portant le
+    schéma D'UNE version vers la suivante. La forme exacte (tableau de
+    structs { version, apply_fn }, ou match sur un entier, ou module
+    dédié) est laissée à l'implementation-plan ; l'invariant est :
+    CHAQUE migration a un numéro de version strictement croissant et
+    contigu, et l'ORDRE d'application est l'ordre des numéros.
+
+    SCHEMA_VERSION_TARGET est une constante = N (la version cible que
+    le code courant sait produire).
+
+    Algorithme de boot (dans migrate(), enveloppant la logique actuelle) :
+
+      1. Lire current = PRAGMA user_version (0 sur une DB vierge ou une
+         DB legacy jamais versionnée).
+
+      2. Si current > SCHEMA_VERSION_TARGET → la DB a été écrite par un
+         binaire PLUS RÉCENT. REFUS PROPRE : retourner une erreur
+         explicite (nouveau variant, par exemple SchemaVersionTooNew
+         { found, supported }), SANS toucher la DB. Le binaire exite en
+         erreur lisible plutôt que de risquer une corruption en
+         downgradant un schéma qu'il ne comprend pas. (cf. acceptance
+         criterion edge "version future".)
+
+      3. Si current == SCHEMA_VERSION_TARGET → NO-OP. La DB est déjà à
+         jour, aucune migration appliquée. Idempotent : relancer le boot
+         ne fait rien. (cf. acceptance criterion edge "DB à jour".)
+
+      4. Si current < SCHEMA_VERSION_TARGET → appliquer EN ORDRE chaque
+         migration de (current+1) à SCHEMA_VERSION_TARGET. Pour chaque
+         migration v :
+           a. ouvrir une transaction BEGIN IMMEDIATE,
+           b. exécuter le DDL de la migration v,
+           c. exécuter PRAGMA user_version = v À L'INTÉRIEUR de la même
+              transaction,
+           d. COMMIT.
+         Ainsi version et schéma avancent ATOMIQUEMENT : un SIGKILL
+         entre deux migrations laisse user_version sur la dernière
+         migration COMMITée, et le prochain boot REPREND exactement là
+         où il s'est arrêté (cf. acceptance criterion edge "reprise après
+         interruption"). Une migration qui échoue rollback son DDL ET son
+         incrément de user_version : la DB reste sur la version précédente,
+         cohérente.
+
+    GARANTIE D'ORDRE STRUCTURELLE (la classe de bug 57019e7 éliminée, pas
+    contournée). La règle d'ordre devient une INVARIANTE DU REGISTRE, pas
+    une convention textuelle : un CREATE INDEX sur une colonne ajoutée par
+    ALTER est, par construction, dans une migration de numéro SUPÉRIEUR ou
+    ÉGAL à celle qui ajoute la colonne, et les migrations s'appliquent dans
+    l'ordre des numéros. Il devient impossible d'exécuter le CREATE INDEX
+    avant l'ALTER sans réécrire l'historique des numéros (ce qu'un reviewer
+    refuse). Recommandation forte pour l'implementation-plan : la colonne
+    ET son index appartiennent à la MÊME migration (atomicité sémantique),
+    ce qui rend l'ordre intra-migration trivialement correct.
+
+    IDEMPOTENCE PAR VERSION, PAS PAR DDL. L'idempotence ne repose plus sur
+    le matching fragile de "duplicate column" ni sur des CREATE IF NOT
+    EXISTS répétés à chaque boot : elle repose sur user_version. Une
+    migration v n'est JAMAIS rejouée une fois que user_version >= v. Cela
+    supprime le besoin du try/catch sur le message d'erreur SQLite du Step 2
+    actuel : la migration qui ajoute author/project/created_at ne tourne
+    qu'une fois, sur les DB où user_version < cette migration. Pour les DB
+    legacy déjà munies de ces colonnes mais sans user_version (current = 0),
+    voir le point d'amorçage ci-dessous.
+
+    AMORÇAGE DES DB LEGACY (current = 0). Une DB existante n'a jamais eu de
+    user_version, donc current = 0 au premier boot après ce RFC. Deux états
+    legacy possibles : (a) DB vierge réelle, (b) DB déjà munie du schéma
+    complet actuel (colonnes author/project/created_at + index présents) car
+    créée par le code pré-RFC. La migration 1 (= le schéma de base actuel)
+    DOIT donc rester idempotente côté DDL (CREATE IF NOT EXISTS conservés)
+    pour ne pas échouer sur une DB legacy déjà peuplée, et les migrations
+    qui ajoutent des colonnes/index DOIVENT tolérer leur présence préalable.
+    Concrètement : on conserve les CREATE ... IF NOT EXISTS pour les objets,
+    et pour les ADD COLUMN on garde une stratégie idempotente — soit le
+    try/catch "duplicate column" actuel encapsulé dans la migration
+    correspondante, soit (préféré) un test préalable via PRAGMA
+    table_info(artifacts) qui vérifie l'absence de la colonne avant l'ALTER,
+    ce qui évite de dépendre du texte du message d'erreur. L'implementation-plan
+    tranche entre ces deux tactiques d'idempotence intra-migration ;
+    recommandation : PRAGMA table_info (déterministe, indépendant de la
+    locale, cf. esprit de la lesson sur la sortie git localisée d5c9c933).
+    Une fois cet amorçage fait, user_version est posé à N et les boots
+    suivants sont des no-op.
+
+    --- CLEANUP DU CONTOURNEMENT (be16dc46, acceptance criterion 5) ---
+
+    Voir la section dédiée cleanup_workaround ci-dessous. En résumé : le
+    Step 2bis ad-hoc introduit par le hotfix 57019e7 est SUPPRIMÉ en tant
+    que step séparé et INTÉGRÉ dans la migration numérotée qui ajoute les
+    colonnes author/project/created_at. Les trois CREATE INDEX rejoignent
+    la même migration que leurs ALTER TABLE. Le hotfix cesse d'exister comme
+    code distinct : il devient une propriété structurelle du registre.
+
+    --- TESTS ENTÉRINÉS EN BASE (b04f8838, acceptance criterion 4) ---
+
+    Voir la section dédiée testing ci-dessous. Exigence ferme : les cas de
+    transition sont des #[test] versionnés dans crates/orchestrator/src/db.rs
+    (module tests existant) et/ou crates/orchestrator/tests/, rejoués par
+    cargo test à chaque CI. PAS de validation manuelle. Le harnais de test
+    de migration existe déjà partiellement (test_migrate_is_idempotent,
+    test_migrate_legacy_db_without_filter_columns_succeeds) ; il est étendu,
+    pas créé de zéro.
+
+    --- ANALYSE TRIAXIALE ---
+
+    Cas nominal (happy path) :
+    (n1) Boot sur DB vierge (user_version = 0) → toutes les migrations 1..N
+         s'appliquent dans l'ordre, user_version finit à N, schéma complet
+         créé, integrity_check = ok.
+    (n2) Boot sur DB déjà à jour (user_version = N) → no-op, zéro migration,
+         exit nominal. Relancer le boot ne fait rien.
+
+    Cas négatif (erreurs, échecs) :
+    (e1) DB de version FUTURE (user_version > N, écrite par un binaire plus
+         récent) → refus propre via SchemaVersionTooNew, exit non-zero, DB
+         non touchée. Pas de downgrade silencieux, pas de corruption.
+    (e2) Une migration v échoue en cours (DDL invalide, SQLITE_FULL, etc.)
+         → la transaction BEGIN IMMEDIATE de v rollback DDL + incrément de
+         user_version. La DB reste sur v-1, cohérente. Le binaire exite en
+         erreur d'init. Au boot suivant, la migration v est retentée depuis
+         v-1 (reprise propre). Si l'échec persiste et corrompt malgré tout,
+         le PILIER D rebuild depuis YAML reste le filet.
+    (e3) Migration appelée sur une DB legacy déjà peuplée (colonnes/index
+         déjà présents, user_version = 0) → les CREATE IF NOT EXISTS et le
+         test PRAGMA table_info rendent chaque migration idempotente côté
+         DDL ; user_version est amorcé à N sans erreur "duplicate column".
+
+    Edge cases (limites, concurrence, reprise) :
+    (g1) Boot interrompu par SIGKILL ENTRE deux migrations (après COMMIT de
+         v, avant v+1) → user_version = v sur disque. Au respawn, le boot
+         reprend à v+1. Aucune migration rejouée, aucune sautée.
+    (g2) SIGKILL PENDANT une migration v (avant son COMMIT) → WAL recovery
+         au prochain open rollback la transaction partielle ; user_version
+         reste à v-1 ; la migration v est rejouée intégralement. Idempotent.
+    (g3) Concurrence : grâce au PILIER A (file lock exclusif, RFC cdbfee72),
+         un seul writer applique les migrations à la fois. Le BEGIN
+         IMMEDIATE de chaque migration ajoute une seconde barrière (verrou
+         write SQLite) si jamais le lock OS était contourné. Pas de double
+         application concurrente.
+    (g4) Interaction PILIER D : le rebuild (main.rs:1504) appelle migrate()
+         sur un .db NEUF (user_version = 0) → applique 1..N puis pose N.
+         Cohérent avec le chemin nominal n1. La DB reconstruite porte la
+         version cible.
+    (g5) user_version posée mais schéma incohérent (cas pathologique : DB
+         manipulée à la main) → integrity_check du PILIER D le détecte au
+         boot et rebuild. La version SQL et l'intégrité physique restent
+         deux gardes complémentaires.
+
+  impact: >
+    Surface de modification estimée (zone protégée crates/ uniquement —
+    aucun fichier company/plugins/, aucune zone YAML) :
+
+    - crates/orchestrator/src/db.rs : refonte interne de migrate() en
+      boucle pilotée par PRAGMA user_version sur un registre de migrations
+      numérotées ; suppression du Step 2bis ad-hoc (intégré au registre) ;
+      remplacement du matching "duplicate column" par un test PRAGMA
+      table_info (recommandé) ; constante SCHEMA_VERSION_TARGET ; helpers
+      de lecture/écriture de user_version. Extension du module tests avec
+      les cas de transition. Estimé +120 / -40 lignes (net +80).
+
+    - crates/orchestrator/src/error.rs : nouveau variant
+      SchemaVersionTooNew { found, supported } (refus de version future).
+      Estimé +5 lignes.
+
+    - crates/orchestrator/src/lib.rs : éventuel re-export du nouveau variant
+      ou d'une constante de version si exposée publiquement. Estimé +1 à
+      +3 lignes. Inclus par prudence (cf. lesson 611fde3e : un path oublié
+      bloque le hook ; coût d'inclure un path non modifié = zéro).
+
+    Aucun fichier nouveau n'est strictement nécessaire : le registre peut
+    vivre dans db.rs. TOUTEFOIS, si l'implementation-plan juge db.rs trop
+    gros (2489 lignes actuellement) et préfère isoler le registre dans un
+    module dédié crates/orchestrator/src/migrations.rs, ce fichier est listé
+    en created ci-dessous et le permit doit le couvrir (leçon 611fde3e :
+    les fichiers À CRÉER doivent figurer dans le permit, sinon blocage hook).
+    L'arbitrage db.rs-inline vs module-dédié est laissé à l'implementation-plan ;
+    les deux paths sont couverts par affected_files pour ne pas imposer un
+    second round de permit.
+
+    Impact runtime :
+    - Boot DB à jour : +1 lecture PRAGMA user_version (O(1), en-tête SQLite),
+      zéro migration. Plus RAPIDE que l'actuel qui rejoue toutes les étapes.
+    - Boot DB legacy (premier boot post-RFC) : applique les migrations une
+      fois, pose user_version = N. Coût ponctuel négligeable (quelques DDL).
+    - Boots suivants : no-op. Coût quasi nul.
+
+    Impact compatibilité :
+    - Pas de changement du contrat MCP exposé.
+    - Pas de changement du format des artifacts YAML.
+    - Pas de changement de la sémantique des tables (mêmes colonnes, mêmes
+      index au final). Le schéma PRODUIT est identique à l'actuel ; seul le
+      CHEMIN pour y arriver change (versionné au lieu d'implicite).
+    - Les DB existantes sont amorcées proprement à user_version = N au
+      premier boot, sans perte.
+    - PILIER D (autorepair) inchangé : il appelle migrate() sur un .db neuf,
+      qui suit désormais le chemin versionné nominal.
+
+    Interactions avec autres composants :
+    - RFC cdbfee72 (4 piliers) : ce RFC s'appuie sur le PILIER A (file lock,
+      writer unique pendant la migration), le PILIER C (transaction
+      BEGIN IMMEDIATE autour de chaque migration, déjà la posture actuelle),
+      et le PILIER D (filet si une migration corrompt malgré tout). Aucune
+      régression sur les 4 piliers.
+    - Le PRAGMA user_version est orthogonal à index_metadata.model_version :
+      le premier versionne le SCHÉMA SQL, le second versionne le MODÈLE
+      D'EMBEDDING. Les deux coexistent sans interférence.
+
+    Risques résiduels :
+    - Si un futur contributeur oublie d'incrémenter SCHEMA_VERSION_TARGET
+      en ajoutant une migration, sa migration ne s'appliquera jamais. Mitigé
+      par un test qui asserte que SCHEMA_VERSION_TARGET == nombre de
+      migrations enregistrées (cohérence registre/constante vérifiée par CI).
+    - Si une DB legacy a un schéma divergent non anticipé (objet renommé à
+      la main), l'amorçage peut échouer ; le PILIER D rebuild reste le
+      filet. Acceptable (cf. périmètre : robustesse boot, pas zéro-incident
+      sur DB trafiquées).
+
+  cleanup_workaround: >
+    INVENTAIRE DU CONTOURNEMENT À RETIRER (application de la lesson
+    be16dc46 : la solution générale retire le hotfix ponctuel qu'elle
+    remplace, dans la même unité de travail).
+
+    (a) QUEL contournement. Le hotfix 57019e7 ("create artifacts
+        filter-column indexes AFTER ALTER TABLE") a sorti trois CREATE
+        INDEX (idx_artifacts_author, idx_artifacts_project,
+        idx_artifacts_created_at) de SCHEMA_SQL pour les replacer dans un
+        "Step 2bis" ad-hoc exécuté manuellement après la boucle ALTER
+        TABLE. C'est un réordonnancement ponctuel : il corrige LE symptôme
+        (cet ordre-là) sans encoder la RÈGLE d'ordre.
+
+    (b) OÙ il vit. crates/orchestrator/src/db.rs, lignes 382-393 (le bloc
+        execute_batch "Step 2bis" + son commentaire). Le matching fragile
+        "duplicate column" du Step 2 (db.rs:371-379) est le contournement
+        d'idempotence associé, du même registre de dette.
+
+    (c) ACTION DE RETRAIT. Le Step 2bis cesse d'exister comme step séparé.
+        Les trois CREATE INDEX sont intégrés DANS la même migration
+        numérotée que les ALTER TABLE ADD COLUMN author/project/created_at,
+        positionnés après les ALTER À L'INTÉRIEUR de cette migration. Le
+        matching "duplicate column" est remplacé par un test PRAGMA
+        table_info (recommandé) ou conservé encapsulé dans la migration si
+        l'implementation-plan le préfère. Résultat : il n'y a plus de "Step
+        2bis" ni de contournement textuel ; l'ordre CREATE-INDEX-après-ALTER
+        est garanti par l'appartenance à une seule migration ordonnée.
+        Aucune duplication : le hotfix devient une propriété du registre,
+        pas un patch coexistant.
+
+    (d) TEST À PRÉSERVER. Le test test_migrate_legacy_db_without_filter_columns_succeeds
+        (db.rs:1706) qui couvre exactement le scénario du hotfix DOIT être
+        conservé (éventuellement adapté à la nouvelle API de migrate()), car
+        il vérifie structurellement que la classe de bug reste fermée. Il
+        rejoint la suite de tests de transition décrite ci-dessous.
+
+  testing: >
+    EXIGENCE D'ENTÉRINEMENT EN BASE (application de la lesson b04f8838 et
+    de l'acceptance criterion 4 : les cas triaxiaux sont des tests
+    automatisés versionnés, PAS une validation manuelle de session).
+
+    Les cas suivants DOIVENT être implémentés comme #[test] dans
+    crates/orchestrator/src/db.rs (module tests) et/ou
+    crates/orchestrator/tests/, rejoués par cargo test à chaque CI.
+    L'implementation-plan ne peut PAS satisfaire ce RFC par une validation
+    via REPL/manuelle ; l'Architect reviewer du plan refusera (request_changes)
+    tout plan dont les cas de transition ne finissent pas en base.
+
+    Cas à entériner (couverture triaxiale complète) :
+
+    - NOMINAL DB vierge : open(":memory:") puis migrate() → user_version == N,
+      toutes les tables/colonnes/index attendus présents, integrity_check ok.
+
+    - TRANSITION DB legacy : hand-craft un schéma antérieur (table artifacts
+      sans author/project/created_at, sans index correspondants,
+      user_version = 0 implicite), puis migrate() → migration appliquée sans
+      crash, colonnes + index présents, user_version == N. (Évolution du
+      test test_migrate_legacy_db_without_filter_columns_succeeds existant.)
+
+    - EDGE DB déjà à jour (no-op idempotent) : migrate() puis migrate()
+      à nouveau → second appel ne fait rien (aucune migration rejouée),
+      user_version reste N, integrity_check ok. (Évolution de
+      test_migrate_is_idempotent.)
+
+    - EDGE reprise après interruption : poser manuellement user_version à
+      une valeur intermédiaire k (0 < k < N) sur une DB dont le schéma
+      reflète l'état k, puis migrate() → seules les migrations k+1..N
+      s'appliquent, user_version finit à N. Vérifie la reprise partielle.
+
+    - EDGE version future : poser user_version = N+1, puis migrate() →
+      retourne l'erreur SchemaVersionTooNew (refus propre), la DB n'est PAS
+      modifiée (user_version reste N+1, aucun objet altéré).
+
+    - COHÉRENCE registre : un test asserte que SCHEMA_VERSION_TARGET est
+      égal au nombre de migrations enregistrées (garde-fou contre l'oubli
+      d'incrément lors de l'ajout d'une migration future).
+
+  rollback_plan: >
+    Le rollback est simple et sans perte de données (la DB est un index
+    reconstructible).
+
+    (1) crates/ : git revert du/des commit(s) appliquant ce RFC à db.rs,
+        error.rs, lib.rs (et migrations.rs s'il a été créé). Le binaire
+        recompilé reprend le comportement actuel : migrate() en étapes
+        implicites Step 1/2/2bis/3, sans user_version.
+
+    (2) Effet sur les DB déjà amorcées à user_version = N. Après rollback,
+        le code pré-RFC IGNORE user_version (il ne le lit pas), donc il
+        rejoue ses étapes idempotentes comme avant. La valeur user_version = N
+        reste écrite dans l'en-tête mais devient inerte (aucun code ne la
+        lit). Aucune corruption, aucun blocage. Si l'on veut nettoyer, un
+        PRAGMA user_version = 0 manuel suffit, mais ce n'est pas nécessaire.
+
+    (3) Si une migration future (numéro > celles présentes au moment du
+        rollback) avait été appliquée, le schéma physique reste en place
+        (les colonnes/index ajoutés ne sont pas retirés par le revert du
+        code). Le code pré-RFC les tolère grâce à ses CREATE IF NOT EXISTS
+        et son matching "duplicate column". Donc rollback sûr même avec des
+        migrations déjà appliquées.
+
+    (4) Filet ultime : en cas d'incohérence post-rollback, supprimer
+        orchestrator.db/.db-wal/.db-shm et laisser le PILIER D rebuild
+        depuis les YAML au prochain boot.
+
+    Le rollback laisse le système dans l'état pré-RFC : hotfix 57019e7
+    présent, migration en étapes implicites, pas de versionning. Bug de
+    classe latent mais connu.
+
+  affected_files:
+    modified:
+      - "crates/orchestrator/src/db.rs"
+      - "crates/orchestrator/src/error.rs"
+      - "crates/orchestrator/src/lib.rs"
+    created:
+      - "crates/orchestrator/src/migrations.rs"

@@ -1,0 +1,208 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: fa9bd072-a132-4a37-8163-1895f531f723
+  title: "Freeze MCP perçu après reload_config : saturation CPU du serveur orchestrator par le thread-pool ONNX (fastembed) en spin-wait, pas une coupure"
+  author: architect
+  created_at: "2026-06-04"
+  project: company-os
+  description: >
+    Investigation du symptôme « la session MCP s'est figée/coupée après
+    reload_config() » rapporté par l'utilisateur. Investigation conduite par
+    lecture du code réel (reload_config dans crates/mcp-servers/orchestrator/src/main.rs,
+    CompanyConfig::load, set_max_iterations, migrate(), reindex_all,
+    embedding.rs/fastembed) et observation empirique des processus en cours
+    (ps/proc sur le serveur 90269 vivant). Conclusion : reload_config() N'EST
+    PAS la cause directe (il ne touche ni la DB, ni migrate(), ni le watcher,
+    et il répond reloaded:true à l'instant du diagnostic). La cause du freeze
+    perçu est une SATURATION CPU soutenue du binaire serveur (~600% CPU sur 16
+    cœurs, ~50 threads, spin-wait quasi sans context switches) due au thread-pool
+    intra-op d'ONNX Runtime (backend de fastembed) laissé en configuration par
+    défaut. reload_config a servi de RÉVÉLATEUR : il acquiert le même
+    tokio::Mutex de l'engine que le reindex_all de boot/watcher (qui ré-embed
+    les 123 artifacts), donc tout appel qui tombe pendant une fenêtre de
+    contention voit une latence telle qu'opencode la perçoit comme un freeze.
+    Le fix structurel relève de la PISTE B (intervention côté binaire Rust) et
+    fera l'objet d'un RFC dédié (non rédigé dans cette tâche).
+  tags:
+    - mcp
+    - orchestrator
+    - reload-config
+    - fastembed
+    - onnxruntime
+    - cpu-saturation
+    - spin-wait
+    - lock-contention
+    - performance
+    - critical-infra
+  related:
+    - id: d9399863-254e-42f5-a485-ea019ce56a93
+      kind: rfc
+      relationship: related
+    - id: e84b641d-1266-473e-b93c-cd709aa14ac9
+      kind: diagnostic-report
+      relationship: related
+    - id: 378c387c-7e25-4abd-8ccd-5bb7b4d82449
+      kind: diagnostic-report
+      relationship: related
+
+spec:
+  symptom: >
+    L'utilisateur rapporte que la session MCP s'est figée puis coupée
+    immédiatement après un appel reload_config() : les appels MCP suivants ne
+    répondaient plus. Le contexte : on venait d'enchaîner 5 chantiers RFC avec
+    de nombreux cargo build + reload_config successifs, le dernier (commit
+    7c7171d) refondant le boot du serveur (migrate() versionné par PRAGMA
+    user_version).
+
+    Au moment du diagnostic, le symptôme N'est PAS reproductible : reload_config()
+    répond reloaded:true de façon répétée, index_status remonte
+    file_watcher_alive:true et triplet_coherent:true (123 artifacts FTS+vec
+    cohérents). Le serveur est donc fonctionnel à l'instant t. Le freeze était
+    soit transitoire (latence extrême perçue comme une coupure), soit lié à une
+    fenêtre de contention précise.
+
+  root_cause: >
+    Cause racine identifiée par observation empirique du serveur vivant + lecture
+    du code. Le freeze N'EST PAS imputable à reload_config() lui-même, mais à un
+    état de saturation CPU permanent du binaire serveur dont reload_config() est
+    seulement le révélateur via la contention de lock.
+
+    PREUVE 1 — reload_config() est trivial et inoffensif (hypothèses 1 et 2
+    RÉFUTÉES). Le tool reload_config (main.rs:922-939) fait exactement deux
+    choses : CompanyConfig::load(&root) (relecture de 4 fichiers YAML de config
+    via std::fs::read_to_string + serde_yaml, loader.rs:18-33) puis
+    engine.lock().await.set_max_iterations(new_max) (engine.rs:176-178, une
+    simple affectation de champ u32). Il NE rouvre PAS la DB, NE réindexe PAS,
+    NE touche PAS le file watcher, et N'appelle PAS migrate(). migrate()
+    (db.rs:367) n'est invoqué qu'au boot, jamais depuis reload_config. La
+    refonte SQL du commit 7c7171d ne change que le chemin de boot ; elle est
+    donc hors du chemin reload_config (hypothèse 2 réfutée).
+
+    PREUVE 2 — Le serveur est en saturation CPU soutenue, vivant mais en
+    spin-wait (hypothèse 3 CONFIRMÉE, variante « non-répondant sans exit »).
+    Observation des processus (PID 90269, companyos-orchestrator-server, lancé
+    11:25) :
+      - %CPU ≈ 597-599 sur une machine à 16 cœurs (nproc=16).
+      - TIME (CPU cumulé) passe de 00:27:18 à 00:27:35 en 3 s de wall-clock,
+        soit ~17 s de CPU consommées en 3 s réelles : le process brûle ~6 cœurs
+        en continu.
+      - 50 threads, dont 33 nommés « tokio-runtime-w », le reste l'intra-op
+        pool. 1 thread « notify-rs inotify » (le watcher).
+      - Compteurs de /proc/90269/status : voluntary_ctxt_switches=18,
+        nonvoluntary_ctxt_switches=90. Des valeurs aussi basses pour un process
+        qui consomme 6 cœurs sont la signature d'un BUSY SPIN (les threads ne
+        dorment pas, ils tournent en boucle d'attente active).
+      - VmRSS ≈ 1.2 GB (modèle d'embedding chargé en mémoire).
+
+    PREUVE 3 — Le coupable du spin est le thread-pool ONNX Runtime de fastembed,
+    non tuné. L'embedder (embedding.rs:73-114) charge
+    fastembed::TextEmbedding (modèle MultilingualE5Small, backend ONNX Runtime
+    via la crate fastembed confirmée dans Cargo.lock) avec un TextInitOptions
+    qui ne configure NI le nombre de threads intra-op/inter-op, NI le mode de
+    spinning du thread-pool. Par défaut, ONNX Runtime dimensionne son intra-op
+    pool au nombre de cœurs physiques (16 ici) et laisse ces threads en
+    SPIN-WAIT actif entre deux inférences. Conséquence : une fois le modèle
+    chargé et utilisé (au moins une fois via reindex_all au boot et/ou via le
+    watcher), le pool ONNX reste à tourner à vide en consommant tous les cœurs,
+    indépendamment de toute requête MCP. C'est cohérent avec les 50 threads, le
+    ~600% CPU permanent, et les context switches quasi nuls.
+
+    PREUVE 4 — Pourquoi reload_config a SEMBLÉ déclencher le freeze (le lien de
+    contention). L'engine est protégé par un unique tokio::Mutex
+    (Arc<Mutex<engine>>, main.rs:1543). Trois chemins prennent ce lock :
+      (a) le reindex_all de boot, en tâche background (main.rs:1564-1576),
+          qui détient le lock pendant TOUTE la durée d'un reindex_all
+          (delete_all + ré-embedding des 123 artifacts, engine.rs:1191-1228) ;
+      (b) le reindex_all déclenché par le file watcher sur tout changement
+          d'artifact (main.rs:1639-1648), même chemin, même lock, debounce 500ms ;
+      (c) reload_config() lui-même (main.rs:926) et tous les autres tools
+          (search, get, ...) via engine.lock().await.
+    Pendant le chantier (5 RFC, nombreux writes YAML + cargo build), chaque
+    vague d'écritures YAML a pu déclencher un reindex_all complet qui (i)
+    sature le CPU via ONNX et (ii) détient le lock engine. Un reload_config()
+    (ou n'importe quel tool) tombant dans cette fenêtre attend le lock pendant
+    que le CPU est à genoux : la latence devient telle qu'opencode perçoit un
+    freeze, puis ce qui ressemble à une coupure. Le fait que reload_config
+    réponde normalement à l'instant t (hors fenêtre de reindex actif,
+    last_indexed_at figé à 09:29, queue vide) confirme le caractère transitoire
+    et contentionnel, pas une coupure dure.
+
+    HYPOTHÈSES ÉCARTÉES :
+      - H4 (circuit breaker du proxy ouvert) : RÉFUTÉE. Le proxy (PID 90255) et
+        son child (90269) tournent toujours depuis 11:25, aucun exit, aucun
+        respawn loop. Le circuit breaker (3 restarts/30s) ne s'est pas ouvert.
+      - H5 (logs serveur/proxy) : aucun fichier .log dédié sur disque ni dans
+        /tmp ; le proxy logge sur stderr (hérité par opencode), non capturé
+        ici. Pas de trace persistante exploitable a posteriori, d'où le recours
+        à l'observation live des processus.
+      - Coupure réseau/transport MCP : RÉFUTÉE, la socket et les process sont
+        sains et répondent.
+
+    CLASSEMENT DES FACTEURS PAR VRAISEMBLANCE :
+      1. (haute, CONFIRMÉE) Saturation CPU permanente par le spin-wait du
+         thread-pool ONNX non tuné → le serveur est chroniquement sous tension
+         CPU.
+      2. (haute, CONFIRMÉE) Contention sur l'unique Mutex engine entre
+         reindex_all (boot + watcher) et les tools : reload_config sert de
+         révélateur quand il attend ce lock pendant un reindex actif sous CPU
+         saturé.
+      3. (moyenne, aggravant) reindex_all est « delete_all + ré-embed des 123 »
+         à chaque déclenchement watcher : coût O(n) complet à chaque changement,
+         qui amplifie la durée de rétention du lock et la charge ONNX.
+      4. (faible) Interaction avec la refonte migrate() (commit 7c7171d) :
+         non impliquée dans le chemin reload_config ; au pire, un boot plus
+         lent (migrations + recovery WAL après un restart) repousse le premier
+         reindex, sans changer la nature du problème.
+
+  resolution: >
+    Aucun correctif n'est appliqué dans cette tâche (diagnostic uniquement).
+    Le freeze n'étant pas une coupure dure mais une latence de contention sous
+    CPU saturé, deux niveaux de réponse sont recommandés, le second étant
+    structurel et nécessitant un RFC.
+
+    MITIGATION IMMÉDIATE (opérationnelle, sans changement de code) : si un freeze
+    réapparaît, ne pas quitter la session ; attendre quelques secondes que le
+    reindex_all en cours libère le lock engine et que la pression ONNX retombe,
+    puis réessayer l'appel (cf. règle mcp_reconnect, déjà en place). Le proxy
+    résilient (RFC d9399863) ne traite PAS ce cas car il n'y a ni restart ni
+    exit du binaire à détecter : le child est vivant mais lent. C'est l'angle
+    mort « serveur transitoirement non-répondant SANS exit » explicitement
+    laissé ouvert par la section « INTERACTIONS AVEC reload_config » du RFC
+    d9399863 (PISTE B).
+
+    FIX STRUCTUREL RECOMMANDÉ — RFC PISTE B (à rédiger séparément). Scope
+    proposé, à arbitrer dans le RFC, par ordre de priorité :
+
+      1. (priorité haute) Brider le thread-pool ONNX Runtime / fastembed.
+         Configurer explicitement l'embedder pour (a) limiter le nombre de
+         threads intra-op (p.ex. 2 à 4 au lieu de 16) et (b) désactiver le
+         spin-wait actif du thread-pool (passer le pool en mode « blocking »
+         plutôt que « spinning »), via les options d'init ONNX exposées par
+         fastembed (ou variables d'environnement ONNX Runtime du type
+         intra-op threads / allow_spinning si fastembed ne les expose pas en
+         API). Objectif : un serveur au repos doit consommer ~0% CPU, pas 600%.
+         C'est la cause racine du freeze perçu.
+
+      2. (priorité moyenne) Réduire la granularité du reindex sur événement
+         watcher : remplacer le reindex_all (delete_all + ré-embed des 123) par
+         une réindexation incrémentale ciblée du/des seul(s) fichier(s)
+         modifié(s) (un index_artifact par chemin changé). Cela raccourcit
+         drastiquement la rétention du lock engine et la charge d'embedding par
+         changement, supprimant la fenêtre de contention qui révèle le problème.
+
+      3. (priorité moyenne) Découpler les lectures de la réindexation :
+         évaluer si reload_config et les tools en lecture seule (search, get,
+         index_status) doivent vraiment prendre le même Mutex que reindex_all,
+         ou si un schéma RwLock / une connexion lecture dédiée permettrait à
+         reload_config de répondre même pendant un reindex en cours.
+
+    Le RFC devra documenter le rationale, mesurer le CPU au repos avant/après
+    le bridage ONNX, et fournir un test reproductible (mesure de %CPU du
+    serveur idle, et latence d'un reload_config concurrent à un reindex_all).
+    La justification RFC (vs design-doc) tient : le code Rust de l'orchestrator
+    et potentiellement la config d'embedding sont du cœur runtime partagé par
+    tous les agents (zone protégée), donc changement structurel nécessitant
+    approbation CEO + write permit.
+
+  status: investigating

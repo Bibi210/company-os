@@ -1,0 +1,167 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: cf3c40a8-37a2-4e73-ab01-aefc282ec2a4
+  title: "Discipline de migration SQL par PRAGMA user_version + registre de migrations numérotées : éliminer structurellement la classe de bug d'ordonnancement DDL"
+  author: implementer
+  created_at: "2026-06-04"
+  description: >
+    Refonte de OrchestratorDb::migrate() (RFC 973a5569) : remplacer une
+    séquence impérative plate de steps DDL par un registre ORDONNÉ de
+    migrations numérotées piloté par PRAGMA user_version. Le pattern
+    transforme une garantie d'ordre implicite et fragile (le hotfix 57019e7
+    "CREATE INDEX doit venir après ALTER", maintenu à la main entre deux
+    steps) en propriété STRUCTURELLE (les deux opérations vivent dans la
+    même migration, donc le même BEGIN IMMEDIATE, donc le même ordre
+    garanti). Capitalise aussi : remplacer le matching fragile du message
+    d'erreur SQLite "duplicate column" par PRAGMA table_info déterministe,
+    refuser proprement une DB de version future (variant d'erreur dédié,
+    DB non touchée), et l'application concrète de b04f8838 (les 7 tests de
+    transition sont entérinés en base, pas exécutés à la main).
+  tags:
+    - sqlite
+    - schema-migration
+    - user-version
+    - migrations-registry
+    - idempotence
+    - ddl-ordering
+    - orchestrator
+    - regression-prevention
+    - companyos-internals
+    - critical-infra
+  related:
+    - id: 973a5569-ec7e-4ee0-a868-2314e3cd5bd4
+      kind: rfc
+      relationship: derived-from
+    - id: b04f8838-84b5-4332-b3a4-5782a943d766
+      kind: lesson-learned
+      relationship: related
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: related
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    OrchestratorDb::migrate() était une suite impérative de "steps" : Step 1
+    créait le schéma de base (CREATE IF NOT EXISTS), Step 2 ajoutait par
+    ALTER les colonnes author/project/created_at sur artifacts, Step 2bis
+    créait les index sur ces colonnes, Step 3 réparait la dérive du
+    tokenizer FTS. La correction de la garantie d'ordre entre Step 2 et Step
+    2bis était précisément le hotfix 57019e7 : si les CREATE INDEX étaient
+    émis avant les ALTER (par exemple en les remontant dans SCHEMA_SQL), une
+    DB legacy dont la table artifacts précédait les colonnes plantait au
+    boot du serveur avec "no such column: author". Cette garantie d'ordre
+    n'était maintenue que par la discipline humaine de placer Step 2bis
+    après Step 2, sans rien de structurel pour l'empêcher de régresser.
+
+    Deux autres fragilités cohabitaient. (1) L'idempotence des ALTER
+    reposait sur un try/catch qui inspectait le MESSAGE d'erreur SQLite et
+    matchait la sous-chaîne "duplicate column" : dépendant de la locale et
+    du wording d'une version SQLite, donc cassable silencieusement. (2)
+    Aucune notion de version de schéma : rien ne distinguait une DB fraîche,
+    une DB legacy à mi-chemin, ou une DB écrite par un binaire FUTUR plus
+    récent (qui aurait dû être refusée plutôt que "migrée" à l'envers).
+
+    La DB de production était dans un état divergent révélateur :
+    user_version=0 (elle précédait toute discipline de version) MAIS les
+    colonnes ET les index étaient déjà présents (l'ancien migrate() les
+    avait posés à un boot précédent). Tout nouveau mécanisme devait amorcer
+    cet état sans crasher.
+
+  insight: >
+    PRINCIPE CENTRAL — TRANSFORMER UNE GARANTIE IMPLICITE EN PROPRIÉTÉ
+    STRUCTURELLE. Le hotfix 57019e7 reposait sur "le développeur place bien
+    le CREATE INDEX après l'ALTER". C'est une garantie d'ordre qu'aucun
+    invariant n'imposait : un refactor pouvait la casser sans qu'aucun test
+    ne hurle. En regroupant ALTER + CREATE INDEX dans une SEULE migration
+    (migration 2), l'ordre devient une conséquence de l'ordre des
+    instructions DANS une fonction unique, exécutées dans une transaction
+    unique. La classe de bug "index créé avant la colonne" n'est plus
+    "évitée par convention" : elle est devenue impossible à exprimer. C'est
+    la différence entre corriger un bug et éliminer la catégorie du bug.
+
+    PRAGMA user_version EST LE BON OUTIL, PAS UNE TABLE schema_version. SQLite
+    offre nativement un entier de version par base (PRAGMA user_version, 0
+    par défaut). Pas besoin d'une table de métadonnées maison : la version
+    vit dans le header de la DB, gratuite et atomique. Subtilité technique :
+    PRAGMA user_version N'ACCEPTE PAS de paramètre bindé (?), il faut
+    interpoler l'entier via format!. C'est sûr ici parce que la valeur est
+    toujours un champ version du registre constant MIGRATIONS (un littéral
+    i64 du code), jamais une entrée externe. Documenter ce "pourquoi format!
+    et pas bind" dans le code évite qu'un reviewer le prenne pour une faille
+    d'injection.
+
+    ATOMICITÉ SCHÉMA + VERSION DANS LA MÊME TRANSACTION. Le stamp de
+    user_version doit se faire DANS le BEGIN IMMEDIATE de la migration, avant
+    le COMMIT. Sinon un crash entre "DDL appliqué" et "version stampée"
+    laisserait une DB au schéma vN mais marquée vN-1, qui re-tenterait la
+    migration au boot suivant. En les liant dans la même transaction, soit
+    les deux passent (COMMIT), soit aucun (ROLLBACK), et la DB reste sur la
+    version précédente, prête à reprendre proprement.
+
+    IDEMPOTENCE PAR VERSION ET IDEMPOTENCE DDL SONT COMPLÉMENTAIRES. La boucle
+    saute les migrations dont version <= user_version (idempotence "par
+    version"). Mais chaque migration RESTE idempotente côté DDL (CREATE IF
+    NOT EXISTS, garde column_exists via PRAGMA table_info) — c'est ce qui
+    permet d'amorcer une DB legacy à user_version=0 dont le schéma est déjà
+    partiellement ou totalement en place, comme la DB de prod. Sans cette
+    double idempotence, l'amorçage d'une DB divergente planterait.
+
+    REFUSER UNE VERSION FUTURE EST UNE GARANTIE DE SÉCURITÉ, PAS UN LUXE.
+    current > SCHEMA_VERSION_TARGET signifie qu'un binaire plus récent a
+    touché cette DB ; appliquer "à l'envers" ou ignorer corromprait
+    silencieusement. Le variant SchemaVersionTooNew + retour immédiat SANS
+    toucher la DB est le comportement correct. Un test prouve que la DB reste
+    intacte dans ce cas.
+
+    APPLICATION DIRECTE DE b04f8838. Les 7 cas de transition (DB vierge,
+    legacy sans colonnes, idempotent no-op, reprise à mi-chemin, refus
+    version future, cohérence registre/constante, et l'état divergent
+    EXACT de la prod : user_version=0 + colonnes déjà présentes) ne sont pas
+    validés à la main : ils sont entérinés comme #[test] cargo, rejoués à
+    chaque CI. Le test de cohérence (MIGRATIONS.len() == SCHEMA_VERSION_TARGET
+    + versions 1..=N contiguës) est le garde-fou qui transforme "oublier
+    d'incrémenter la constante en ajoutant une migration" d'un bug runtime
+    silencieux en échec de compilation des tests.
+
+  recommendation: >
+    PRATIQUE 1 — POUR TOUTE BASE SQLITE VERSIONNÉE, UTILISER PRAGMA
+    user_version + UN REGISTRE ORDONNÉ DE MIGRATIONS. Le pattern : une
+    constante SCHEMA_VERSION_TARGET, un slice ordonné MIGRATIONS (version +
+    fn apply), une boucle qui lit user_version, refuse > target, puis applique
+    en ordre chaque migration > current dans sa propre transaction en stampant
+    user_version DANS la transaction. Ne pas réinventer une table de version
+    maison quand SQLite en offre une native.
+
+    PRATIQUE 2 — QUAND DEUX OPÉRATIONS DDL ONT UN ORDRE OBLIGATOIRE, LES
+    METTRE DANS LA MÊME MIGRATION, JAMAIS DANS DEUX STEPS SÉPARÉS. Si "B doit
+    venir après A", co-localiser A et B dans une fonction de migration unique
+    rend l'ordre structurel. Toute garantie d'ordre maintenue "par
+    convention" entre deux unités séparées est une régression en attente.
+
+    PRATIQUE 3 — NE JAMAIS BRANCHER SUR LE MESSAGE TEXTUEL D'UNE ERREUR
+    SQLITE. Pour tester l'existence d'une colonne, utiliser PRAGMA
+    table_info(<table>) et inspecter la colonne "name". Pour l'existence d'un
+    objet, interroger sqlite_master. Ces vérifications sont déterministes et
+    indépendantes de la locale/version, contrairement au matching de
+    sous-chaîne sur to_string() de l'erreur.
+
+    PRATIQUE 4 — DOCUMENTER LES INTERPOLATIONS format! DANS LE SQL COMME
+    SÛRES-PAR-CONSTRUCTION. PRAGMA user_version et PRAGMA table_info(<table>)
+    n'acceptent pas de bind ; l'interpolation est obligatoire. Ajouter un
+    commentaire explicite "valeur = constante du registre / littéral
+    hard-codé, jamais d'entrée externe" pour distinguer ce cas légitime d'une
+    vraie faille d'injection aux yeux d'un futur reviewer.
+
+    PRATIQUE 5 — TESTER L'ÉTAT DIVERGENT RÉEL DE LA PROD, PAS SEULEMENT LES
+    ÉTATS THÉORIQUES. Le test le plus précieux ici reproduisait l'état EXACT
+    de la DB de production (user_version=0 avec colonnes+index déjà présents),
+    pas seulement la DB vierge ou la DB legacy nue. Inspecter l'état réel de
+    la base (sqlite3 PRAGMA user_version, table_info) AVANT d'écrire les tests
+    permet de cibler le cas qui casserait vraiment au boot. Vérification finale
+    : booter le binaire serveur réel contre une COPIE de la DB de prod confirme
+    de bout en bout que migrate() ne crashe pas le boot (ici : 122 artifacts
+    indexés, integrity_check ok, DB amorcée à user_version=2).

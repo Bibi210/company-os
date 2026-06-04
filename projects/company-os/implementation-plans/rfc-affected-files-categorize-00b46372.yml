@@ -1,0 +1,348 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 00b46372-4ab0-4285-9bf6-49cf2c73aa28
+  title: "Implementation-plan : schema RFC affected_files modified/created (anyOf rétro-compatible)"
+  author: implementer
+  created_at: "2026-06-04"
+  description: >
+    Plan d'implémentation du RFC a4eb3ee7 (approuvé). Remplace le bloc
+    spec.affected_files du schema RFC (company/schemas/rfc.schema.json,
+    actuellement un array plat de strings, lignes 24-27) par un anyOf à deux
+    branches : FORME A legacy (array de strings, identique au caractère près
+    à l'existant, garantit la rétro-compatibilité) et FORME B structurée
+    (objet {modified, created}, deux listes optionnelles, additionalProperties:
+    false). Le JSON Schema exact est celui dicté par la proposal du RFC.
+    AUCUNE ligne de Rust ne change : grep "affected_files" sur crates/ = 0,
+    le champ est purement documentaire et le mécanisme de permit repose sur
+    target_paths fourni par le CEO, pas sur affected_files (RFC impact §2).
+    Le plan ajoute aussi une règle dans company/config/shared-rules.yml
+    recommandant la FORME B pour les RFCs touchant du code (cleanup du
+    contournement de prose, application be16dc46 + AC5). Les TESTS sont des
+    validations exécutées via le tool MCP yaml-validator (validate_yaml sur
+    des RFCs FORME A et FORME B en mémoire, aucun fichier écrit, donc hors
+    zone protégée) couvrant les trois axes : nominal, négatif, edge. La lesson
+    de capitalisation se fait APRÈS merge, hors scope de ce plan.
+  tags:
+    - rfc-schema
+    - affected-files
+    - schema
+    - companyos-internals
+    - friction-permits
+    - backward-compatible
+  related:
+    - id: a4eb3ee7-45c1-4422-a43a-fbbc07d686f0
+      kind: rfc
+      relationship: input
+    - id: 08d5b9a2-2dc6-4b73-8e6a-c7799367b04d
+      kind: task-request
+      relationship: input
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: input
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: input
+    - id: 3f507271-70ba-49ac-9a08-eeb833fb6063
+      kind: lesson-learned
+      relationship: related
+    - id: 54f76b21-372c-4209-98cf-d2ead9749c8f
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  dependencies:
+    - >
+      RFC a4eb3ee7 APPROUVÉ (status: approved, approved_at 2026-06-04). Ce
+      plan en dérive directement ; aucune décision architecturale n'est
+      remise en question. Le JSON Schema à poser est dicté MOT POUR MOT par
+      la proposal du RFC (bloc "JSON SCHEMA EXACT"). Si une décision du RFC
+      s'avère insuffisante en exécution, escalade à l'Architect, jamais de
+      redesign en implémentation.
+    - >
+      Write permit CEO requis AVANT toute écriture des fichiers protégés.
+      Paths littéraux à couvrir par le permit (cf. RFC affected_files, les
+      DEUX EXISTANTS, aucun fichier à créer) :
+        - company/schemas/rfc.schema.json   (MODIFICATION)
+        - company/config/shared-rules.yml   (MODIFICATION)
+      Avant de commencer la phase exécution (hors scope de ce plan), vérifier
+      via check_write_permit que CHACUN de ces deux paths est couvert
+      (lesson 611fde3e ENSEIGNEMENT 3 / RECOMMANDATION 3 : un path oublié =
+      blocage hook au moment de l'écriture).
+    - >
+      FAIT ÉTABLI ET VÉRIFIÉ AU REVIEW DU RFC : aucun code Rust ne lit
+      affected_files (grep "affected_files" sur crates/ = 0 occurrence). Ce
+      plan ne touche donc AUCUNE crate, AUCUN .rs, AUCUN Cargo.toml.
+      Contraste avec lesson 3f507271 (ajouter un KIND impose de toucher
+      types.rs) : ici on ne crée pas de kind, on élargit la forme acceptée
+      d'un champ existant via une construction JSON Schema standard (anyOf),
+      pilotée par le SchemaRegistry schema-driven (RFC impact §3). AC3 du
+      task-request est donc satisfait par le constat "aucun code ne lit ce
+      champ", à documenter tel quel.
+
+  steps:
+    - description: >
+        ÉTAPE 0 — DÉCISIONS STRUCTURELLES (à figer avant d'écrire le patch).
+        D0.1 — UN SEUL FICHIER DE CODE MODIFIÉ : company/schemas/rfc.schema.json.
+          Le seul changement est le remplacement du bloc affected_files
+          (actuellement lignes 24-27 : { "type": "array", "items": { "type":
+          "string" } }) par le bloc anyOf à deux branches dicté par la
+          proposal du RFC. TOUT LE RESTE DU SCHEMA est identique au caractère
+          près : allOf + $ref _base.schema.json (ligne 5), const kind "rfc"
+          (ligne 8), enum status (lignes 11-14), properties motivation/proposal/
+          impact/rollback_plan (lignes 20-23), required spec [motivation,
+          proposal, impact] (ligne 29), required [spec] (ligne 32).
+        D0.2 — anyOf, PAS oneOf (décision RFC tranchée dans la proposal) :
+          les deux branches sont mutuellement exclusives par construction (un
+          array n'est jamais un objet), donc anyOf et oneOf acceptent le même
+          ensemble ; anyOf est retenu pour la robustesse aux évolutions
+          futures. Ne PAS substituer oneOf.
+        D0.3 — modified ET created OPTIONNELS sur la branche objet (pas de
+          required) : un RFC peut n'avoir que des créations ou que des
+          modifications ; l'objet vide {} et les listes vides [] sont tolérés
+          au niveau schema (la discipline de remplissage relève de la règle de
+          process posée à l'ÉTAPE 2, pas de la contrainte structurelle).
+        D0.4 — additionalProperties: false sur la branche objet : une clé
+          inconnue ou une faute de frappe (ex. "modifeid", "create") est
+          REJETÉE plutôt que silencieusement ignorée. C'est ce qui fournit
+          l'axe NÉGATIF testable de l'ÉTAPE 3.
+        D0.5 — descriptions des sous-champs : reprendre LITTÉRALEMENT les
+          chaînes "description" du bloc JSON SCHEMA EXACT du RFC (branche array
+          "Legacy flat form: ..." ; branche objet "Structured form ..." ;
+          modified "Files that already exist in HEAD and will be edited." ;
+          created "New files that do not yet exist and will be created.").
+          Elles documentent l'intention dans le schema lui-même.
+      files:
+        - company/schemas/rfc.schema.json
+    - description: >
+        ÉTAPE 1 — PATCH DU BLOC affected_files DANS rfc.schema.json. Remplacer
+        EXACTEMENT les lignes 24-27 actuelles :
+            "affected_files": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+        par le bloc anyOf dicté par la proposal du RFC (reproduit ici pour
+        l'exécutant, à recopier au caractère près) :
+            "affected_files": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "Legacy flat form: a single list of file paths (modified or created indistinctly). Kept for backward compatibility."
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "modified": {
+                      "type": "array",
+                      "items": { "type": "string" },
+                      "description": "Files that already exist in HEAD and will be edited."
+                    },
+                    "created": {
+                      "type": "array",
+                      "items": { "type": "string" },
+                      "description": "New files that do not yet exist and will be created."
+                    }
+                  },
+                  "additionalProperties": false,
+                  "description": "Structured form distinguishing files to modify from files to create. Both keys optional; either may be empty or absent."
+                }
+              ]
+            }
+        Le bloc remplacé est INTÉGRÉ DANS spec.properties, à la même position
+        que l'ancien affected_files (entre rollback_plan et la clé "required"
+        du spec). Après écriture : vérifier que le JSON entier est bien formé
+        (parse JSON valide) AVANT toute autre étape, sinon le SchemaRegistry
+        échouerait à charger le schema. Le fichier reste un objet allOf de deux
+        sous-schemas ; aucune virgule manquante ni accolade en trop.
+      files:
+        - company/schemas/rfc.schema.json
+    - description: >
+        ÉTAPE 2 — AJOUT D'UNE RÈGLE DANS shared-rules.yml RECOMMANDANT LA
+        FORME B (cleanup du contournement de prose, application be16dc46
+        PRATIQUE 1/2 + AC5 du task-request + RFC cleanup_workaround ACTION 2).
+        Ajouter sous spec.rules une nouvelle clé (ex. affected_files_categorization)
+        avec une description qui :
+          (a) RECOMMANDE (sans imposer) la FORME B structurée
+              {modified, created} pour les RFCs touchant du code, et explique
+              que modified = fichiers existants à éditer, created = fichiers
+              nouveaux à créer ;
+          (b) précise que la FORME A (array plat) reste valide et acceptée
+              (rétro-compatibilité), à privilégier pour les RFCs ne touchant
+              que des artifacts YAML sans création de fichier ;
+          (c) relie la recommandation à son objet : éviter le blocage hook
+              dû à un fichier à créer oublié dans le permit (lesson 611fde3e
+              ENSEIGNEMENT 3), en rendant la distinction explicite et
+              exploitable par un futur outillage de pré-vérification de permit ;
+          (d) note que cette règle REMPLACE le contournement de prose (la
+              distinction modified/created explicitée à la main dans la section
+              impact des RFCs récents 359f9162 / 1c0f2570 / bde023e2 / cdbfee72)
+              en fermant ce chemin pour les FUTURS auteurs (be16dc46 :
+              le cleanup fait partie du scope de la solution).
+        CONTRAINTE D'ÉDITION : insertion additive sous spec.rules, NE PAS
+        modifier les règles existantes ni la description du kind rfc (ligne 57)
+        au-delà du strict nécessaire. Respecter l'indentation YAML exacte du
+        fichier (les règles existantes sont des clés mappées vers un objet
+        { description: > ... }). Après édition : le YAML doit rester valide
+        (project-config), vérifié à l'ÉTAPE 4.
+        NOTE be16dc46 PAS D'ACTION sur les RFCs déjà mergés : leur prose est un
+        artefact historique figé, on ne réécrit pas le passé. C'est l'ajout de
+        la règle (c'est-à-dire fermer le chemin pour les futurs auteurs) qui
+        constitue le cleanup, pas la réécriture des RFCs clos.
+      files:
+        - company/config/shared-rules.yml
+    - description: >
+        ÉTAPE 3 — TESTS DE VALIDATION DU SCHEMA VIA LE TOOL MCP yaml-validator.
+        MÉTHODE (réponse à "comment tester un changement de schema JSON ?") :
+        un changement de schema JSON se teste en soumettant des artifacts au
+        validator et en observant accept/reject. On utilise validate_yaml du
+        serveur MCP yaml-validator, qui auto-détecte le kind depuis le contenu
+        YAML (ici kind: rfc) et valide contre rfc.schema.json. PRÉREQUIS
+        D'EXÉCUTION : après le patch de l'ÉTAPE 1, le watcher de schemas
+        recharge automatiquement rfc.schema.json (RFC impact §3) ; en fallback,
+        appeler reload_schemas() avant de lancer les cas pour garantir que le
+        validator utilise bien le nouveau schema. AUCUN fichier de test n'est
+        écrit sur disque : les cas sont des chaînes YAML passées en mémoire à
+        validate_yaml, donc cette étape ne touche AUCUNE zone protégée et ne
+        requiert AUCUN permit ni amendement RFC.
+
+        Chaque cas RFC ci-dessous est minimalement valide par ailleurs (kind:
+        rfc, api_version, metadata complet {id UUID, title, author, created_at},
+        spec.motivation, spec.proposal, spec.impact requis) de façon à ISOLER
+        la validation de affected_files : un échec doit provenir d'affected_files,
+        pas d'un autre champ manquant. Pour les cas NÉGATIFS, on vérifie que le
+        rejet est bien IMPUTABLE à affected_files (message d'erreur pointant le
+        champ / la sous-clé), pas à un effet de bord.
+
+        AXE NOMINAL (doivent VALIDER) :
+          N1 — FORME A legacy : affected_files = array plat de 2 strings.
+               Reproduit le format des 22 RFCs existants. Attendu : VALIDE.
+          N2 — FORME B complète : affected_files = objet { modified: [2 paths],
+               created: [1 path] }. Le cas d'usage cible du RFC. Attendu : VALIDE.
+
+        AXE NÉGATIF (doivent ÊTRE REJETÉS) :
+          G1 — clé inconnue / typo : affected_files = objet { modified: [...],
+               "modifeid": [...] } (faute de frappe). additionalProperties:false
+               (D0.4) doit REJETER. Vérifie que la typo n'est pas silencieusement
+               ignorée. Attendu : REJET imputable à affected_files.
+          G2 — item non-string dans la branche array : affected_files =
+               [ "company/schemas/rfc.schema.json", 42 ]. items:{type:string}
+               doit REJETER l'entier. Attendu : REJET.
+          G3 — item non-string dans une sous-liste de la branche objet :
+               affected_files = { modified: [ 123 ] }. Attendu : REJET.
+          G4 — type scalaire : affected_files = "company/schemas/rfc.schema.json"
+               (string nue, ni array ni objet). Aucune branche de l'anyOf ne
+               matche. Attendu : REJET.
+          NOTE anyOf et messages d'erreur (lesson c5413270 : un protocole réel
+          a plus d'invariants qu'un pseudo-code) : un échec anyOf peut produire
+          un message agrégeant les échecs des deux branches. Le critère de
+          succès du test négatif est BINAIRE (rejeté oui/non) ; la lisibilité
+          exacte du message est secondaire. Documenter le message réellement
+          produit pour chaque cas G dans le compte-rendu de validation.
+
+        AXE EDGE (comportement aux limites) :
+          E1 — objet vide : affected_files = {} . Branche objet, both keys
+               absent (D0.3). Attendu : VALIDE (toléré au niveau schema).
+          E2 — listes vides : affected_files = { modified: [], created: [] }.
+               Attendu : VALIDE.
+          E3 — only-created : affected_files = { created: ["crates/x/lock.rs"] },
+               pas de modified. Le cas exact de la lesson 611fde3e (fichiers à
+               créer oubliés). Attendu : VALIDE.
+          E4 — only-modified : affected_files = { modified: ["company/schemas/
+               rfc.schema.json"] }, pas de created. Attendu : VALIDE.
+          E5 — array vide : affected_files = []. Branche array, liste vide.
+               Attendu : VALIDE (rétro-compat : un RFC sans fichier listé).
+          E6 — RÉTRO-COMPATIBILITÉ sur RFCs RÉELS : sélectionner 2 ou 3 RFCs
+               existants en FORME A (ex. ce RFC a4eb3ee7 lui-même qui est en
+               FORME A par bootstrap, 359f9162, cdbfee72) et les passer à
+               validate_file. Attendu : tous VALIDES après le patch (preuve
+               directe d'AC2 "aucun RFC existant ne casse"). validate_file est
+               lecture seule, n'écrit rien.
+
+        LIVRABLE DE CETTE ÉTAPE : un compte-rendu (dans le commit message ou un
+        diagnostic-report si un cas échoue) listant les 13 cas (N1-N2, G1-G4,
+        E1-E6) avec verdict observé vs attendu. Critère done de l'étape : 100%
+        des verdicts observés == attendus.
+      files: []
+    - description: >
+        ÉTAPE 4 — VALIDATION CI INTERNE (séquence write_permit_full_sequence,
+        cas 3 = CompanyOS lui-même ; règle CI = source de vérité). APRÈS
+        consume du permit et commit du code :
+          (a) valider company/schemas/rfc.schema.json comme JSON bien formé
+              (le chargement par SchemaRegistry échoue si malformé) — un cargo
+              build du workspace exerce le chargement des schemas par les
+              serveurs MCP ;
+          (b) cargo build SANS --target-dir (déclenche le hot-reload des MCP
+              servers) — DOIT être vert ;
+          (c) cargo test du workspace — DOIT être vert (0 failed). Aucun test
+              Rust nouveau n'est ajouté par ce plan (aucun code Rust touché),
+              donc l'objectif est la NON-RÉGRESSION : les tests existants
+              passent à l'identique, prouvant que le patch schema (fichier de
+              données chargé au runtime) n'a rien cassé côté binaire ;
+          (d) exécuter les 13 cas de l'ÉTAPE 3 via yaml-validator (reload_schemas()
+              en fallback si le watcher n'a pas encore rechargé) — 100% verts ;
+          (e) reload_config() EN DERNIER, uniquement si (b), (c), (d) verts.
+        NOTE : cette étape appartient à la phase EXÉCUTION (post-approbation du
+        plan + post-permit), elle est listée ici pour compléter la Definition
+        of Done, PAS pour être exécutée maintenant.
+      files: []
+    - description: >
+        ÉTAPE 5 — CAPITALISATION (HORS SCOPE EXÉCUTION DE CE PLAN, NOTÉE POUR
+        LA DEFINITION OF DONE). Après merge, produire la lesson-learned du
+        chantier (déclencheur lesson_after_every_artifact : implementation-plan
+        terminé). Au titre du cleanup be16dc46 ACTION 1 + RFC cleanup_workaround
+        ACTION 1 : amender ou superseder la RECOMMANDATION 3 de la lesson
+        611fde3e pour qu'elle pointe vers le champ structuré affected_files.created
+        comme moyen CANONIQUE, au lieu de la pratique manuelle "l'Architect se
+        force à imaginer le diff". search(kind=lesson-learned, "affected_files
+        created modified") détermine créer-vs-amender au moment de la
+        capitalisation (règle lessons + lesson_chaining : lier via supersedes
+        / derived-from / related). Cette étape ne touche AUCUNE zone protégée
+        (les lessons vivent dans company/lessons/, hors zone protégée code) et
+        ne requiert aucun permit. La lesson elle-même se fait APRÈS, en
+        capitalisation, comme indiqué par le PM.
+      files: []
+
+  risks:
+    - >
+      RISQUE 1 — JSON Schema mal formé après le patch (virgule, accolade). Un
+      schema invalide ferait échouer le chargement par SchemaRegistry et
+      casserait TOUTE validation RFC. Mitigation : recopier le bloc anyOf au
+      caractère près depuis la proposal du RFC ; vérifier le parse JSON
+      immédiatement après l'ÉTAPE 1 (avant tout autre changement) ; cargo
+      build + un cas de validation nominal (N1) confirment le chargement
+      correct à l'ÉTAPE 4. Rollback trivial (RFC rollback_plan) : restaurer
+      le bloc array simple.
+    - >
+      RISQUE 2 — Régression de rétro-compatibilité (un RFC existant devient
+      invalide). Probabilité quasi nulle : la branche A de l'anyOf est
+      IDENTIQUE au caractère près à l'ancien schema (RFC impact §1).
+      Mitigation : cas E6 (validate_file sur des RFCs réels en FORME A) prouve
+      empiriquement AC2 ; si un seul RFC réel échoue, c'est un signal d'alarme
+      à investiguer avant merge (diagnostic-report).
+    - >
+      RISQUE 3 — additionalProperties:false trop strict masquant un cas
+      légitime. Analysé : sur la branche objet, seuls modified et created sont
+      des clés sémantiquement attendues ; toute autre clé est soit une typo
+      (qu'on VEUT rejeter, c'est l'intention de l'axe négatif G1), soit une
+      extension future qui passerait par un nouveau RFC schema. Pas de cas
+      légitime bloqué. Mitigation : aucune action, c'est le comportement voulu.
+    - >
+      RISQUE 4 — Le validator ne recharge pas le schema patché (cache).
+      Mitigation : le watcher recharge automatiquement à chaque écriture sous
+      company/schemas/ (RFC impact §3) ; reload_schemas() est le fallback
+      explicite avant de lancer les cas de l'ÉTAPE 3 / 4(d). Si après
+      reload_schemas() un cas nominal FORME B (N2) est encore rejeté, c'est un
+      signe que le rechargement n'a pas pris : ré-essayer reload_schemas() puis
+      escalader (diagnostic-report) plutôt que de conclure à tort que le patch
+      est faux.
+    - >
+      RISQUE 5 — Périmètre des fichiers écrits. Les SEULS fichiers écrits par
+      ce plan sont les DEUX affected_files du RFC, tous EXISTANTS, aucun à
+      créer : company/schemas/rfc.schema.json et company/config/shared-rules.yml.
+      AUCUN .rs, AUCUN Cargo.toml, AUCUN fichier de test sur disque (les tests
+      sont des appels MCP en mémoire, ÉTAPE 3). Le write permit ne doit couvrir
+      QUE ces deux paths. Aucun amendement du RFC affected_files n'est
+      nécessaire. Mitigation oubli de path (lesson 611fde3e : path oublié =
+      blocage hook) : avant la phase exécution, check_write_permit sur CHACUN
+      des deux paths (cf. spec.dependencies).

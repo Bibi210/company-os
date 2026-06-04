@@ -1,0 +1,178 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 85ad44d3-e0a5-49e3-93f7-6a384cd161b7
+  title: "Le hook defense-in-depth ne wipe plus par défaut : revert SÉLECTIF (baseline = union snapshot + HEAD), nucléaire borné au seul cas baseline-indéterminable"
+  author: implementer
+  created_at: "2026-06-04"
+  description: >
+    Capitalisation après l'implémentation du RFC bde023e2 (plan 655fb3fb) qui
+    réécrit revertPermitTampering dans company/plugins/defense-in-depth-core.mjs.
+    Le comportement par défaut du hook face à une altération hors-canal de la
+    table write_permits N'EST PLUS le wipe total : c'est désormais un DELETE
+    SÉLECTIF qui ne supprime que les ids HORS d'une baseline légitime, calculée
+    comme l'UNION de deux sources (snapshot before = Source A, ids scellés en
+    HEAD git = Source B). Le wipe nucléaire ne subsiste QUE dans le cas résiduel
+    strict « Source A null ET Source B inexploitable » (baseline indéterminable).
+    Cette lesson documente la distinction CRITIQUE null (indéterminable -> wipe)
+    vs Set vide (déterminable mais vide -> DELETE total qui ferme la faille
+    historique L230), la fermeture de cette faille, les surprises rencontrées,
+    et supersede PARTIELLEMENT la lesson ed7776fb (le wipe n'est plus le défaut)
+    tout en préservant ses parties encore valides (jamais de SQL direct).
+  tags:
+    - defense-in-depth
+    - write-permits
+    - selective-revert
+    - security
+    - critical-infra
+    - companyos-internals
+    - mcp
+    - sqlite
+    - git
+    - lessons-from-implementation
+  related:
+    - id: ed7776fb-d56d-4f61-9f48-807897c6325d
+      kind: lesson-learned
+      relationship: supersedes
+    - id: bde023e2-8633-42c9-911a-80dcd5157c62
+      kind: rfc
+      relationship: derived-from
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: related
+    - id: 359f9162-18f2-4b72-85b0-7d0e44608959
+      kind: rfc
+      relationship: related
+
+spec:
+  context: >
+    La lesson ed7776fb (2026-05-20) documentait que le hook defense-in-depth,
+    face à toute altération non-MCP de write_permits, WIPAIT toute la table.
+    Le RFC bde023e2 a transformé ce comportement, sur décision CEO, en revert
+    sélectif. Implémentation faite dans company/plugins/defense-in-depth-core.mjs
+    (commit 4f803b6), avec tests triaxiaux ajoutés au fichier existant
+    company/plugins/tests/defense-in-depth-core.test.mjs (couvert par un
+    amendement RFC ajoutant ce path à affected_files).
+
+    Architecture livrée — revertPermitTampering(rootDir, before) :
+    1. Détection de divergence inchangée : before===null && after===null ->
+       return false (pas de DB) ; before===after -> return false (intact).
+    2. En cas de divergence, on calcule une baseline légitime via buildBaseline,
+       UNION de deux sources :
+       - Source A (parsePermitIds) : ids extraits du blob snapshot "before"
+         (format "<count>|<id>:<status>,..."). Le helper strippe le préfixe
+         "<count>|" qui polluait historiquement le premier id (L228). Retourne
+         null si before===null, sinon un Set (éventuellement vide pour "0|").
+       - Source B (permitIdsFromHeadDb) : ids des permits SCELLÉS en HEAD git.
+         git cat-file -e HEAD:<db> puis git show HEAD:<db> matérialisé dans
+         /tmp (HORS zone protégée, couvert par BASH_SAFE_PATHS), SELECT id via
+         runSqliteWithTimeout, cleanup try/finally INCONDITIONNEL. Retourne un
+         Set (éventuellement vide si HEAD a 0 permit) ou null si inexploitable.
+    3. buildBaseline : null SSI Source A null ET Source B null ; sinon Set
+       (union, éventuellement vide).
+    4. Branchement final :
+       - baseline === null -> DELETE FROM write_permits (WIPE résiduel, fail-safe,
+         SEUL chemin nucléaire restant).
+       - baseline Set non vide -> DELETE FROM write_permits WHERE id NOT IN (...).
+       - baseline Set VIDE -> DELETE FROM write_permits (DELETE total). C'est la
+         branche else qui MANQUAIT à l'ancien code et qui ferme la faille L230.
+
+    Tests : 46 verts (16 suites, 0 failed), dont nominal n1-n3, négatif g1-g4
+    (g2 = fermeture L230, g3 = wipe résiduel borné), edge e1-e5b (e4 = permit
+    scellé entre deux bash préservé par l'union, e5/e5b = cleanup /tmp vérifié
+    en succès et en échec). cargo build + cargo test verts (Rust non touché).
+
+  insight: >
+    POINT A — LA DISTINCTION null vs Set VIDE EST LE COEUR DE LA SÉCURITÉ.
+    Deux états « zéro permit » sont sémantiquement OPPOSÉS et ne doivent JAMAIS
+    être confondus :
+      - null = baseline INDÉTERMINABLE (on ne peut affirmer aucun permit
+        légitime : ni snapshot, ni HEAD exploitable) -> fail-safe -> WIPE total.
+      - Set vide = baseline DÉTERMINABLE et vide (on sait avec certitude qu'il
+        n'y a AUCUN permit légitime) -> DELETE sur TOUT, ce qui supprime tout
+        intrus. Ce n'est PAS un wipe « par défaut d'information », c'est un
+        DELETE « par connaissance que rien n'est légitime ».
+    Confondre les deux dans un sens régresse vers ed7776fb (on wipe alors qu'on
+    aurait pu être sélectif) ; dans l'autre sens, on laisse survivre un intrus
+    (faille). Le contrat strict des trois helpers (null vs Set) encode l'invariant.
+
+    POINT B — LA FAILLE L230 ÉTAIT UN SILENCE, PAS UN BUG VISIBLE.
+    L'ancien code calculait `placeholders` à partir des ids du snapshot, puis
+    `if (placeholders) { DELETE ... NOT IN ... }`. Quand la DB était initialement
+    VIDE (snapshot "0|"), placeholders était la chaîne vide, donc AUCUN DELETE
+    n'était émis. Un permit injecté hors-canal pendant le bash sur une DB
+    initialement vide SURVIVAIT silencieusement. La branche else manquante
+    (baseline vide -> DELETE total) ferme exactement ce trou. Leçon : un `if`
+    sans `else` sur une garde de sécurité est un point d'attention systématique.
+
+    POINT C — SOURCE B DÉPEND ENTIÈREMENT DU SCELLEMENT HEAD (RFC 359f9162).
+    La fiabilité de la Source B repose sur l'invariant « tout permit légitime
+    est scellé en HEAD au grant atomique » livré par 359f9162. Sans cet
+    invariant, Source B serait incomplète. Le design est robuste à cet égard :
+    si Source B est indisponible, le fallback Source A puis wipe résiduel garde
+    un comportement correct (jamais moins sûr que l'existant). La dépendance est
+    réelle mais non bloquante.
+
+    POINT D — execSync ÉCHAPPE AUX GUARDS ANTI-DB / ANTI-sqlite3.
+    Source B référence company/data/orchestrator.db et lance sqlite3 sur une
+    copie /tmp. Ces guards (L283 anti-DB, L293 anti-sqlite3) ne filtrent QUE
+    input.tool === "bash" (le tool d'opencode), pas les execSync internes du
+    hook. La matérialisation HORS zone protégée (/tmp) est une précaution
+    supplémentaire : même si la copie était traitée comme protégée, /tmp est
+    dans BASH_SAFE_PATHS. Double ceinture.
+
+    POINT E — SURPRISE DE TEST : stderr git « pas un dépôt git » est ATTENDU.
+    Les cas où Source B est volontairement inexploitable (g3, g4, e5b, baseline
+    Source-A-seule) exécutent git cat-file dans un tmp sans repo git. git écrit
+    sur stderr « ni ceci ni aucun de ses parents n'est un dépôt git » mais run()
+    convertit l'échec en null (Source B null), ce qui est exactement le chemin
+    testé. Ce bruit stderr n'est PAS un échec de test ; les 46 tests passent.
+
+    --- CE QUI RESTE VALIDE DE ed7776fb (NON superseded) ---
+    Le POINT 1 de ed7776fb reste vrai : la DB des permits est un journal
+    d'autorisations dont l'intégrité dépend d'une chaîne MCP authentifiée ; un
+    UPDATE direct est indistinguable d'une falsification. Le POINT 3 (procédure
+    en cas de coupure MCP) reste vrai : retry, puis diagnostic-report, jamais de
+    SQL direct. Le hook reste un mécanisme défensif agressif ; il est seulement
+    devenu CHIRURGICAL au lieu de NUCLÉAIRE dans le cas nominal.
+
+    --- CE QUI EST OBSOLÈTE DANS ed7776fb (superseded) ---
+    Le POINT 2 (« la stratégie wipe est préférable au log », présentée comme le
+    comportement par défaut assumé) est PÉRIMÉ : le wipe n'est plus le défaut,
+    il est borné au seul cas baseline-indéterminable. La PRATIQUE 3 (« RFC
+    potentiel : assouplissement du wipe », posée comme idée à évaluer) est
+    RÉALISÉE par bde023e2 : le mécanisme chirurgical (a) ne logge pas mais (b)
+    restaure sélectivement en supprimant les ids hors baseline et (c) laisse
+    les ids légitimes intacts. L'idée prospective est devenue du code livré.
+
+  recommendation: >
+    PRATIQUE 1 (préservée de ed7776fb) — JAMAIS DE SQL DIRECT SUR LES TABLES
+    SENSIBLES. write_permits et consorts : écriture exclusivement via MCP. Le
+    revert est devenu sélectif, mais ça ne légitime PAS le SQL direct : un
+    UPDATE/INSERT/DELETE hors-canal reste une altération que le hook détectera
+    et corrigera (en supprimant les ids hors baseline). SELECT pour debug reste
+    toléré.
+
+    PRATIQUE 2 (préservée de ed7776fb) — DIAGNOSTIC-REPORT PLUTÔT QUE WORKAROUND
+    en cas de coupure MCP sur un appel critique (consume/grant/vote). Documenter
+    l'état (permit_id, commit hash, étape) et stopper.
+
+    PRATIQUE 3 (NOUVELLE) — POUR TOUTE GARDE DE SÉCURITÉ « ZÉRO ÉLÉMENT »,
+    DISTINGUER EXPLICITEMENT « inconnu » DE « connu-vide ». Modéliser l'inconnu
+    par null (ou un type optionnel) et le connu-vide par une collection vide,
+    JAMAIS par la même valeur. Tester les DEUX chemins séparément (ici g2 vs g3).
+    Le piège classique : `if (collection.length) { ... }` traite silencieusement
+    le vide comme « rien à faire », ce qui est faux quand le vide signifie
+    « supprimer tout ».
+
+    PRATIQUE 4 (NOUVELLE) — POUR UN HELPER QUI MATÉRIALISE UN FICHIER TEMPORAIRE,
+    LE CLEANUP VA DANS UN finally INCONDITIONNEL, et un test edge doit vérifier
+    l'ABSENCE du fichier après l'appel EN SUCCÈS ET EN ÉCHEC (e5 + e5b). Un
+    cleanup placé dans le corps try fuit dès qu'une exception remonte.
+
+    PRATIQUE 5 (NOUVELLE) — QUAND ON MODIFIE LE HOOK QUI SE SURVEILLE LUI-MÊME,
+    le commit du code doit se faire AVEC le permit actif, le consume APRÈS, et la
+    séquence write_permit_full_sequence (commit -> consume -> cargo build+test ->
+    reload_config en dernier) reste non-négociable. Le hook a correctement laissé
+    passer son propre commit ciblé (permit actif, fichiers couverts) sans
+    auto-wipe : la preuve que le sélectif fonctionne en conditions réelles.

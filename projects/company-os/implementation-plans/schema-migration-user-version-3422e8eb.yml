@@ -1,0 +1,275 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 3422e8eb-5c9f-4de4-a6f2-9c69d8671ca7
+  title: "Plan d'implémentation — Discipline de migration SQL : PRAGMA user_version + registre de migrations numérotées dans migrations.rs"
+  author: implementer
+  created_at: "2026-06-04"
+  description: >
+    Implementation-plan dérivé du RFC 973a5569 (approuvé). Refonte interne de
+    OrchestratorDb::migrate() (db.rs:353) en boucle pilotée par PRAGMA
+    user_version sur un registre ORDONNÉ de migrations numérotées, isolé dans
+    un nouveau module crates/orchestrator/src/migrations.rs. Intègre le hotfix
+    57019e7 (Step 2bis) dans la migration numérotée portant ses ALTER, remplace
+    le matching fragile "duplicate column" par PRAGMA table_info(artifacts),
+    ajoute le variant SchemaVersionTooNew pour refuser proprement une DB de
+    version future, et entérine 6 tests #[test] de transition dans la suite
+    cargo. La signature publique pub fn migrate(&self) -> Result<(),
+    OrchestratorError> est CONSERVÉE : aucun des 4 sites d'appel
+    (main.rs:1385, 1448, 1504, tests) n'est adapté.
+  tags:
+    - sqlite
+    - schema-migration
+    - user-version
+    - orchestrator
+    - migrations-module
+    - idempotence
+    - testing
+    - companyos-internals
+    - critical-infra
+  related:
+    - id: 973a5569-ec7e-4ee0-a868-2314e3cd5bd4
+      kind: rfc
+      relationship: input
+    - id: 1554764d-1836-4705-84f6-2171b5caa727
+      kind: task-request
+      relationship: input
+    - id: b04f8838-84b5-4332-b3a4-5782a943d766
+      kind: lesson-learned
+      relationship: related
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: related
+    - id: d5c9c933-2955-41e1-b2ae-73c9f307f09f
+      kind: lesson-learned
+      relationship: related
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  steps:
+    - description: >
+        OVERVIEW + DÉCISION D'ARCHITECTURE (étape 0, non-code). Le RFC tranche
+        le QUOI/POURQUOI (PRAGMA user_version + registre numéroté ordonné
+        idempotent, atomicité user_version dans la transaction, refus version
+        future, cleanup du Step 2bis, tests entérinés). Ce plan tranche le
+        COMMENT/ORDRE.
+        DÉCISION : module dédié crates/orchestrator/src/migrations.rs (PAS
+        db.rs-inline). Justification : db.rs fait déjà 2489 lignes ; le registre
+        (SCHEMA_VERSION_TARGET + tableau de migrations + corps DDL + helpers
+        read/write user_version + test de cohérence) forme une unité cohérente
+        et hautement testable que l'isolement rend plus lisible à reviewer. Le
+        RFC anticipe cet arbitrage (section impact) et couvre déjà le path
+        migrations.rs dans affected_files.created, donc AUCUN second round de
+        permit. migrate() reste dans db.rs et devient une mince boucle
+        d'orchestration appelant migrations.rs.
+        RÉPARTITION : migrations.rs porte SCHEMA_VERSION_TARGET, le type
+        Migration, le slice ordonné MIGRATIONS, les corps DDL des migrations 1
+        et 2, les helpers read_user_version/write_user_version, et le module de
+        tests. db.rs porte migrate() réécrit + `mod migrations;`. error.rs porte
+        le variant SchemaVersionTooNew. lib.rs : en principe inchangé (re-export
+        OrchestratorError déjà présent), path conservé au permit par prudence
+        (lesson 611fde3e).
+        INVARIANTS NON NÉGOCIABLES (du RFC) : SCHEMA_VERSION_TARGET == nombre de
+        migrations (test garde-fou) ; PRAGMA user_version = v À L'INTÉRIEUR du
+        BEGIN IMMEDIATE de la migration v ; idempotence par version (user_version)
+        mais migrations RESTENT idempotentes côté DDL (CREATE IF NOT EXISTS +
+        table_info) pour amorcer les DB legacy à user_version=0 ; current > N →
+        SchemaVersionTooNew, DB non touchée ; PRAGMA user_version NON paramétrable
+        → interpoler l'entier via format! (sûr car constante du registre).
+      files: []
+
+    - description: >
+        ÉTAPE 1 — migrations.rs : squelette du registre + helpers user_version
+        (action: CREATE le fichier). Définir :
+        (a) pub const SCHEMA_VERSION_TARGET: i64 = 2 (deux migrations : base +
+            colonnes/index author/project/created_at).
+        (b) struct Migration { version: i64, apply: fn(&rusqlite::Connection)
+            -> rusqlite::Result<()> }.
+        (c) const MIGRATIONS: &[Migration] = &[ { version: 1, apply:
+            migration_01_base_schema }, { version: 2, apply:
+            migration_02_filter_columns_and_indexes } ] ; ordre = ordre des
+            numéros, contigu de 1 à N.
+        (d) pub(crate) fn read_user_version(conn) -> rusqlite::Result<i64> :
+            conn.query_row("PRAGMA user_version", [], |r| r.get(0)).
+        (e) fn write_user_version(conn, v: i64) -> rusqlite::Result<()> :
+            conn.execute_batch(&format!("PRAGMA user_version = {v}")), avec
+            commentaire explicite : PRAGMA user_version ne supporte pas le bind
+            (?), d'où l'interpolation ; sûr car v est un entier constant du
+            registre, pas d'input externe (contrainte technique RFC).
+        Pas de logique de boucle ici (elle vit dans migrate()). Dépend de : rien.
+      files:
+        - crates/orchestrator/src/migrations.rs
+
+    - description: >
+        ÉTAPE 2 — migrations.rs : migration 1, schéma de base actuel, idempotent
+        (action: CREATE, dans le même fichier). Implémenter fn
+        migration_01_base_schema(conn) -> rusqlite::Result<()> : reprend
+        EXACTEMENT le contenu déclaratif du Step 1 actuel, soit l'exécution de
+        SCHEMA_SQL + FTS_SQL + VEC_TABLE_SQL (tous CREATE ... IF NOT EXISTS, donc
+        idempotents et tolérants à une DB legacy déjà peuplée, cf. RFC amorçage
+        current=0). Les constantes SCHEMA_SQL/FTS_SQL/VEC_TABLE_SQL vivent dans
+        db.rs (db.rs:50/103/130) : les rendre pub(crate) pour que migrations.rs
+        y accède (moindre changement, vs déplacement). NE PAS inclure BEGIN/COMMIT
+        dans le corps (la transaction est ouverte par la boucle de migrate(),
+        étape 5). NE PAS poser user_version ici (la boucle le fait dans la même
+        transaction). Dépend de : étape 1.
+      files:
+        - crates/orchestrator/src/migrations.rs
+
+    - description: >
+        ÉTAPE 3 — migrations.rs : migration 2, colonnes author/project/created_at
+        + leurs index (INTÈGRE le hotfix 57019e7), idempotence via table_info
+        (action: CREATE, même fichier). CŒUR DU CLEANUP (be16dc46) et du
+        remplacement du matching fragile (esprit d5c9c933). Implémenter fn
+        migration_02_filter_columns_and_indexes(conn) -> rusqlite::Result<()> :
+        (a) Helper local fn column_exists(conn, table, col) -> rusqlite::Result<bool>
+            exécutant PRAGMA table_info(<table>) et testant la présence de <col>
+            dans la colonne "name" du résultat. DÉTERMINISTE, indépendant de la
+            locale (vs matching "duplicate column").
+        (b) Pour chaque (col, decl) author/project/created_at : si
+            !column_exists(conn,"artifacts",col) alors conn.execute(decl,[]).
+            PLUS AUCUN try/catch sur le message d'erreur SQLite.
+        (c) APRÈS les ALTER, dans la MÊME fonction (donc même migration, donc
+            même transaction) : les TROIS CREATE INDEX IF NOT EXISTS
+            (idx_artifacts_author, idx_artifacts_project, idx_artifacts_created_at)
+            que portait le Step 2bis. L'ordre CREATE-INDEX-après-ALTER est garanti
+            par l'ordre des instructions DANS la fonction ET par l'appartenance à
+            une migration unique : la classe de bug 57019e7 devient structurellement
+            impossible (RFC garantie d'ordre).
+        Résultat : le Step 2bis cesse d'exister comme code distinct ; le hotfix
+        est une propriété du registre (be16dc46 PRATIQUE 1+2). Dépend de : étape 2.
+      files:
+        - crates/orchestrator/src/migrations.rs
+
+    - description: >
+        ÉTAPE 4 — error.rs : variant SchemaVersionTooNew (action: MODIFY).
+        Ajouter au enum OrchestratorError (thiserror plat) :
+        #[error("Database schema version {found} is newer than supported version {supported}; refusing to downgrade")]
+        SchemaVersionTooNew { found: i64, supported: i64 }.
+        Champs i64 cohérents avec le type de PRAGMA user_version. Aucun autre
+        variant touché (périmètre minimal). Pas de #[from]. Dépend de : rien.
+      files:
+        - crates/orchestrator/src/error.rs
+
+    - description: >
+        ÉTAPE 5 — db.rs : refonte de migrate() en boucle pilotée par user_version
+        (action: MODIFY). Signature INCHANGÉE : pub fn migrate(&self) ->
+        Result<(), OrchestratorError> (db.rs:353). Ajouter `mod migrations;`
+        (db.rs ou crate root selon la convention de déclaration des mods du
+        crate). Nouvel algorithme :
+        1. let current = migrations::read_user_version(&self.conn)?;
+        2. if current > migrations::SCHEMA_VERSION_TARGET { return
+           Err(OrchestratorError::SchemaVersionTooNew { found: current,
+           supported: migrations::SCHEMA_VERSION_TARGET }); }  // DB NON touchée.
+        3. for m in MIGRATIONS.iter().filter(|m| m.version > current) (l'itération
+           suit l'ordre du slice, donc l'ordre des versions) :
+           a. BEGIN IMMEDIATE ;
+           b. (m.apply)(&self.conn) → si Err : ROLLBACK best-effort puis propager
+              (OrchestratorError::Database) ; DDL ET user_version rollback ensemble,
+              la DB reste sur m.version-1 (RFC cas e2/g2) ;
+           c. migrations::write_user_version(&self.conn, m.version)? DANS la même
+              transaction (avant COMMIT) → atomicité schéma+version ;
+           d. COMMIT.
+           NOTE TRANSACTION : encapsuler dans un helper qui exécute BEGIN
+           IMMEDIATE, la closure, le PRAGMA user_version, puis COMMIT, avec un
+           ROLLBACK best-effort sur le chemin d'erreur (match sur le résultat ;
+           en Err exécuter "ROLLBACK" avant retour) pour ne jamais laisser une
+           transaction ouverte.
+        4. APRÈS la boucle : CONSERVER le Step 3 actuel INCHANGÉ (drift FTS via
+           fts_tokenizer_needs_upgrade + DROP/recreate conditionnel, db.rs:401-410).
+           Il reste hors registre : réparation conditionnelle de drift, pas une
+           transition de version ; déjà idempotent et transactionnel.
+        SUPPRIMER : l'ancien Step 1 inline (355-356), l'ancien Step 2 ALTER +
+        matching "duplicate column" (363-380), l'ancien Step 2bis CREATE INDEX
+        (382-393). Leur logique vit désormais dans migrations.rs (migrations 1 et
+        2). Mettre à jour le doc-comment de migrate() (348-352) pour décrire le
+        mécanisme user_version + registre. Dépend de : étapes 1, 2, 3, 4.
+      files:
+        - crates/orchestrator/src/db.rs
+
+    - description: >
+        ÉTAPE 6 — lib.rs : vérification du re-export (modif conditionnelle,
+        action: MODIFY si nécessaire). lib.rs:14 fait déjà `pub use
+        error::OrchestratorError;` : le variant SchemaVersionTooNew est donc
+        automatiquement ré-exporté, aucun changement requis pour l'erreur.
+        SCHEMA_VERSION_TARGET et le module migrations restent pub(crate)/privés
+        (aucun consommateur hors-crate), donc PAS de re-export public à ajouter.
+        Conclusion : lib.rs n'a en principe AUCUNE modification. Path conservé au
+        permit par prudence (lesson 611fde3e : coût d'inclure un path non modifié
+        = zéro ; coût d'un path manquant = round-trip permit). Si à l'écriture la
+        déclaration `mod migrations;` doit vivre dans lib.rs plutôt que db.rs
+        (selon la convention du crate), c'est ICI qu'elle est ajoutée — d'où
+        l'inclusion du path. Dépend de : étape 5.
+      files:
+        - crates/orchestrator/src/lib.rs
+
+    - description: >
+        ÉTAPE 7 — Tests entérinés en base : 6 cas #[test] cargo (lesson b04f8838,
+        action: MODIFY le module tests). Tous versionnés dans le module tests de
+        db.rs (et/ou migrations.rs pour la cohérence registre), rejoués par cargo
+        test à chaque CI. AUCUNE validation manuelle (b04f8838 PRATIQUE 1+2).
+        Couverture triaxiale complète :
+        TEST 1 — NOMINAL DB vierge : open(":memory:") + migrate() → assert
+        read_user_version == SCHEMA_VERSION_TARGET ; tables artifacts/artifacts_fts/
+        artifacts_vec/index_metadata présentes ; colonnes author/project/created_at
+        présentes (via table_info) ; 3 index présents ; integrity_check() == true.
+        TEST 2 — TRANSITION DB legacy (ÉVOLUTION de
+        test_migrate_legacy_db_without_filter_columns_succeeds, db.rs:1706,
+        PRÉSERVÉ cf. RFC cleanup point d) : hand-craft la table artifacts legacy
+        SANS author/project/created_at et SANS index, user_version implicite 0,
+        puis migrate() → succès sans crash "no such column", colonnes + 3 index
+        présents, read_user_version == N.
+        TEST 3 — EDGE DB à jour, no-op idempotent (ÉVOLUTION de
+        test_migrate_is_idempotent, db.rs:1688) : migrate() puis migrate() à
+        nouveau → second appel n'applique aucune migration (user_version reste N),
+        integrity_check ok. Optionnel : prouver le no-op (read_user_version déjà
+        N avant le 2e appel, ou compteur sqlite_master stable).
+        TEST 4 — EDGE reprise après interruption : open(":memory:") ; appliquer
+        manuellement le schéma de la version 1 (migration_01 + write_user_version(1))
+        pour simuler un arrêt après la migration 1 ; puis migrate() → SEULE la
+        migration 2 s'applique, read_user_version finit à N=2, colonnes/index de
+        la migration 2 présents (RFC g1, reprise partielle).
+        TEST 5 — EDGE version future : open(":memory:") ; migrate() (pose N) ;
+        write_user_version(N+1) ; puis migrate() → Err(SchemaVersionTooNew {
+        found: N+1, supported: N }) via matches!(...) ; assert read_user_version
+        TOUJOURS N+1 (DB non modifiée, RFC e1).
+        TEST 6 — COHÉRENCE registre/constante (dans migrations.rs ou db.rs tests) :
+        assert MIGRATIONS.len() as i64 == SCHEMA_VERSION_TARGET ; et assert que
+        les versions de MIGRATIONS sont 1..=N strictement croissantes et contiguës
+        (garde-fou RFC contre l'oubli d'incrément).
+        Ces 6 tests couvrent les acceptance criteria 2/3/4 du task-request et
+        l'analyse triaxiale du RFC (nominal n1/n2, négatif e1, edges g1 + reprise).
+        Dépend de : étapes 5, 6.
+      files:
+        - crates/orchestrator/src/db.rs
+        - crates/orchestrator/src/migrations.rs
+
+    - description: >
+        ÉTAPE 8 — VALIDATION / CI interne (cf. shared-rules règle CI, cas 3 : les
+        étapes cargo de write_permit_full_sequence constituent la CI interne).
+        Exécutée APRÈS consume du permit, AVANT reload_config :
+        1. cargo build (sans --target-dir) — compile orchestrator avec le module
+           migrations.rs et le variant d'erreur ; déclenche le hot-reload du
+           binaire MCP.
+        2. cargo test -p companyos-orchestrator — les 6 nouveaux/étendus #[test]
+           passent (0 failed), ET la suite existante reste verte (non-régression :
+           les 4 sites d'appel de migrate() compilent sans adaptation, signature
+           inchangée).
+        3. reload_config() EN DERNIER, uniquement si build + test verts.
+        Critère done objectif : cargo test vert intégral (b04f8838 + c1e235dc : la
+        CI est la source de vérité, les tests entérinés en base sont la preuve de
+        non-régression dans le temps).
+      files: []
+
+  dependencies:
+    - "Write permit CEO couvrant : crates/orchestrator/src/db.rs, error.rs, lib.rs (modified) et crates/orchestrator/src/migrations.rs (created) — déjà listés dans RFC 973a5569 affected_files. Vérifier via check_write_permit avant écriture (lesson 611fde3e)."
+    - "Signature pub fn migrate(&self) -> Result<(), OrchestratorError> conservée : 4 sites d'appel (main.rs:1385, 1448, 1504, tests) inchangés."
+
+  risks:
+    - "Oubli d'incrémenter SCHEMA_VERSION_TARGET lors de l'ajout d'une future migration → migration jamais appliquée. MITIGÉ par le TEST 6 (cohérence registre/constante) qui échoue en CI."
+    - "Constantes SCHEMA_SQL/FTS_SQL/VEC_TABLE_SQL à rendre pub(crate) dans db.rs pour accès depuis migrations.rs : risque de visibilité oublié → erreur de compilation rattrapée par cargo build (étape 8)."
+    - "Transaction laissée ouverte sur erreur de migration si le ROLLBACK best-effort est oublié → boot suivant peut échouer en 'cannot start a transaction within a transaction'. MITIGÉ par l'encapsulation helper BEGIN/closure/COMMIT avec ROLLBACK sur Err (étape 5 NOTE TRANSACTION)."
+    - "Emplacement de `mod migrations;` (db.rs vs lib.rs) selon la convention du crate : tranché à l'écriture, les deux paths couverts par le permit. N'affecte que l'emplacement d'une ligne."
+    - "DB legacy au schéma divergent non anticipé (objet renommé à la main) : l'amorçage peut échouer ; le PILIER D rebuild reste le filet (RFC périmètre, hors-scope de ce plan)."

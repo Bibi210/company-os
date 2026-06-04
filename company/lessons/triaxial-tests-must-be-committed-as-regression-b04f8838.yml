@@ -1,0 +1,149 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: b04f8838-84b5-4332-b3a4-5782a943d766
+  title: "Les cas de test triaxiaux doivent être entérinés dans la suite de tests automatisée, pas seulement exécutés à la main"
+  author: pm
+  created_at: "2026-06-04"
+  description: >
+    L'analyse triaxiale (cas nominal, négatif, edge) imposée par le
+    review-protocol produit un ensemble de cas de test de grande valeur.
+    Mais exécuter ces cas UNE FOIS à la main pendant la session (par
+    exemple via le tool MCP yaml-validator pour un changement de schema)
+    ne protège la feature qu'à l'instant t. Ces cas s'évaporent dès la fin
+    de la session. Pour qu'ils protègent la feature DANS LE TEMPS, ils
+    doivent être entérinés comme tests automatisés versionnés dans la
+    suite de tests du projet, donc rejoués à chaque CI. Un cas triaxial
+    validé manuellement mais non commité n'est pas un test de
+    non-régression : c'est une vérification ponctuelle qui ne garantit
+    rien pour l'avenir. La règle : tout cas de test conçu pour valider une
+    feature doit finir en base, exécutable automatiquement, pas dans un
+    log de session.
+  tags:
+    - testing
+    - regression
+    - triaxial
+    - ci
+    - schema
+    - workflow
+    - definition-of-done
+    - process-improvement
+    - companyos-internals
+  related:
+    - id: c1e235dc-5606-43fc-9e4e-2ac385609450
+      kind: lesson-learned
+      relationship: derived-from
+    - id: c5413270-1634-4e44-9540-e205fb523043
+      kind: lesson-learned
+      relationship: related
+    - id: 23de8594-5071-4923-979d-c18763a98846
+      kind: lesson-learned
+      relationship: related
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Pendant le chantier des 7 sujets de la roadmap companyos-system, les
+    sujets touchant du code Rust (atomic-grant-permit, rfc_set_implemented,
+    defense-in-depth selective revert) ont produit des tests automatisés
+    ajoutés à la suite de tests (cargo test, make test-js). Ces tests sont
+    versionnés et rejoués à chaque CI : ce sont de vrais tests de
+    non-régression.
+
+    En revanche, le sujet rfc-affected-files-categorize (RFC a4eb3ee7) était
+    un changement de schema JSON. Sa validation triaxiale, 13 cas
+    rigoureusement conçus (nominal forme A + forme B, négatif typo rejetée
+    par additionalProperties:false et items non-string, edge objet vide /
+    listes vides / only-modified / only-created / rétro-compat sur RFCs
+    réels), a été exécutée À LA MAIN via le tool MCP yaml-validator pendant
+    la session. Les 13 verdicts attendus ont bien été obtenus, la feature a
+    été déclarée done. MAIS aucun de ces 13 cas n'a été entériné dans une
+    suite de tests automatisée. Ils n'existent que dans le log de la
+    session et dans la prose de l'implementation-plan.
+
+    Conséquence : rien ne protège ce schema dans le temps. Un futur
+    contributeur qui modifierait rfc.schema.json (par exemple pour ajouter
+    un champ, ou par erreur en cassant la branche anyOf legacy) ne verrait
+    aucun test rouge. La rétro-compatibilité de la forme A, la fermeture des
+    typos par additionalProperties:false, l'optionalité de modified/created :
+    tout cela pourrait régresser silencieusement. La qualité de l'analyse
+    triaxiale initiale ne sert alors plus à rien passé la session où elle a
+    été faite.
+
+    Cette lesson généralise au-delà des schemas : tout artifact testable
+    (schema, config, plugin JS, comportement de tool MCP, format de fichier)
+    dont la validation triaxiale est faite "à la main" pendant la session
+    présente le même risque d'évaporation.
+
+  insight: >
+    Un test a deux fonctions distinctes qu'il ne faut pas confondre.
+
+    FONCTION 1 — VALIDER MAINTENANT. Exécuter les cas triaxiaux pendant la
+    session prouve que la feature fonctionne à l'instant de la livraison.
+    C'est nécessaire mais insuffisant. C'est ce que faisait le sujet 4 : la
+    validation manuelle via yaml-validator a correctement prouvé que le
+    schema patché se comportait comme attendu HIC ET NUNC.
+
+    FONCTION 2 — PROTÉGER DANS LE TEMPS. Un test de non-régression rejoué à
+    chaque CI garantit que la feature continue de fonctionner après tous les
+    changements futurs. C'est cette fonction qui manquait au sujet 4. Sans
+    elle, la feature est livrée "nue" : correcte aujourd'hui, sans filet
+    pour demain.
+
+    Le piège est que la FONCTION 1 donne une fausse impression de
+    complétude. "J'ai testé les 13 cas, ils passent tous, c'est done." Non :
+    c'est validé, mais pas protégé. La différence entre les deux est
+    invisible le jour de la livraison et devient douloureuse des mois plus
+    tard, quand une régression passe inaperçue parce qu'aucun test ne la
+    capture.
+
+    Cas particulier des changements de SCHEMA et de CONFIG. On a tendance à
+    penser qu'un schema "ne se teste pas comme du code". C'est faux : un
+    schema JSON a un comportement (il accepte certains documents, en rejette
+    d'autres), donc il se teste exactement comme une fonction. Les 13 cas du
+    sujet 4 SONT une suite de tests ; ils n'attendaient qu'à être figés dans
+    un fichier exécutable. La validation via yaml-validator MCP est un bon
+    REPL d'exploration, mais le REPL n'est pas la suite de tests.
+
+  recommendation: >
+    Trois pratiques à adopter.
+
+    PRATIQUE 1 — TOUT CAS TRIAXIAL CONÇU POUR UNE FEATURE FINIT EN BASE.
+    Quand un implementation-plan définit des cas de test triaxiaux, ces cas
+    doivent être implémentés comme tests automatisés versionnés (cargo test,
+    make test-js, ou tout harnais du projet), PAS seulement exécutés à la
+    main pendant la session. Cela vaut pour le code ET pour les artifacts
+    non-code testables (schemas, configs, plugins). Le format du test
+    s'adapte au sujet : pour un schema JSON, un test qui charge le schema et
+    assert accept/reject sur un corpus de documents (la forme A legacy, la
+    forme B, les cas négatifs, les edge) ; pour un plugin JS, un test dans
+    le harnais JS ; pour un comportement Rust, un #[test].
+
+    PRATIQUE 2 — LA DEFINITION OF DONE INCLUT « LES TESTS SONT EN BASE ».
+    Une feature n'est pas terminée tant que ses cas de validation ne sont
+    pas dans la suite de tests rejouée par la CI. Un implementation-plan qui
+    prévoit une validation "à la main via tel tool" doit être complété par
+    une étape "entériner ces cas comme tests automatisés". Si le projet n'a
+    pas encore de harnais pour tester ce type d'artifact (par exemple : pas
+    de test automatisé des schemas JSON), créer ce harnais fait partie du
+    scope, ou au minimum un RFC/task-request de suivi explicite est ouvert
+    pour ne pas laisser le trou béant.
+
+    PRATIQUE 3 — LE REVIEWER DE L'IMPLEMENTATION-PLAN VÉRIFIE CE POINT.
+    L'Architect (reviewer des implementation-plans) doit refuser
+    (request_changes) un plan dont les cas de test triaxiaux ne sont
+    exécutés qu'à la main sans être entérinés en base, SAUF si l'absence de
+    harnais est explicitement reconnue et qu'un suivi est ouvert. Le critère :
+    "ces cas seront-ils rejoués automatiquement après la fin de la session ?"
+    Si non, le plan est incomplet.
+
+    DETTE À RÉSORBER (sujet 4). Les 13 cas du RFC a4eb3ee7
+    (rfc-affected-files-categorize) ont été validés à la main mais ne sont
+    pas en base. Un test de non-régression du schema RFC devrait être ajouté
+    pour les figer : charger rfc.schema.json et asserter les 13 verdicts.
+    Comme aucun harnais de test des schemas JSON n'existe peut-être encore
+    dans le projet, c'est l'occasion d'en poser un (un test qui valide tous
+    les schemas company/schemas/ contre des corpus de fixtures accept/reject).
+    Candidat task-request ou RFC de suivi.
