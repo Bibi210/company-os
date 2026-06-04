@@ -7,6 +7,7 @@ use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 use crate::error::OrchestratorError;
+use crate::migrations;
 use crate::types::*;
 
 /// One-shot process-wide registration of the `sqlite-vec` C extension via
@@ -47,7 +48,7 @@ fn ensure_sqlite_vec_loaded() {
     });
 }
 
-const SCHEMA_SQL: &str = "
+pub(crate) const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS review_rounds (
     id TEXT PRIMARY KEY,
     artifact_path TEXT NOT NULL,
@@ -100,7 +101,7 @@ CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(kind);
 CREATE INDEX IF NOT EXISTS idx_relations_target ON artifact_relations(target_id);
 ";
 
-const FTS_SQL: &str = "
+pub(crate) const FTS_SQL: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS artifacts_fts USING fts5(
     id UNINDEXED,
     kind,
@@ -127,7 +128,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS artifacts_fts USING fts5(
 /// rebuilds (themselves repopulated by the engine boot path). Used to
 /// pin the `model_version` at boot and to trigger wipe + reindex_all
 /// when the runtime model_version drifts from the stored one.
-const VEC_TABLE_SQL: &str = "
+pub(crate) const VEC_TABLE_SQL: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS artifacts_vec USING vec0(
     artifact_id text,
     embedding float[384] distance_metric=cosine
@@ -345,54 +346,44 @@ impl OrchestratorDb {
         Ok(())
     }
 
-    /// Apply the schema migration inside a single BEGIN IMMEDIATE/COMMIT
-    /// transaction. Rationale (cf. design-doc 45c04902 PILIER C and
-    /// diagnostic 378c387c factor 3): if SIGKILL strikes mid-DDL, SQLite
-    /// will rollback the partial transaction on the next open via WAL
-    /// recovery, eliminating the FTS5 partially-materialized schema risk.
+    /// Apply the schema migrations driven by `PRAGMA user_version`, then
+    /// perform the (non-versioned) FTS5 tokenizer-drift repair.
+    ///
+    /// Rationale (RFC 973a5569): the schema is versioned via the
+    /// `crate::migrations` registry. We read the stored `user_version`,
+    /// refuse a DB newer than this binary supports (the DB is left
+    /// untouched in that case), then apply, IN ORDER, every migration whose
+    /// number is strictly greater than the stored version. Each migration
+    /// runs inside its own `BEGIN IMMEDIATE`/`COMMIT`, and `user_version`
+    /// is stamped to the migration's number INSIDE that same transaction —
+    /// so the schema change and its version bump are atomic. If a migration
+    /// fails, we `ROLLBACK` (best-effort) and propagate, leaving the DB on
+    /// the previous version (cf. design-doc 45c04902 PILIER C: a SIGKILL
+    /// mid-DDL is recovered by WAL rollback on the next open).
+    ///
+    /// The FTS5 tokenizer-drift repair (former "Step 3") is kept verbatim
+    /// AFTER the loop: it is a conditional drift repair, not a schema
+    /// version transition, so it stays out of the numbered registry.
     pub fn migrate(&self) -> Result<(), OrchestratorError> {
-        // Step 1: base schema (idempotent CREATE IF NOT EXISTS).
-        let migration_sql = format!("BEGIN IMMEDIATE;{SCHEMA_SQL}{FTS_SQL}{VEC_TABLE_SQL}COMMIT;");
-        self.conn.execute_batch(&migration_sql)?;
+        let current = migrations::read_user_version(&self.conn)?;
 
-        // Step 2: ALTER artifacts to add the structured filter columns
-        // (author, project, created_at) if missing. These were added in
-        // RFC bdee1af4 étape 10; older DBs need a soft upgrade. SQLite
-        // does not have IF NOT EXISTS for ADD COLUMN, so we catch the
-        // 'duplicate column' error which means it is already there.
-        for (col, decl) in &[
-            ("author", "ALTER TABLE artifacts ADD COLUMN author TEXT"),
-            ("project", "ALTER TABLE artifacts ADD COLUMN project TEXT"),
-            (
-                "created_at",
-                "ALTER TABLE artifacts ADD COLUMN created_at TEXT",
-            ),
-        ] {
-            if let Err(e) = self.conn.execute(decl, []) {
-                // Match "duplicate column name" -> already there, safe.
-                let msg = e.to_string();
-                if !msg.contains("duplicate column") {
-                    return Err(OrchestratorError::Database(e));
-                }
-                // silent: column already exists.
-                let _ = col;
-            }
+        // Refuse a DB created by a newer binary. The DB is NOT touched.
+        if current > migrations::SCHEMA_VERSION_TARGET {
+            return Err(OrchestratorError::SchemaVersionTooNew {
+                found: current,
+                supported: migrations::SCHEMA_VERSION_TARGET,
+            });
         }
 
-        // Step 2bis: create indexes on the columns added in step 2.
-        // These indexes MUST come AFTER the ALTER TABLE because legacy
-        // DBs do not have these columns when migrate() starts — emitting
-        // these CREATE INDEX in SCHEMA_SQL would fail with
-        // "no such column: author" on a pre-existing artifacts table
-        // before step 2 has a chance to add the columns (cf. hotfix RFC
-        // bdee1af4: server crashed at boot with exactly this message).
-        self.conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_artifacts_author ON artifacts(author);\
-             CREATE INDEX IF NOT EXISTS idx_artifacts_project ON artifacts(project);\
-             CREATE INDEX IF NOT EXISTS idx_artifacts_created_at ON artifacts(created_at);",
-        )?;
+        // Apply, in registry order, every migration newer than `current`.
+        for m in migrations::MIGRATIONS
+            .iter()
+            .filter(|m| m.version > current)
+        {
+            self.apply_migration_in_tx(m)?;
+        }
 
-        // Step 3: detect tokenizer drift on artifacts_fts. If the live
+        // Non-versioned drift repair: detect tokenizer drift on artifacts_fts. If the live
         // DDL does not include our explicit unicode61 tokenizer, drop +
         // recreate the FTS5 table. Caller (run_server) is responsible
         // for triggering a reindex_all afterwards (we don't do it here
@@ -410,6 +401,33 @@ impl OrchestratorDb {
         }
 
         Ok(())
+    }
+
+    /// Apply a single migration inside its own `BEGIN IMMEDIATE`/`COMMIT`
+    /// transaction, stamping `PRAGMA user_version` to the migration's
+    /// number in the SAME transaction so the schema change and the version
+    /// bump are atomic. On any error, a best-effort `ROLLBACK` is issued so
+    /// no transaction is ever left open (which would otherwise make the
+    /// next operation fail with "cannot start a transaction within a
+    /// transaction") and the DB stays on the previous version.
+    fn apply_migration_in_tx(&self, m: &migrations::Migration) -> Result<(), OrchestratorError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+
+        let result = (m.apply)(&self.conn)
+            .and_then(|()| migrations::write_user_version(&self.conn, m.version));
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                // Best-effort rollback: ignore its own error, surface the
+                // original migration failure.
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(OrchestratorError::Database(e))
+            }
+        }
     }
 
     /// Inspect the live DDL of `artifacts_fts` and return true if the
@@ -1685,16 +1703,245 @@ mod tests {
         assert!(version.starts_with('v'), "vec_version() = {version}");
     }
 
+    // Helper: does column `col` exist on `table`? Mirrors the production
+    // `column_exists` (PRAGMA table_info) but lives in the test module so we
+    // can assert on schema shape without exposing the private helper.
+    fn test_column_exists(db: &OrchestratorDb, table: &str, col: &str) -> bool {
+        let mut stmt = db
+            .conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        names.iter().any(|n| n == col)
+    }
+
+    // Helper: list index names on `table`.
+    fn test_index_names(db: &OrchestratorDb, table: &str) -> Vec<String> {
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1 \
+                 ORDER BY name",
+            )
+            .unwrap();
+        stmt.query_map([table], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    // Helper: does a table/virtual-table named `name` exist?
+    fn test_table_exists(db: &OrchestratorDb, name: &str) -> bool {
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1 \
+                 AND type IN ('table', 'view')",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        count > 0
+    }
+
+    fn user_version(db: &OrchestratorDb) -> i64 {
+        db.conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    // TEST 1 — NOMINAL: a fresh in-memory DB migrates to the target version
+    // with the complete schema (tables, filter columns, indexes) and passes
+    // integrity_check.
     #[test]
-    fn test_migrate_is_idempotent() {
-        // The wrapping transaction must still allow multiple calls
-        // (each call wraps SCHEMA_SQL + FTS_SQL in a fresh BEGIN/COMMIT,
-        // and all CREATE statements are IF NOT EXISTS).
+    fn test_migrate_fresh_db_reaches_target_version() {
         let db = OrchestratorDb::open(":memory:").unwrap();
         db.migrate().unwrap();
+
+        assert_eq!(
+            user_version(&db),
+            crate::migrations::SCHEMA_VERSION_TARGET,
+            "fresh DB must end at SCHEMA_VERSION_TARGET"
+        );
+
+        for t in [
+            "artifacts",
+            "artifacts_fts",
+            "artifacts_vec",
+            "index_metadata",
+        ] {
+            assert!(test_table_exists(&db, t), "missing table {t}");
+        }
+
+        for c in ["author", "project", "created_at"] {
+            assert!(
+                test_column_exists(&db, "artifacts", c),
+                "missing column {c} on artifacts"
+            );
+        }
+
+        let idx = test_index_names(&db, "artifacts");
+        for expected in [
+            "idx_artifacts_author",
+            "idx_artifacts_created_at",
+            "idx_artifacts_project",
+        ] {
+            assert!(
+                idx.iter().any(|n| n == expected),
+                "missing index {expected}; got {idx:?}"
+            );
+        }
+
+        assert!(db.integrity_check().unwrap());
+    }
+
+    // TEST 3 — EDGE: a DB already at the target version is a no-op on a second
+    // migrate() (user_version stays put, no migration re-applied). Evolution
+    // of the former test_migrate_is_idempotent.
+    #[test]
+    fn test_migrate_is_idempotent() {
+        let db = OrchestratorDb::open(":memory:").unwrap();
         db.migrate().unwrap();
-        let ok = db.integrity_check().unwrap();
-        assert!(ok);
+        let v_after_first = user_version(&db);
+        assert_eq!(v_after_first, crate::migrations::SCHEMA_VERSION_TARGET);
+
+        // Snapshot the schema object set to prove the second call is a no-op.
+        let count_before: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap();
+
+        db.migrate().unwrap();
+
+        assert_eq!(
+            user_version(&db),
+            v_after_first,
+            "second migrate() must not change user_version"
+        );
+        let count_after: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count_before, count_after,
+            "second migrate() must not create/drop schema objects"
+        );
+        assert!(db.integrity_check().unwrap());
+    }
+
+    // TEST 4 — EDGE: resume after interruption. We simulate a DB that stopped
+    // after migration 1 (schema v1 applied, user_version = 1) and assert that
+    // migrate() applies ONLY migration 2, finishing at the target version.
+    #[test]
+    fn test_migrate_resumes_from_intermediate_version() {
+        let db = OrchestratorDb::open(":memory:").unwrap();
+
+        // Simulate a DB whose schema reached version 1 BEFORE migration 2
+        // existed: a legacy `artifacts` table without the filter columns,
+        // plus the FTS/vec tables, stamped user_version = 1 as if the process
+        // committed migration 1 and then stopped.
+        db.conn
+            .execute_batch(
+                "CREATE TABLE artifacts (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    description TEXT NOT NULL DEFAULT '',
+                    tags TEXT NOT NULL DEFAULT '[]',
+                    file_path TEXT NOT NULL,
+                    indexed_at TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        db.conn.execute_batch(crate::db::FTS_SQL).unwrap();
+        db.conn.execute_batch(crate::db::VEC_TABLE_SQL).unwrap();
+        db.conn.execute_batch("PRAGMA user_version = 1").unwrap();
+
+        // At v1 the filter columns/indexes must NOT exist yet.
+        assert!(!test_column_exists(&db, "artifacts", "author"));
+
+        db.migrate().unwrap();
+
+        assert_eq!(
+            user_version(&db),
+            crate::migrations::SCHEMA_VERSION_TARGET,
+            "resume must finish at SCHEMA_VERSION_TARGET"
+        );
+        for c in ["author", "project", "created_at"] {
+            assert!(
+                test_column_exists(&db, "artifacts", c),
+                "migration 2 column {c} must be present after resume"
+            );
+        }
+        let idx = test_index_names(&db, "artifacts");
+        for expected in [
+            "idx_artifacts_author",
+            "idx_artifacts_created_at",
+            "idx_artifacts_project",
+        ] {
+            assert!(idx.iter().any(|n| n == expected), "missing {expected}");
+        }
+    }
+
+    // TEST 5 — EDGE/NEGATIVE: a DB whose user_version is newer than this
+    // binary supports is refused with SchemaVersionTooNew and is left
+    // untouched.
+    // TEST 4bis — EDGE: the exact divergent state of the PRODUCTION DB at the
+    // time of RFC 973a5569: user_version is still 0 (it predates the
+    // user_version discipline) but the artifacts table ALREADY has the filter
+    // columns AND their indexes (the old imperative migrate() added them on a
+    // previous boot). migrate() must treat this as a full run (current = 0),
+    // find every ALTER/index already satisfied (no-op via column_exists /
+    // IF NOT EXISTS), and stamp user_version to the target WITHOUT crashing.
+    #[test]
+    fn test_migrate_legacy_v0_with_columns_already_present_boots() {
+        let db = OrchestratorDb::open(":memory:").unwrap();
+
+        // Materialize the full current schema, then explicitly reset
+        // user_version to 0 to mirror a DB that reached today's shape under
+        // the OLD migrate() (which never set user_version).
+        db.migrate().unwrap();
+        db.conn.execute_batch("PRAGMA user_version = 0").unwrap();
+        // Sanity: columns + indexes already there, version artificially 0.
+        assert!(test_column_exists(&db, "artifacts", "author"));
+        assert_eq!(user_version(&db), 0);
+
+        // Re-running migrate() must not crash on "duplicate column" and must
+        // re-stamp the version to the target.
+        db.migrate()
+            .expect("legacy v0 DB with columns already present must boot");
+        assert_eq!(
+            user_version(&db),
+            crate::migrations::SCHEMA_VERSION_TARGET,
+            "divergent legacy DB must be re-stamped to SCHEMA_VERSION_TARGET"
+        );
+        assert!(db.integrity_check().unwrap());
+    }
+
+    #[test]
+    fn test_migrate_refuses_future_version_untouched() {
+        let db = OrchestratorDb::open(":memory:").unwrap();
+        db.migrate().unwrap();
+        let future = crate::migrations::SCHEMA_VERSION_TARGET + 1;
+        db.conn
+            .execute_batch(&format!("PRAGMA user_version = {future}"))
+            .unwrap();
+
+        let err = db.migrate().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OrchestratorError::SchemaVersionTooNew { found, supported }
+                    if found == future && supported == crate::migrations::SCHEMA_VERSION_TARGET
+            ),
+            "expected SchemaVersionTooNew, got {err:?}"
+        );
+        // DB must be untouched: user_version still the future value.
+        assert_eq!(user_version(&db), future, "refused DB must not be modified");
     }
 
     // Hotfix RFC bdee1af4: a legacy DB whose `artifacts` table predates
@@ -1751,6 +1998,14 @@ mod tests {
                 "missing expected index {expected} on artifacts; got {names:?}"
             );
         }
+
+        // A legacy DB starts at user_version = 0 and must be boot-strapped to
+        // the target version (RFC 973a5569 amorçage current=0).
+        assert_eq!(
+            user_version(&db),
+            crate::migrations::SCHEMA_VERSION_TARGET,
+            "legacy DB must be boot-strapped to SCHEMA_VERSION_TARGET"
+        );
     }
 
     #[test]

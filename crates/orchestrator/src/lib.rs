@@ -4,6 +4,7 @@ pub mod engine;
 pub mod error;
 pub mod fusion;
 pub mod lock;
+pub(crate) mod migrations;
 pub mod query;
 pub mod roadmap_summary;
 pub mod types;

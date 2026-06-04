@@ -75,6 +75,11 @@ pub enum OrchestratorError {
     IntegrityFailure { details: String },
 
     #[error(
+        "Database schema version {found} is newer than supported version {supported}; refusing to downgrade"
+    )]
+    SchemaVersionTooNew { found: i64, supported: i64 },
+
+    #[error(
         "Embedding model cache not found at '{path}'. Run \
          'cargo run -p companyos-orchestrator-server -- --prefetch-embeddings' first."
     )]
