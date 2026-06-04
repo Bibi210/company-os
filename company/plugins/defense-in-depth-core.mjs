@@ -12,7 +12,7 @@
 //                    | fix:     ...
 
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync, rmdirSync } from "node:fs";
+import { existsSync, readFileSync, rmdirSync, unlinkSync } from "node:fs";
 import { resolve, relative, dirname } from "node:path";
 
 // Bootstrap: the one hardcoded path — everything else is read from it
@@ -213,32 +213,142 @@ function snapshotPermits(rootDir) {
   );
 }
 
+// SOURCE B — ids des permits scellés dans HEAD git.
+// Lit company/data/orchestrator.db tel que committé en HEAD, en matérialisant
+// une copie temporaire HORS zone protégée (/tmp, couvert par BASH_SAFE_PATHS),
+// puis SELECT id dessus. Fiabilité garantie par RFC 359f9162 : tout permit
+// légitime est scellé en HEAD au moment du grant atomique.
+// Contrat :
+//   - retourne un Set<string> d'ids (éventuellement VIDE si HEAD a 0 permit)
+//     => Source B EXPLOITABLE, contribue ses ids (0 ou +) à l'union.
+//   - retourne null si Source B INEXPLOITABLE (pas de DB en HEAD, git en échec,
+//     SELECT en échec, DB corrompue).
+// La distinction Set vide vs null est CRITIQUE et ne doit jamais être confondue.
+function permitIdsFromHeadDb(rootDir) {
+  const dbPath = _zones.db_path;
+  if (!dbPath) return null;
+
+  // (1) La DB existe-t-elle en HEAD ? run() renvoie "" si présente, null sinon.
+  if (run(`git cat-file -e "HEAD:${dbPath}"`, rootDir) === null) return null;
+
+  // (2) Chemin temporaire unique dans /tmp (jamais en zone protégée).
+  const tmpPath = `/tmp/companyos-headdb-${process.pid}-${Date.now()}.db`;
+
+  try {
+    // (3) Matérialiser la DB committée. execSync (via run) n'est PAS intercepté
+    //     par les guards anti-DB L283 / anti-sqlite3 L293 (ceux-ci ne filtrent
+    //     que input.tool === "bash").
+    if (run(`git show "HEAD:${dbPath}" > "${tmpPath}"`, rootDir) === null) {
+      return null; // git show a échoué
+    }
+    // (4) SELECT des ids sur la copie /tmp (chemin sûr, sqlite3 légitime ici).
+    const out = runSqliteWithTimeout(tmpPath, "SELECT id FROM write_permits", rootDir);
+    if (out === null) return null; // SELECT en échec / DB illisible / corrompue
+
+    // (5) Parser : un id par ligne. Set éventuellement vide si HEAD a 0 permit.
+    return new Set(out.split("\n").filter(Boolean));
+  } catch {
+    return null; // toute exception -> Source B inexploitable
+  } finally {
+    // (6) CLEANUP INCONDITIONNEL : pas de fuite de fichier temporaire.
+    try { unlinkSync(tmpPath); } catch { /* déjà absent / jamais créé */ }
+  }
+}
+
+// SOURCE A — ids extraits du blob snapshot "before" (snapshotPermits).
+// Format du blob : "<count>|<id1>:<status1>,<id2>:<status2>,...".
+// Réutilise EXACTEMENT le même split que l'ancien beforeIds L228
+// (split(",") puis split(":")[0]), MAIS strippe en plus le préfixe "<count>|"
+// qui pollue le premier segment : sans ce strip, le premier id deviendrait
+// "<count>|<id1>" — un id fantôme qui ne matche jamais un vrai UUID (bénin
+// dans l'ancien code, mais on l'évite ici pour la robustesse). Le SET d'ids
+// importe, pas l'ordre.
+// Contrat :
+//   - before === null -> retourne null (Source A absente).
+//   - before non null -> Set<string> (VIDE si "0|" : 0 permit dans le snapshot).
+function parsePermitIds(before) {
+  if (before === null) return null;
+  const ids = before
+    .split(",")
+    .map((segment) => {
+      // Strip du préfixe "<count>|" présent uniquement sur le premier segment.
+      const pipeIdx = segment.lastIndexOf("|");
+      const cleaned = pipeIdx >= 0 ? segment.slice(pipeIdx + 1) : segment;
+      return cleaned.split(":")[0];
+    })
+    .filter(Boolean);
+  return new Set(ids);
+}
+
+// Construit la baseline légitime par UNION des deux sources.
+// baseline = union(Source A si non nulle, Source B si exploitable).
+// Contrat :
+//   - Source A null ET Source B null -> retourne null : baseline INDÉTERMINABLE
+//     (= cas résiduel -> wipe nucléaire dans revertPermitTampering).
+//   - sinon -> Set<string> (l'union), éventuellement VIDE : baseline
+//     DÉTERMINABLE mais vide (-> DELETE sur TOUT, ferme la faille L230).
+// La distinction null (indéterminable) vs Set vide (déterminable-vide) est le
+// coeur de l'invariant : sélectif si baseline connue, nucléaire seulement si
+// baseline inconnue.
+function buildBaseline(rootDir, before) {
+  const sourceA = parsePermitIds(before); // Set | null
+  const sourceB = permitIdsFromHeadDb(rootDir); // Set | null
+  if (sourceA === null && sourceB === null) return null;
+  return new Set([...(sourceA ?? []), ...(sourceB ?? [])]);
+}
+
 function revertPermitTampering(rootDir, before) {
   const after = snapshotPermits(rootDir);
-  if (before === null && after === null) return false;
-  if (before === after) return false;
-  // Permits were tampered — restore from backup or delete new ones
+  if (before === null && after === null) return false; // pas de DB
+  if (before === after) return false; // identique, aucune altération
+
+  // Divergence détectée. La baseline légitime est l'UNION du snapshot before
+  // (Source A) et des permits scellés en HEAD git (Source B).
   const dbPath = resolve(rootDir, _zones.db_path);
-  // Nuclear option: delete any permits not in the before snapshot
-  if (before === null) {
-    // DB didn't exist before, now it does — wipe permits
+  const baseline = buildBaseline(rootDir, before); // Set | null
+
+  if (baseline === null) {
+    // CAS RÉSIDUEL : Source A null ET Source B inexploitable. Aucune baseline
+    // légitime affirmable -> wipe total (fail-safe). SEUL chemin nucléaire
+    // restant (décision CEO 1, RFC bde023e2). Borné à ce cas strict.
     runSqliteWithTimeout(dbPath, "DELETE FROM write_permits", rootDir);
   } else {
-    // Extract IDs from before snapshot and delete anything new
-    const beforeIds = (before.split(",").map(s => s.split(":")[0]).filter(Boolean));
-    const placeholders = beforeIds.map(id => `'${id}'`).join(",");
+    // CAS NOMINAL : baseline déterminable (même vide). DELETE SÉLECTIF : on
+    // supprime tout id HORS baseline. Les ids légitimes (before + HEAD) sont
+    // préservés ; tout intrus hors-canal est supprimé.
+    // Quoting : les ids sont des UUID v4 (generate_id), sans quote simple ni
+    // caractère SQL spécial, et proviennent tous du canal MCP (snapshot + HEAD).
+    // L'interpolation `'${id}'` reste sûre dans ce contexte fermé (même
+    // hypothèse que l'ancien code L229).
+    const placeholders = [...baseline].map((id) => `'${id}'`).join(",");
     if (placeholders) {
       runSqliteWithTimeout(
         dbPath,
         `DELETE FROM write_permits WHERE id NOT IN (${placeholders})`,
         rootDir,
       );
+    } else {
+      // Baseline déterminable mais VIDE -> aucun id légitime -> DELETE sur TOUT.
+      // FERME LA FAILLE L230 : avant, placeholders vide => aucun DELETE émis
+      // => un permit injecté pendant un bash sur DB initialement vide survivait.
+      runSqliteWithTimeout(dbPath, "DELETE FROM write_permits", rootDir);
     }
   }
   return true;
 }
 
-export { isYaml, isSafeBashPath, isVolatile, isInProtectedZone, loadProtectedZones };
+export {
+  isYaml,
+  isSafeBashPath,
+  isVolatile,
+  isInProtectedZone,
+  loadProtectedZones,
+  snapshotPermits,
+  parsePermitIds,
+  permitIdsFromHeadDb,
+  buildBaseline,
+  revertPermitTampering,
+};
 
 export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
   // Load protected zones on init
