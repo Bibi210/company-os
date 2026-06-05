@@ -1,0 +1,167 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: dabc159c-f6f7-4d56-913a-e7e83830977a
+  title: "Discipline 'lister les callers avant de changer une signature d'API publique de crate'"
+  author: pm
+  created_at: "2026-06-04"
+  project: company-os
+  description: >
+    Deux occurrences documentées de callers oubliés dans un RFC,
+    causant un cycle d'extension permit en cours d'exécution :
+    (1) `types.rs` oublié dans le RFC bdee1af4 (refonte search) ;
+    (2) `crates/mcp-servers/yaml/src/main.rs` oublié dans le RFC
+    062ebaa8 (file watcher fix), découvert au premier cargo build.
+
+    Pattern de la lesson 611fde3e étendu : un RFC qui modifie une
+    signature d'API publique d'une crate doit inventorier tous les
+    callers avant validation. Aujourd'hui, c'est laissé à la
+    diligence de l'Architect et de l'Implementer sans mécanisme
+    explicite. Conséquence : on découvre les callers manquants en
+    cours d'exécution, on s'arrête, on demande au CEO un permit
+    complémentaire. Friction évitable.
+
+    L'objectif est de formaliser cette discipline de manière
+    actionnable. L'Architect arbitre entre les options possibles :
+    (a) checklist obligatoire dans le template d'implementation-plan,
+    (b) règle dans shared-rules ou review-protocol imposant
+    l'inventaire au moment de la review du RFC ou du plan,
+    (c) tool MCP qui exploite l'index LSP / grep pour produire
+    l'inventaire automatiquement à partir d'un nom de fonction ou
+    de struct, (d) une combinaison.
+  tags:
+    - workflow
+    - api
+    - callers
+    - rfc-discipline
+    - implementation-plan
+    - permits
+    - friction-reduction
+  related:
+    - id: ea6e9dd1-93dc-4b19-9854-103328203489
+      kind: lesson-learned
+      relationship: derived-from
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  priority: medium
+  status: backlog
+
+  acceptance_criteria:
+    - >
+      Le diagnostic est posé proprement : combien de RFCs récents
+      ont oublié un caller (recensement empirique sur la session
+      passée), à quelle étape l'oubli a été détecté (review RFC,
+      review plan, cargo build, runtime), quel a été le coût
+      (cycles permit extension, agent-messages au CEO).
+
+    - >
+      Le mécanisme retenu est explicite et actionnable. Pas une
+      règle floue type "l'Architect doit vérifier" : un trigger,
+      un format, un endroit où le résultat de l'inventaire est
+      consigné (probablement dans l'implementation-plan), et un
+      reviewer responsable de vérifier que c'est fait.
+
+    - >
+      Le mécanisme retenu couvre les deux contextes observés :
+      changement de signature d'une fonction publique d'une crate
+      (ex. spawn_watcher), et changement de structure d'un type
+      public (ex. SearchParams). Pas juste les fonctions.
+
+    - >
+      Si un tool MCP est introduit (option c), il s'appuie sur
+      l'infra existante (LSP via vscode-mcp ? grep sur les
+      crates ? get_references du LSP ?) plutôt que de réinventer
+      un parseur Rust ad-hoc. Pas de surface de maintenance
+      inutile.
+
+    - >
+      Mise à jour des artifacts de référence si nécessaire :
+      shared-rules.yml (nouvelle règle si option b ou d),
+      review-protocol.yml (si la responsabilité est attribuée à
+      un reviewer spécifique), template d'implementation-plan
+      (si option a ou d).
+
+    - >
+      Test ou validation : appliqué rétroactivement aux deux RFCs
+      qui ont eu le bug (bdee1af4 et 062ebaa8), le mécanisme
+      aurait-il détecté les callers oubliés ? La question est
+      posée et documentée comme partie du diagnostic, c'est le
+      sanity-check.
+
+    - >
+      Lesson-learned produite à la clôture, chaînée à ea6e9dd1
+      (qui a identifié le pattern) et 611fde3e (lesson originale
+      sur affected_files).
+
+  investigation_hints: >
+    Pistes non prescriptives.
+
+    (1) Lookup mémoire à faire avant production. Au minimum :
+    lessons 611fde3e (affected_files complets), ea6e9dd1
+    (callers d'API), 8fd49300 (write_permit sequence), b04f8838
+    (tests triaxiaux en CI plutôt qu'en session). Les
+    diagnostics et agent-messages des deux blockers (4f000127,
+    05224964, 4ade4e7c). Le RFC a4eb3ee7 (affected_files
+    modified/created) qui adresse un sujet adjacent mais
+    différent : il distingue création vs modification, alors
+    qu'ici on parle de l'exhaustivité des chemins listés.
+
+    (2) Option (a) checklist plan. Avantage : zéro nouveau code,
+    juste une discipline ajoutée. Inconvénient : la checklist se
+    fait dans l'éditeur, pas de vérification mécanique. Si
+    l'Implementer oublie, ça repasse.
+
+    (3) Option (b) règle de review. Avantage : le reviewer
+    (Architect sur le plan, ou PM/Implementer sur le RFC) doit
+    constater que l'inventaire est présent. Inconvénient :
+    pareil que (a), la qualité de l'inventaire dépend de l'oeil
+    humain.
+
+    (4) Option (c) tool MCP. Avantage : déterministe, ne peut
+    pas être oublié si appelé. Inconvénient : qui l'appelle et
+    quand ? Le tool peut être appelé manuellement par l'Architect
+    ou l'Implementer pendant la rédaction du plan, ou être appelé
+    automatiquement par un hook au moment du commit du plan, ou
+    être invoqué par le review_protocol comme prérequis à la
+    review. Décision structurelle.
+
+    (5) Option (d) combinaison. Une checklist dans le plan
+    (option a) qui REFERENCE l'output d'un tool MCP (option c)
+    est probablement le meilleur compromis. L'inventaire est
+    matérialisé, le tool fait le gros du travail, le plan le
+    consigne pour traçabilité.
+
+    (6) Granularité. Les "API publiques d'une crate" se limitent
+    aux symboles `pub` qui traversent une frontière de crate.
+    L'inventaire doit cibler ces symboles, pas les helpers
+    internes. Un `pub(crate)` n'est pas concerné.
+
+    (7) Mention de scope. La discipline cible les
+    implementation-plans qui dérivent d'un RFC modifiant un
+    code Rust en zone protégée. Pas pertinent pour les RFCs
+    purement YAML/config.
+
+    (8) Anti-pattern à éviter : faire de l'inventaire un
+    rituel formel dépourvu de signal. Si l'inventaire est juste
+    "j'ai regardé", sans liste concrète, ça ne sert à rien. Le
+    livrable de l'option retenue doit être une LISTE
+    nominative des callers (fichier:ligne par occurrence) qui
+    permette de vérifier qu'on a tous les chemins dans
+    affected_files.
+
+  out_of_scope: >
+    Ce task-request NE traite PAS :
+    - La détection des callers cross-crate au niveau du build
+      (Rust compile already-fails sur un caller oublié si la
+      signature change de manière incompatible). Le sujet ici
+      est l'inventaire AVANT cargo build, pour anticiper les
+      besoins de permit.
+    - L'auto-mise à jour des callers (un outil de refactor qui
+      modifie automatiquement les call sites). Sujet adjacent
+      possible plus tard, mais pas le scope ici.
+    - Les signatures d'API publiques exposées hors workspace
+      (ex. via crates.io). Notre workspace est interne, tous
+      les callers sont dans le repo.

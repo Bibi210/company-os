@@ -1,0 +1,247 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: e8c4d628-f2a4-424d-a643-83835ff719dc
+  title: "Roadmap auto-sync du status + typage strict du ref `external` → `loose` avec catégorie enum"
+  author: pm
+  created_at: "2026-06-04"
+  project: company-os
+  description: >
+    La règle "pas d'auto-sync" du RFC original a49801aa s'est avérée
+    intenable en pratique. La première roadmap du domaine
+    companyos-system (329da45f) a dérivé du réel : 5 RFCs candidats
+    sont passés de "future planned" à mergés sans que la roadmap ne
+    soit mise à jour, jusqu'à ce que le PM le fasse à la main quand
+    l'utilisateur a demandé "où on en est ?". Le risque 1 documenté
+    dans le RFC original ("duplication de vérité, mitigation =
+    convention sociale") s'est matérialisé immédiatement.
+
+    Décision utilisateur : passer à un auto-sync absolu qui calcule
+    le status de chaque item depuis l'artifact source référencé. Le
+    pipeline d'indexation (déjà existant côté orchestrator : file
+    watcher + engine.index_artifact) est étendu pour appliquer ce
+    mapping au moment où une roadmap est indexée. Le PM conserve un
+    droit absolu sur le status `blocked` : si un item porte
+    explicitement status=blocked dans le YAML, l'auto-sync ne le
+    touche pas. Tout autre status est écrasé.
+
+    Le type `external` du schéma roadmap actuel est aussi revu :
+    aujourd'hui, il accepte juste un `label` libre, ce qui ne dit
+    rien de la nature du sujet tracé sans artifact formel.
+    Décision utilisateur : remplacer par un type `loose` avec une
+    catégorie typée par enum (idea, exploration, hotfix,
+    observation, dependency).
+
+    Une couche supplémentaire de drift warnings est ajoutée à
+    `summarize_roadmap` comme filet de sécurité : si malgré
+    l'auto-sync un status YAML diverge du mapping calculé (par
+    exemple parce qu'un agent a écrit manuellement le YAML hors
+    pipeline), le warning le signale.
+  tags:
+    - roadmap
+    - auto-sync
+    - schema
+    - indexation
+    - typage
+    - pm-workflow
+    - critical-infra
+  related:
+    - id: a49801aa-911e-45d7-95a3-b21d6ea2bd2d
+      kind: rfc
+      relationship: supersedes
+    - id: 329da45f-e24f-4200-9e18-e2e47b5a4f27
+      kind: roadmap
+      relationship: related
+    - id: 3cd72740-1424-46ac-8ee6-96f714f3fa94
+      kind: rfc
+      relationship: related
+
+spec:
+  priority: high
+  status: backlog
+
+  acceptance_criteria:
+    - >
+      Le schéma roadmap est mis à jour. Le type `external` du
+      `ref.oneOf` est remplacé par un type `loose` qui exige deux
+      champs : `category` (enum strict parmi idea, exploration,
+      hotfix, observation, dependency) et `label` (string libre,
+      max ~200 chars pour rester lisible). additionalProperties
+      false. Migration des roadmaps existantes incluse (la roadmap
+      329da45f a 3 items à reclasser).
+
+    - >
+      L'auto-sync du status est implémenté côté pipeline
+      d'indexation. Quand une roadmap est indexée par
+      engine.index_artifact (au boot via reindex_all, à chaque
+      écriture YAML via le file watcher, ou à un index_now manuel),
+      le serveur calcule pour chaque item le status mappé depuis
+      l'artifact source référencé, puis écrit ce status calculé
+      dans la table d'index. Le YAML sur disque n'est PAS modifié
+      (le calcul vit dans la projection indexée, accédée par
+      summarize_roadmap et list_roadmaps).
+
+    - >
+      Le mapping de l'auto-sync est tranché et documenté
+      explicitement dans le RFC. Au minimum :
+        - ref type=rfc : status="draft"→planned,
+          "review"→in_progress, "approved"→in_progress,
+          "implemented"→done, "rejected"→cancelled.
+        - ref type=project : à arbitrer par l'Architect selon
+          l'état du project-config (project actif = in_progress,
+          archivé = done ou cancelled). Si pas de signal clair,
+          fallback sur "planned".
+        - ref type=loose : pas d'auto-sync (pas d'artifact
+          source). Status manuel respecté.
+
+    - >
+      Le `status: blocked` est sacralisé comme droit du PM. Si un
+      item YAML porte explicitement status=blocked, l'auto-sync ne
+      touche pas. C'est la seule exception au mapping calculé.
+      Tout autre status (planned, in_progress, done, cancelled)
+      est écrasé par le mapping si l'item a une ref `project` ou
+      `rfc`.
+
+    - >
+      Le tool `summarize_roadmap` est enrichi d'un champ
+      `drift_warnings` qui liste les incohérences résiduelles : un
+      item dont le status mappé (calculé par l'auto-sync) diffère
+      du status présent dans le YAML sur disque. C'est un filet de
+      sécurité pour détecter les écritures YAML hors-pipeline (par
+      exemple un agent qui édite à la main). Format minimum :
+      item.key + status YAML + status mappé + ref.
+
+    - >
+      Le tool `list_roadmaps` reste compatible. Les compteurs
+      (in_progress_count, blocked_count, etc.) reflètent les
+      statuts post-auto-sync.
+
+    - >
+      Tests automatisés sérieux. Au minimum :
+        - tests unitaires sur la fonction de mapping (chaque
+          combinaison ref-type × status-artifact-source).
+        - tests d'intégration sur le pipeline complet : créer une
+          roadmap référençant un RFC dans plusieurs états, vérifier
+          que index_artifact applique le bon mapping.
+        - test d'invariance blocked : un item YAML status=blocked
+          reste blocked après auto-sync, même si l'artifact source
+          est implemented.
+        - test de drift_warning : un YAML édité hors-pipeline (par
+          exemple via sqlite injection en test) produit le warning
+          attendu.
+
+    - >
+      Migration de la roadmap 329da45f effectuée dans le même cycle :
+        - tous les items à ref rfc voient leur status recalculé par
+          le mapping (vérification que ça donne le même résultat
+          que l'état actuel manuel).
+        - les 3 items external (db-schema-migration-hotfix → hotfix,
+          api-callers-discoverability → idea, backup-strategy →
+          observation ou exploration) sont migrés au type loose
+          avec leur category.
+
+    - >
+      Lesson-learned produite à la clôture, chaînée avec la lesson
+      qui documentera la supersession partielle du RFC a49801aa
+      (le risque 1 "duplication de vérité" était mal arbitré, la
+      mitigation "convention sociale" s'est avérée insuffisante en
+      moins d'une session).
+
+  investigation_hints: >
+    Pistes non prescriptives, l'Architect arbitre.
+
+    (1) Le pipeline d'indexation à étendre vit dans
+    crates/orchestrator/src/engine.rs (méthode index_artifact) et
+    crates/orchestrator/src/db.rs (table artifacts ou table
+    dédiée roadmap_items ?). Décision structurelle : stocker les
+    items de roadmap dans une table dédiée (avec status calculé
+    post-mapping) ou continuer à les stocker comme JSON dans la
+    table artifacts ? Trade-off : table dédiée = queries efficaces
+    pour summarize_roadmap mais migration nécessaire ; JSON inline
+    = simple mais recalcul à chaque summarize.
+
+    (2) Le mapping ref type=rfc nécessite de connaître le status
+    de l'artifact référencé. La table artifacts indexée contient
+    déjà cette info (kind=rfc + status). Vérifier que le pipeline
+    a accès aux statuts au moment où il indexe une roadmap. Cas
+    dégénéré : item de roadmap référence un RFC pas encore
+    indexé (race au boot ou orphan). Politique à trancher : status
+    "unknown" ? Fallback "planned" ? Skip + warning ?
+
+    (3) Le mapping ref type=project a moins de signal clair côté
+    metadata.status (les projects ont un project-config sans
+    status). Options : (a) déduire de l'activité (commits récents
+    sur projects/<slug>/), (b) déduire de l'existence des
+    artifacts du projet (a-t-il un task-request done, etc.),
+    (c) garder un override manuel pour les projects (et n'auto-
+    sync que les rfc).
+
+    (4) La règle "blocked sacralisé" doit être implémentée comme
+    une short-circuit AVANT le mapping : if yaml_status ==
+    "blocked" return blocked, else compute mapping. Cohérence
+    avec le schéma : `blocked` reste dans l'enum status, et c'est
+    la SEULE valeur que le PM peut écrire manuellement et qui
+    sera respectée.
+
+    (5) Drift warnings : le summarize_roadmap compare item.status
+    YAML (lu depuis le fichier ou depuis la projection indexée
+    initiale) vs item.status mappé (calculé). Si différents, et
+    le YAML n'est PAS blocked, drift. Sinon (égaux ou blocked),
+    pas de warning.
+
+    (6) Type loose. Schéma proposé :
+        ref:
+          type: loose
+          category: idea | exploration | hotfix | observation | dependency
+          label: string (max ~200 chars)
+        - idea : sujet en réflexion, pas encore mûr pour task-request.
+        - exploration : sujet creusé activement, sans engagement de livraison.
+        - hotfix : action ponctuelle appliquée hors RFC (typique
+          db-schema-migration-hotfix de la roadmap actuelle).
+        - observation : constat à garder en mémoire (genre "le
+          pre-commit utilise le release stale du yaml-validator").
+        - dependency : dépendance externe non maîtrisée (autre
+          équipe, lib upstream).
+
+    (7) Le RFC supersedes partiellement le a49801aa. Le risque 1
+    de a49801aa ("pas d'auto-sync, convention sociale") est
+    renversé. Le risque 2 ("roadmaps zombies") devient caduc
+    pour les items à ref rfc/project (auto-sync les maintient à
+    jour) mais reste actif pour les items loose (la convention
+    sociale s'applique encore là).
+
+    (8) Migration de l'existant. La roadmap 329da45f doit être
+    réécrite. Idéalement le RFC inclut un script de migration ou
+    une étape de plan qui se charge mécaniquement de la
+    transformation external → loose avec category déduite, et de
+    la vérification que les status existants matchent le mapping
+    après auto-sync.
+
+    (9) Le placement du calcul. Deux options principales :
+        (a) Calcul au moment de l'indexation (matérialisé en DB) :
+            chaque indexation de roadmap déclenche un re-mapping.
+            Avantage : summarize_roadmap est rapide. Inconvénient :
+            une roadmap doit être ré-indexée quand un RFC qu'elle
+            référence change de status (sinon drift).
+        (b) Calcul au moment du summarize (à la volée) : la table
+            ne stocke pas le status mappé, summarize lit la roadmap
+            + les artifacts référencés et calcule à la lecture.
+            Avantage : toujours frais. Inconvénient : coût par
+            appel summarize (plusieurs requêtes).
+        Mon avis PM (non bloquant) : option (b) plus simple à
+        raisonner, le coût est négligeable à notre échelle (<200
+        artifacts par roadmap maximum). Mais c'est l'Architect qui
+        tranche.
+
+  out_of_scope: >
+    Ce task-request NE traite PAS :
+    - L'ajout de nouveaux ref types (task-request, design-doc,
+      lesson-learned). Tu as décidé qu'on reste sur project, rfc,
+      loose. Si plus tard on veut étendre, ce sera un RFC séparé.
+    - L'auto-sync sur les items à ref project (l'Architect peut
+      proposer un mapping si simple, sinon différer). Le scope
+      minimum cible les RFCs.
+    - La question de la review d'une roadmap (review-protocol).
+      Une roadmap reste un artifact non-reviewé, comme aujourd'hui.
+    - L'archivage automatique d'une roadmap quand tous ses items
+      sont done. Sujet adjacent, hors scope.
