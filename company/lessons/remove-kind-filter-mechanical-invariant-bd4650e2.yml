@@ -1,0 +1,187 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: bd4650e2-ab42-4b4e-9c10-cca638ded48c
+  title: "Retirer un paramètre d'API plutôt qu'écrire une règle de non-usage : l'application directe de l'invariant mécanique (4e5c109b) au retrait du filtre kind de search"
+  author: implementer
+  created_at: "2026-06-05"
+  description: >
+    Capitalisation de clôture après l'implémentation du RFC 1d3a3581
+    (retrait du filtre kind et des filtres morts author/project/dates de
+    la surface MCP search) sur le plan 1c7380e5. Trois enseignements :
+    (a) le cas d'école de la préférence 4e5c109b — on ne corrige PAS un
+    anti-pattern d'usage (filtrer par kind appauvrit le rappel) par une
+    règle « n'utilisez pas kind », on RETIRE le paramètre, ce qui rend
+    l'anti-pattern impossible ; (b) le pendant exact de la lesson
+    600307a4 — les 6 filtres ajoutés « au cas où » lors de la refonte
+    bdee1af4 étaient du cargo-cult d'API, 4 sur 6 n'ont jamais eu un seul
+    caller en 5 jours ; ajouter une surface large invite à des usages qui
+    dégradent le produit ; (c) deux frictions opérationnelles observées :
+    le token d'auth expiré en cours de session (hot-reload déclenché par
+    cargo build) et le churn permanent de orchestrator.db par l'indexation
+    automatique pendant les commits.
+  tags:
+    - search
+    - retrieval
+    - api
+    - filters
+    - simplification
+    - breaking-change
+    - determinism
+    - mechanical-invariant
+    - cargo-cult
+    - companyos-internals
+    - lessons-from-implementation
+  related:
+    - id: 4e5c109b-ec35-46ff-98af-3714b1d7a36f
+      kind: lesson-learned
+      relationship: derived-from
+    - id: 600307a4-74f6-43dd-95e1-4dee3d2326c1
+      kind: lesson-learned
+      relationship: related
+    - id: 1d3a3581-db81-4c95-9973-2cbae7be35df
+      kind: rfc
+      relationship: derived-from
+    - id: 1c7380e5-5d5f-46cf-bcb3-8dada9f10ef3
+      kind: implementation-plan
+      relationship: derived-from
+    - id: 655f74d7-7ac4-44b2-88ff-f0063d7680d9
+      kind: diagnostic-report
+      relationship: related
+
+spec:
+  context: >
+    La refonte search bdee1af4 (lesson 600307a4) a livré un hybrid
+    retrieval performant (recall@10 = 0.895, p95 = 5ms) MAIS a, au
+    passage, exposé six filtres structurés sur la surface MCP : kind,
+    author, tags, project, created_after/created_before, id_prefix.
+    L'intention du retrieval hybride est de maximiser le rappel tous
+    kinds confondus. Le filtre kind contredisait frontalement cette
+    intention : il invitait les agents à restreindre la recherche à un
+    type unique, transformant le lookup mémoire en vue tunnel.
+
+    Décision utilisateur (task-request e362e438) : retirer kind. Le
+    diagnostic 655f74d7 a mesuré empiriquement l'usage des 6 filtres par
+    recension rg exhaustive sur crates/ + company/ + docs/. Constat :
+    kind n'avait qu'un usage prose (dédup lessons, précisément
+    l'anti-pattern) ; author/project/dates avaient ZÉRO caller, ZÉRO
+    mention, ZÉRO workflow ; seuls tags et id_prefix avaient un usage
+    qualitatif légitime. La fonction legacy engine.search(query, kind,
+    limit) était du code mort (zéro caller).
+
+    Le RFC 1d3a3581 a tranché : retrait PUR (pas de deprecation graceful)
+    de kind + author + project + dates de la surface MCP ET de la struct
+    interne SearchFilters (sauf kinds, conservé pour la list-mode et
+    list_by_kind des roadmaps). Implémentation en 3 commits chirurgicaux,
+    cargo build + cargo test verts (145 tests orchestrator, dont 2
+    nouveaux tests de contrat pour les filtres survivants id_prefix et
+    tags). Permit f909a687 (6 target_paths) consommé sans extension.
+
+  insight: >
+    TROIS ENSEIGNEMENTS.
+
+    ENSEIGNEMENT 1 — LE CAS D'ÉCOLE DE L'INVARIANT MÉCANIQUE (4e5c109b).
+
+    Ce RFC est l'application la plus pure de la préférence 4e5c109b
+    rencontrée jusqu'ici. Le problème (« filtrer par kind appauvrit le
+    rappel ») admettait deux corrections possibles :
+
+    (a) La voie déléguée : ajouter une règle dans shared-rules « ne
+        filtrez pas par kind dans search ». C'est une discipline confiée
+        au LLM, violable à chaque appel, et qui DÉMENT le schéma du tool
+        (le champ kind reste proposé par l'auto-complétion).
+    (b) La voie mécanique : RETIRER le paramètre kind de SearchParams.
+        L'invariant « on ne peut pas filtrer par kind dans search »
+        devient impossible à violer parce que le champ n'existe plus.
+
+    Le RFC a choisi (b), explicitement au nom de 4e5c109b. Le corollaire
+    décisif est l'argument contre la deprecation graceful : garder kind
+    « accepté mais ignoré avec warning » maintient l'INVITATION à filtrer
+    dans le JSON Schema exposé aux agents. Un champ déprécié-mais-présent
+    continue d'être proposé par l'auto-complétion du LLM. Le seul moyen
+    de tuer l'invitation est de tuer le champ. C'est une nuance
+    importante de 4e5c109b appliquée aux surfaces LLM : la présence d'un
+    champ dans un schéma EST une incitation comportementale, pas un
+    artefact neutre.
+
+    ENSEIGNEMENT 2 — LE PENDANT EXACT DE 600307a4 : LE CARGO-CULT D'API
+    SE PAIE PLUS TARD.
+
+    La lesson 600307a4 a capitalisé la CRÉATION de search hybride et
+    listait fièrement « filtres structurés (kind, author, tags, project,
+    dates, id_prefix) ». Cinq jours plus tard, ce RFC en RETIRE quatre
+    sur six. Le diagnostic 655f74d7 prouve que author/project/dates n'ont
+    JAMAIS eu un seul caller, ni interne ni prose, ni le moindre workflow.
+    Ils ont été exposés « au cas où » pendant l'implémentation bdee1af4.
+
+    L'enseignement n'est pas « 600307a4 a eu tort » : ces filtres étaient
+    cheap à ajouter et plausibles a priori. L'enseignement est que la
+    surface d'une API n'est jamais neutre. Une surface large n'est pas
+    « de l'optionnalité gratuite » : elle a un coût d'invitation (les
+    agents/LLM l'utilisent, parfois mal, ici en appauvrissant le rappel)
+    et un coût de maintenance (chaque champ doit être câblé, testé,
+    documenté, puis retiré). C'est la lesson 02b8e1ce (cargo-cult des
+    paramètres) élevée du niveau APPEL au niveau DÉFINITION d'API :
+    n'exposer un paramètre QUE quand un caller concret le réclame, pas
+    « au cas où ». YAGNI s'applique aux surfaces autant qu'au code.
+
+    ENSEIGNEMENT 3 — DEUX FRICTIONS OPÉRATIONNELLES.
+
+    Friction A — token d'auth expiré en cours de session. Au moment de
+    consume_write_permit en fin de chantier, l'appel a échoué avec
+    « Authentication failed / Invalid or missing auth token ». Cause
+    probable : un cargo build pendant l'exécution a déclenché le
+    hot-reload du binaire MCP (mécanisme documenté), invalidant le token
+    obtenu en début de session. Mitigation appliquée : re-authenticate()
+    puis re-consume, conforme à la règle mcp_reconnect. À retenir : sur
+    un chantier Rust avec permit, le token n'est PAS garanti stable d'un
+    bout à l'autre de la session ; il faut être prêt à le rafraîchir,
+    typiquement juste avant les opérations privilégiées finales (consume).
+
+    Friction B — churn permanent de company/data/orchestrator.db. Le
+    fichier DB est re-modifié en continu par l'indexation automatique
+    (chaque écriture de YAML auto-indexée). Pendant la phase de commits,
+    il réapparaît en « modified » après chaque commit. Ce n'est pas un
+    bug, mais ça impose de décider explicitement quand on le commit (je
+    l'ai groupé avec le commit des artifacts). À retenir : ne pas
+    s'acharner à obtenir un working tree parfaitement propre sur la DB,
+    c'est un fichier vivant.
+
+  recommendation: >
+    TROIS RECOMMANDATIONS ACTIONNABLES.
+
+    RECOMMANDATION 1 — POUR TOUTE DÉCISION « CORRIGER UN ANTI-PATTERN
+    D'USAGE ». Se poser systématiquement la question 4e5c109b : peut-on
+    SUPPRIMER l'affordance qui rend l'anti-pattern possible, plutôt que
+    d'écrire une règle qui demande de ne pas l'utiliser ? Sur une surface
+    consommée par un LLM, la présence d'un champ/paramètre dans le schéma
+    est une incitation comportementale active. La deprecation graceful
+    (accepté + warning) ne tue PAS cette incitation ; seul le retrait pur
+    le fait. Préférer le retrait pur quand il n'y a pas de client externe
+    versionné, ce qui est toujours le cas des surfaces MCP internes.
+
+    RECOMMANDATION 2 — POUR TOUT RFC/DESIGN QUI AJOUTE UNE SURFACE D'API.
+    N'exposer un paramètre/filtre/option QUE si un caller concret le
+    réclame dans le même cycle. Bannir le « au cas où ». Le coût d'un
+    champ exposé n'est pas nul : invitation comportementale + câblage +
+    tests + doc + retrait futur. La paire de lessons 600307a4 (création
+    de 6 filtres) / bd4650e2 (retrait de 4) est la preuve empirique
+    chiffrée que le cargo-cult d'API se paie en dette quelques jours plus
+    tard. Reviewer un design : pour chaque paramètre exposé, exiger soit
+    un caller concret, soit une justification de besoin imminent
+    documentée.
+
+    RECOMMANDATION 3 — POUR TOUTE SESSION RUST AVEC PERMIT ACTIF.
+    (a) Anticiper que le token d'auth peut expirer si un cargo build
+    déclenche le hot-reload MCP. Concrètement : juste avant les
+    opérations privilégiées finales (consume_write_permit, submit_vote),
+    être prêt à re-authenticate() si la première tentative échoue sur
+    « auth failed ». Ce n'est pas une panne, c'est le cycle de vie normal
+    du binaire rechargé. (b) Traiter orchestrator.db comme un fichier
+    vivant : décider une fois où le commit (avec les artifacts) et ne pas
+    chercher un working tree DB immaculé. (c) Confirmé une fois de plus :
+    le caller-inventory (rg + lecture ciblée) AVANT exécution a validé
+    que les 6 target_paths couvraient l'union définition+callers de
+    SearchFilters, donc zéro extension de permit. La discipline
+    rules.must caller-inventory (RFC eb42a8de) fonctionne quand elle est
+    réellement exécutée en amont, pas découverte au premier build.

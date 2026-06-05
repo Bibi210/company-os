@@ -2,7 +2,8 @@ api_version: companyos/v1
 kind: rfc
 metadata:
   id: 1d3a3581-db81-4c95-9973-2cbae7be35df
-  status: approved
+  status: implemented
+  implemented_at: "2026-06-05T19:49:27.571650747+00:00"
   approved_at: "2026-06-05T19:35:02.650394342+00:00"
   title: "Retrait du filtre kind (et des filtres morts author/project/dates) de la surface MCP search ; conservation de tags et id_prefix"
   author: architect
