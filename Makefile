@@ -50,14 +50,35 @@ clean:
 	cargo clean
 	rm -f company/data/orchestrator.db company/data/orchestrator.db-shm company/data/orchestrator.db-wal
 
-## Super clean: clean + wipe all generated artifacts (projects, lessons, rfcs, diagnostics)
-## Preserves: personas, config, schemas, plugins
+## Super clean: clean + wipe all generated artifacts, preserving system config.
+##
+## Wipes (generated artifacts):
+##   - projects/*/  ........ ALL project-scoped kinds (task-requests, design-docs,
+##                           implementation-plans, review-reports, diagnostic-reports,
+##                           config), covered recursively by the single rm -rf.
+##   - company/lessons/ .... lesson-learned
+##   - company/rfcs/ ....... rfc
+##   - company/roadmaps/ ... roadmap
+##   - company/agent-messages/ ... agent-message (TRANSITIONAL, see below)
+##
+## Preserves (never touched): company/personas, company/config, company/schemas,
+##   company/plugins, company/scripts, company/data (the DB is wiped separately by
+##   the `clean` target this depends on).
+##
+## Keep in sync with spec.rules.file_placement in company/config/shared-rules.yml.
+## When a new GLOBAL kind is added there, add its company/<folder>/ rm line here.
+## Project kinds need NO new line: rm -rf projects/*/ already covers them.
+##
+## PILLAR D (RFC cdbfee72): after clean-company the orchestrator index
+## (company/data/orchestrator.db, already wiped by `clean`) is incoherent until the
+## next boot, which rebuilds it deterministically from the remaining YAML (logically
+## empty on the generated-artifact side). This is the intended design, not a bug.
 clean-company: clean
 	rm -rf projects/*/
 	rm -f company/lessons/*.yml
 	rm -f company/rfcs/*.yml
-	rm -f company/diagnostics/*.yml
-	rm -f company/design-docs/*.yml
+	rm -f company/roadmaps/*.yml
+	rm -f company/agent-messages/*.yml   # TRANSITIONAL: removed by RFC 3d9f0b0c (agent-message kind retirement)
 	@echo "All artifacts wiped. Personas/config/schemas preserved. Run 'make setup' to rebuild."
 
 ## Full setup: git hooks + release build + CI (run once after clone)

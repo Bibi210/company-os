@@ -1,0 +1,92 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 7d54f0b3-17ca-4b37-b106-600005cc2ad9
+  title: "Plan d'implementation du realignement de la cible Makefile clean-company sur file_placement"
+  author: implementer
+  created_at: "2026-06-05"
+  project: company-os
+  description: >
+    Plan d'execution concret du design-doc 98bb95af : realignement de la
+    cible clean-company du Makefile sur la convention file_placement. Une
+    seule unite a editer (le Makefile racine, hors zone protegee, donc sans
+    write permit). Couvre les 5 ecarts E1-E5 du diagnostic fed2cac0.
+    Option (b) retenue (arbitrage PM) : inclure company/agent-messages/ en
+    ligne transitoire marquee, le retrait final etant confie au RFC 3d9f0b0c.
+  tags:
+    - makefile
+    - tooling
+    - cleanup
+    - conventions
+    - file-placement
+    - companyos-internals
+  related:
+    - id: 98bb95af-9667-4625-8817-d28fb3c0e1f7
+      kind: design-doc
+      relationship: input
+    - id: fed2cac0-3e41-4be1-8815-e8c0e755b384
+      kind: diagnostic-report
+      relationship: related
+    - id: 3d9f0b0c-856d-4799-ac10-e25fad5d1965
+      kind: rfc
+      relationship: related
+
+spec:
+  steps:
+    - description: >
+        ETAPE 1 (E1) — Retirer les 2 lignes no-op (paths inexistants) de la
+        cible clean-company : `rm -f company/diagnostics/*.yml` et
+        `rm -f company/design-docs/*.yml`. Justification : diagnostic-report
+        et design-doc sont des kinds PROJET (projects/<slug>/...), deja
+        entierement couverts par le `rm -rf projects/*/` en tete de cible.
+        Ces 2 lignes sont des no-op trompeurs (dossiers inexistants).
+      files:
+        - Makefile
+    - description: >
+        ETAPE 2 (E2) — Ajouter `rm -f company/roadmaps/*.yml`. Le kind
+        roadmap (RFC a49801aa) est posterieur a la redaction du Makefile et
+        n'etait pas couvert ; un make clean-company laissait les roadmaps en
+        place, contredisant l'intent "wipe all generated artifacts".
+        Depend de l'etape 1.
+      files:
+        - Makefile
+    - description: >
+        ETAPE 3 (E3, option b) — Ajouter `rm -f company/agent-messages/*.yml`
+        avec un commentaire inline marquant la ligne comme TRANSITOIRE (a
+        retirer par le RFC 3d9f0b0c lors du retrait du kind agent-message).
+        Tant que le kind existe, la cible doit le couvrir pour coherence
+        (composant 4 scenario b du design-doc). Depend de l'etape 1.
+      files:
+        - Makefile
+    - description: >
+        ETAPE 4 (E5 + DECISION 3 + PILIER D) — Reecrire le bloc de
+        commentaire au-dessus de clean-company : (a) lister correctement ce
+        qui est wipe (lessons, rfcs, roadmaps, agent-messages transitoire,
+        artifacts projet via projects/*/) et ce qui est PRESERVE (personas,
+        config, schemas, plugins, scripts, data — invariant E5) ; (b) ancrer
+        DECISION 3 via "Keep in sync with spec.rules.file_placement in
+        company/config/shared-rules.yml" ; (c) documenter FAIT PILIER D :
+        apres clean-company l'index orchestrator (DB deja wipe par la cible
+        clean) est incoherent jusqu'au prochain boot qui reconstruit depuis
+        les YAML restants (comportement voulu RFC cdbfee72, pas un bug).
+        L'approche reste STATIQUE (DECISION 2), aucun find dynamique. Depend
+        des etapes 2 et 3.
+      files:
+        - Makefile
+    - description: >
+        ETAPE 5 (sanity + verification + commit) — (a) cargo build et cargo
+        test : sanity check seul, la cible Makefile n'est pas compilee,
+        aucun impact attendu. (b) Verification manuelle de couverture (OQ2,
+        sans cible dry-run) : confirmer que chaque kind global generable a sa
+        ligne rm et qu'aucune ligne ne cible un dossier preserve. (c) commit
+        du Makefile. Depend de l'etape 4.
+      files:
+        - Makefile
+  dependencies:
+    - "Makefile hors zone protegee (protected-zones.json) : aucun write permit, aucun RFC."
+    - "Design-doc 98bb95af approuve (round 4f3f5a77, consensus_reached) : tous les arbitrages tranches."
+    - "RFC 3d9f0b0c (retrait agent-message) en cours en parallele : retirera la ligne transitoire de l'etape 3 a sa cloture (AC5 task-request 95e93649)."
+  risks:
+    - "Risque faible : la ligne transitoire agent-messages survit si le RFC 3d9f0b0c est abandonne. Mitigation : commentaire explicite + lien related, et c'est un no-op une fois le dossier disparu."
+    - "Risque de sur-suppression ecarte par construction : liste statique explicite de sous-dossiers, aucun glob company/*.yml large, aucun chemin preserve cible (verifie etape 5b)."
+    - "Aucun risque de build : la cible Makefile n'est pas compilee ; cargo build/test ne sont qu'un sanity check."
