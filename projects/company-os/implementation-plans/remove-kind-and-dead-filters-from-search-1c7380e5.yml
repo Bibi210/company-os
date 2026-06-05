@@ -1,0 +1,170 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 1c7380e5-5d5f-46cf-bcb3-8dada9f10ef3
+  title: "Plan d'implémentation : retrait kind + filtres morts (author/project/dates) de la surface MCP search"
+  author: implementer
+  created_at: "2026-06-05"
+  description: >
+    Plan d'implémentation dérivé du RFC 1d3a3581 (approuvé) et du
+    diagnostic-report 655f74d7. Retire de la struct SearchParams (surface
+    MCP) les paramètres kind, author, project, created_after,
+    created_before ; conserve query, limit, mode, tags, id_prefix,
+    explain, rerank, hyde. Retire de la struct interne SearchFilters les
+    champs author, project, created_after, created_before ; conserve
+    kinds (list-mode + list_by_kind), tags, id_prefix. Supprime la
+    fonction legacy engine.search(query, kind, limit) confirmée code mort
+    (zéro caller, vérifié rg + get_references). Réduit append_filter_clauses
+    et le calcul has_filter en conséquence. Migre les 2 occurrences prose
+    search(query, kind="lesson-learned") de shared-rules.yml en
+    search(query). Met à jour docs/search-guide.md (sections 2.4 et 4).
+    Couvert par le write permit f909a687 (6 target_paths). Inventaire des
+    callers re-vérifié : SearchFilters n'est consommé que par le crate
+    orchestrator (db/engine/tests) et mcp-servers/orchestrator/main.rs,
+    tous dans les 6 paths du permit. Aucun caller hors périmètre.
+  tags:
+    - search
+    - retrieval
+    - api
+    - filters
+    - simplification
+    - breaking-change
+    - implementation-plan
+    - companyos-internals
+  related:
+    - id: 1d3a3581-db81-4c95-9973-2cbae7be35df
+      kind: rfc
+      relationship: input
+    - id: 655f74d7-7ac4-44b2-88ff-f0063d7680d9
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: 600307a4-74f6-43dd-95e1-4dee3d2326c1
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  steps:
+    - description: >
+        ÉTAPE 1 (cœur, db.rs) — Réduire la struct SearchFilters
+        (db.rs:150-158). Supprimer les champs author, project,
+        created_after, created_before. Conserver kinds, tags, id_prefix.
+        Mettre à jour le doc-comment qui décrit les champs si nécessaire.
+        Critère : la struct ne porte plus que 3 champs.
+      files:
+        - crates/orchestrator/src/db.rs
+    - description: >
+        ÉTAPE 2 (cœur, db.rs) — Réduire append_filter_clauses
+        (db.rs:163-216). Supprimer les blocs author (181-184), project
+        (185-188), created_after (189-192), created_before (193-196).
+        Conserver les blocs kinds, id_prefix, tags. Critère : la fonction
+        ne génère plus de clauses a.author / a.project / a.created_at.
+      files:
+        - crates/orchestrator/src/db.rs
+    - description: >
+        ÉTAPE 3 (cœur, engine.rs) — Supprimer la fonction legacy
+        engine.search(query, kind, limit) (engine.rs:761-781). Vérification
+        finale d'absence de caller via get_references LSP (déjà confirmée
+        par rg : zéro caller). Critère : la fonction n'existe plus, le
+        crate compile (search_hybrid reste le point d'entrée).
+      files:
+        - crates/orchestrator/src/engine.rs
+    - description: >
+        ÉTAPE 4 (cœur, engine.rs) — Réduire le calcul has_filter dans
+        search_hybrid (engine.rs:794-800). Supprimer les disjonctions
+        author / project / created_after / created_before. Conserver
+        kinds, tags, id_prefix. Critère : has_filter ne référence plus
+        que 3 champs ; la branche list-mode (query vide + tags ou
+        id_prefix ou kinds) reste atteignable ; l'erreur "empty query
+        requires at least one filter" reste levée pour query vide sans
+        filtre.
+      files:
+        - crates/orchestrator/src/engine.rs
+    - description: >
+        ÉTAPE 5 (surface MCP, main.rs) — Réduire la struct SearchParams
+        (main.rs:159-196). Supprimer les champs kind, author, project,
+        created_after, created_before (et leurs attributs #[schemars]).
+        Conserver query, limit, mode, tags, id_prefix, explain, rerank,
+        hyde. Réduire le handler search() (main.rs:985-993) : la
+        construction de SearchFilters ne mappe plus que tags et id_prefix
+        (kinds = None côté surface MCP, alimenté uniquement en interne).
+        Critère : le schema JSON exposé du tool search ne propose plus
+        kind/author/project/dates. Comportement rmcp sur champ inconnu
+        (R2 du RFC) à documenter empiriquement après build (cf. ÉTAPE 9).
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+    - description: >
+        ÉTAPE 6 (tests) — Vérifier integration_search.rs. Le test
+        filters_push_down_kind (l.460-485, #[ignore]) construit
+        SearchFilters{kinds: Some(...), ..Default::default()} : kinds est
+        conservé, donc il compile sans modification. Ajouter un test de
+        contrat post-RFC vérifiant que tags et id_prefix filtrent
+        correctement via search_hybrid (list-mode query vide + filtre, ou
+        query + filtre). Critère : nouveau test vert, filters_push_down_kind
+        compile toujours.
+      files:
+        - crates/orchestrator/tests/integration_search.rs
+    - description: >
+        ÉTAPE 7 (config prose, shared-rules.yml) — Migrer les 2 occurrences
+        search(query, kind="lesson-learned") (l.81 catalogue lesson-learned,
+        l.180 règle `lessons`) en search(query). Ajuster le message
+        accompagnant pour expliciter que le rappel large remonte mieux les
+        lessons proches qu'un filtre par type. Critère : aucune occurrence
+        de search(query, kind=...) résiduelle dans shared-rules.yml.
+      files:
+        - company/config/shared-rules.yml
+    - description: >
+        ÉTAPE 8 (doc, search-guide.md) — Mettre à jour section 2.4 (Filtres
+        structurés) : ne plus lister que kinds (interne/list-mode), tags,
+        id_prefix comme filtres push-down ; retirer author, project, dates.
+        Mettre à jour section 4 (API du tool MCP search) : retirer kind,
+        author, project, created_after, created_before de l'exemple JSON ;
+        documenter que le filtrage par kind relève d'un futur tool
+        list_artifacts (renvoi DÉCISION 4 du RFC). Critère : l'exemple
+        JSON et la liste des filtres reflètent la surface post-RFC.
+      files:
+        - docs/search-guide.md
+    - description: >
+        ÉTAPE 9 (validation CI interne) — Après chaque modif Rust :
+        get_diagnostics LSP. Avant chaque commit : cargo build (sans
+        --target-dir) + cargo test verts (le pre-commit hook fait make
+        ci). Documenter le comportement rmcp observé sur champ inconnu
+        (R2). Critère : 0 erreur de compilation, 0 test failed.
+      files: []
+    - description: >
+        ÉTAPE 10 (clôture) — Dans l'ordre strict (séquence
+        write_permit_full_sequence + lesson 8fd49300) : (1) commits du
+        code déjà faits, (2) consume_write_permit(f909a687) en dernier
+        après tous les commits, (3) cargo build + cargo test finaux verts,
+        (4) lesson-learned chaînée 4e5c109b + 600307a4, (5)
+        rfc_set_implemented(1d3a3581), (6) reload_config en TOUT dernier.
+      files: []
+  dependencies:
+    - "ÉTAPE 2 dépend de ÉTAPE 1 (append_filter_clauses lit les champs de SearchFilters)"
+    - "ÉTAPE 4 dépend de ÉTAPE 1 (has_filter lit les champs de SearchFilters)"
+    - "ÉTAPE 5 dépend de ÉTAPE 1 (le handler construit SearchFilters)"
+    - "ÉTAPE 6 dépend de ÉTAPES 1-5 (compilation du crate)"
+    - "ÉTAPE 9 (build+test) dépend de toutes les modifs Rust (1-6)"
+    - "ÉTAPE 10 (clôture) dépend de ÉTAPE 9 verte"
+  risks:
+    - >
+      R1 (RFC) — Prose résiduelle passant kind/author/project/dates.
+      Mitigation : rg de confirmation fait. Seules 2 occurrences kind dans
+      shared-rules.yml (migrées ÉTAPE 7), 0 des autres filtres. Les autres
+      mentions (RFCs, diagnostic, task-request, design-doc) sont des
+      artifacts historiques figés, hors scope.
+    - >
+      R2 (RFC) — Comportement rmcp sur champ inconnu (ignore vs erreur)
+      non déterminé a priori. Mitigation : mesuré empiriquement après
+      build et documenté. Quel que soit le comportement, R1 garantit
+      qu'aucun caller légitime n'envoie ces champs.
+    - >
+      R3 (RFC) — Régression list-mode si has_filter mal réduit.
+      Mitigation : test de contrat ÉTAPE 6 (query vide + tags) + le test
+      d'erreur "empty query requires at least one filter" reste vert.
+    - >
+      Caller-inventory (rules.must) — SearchFilters est une API publique
+      de crate (re-exportée lib.rs:12). Recension get_references/rg
+      confirme : consommée uniquement par crates/orchestrator (db.rs,
+      engine.rs, tests) et crates/mcp-servers/orchestrator/main.rs:985.
+      Tous dans les 6 target_paths du permit f909a687. Aucun caller hors
+      périmètre. Pas d'extension de permit nécessaire.

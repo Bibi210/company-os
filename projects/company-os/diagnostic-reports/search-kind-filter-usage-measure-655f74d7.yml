@@ -1,0 +1,233 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: 655f74d7-7ac4-44b2-88ff-f0063d7680d9
+  title: "Usage empirique des six filtres structurés de search() : kind, tags, author, project, dates, id_prefix"
+  author: architect
+  created_at: "2026-06-05"
+  project: company-os
+  description: >
+    Investigation cadrée par le task-request e362e438 (retrait du
+    paramètre kind du tool MCP search). Mesure l'usage réel des six
+    filtres structurés introduits par le RFC bdee1af4 (refonte search
+    hybride implémentée). Recense exhaustivement les callers de search
+    et de la struct SearchFilters dans le workspace via rg, distingue
+    les filtres effectivement consommés par du code des filtres
+    purement exposés à la surface MCP (donc actionnés uniquement par
+    les agents), et établit le constat clé : la signature legacy
+    engine.search(query, kind, limit) est du code mort (zéro caller
+    interne), et le besoin de listing par kind est déjà couvert par la
+    branche list-mode de search_hybrid. Pilote le RFC 1d3a3581.
+  tags:
+    - search
+    - retrieval
+    - filters
+    - api
+    - usage-measure
+    - companyos-internals
+  related:
+    - id: e362e438-e550-4c98-9cdd-2af21b5d8978
+      kind: task-request
+      relationship: input
+    - id: bdee1af4-4944-4bee-b7c0-18efd6c7961f
+      kind: rfc
+      relationship: related
+    - id: 600307a4-74f6-43dd-95e1-4dee3d2326c1
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  symptom: >
+    Décision utilisateur : retirer le paramètre kind du tool MCP
+    search. Le filtre kind incite les agents à restreindre la recherche
+    à un type d'artifact unique, ce qui appauvrit le rappel et contredit
+    l'intention du retrieval hybride (RFC bdee1af4) : retourner BEAUCOUP
+    de résultats tous kinds confondus pour exposer l'écosystème complet
+    d'un sujet. Le PM demande à l'Architect de trancher aussi le sort
+    des cinq autres filtres (tags, author, project, dates, id_prefix).
+    Avant de figer la signature, il faut un signal d'usage empirique :
+    quels filtres sont réellement utilisés, par qui, et lesquels sont du
+    cargo-cult d'API.
+
+  root_cause: >
+    PÉRIMÈTRE DE L'INVESTIGATION (pas une "cause" au sens panne, mais le
+    constat empirique qui fonde les décisions du RFC).
+
+    --- ÉTAT ACTUEL DE L'ARCHITECTURE search() (post-bdee1af4) ---
+
+    Le code a évolué au-delà de ce que décrivait la PROPOSITION 9 du RFC
+    bdee1af4. Trois couches coexistent aujourd'hui :
+
+    (1) Surface MCP : struct SearchParams
+        (crates/mcp-servers/orchestrator/src/main.rs:159-196). Expose 13
+        paramètres : query, kind, limit, mode, author, project, tags,
+        created_after, created_before, id_prefix, explain, rerank, hyde.
+        Le handler search() (main.rs:967-1005) mappe ces paramètres vers
+        SearchFilters + SearchRequest et appelle engine.search_hybrid.
+
+    (2) Cœur engine : SearchRequest (engine.rs:95) porte query, mode,
+        filters (SearchFilters), limit, rerank, hyde, explain.
+        engine.search_hybrid (engine.rs:785) est le SEUL point d'entrée
+        réellement utilisé. La struct SearchFilters (db.rs:150-158)
+        porte les six filtres : kinds (Vec), author, tags (Vec),
+        project, created_after, created_before, id_prefix.
+
+    (3) Legacy engine.search(query, kind, limit) (engine.rs:761-781).
+        Wrapper de compat qui construit un SearchFilters{kinds:[kind]}
+        et délègue à search_hybrid. CONSTAT EMPIRIQUE : rg sur
+        ".search(" dans tout crates/ (en excluant search_lexical /
+        search_semantic / search_hybrid / search_artifacts) ne retourne
+        AUCUN caller de cette fonction. C'est du code mort. La
+        PROPOSITION 9 du RFC bdee1af4 affirmait "un seul caller interne
+        main.rs:569" ; depuis, le MCP a migré vers search_hybrid direct
+        (main.rs:1005) et plus personne n'appelle le wrapper legacy.
+
+    --- MESURE FILTRE PAR FILTRE (les six) ---
+
+    Méthode : rg sur "SearchFilters", "kinds:", "kind:", noms de champs,
+    dans crates/ + company/config/ + company/personas/ + docs/.
+
+    FILTRE 1 — kind (kinds dans SearchFilters).
+      - Surface MCP : SearchParams.kind: Option<String> (main.rs:167),
+        mappé en kinds: vec![k] (main.rs:986).
+      - Code interne consommateur : append_filter_clauses (db.rs:168-180)
+        génère "AND a.kind IN (...)". Utilisé par search_lexical,
+        search_semantic ET list_with_filters (la branche list-mode).
+      - Callers internes passant un kind : legacy engine.search (MORT) +
+        list_by_kind pour les roadmaps (engine.rs:1053, 1151) qui
+        n'utilise PAS search mais une requête dédiée list_by_kind.
+      - Mentions prose : shared-rules.yml DEUX occurrences
+        (ligne 81 catalogue lesson-learned, ligne 180 règle `lessons`)
+        instruisent search(query, kind="lesson-learned") pour dédupliquer
+        les lessons. Aucune persona ne mentionne search(...kind...).
+      - Tests : integration_search.rs:462 filters_push_down_kind
+        (marqué #[ignore]), db.rs tests unitaires 2598/2718.
+      - VERDICT USAGE : le filtre kind est exposé MCP et documenté en
+        prose pour UN cas (dédup lessons). Mais ce cas est précisément
+        celui que le task-request identifie comme nuisible : restreindre
+        à un kind unique appauvrit le rappel sémantique. La dédup de
+        lesson bénéficie davantage d'un rappel large qui remonte les
+        lessons proches sémantiquement, pas d'un filtre par type.
+
+    FILTRE 2 — tags (Vec, OR semantics).
+      - Surface MCP : SearchParams.tags (main.rs:177).
+      - Code interne : append_filter_clauses (db.rs:201-215) via
+        EXISTS(json_each). Sémantique OR correcte.
+      - Callers internes : AUCUN. Aucun code du workspace ne construit
+        un SearchFilters{tags:...} hors surface MCP et tests.
+      - Mentions prose : aucune règle ni persona n'invoque tags=...
+      - VERDICT USAGE : exposé MCP, jamais consommé en interne. Usage
+        purement agent-driven, non observé empiriquement. Raffinement
+        légitime EN THÉORIE (réduire un rappel trop large par thématique)
+        mais sans signal d'usage réel à ce jour.
+
+    FILTRE 3 — id_prefix.
+      - Surface MCP : SearchParams.id_prefix (main.rs:183).
+      - Code interne : append_filter_clauses (db.rs:197-200) via LIKE.
+      - Callers internes : AUCUN hors MCP et tests.
+      - Mentions prose : aucune.
+      - VERDICT USAGE : exposé MCP, jamais consommé en interne. MAIS
+        cas d'usage qualitatif fort et distinct du retrieval : cibler un
+        artifact connu par préfixe d'UUID (ex. les agents manipulent en
+        permanence des id courts "bdee1af4"). C'est un raccourci de
+        lookup déterministe, pas une recherche floue. Distinction nette
+        d'avec kind.
+
+    FILTRE 4 — author.
+      - Surface MCP : SearchParams.author (main.rs:173).
+      - Code interne : append_filter_clauses (db.rs:181-184).
+      - Callers internes : AUCUN hors MCP et tests.
+      - Mentions prose : aucune. Aucun workflow CompanyOS ne raisonne
+        "tous les artifacts de l'auteur X". L'auteur est une métadonnée
+        de traçabilité, pas un axe de recherche.
+      - VERDICT USAGE : zéro signal. Candidat au retrait.
+
+    FILTRE 5 — project.
+      - Surface MCP : SearchParams.project (main.rs:175).
+      - Code interne : append_filter_clauses (db.rs:185-188).
+      - Callers internes : AUCUN hors MCP et tests.
+      - Mentions prose : aucune. Le besoin "artifacts d'un projet" existe
+        conceptuellement mais n'est invoqué par aucun caller ni règle.
+        search() est utilisé pour le lookup mémoire TRANSVERSE, pas pour
+        naviguer un projet (la navigation projet se fait par le
+        file_placement projects/<slug>/<kind>s/).
+      - VERDICT USAGE : zéro signal. Candidat au retrait.
+
+    FILTRE 6 — created_after / created_before.
+      - Surface MCP : SearchParams.created_after / created_before
+        (main.rs:179, 181).
+      - Code interne : append_filter_clauses (db.rs:189-196).
+      - Callers internes : AUCUN hors MCP et tests.
+      - Mentions prose : aucune. Aucun workflow ne filtre par fenêtre
+        temporelle. La fraîcheur est gérée par l'ordre de la list-mode
+        (ORDER BY created_at DESC), pas par un filtre date explicite.
+      - VERDICT USAGE : zéro signal. Candidats au retrait.
+
+    --- CONSTAT TRANSVERSE : LA BRANCHE LIST-MODE ---
+
+    search_hybrid (engine.rs:802-817) a une branche spéciale : si la
+    query est vide MAIS qu'au moins un filtre est présent, il appelle
+    list_with_filters (db.rs:1114) qui fait un scan filtré ordonné par
+    created_at DESC, en bypassant FTS et embeddings. C'est en pratique
+    un list_artifacts(filtres) déjà implémenté DANS search. Le besoin
+    "lister tous les RFCs" évoqué par le task-request est donc déjà
+    couvert techniquement par search(query="", kind="rfc"). Retirer kind
+    de la SURFACE MCP sans toucher SearchFilters.kinds (champ interne)
+    préserve cette capacité pour un futur tool list_artifacts dédié.
+
+  resolution: >
+    DÉCISIONS ARCHITECTURALES (formalisées dans le RFC 1d3a3581).
+
+    Le diagnostic dégage trois groupes de filtres selon le signal
+    d'usage et la cohérence avec la mission du retrieval :
+
+    GROUPE A — À RETIRER de la surface MCP search :
+      - kind : décision utilisateur, et confirmé : son seul usage prose
+        (dédup lessons) est précisément l'anti-pattern dénoncé.
+      - author, project, created_after, created_before : zéro signal
+        d'usage interne, zéro mention prose, aucun workflow ne les
+        invoque. Du cargo-cult d'API (lesson 02b8e1ce) : exposés "au cas
+        où" lors de l'implémentation bdee1af4, jamais consommés. Les
+        garder maintient une surface MCP large qui invite à des
+        restrictions appauvrissant le rappel, exactement le défaut visé
+        par le task-request.
+
+    GROUPE B — À GARDER sur la surface MCP search :
+      - tags : raffinement thématique légitime (OR semantics), aligné
+        avec la nature du retrieval (réduire un rappel trop large sans
+        filtrer par TYPE). Position PM confirmée.
+      - id_prefix : raccourci de lookup déterministe par UUID, usage
+        qualitatif distinct du retrieval flou, fortement aligné avec la
+        manière dont les agents manipulent les ids. Position PM confirmée.
+
+    GROUPE C — CONSERVÉ EN INTERNE (SearchFilters), retiré de la surface :
+      - Le champ SearchFilters.kinds N'EST PAS supprimé du cœur : il
+        reste utilisé par la branche list-mode et par list_by_kind. Seul
+        le mapping depuis SearchParams.kind disparaît. Cela préserve la
+        capacité de listing pour un futur tool list_artifacts(kind) sans
+        re-câbler le cœur.
+      - author, project, dates : leur champ dans SearchFilters peut être
+        conservé (inerte) ou retiré. Le RFC tranche : les conserver
+        inertes dans SearchFilters serait à son tour du cargo-cult ;
+        ils sont retirés de SearchFilters ET de append_filter_clauses
+        (sauf si la list-mode en a besoin, ce qui n'est pas le cas). Le
+        RFC précise le périmètre exact de suppression.
+
+    NETTOYAGE COLLATÉRAL :
+      - La fonction legacy engine.search(query, kind, limit) est du code
+        mort confirmé. Le RFC la retire (ou la conserve en la purgeant
+        de l'argument kind), décision tranchée dans le RFC.
+      - shared-rules.yml : les deux occurrences search(query,
+        kind="lesson-learned") (lignes 81 et 180) doivent être
+        reformulées en search(query) simple, cohérent avec le message du
+        task-request (le rappel large remonte mieux les lessons proches).
+
+    BREAKING CHANGE : retrait PUR recommandé (cf. RFC), pas de
+    deprecation graceful. Rationale détaillée dans le RFC : la surface
+    MCP n'a pas de versioning, les seuls callers externes sont les agents
+    via prose (mise à jour dans le même cycle), et un paramètre "accepté
+    mais ignoré avec warning" maintient l'invitation à filtrer par kind
+    que le task-request veut justement supprimer (lesson 4e5c109b :
+    préférer l'invariant mécanique dur à la discipline).
+
+  status: resolved

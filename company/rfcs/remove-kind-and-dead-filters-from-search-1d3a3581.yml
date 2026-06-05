@@ -1,0 +1,377 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 1d3a3581-db81-4c95-9973-2cbae7be35df
+  status: approved
+  approved_at: "2026-06-05T19:35:02.650394342+00:00"
+  title: "Retrait du filtre kind (et des filtres morts author/project/dates) de la surface MCP search ; conservation de tags et id_prefix"
+  author: architect
+  created_at: "2026-06-05"
+  description: >
+    Suite au task-request e362e438 (décision utilisateur) et au
+    diagnostic-report 655f74d7 (mesure d'usage empirique des six filtres
+    structurés introduits par le RFC bdee1af4). Retire le paramètre kind
+    du tool MCP search, ainsi que les trois filtres author, project et
+    created_after/created_before pour lesquels le diagnostic n'a relevé
+    AUCUN signal d'usage interne ni aucune mention dans les règles ou
+    workflows (cargo-cult d'API, lesson 02b8e1ce). Conserve tags
+    (raffinement thématique légitime) et id_prefix (raccourci de lookup
+    déterministe par UUID). Conserve le champ interne SearchFilters.kinds
+    (utilisé par la branche list-mode et par list_by_kind) pour préserver
+    la capacité de listing en vue d'un futur tool list_artifacts.
+    Supprime la fonction legacy engine.search(query, kind, limit),
+    confirmée code mort (zéro caller interne). Met à jour les deux
+    occurrences de search(query, kind="lesson-learned") dans
+    shared-rules.yml et le guide opérateur docs/search-guide.md. Breaking
+    change contrôlé sur la surface MCP search (retrait pur, pas de
+    deprecation graceful). Touche les zones protégées crates/orchestrator/,
+    crates/mcp-servers/orchestrator/, et company/config/shared-rules.yml.
+    Approbation CEO et write permit requis.
+  tags:
+    - search
+    - retrieval
+    - api
+    - filters
+    - simplification
+    - breaking-change
+    - companyos-internals
+  related:
+    - id: e362e438-e550-4c98-9cdd-2af21b5d8978
+      kind: task-request
+      relationship: input
+    - id: 655f74d7-7ac4-44b2-88ff-f0063d7680d9
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: bdee1af4-4944-4bee-b7c0-18efd6c7961f
+      kind: rfc
+      relationship: related
+    - id: 600307a4-74f6-43dd-95e1-4dee3d2326c1
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  motivation: >
+    Le RFC bdee1af4 a refondu search() en hybrid retrieval et a, au
+    passage, introduit six filtres structurés (kind, author, tags,
+    project, dates, id_prefix). L'intention du retrieval hybride est de
+    maximiser le rappel : retourner BEAUCOUP de résultats pertinents tous
+    kinds confondus pour exposer l'écosystème complet d'un sujet
+    (task-request + design-doc + RFC + lesson + diagnostic). Le filtre
+    kind contredit frontalement cette intention : il incite les agents à
+    restreindre la recherche à un type unique, ce qui appauvrit le
+    rappel et transforme le lookup mémoire en vue tunnel.
+
+    Le diagnostic-report 655f74d7 a mesuré l'usage réel des six filtres
+    par recension exhaustive (rg sur SearchFilters, les noms de champs,
+    les callers de search, dans crates/ + company/config/ +
+    company/personas/ + docs/). Trois constats fondent ce RFC :
+
+    (1) Le filtre kind n'a qu'un seul usage documenté en prose :
+    shared-rules.yml instruit deux fois search(query,
+    kind="lesson-learned") pour dédupliquer les lessons (lignes 81 et
+    180). Or c'est précisément l'anti-pattern visé : la dédup de lesson
+    bénéficie d'un rappel sémantique large qui remonte les lessons
+    proches, pas d'un filtre par type qui masque les artifacts adjacents.
+
+    (2) Quatre des six filtres (author, project, created_after,
+    created_before) n'ont AUCUN caller interne, AUCUNE mention dans une
+    règle ou une persona, AUCUN workflow qui les invoque. Ils ont été
+    exposés "au cas où" lors de l'implémentation bdee1af4 et jamais
+    consommés. C'est du cargo-cult d'API (lesson 02b8e1ce) : une surface
+    MCP large invite à des restrictions qui appauvrissent le rappel,
+    exactement le défaut que ce RFC veut éliminer.
+
+    (3) Deux filtres ont un usage qualitatif distinct du retrieval flou
+    et alignés avec la nature du lookup : tags (raffinement thématique,
+    OR semantics, réduit un rappel trop large sans filtrer par TYPE) et
+    id_prefix (raccourci déterministe pour cibler un artifact connu par
+    préfixe d'UUID, exploitant la manière dont les agents manipulent en
+    permanence des ids courts comme "bdee1af4"). Ils sont conservés.
+
+    Justification du choix RFC plutôt que design-doc simple. Les critères
+    de shared-rules.yml pour un RFC sont réunis :
+      (a) Le correctif modifie crates/orchestrator/ et
+          crates/mcp-servers/orchestrator/, zones protégées crates/.
+      (b) Le correctif change la signature du contrat MCP search exposé à
+          tous les agents (breaking change contrôlé).
+      (c) Le correctif modifie company/config/shared-rules.yml, qui
+          régit le comportement de tous les agents.
+      (d) Il s'agit d'un changement structurel de la surface d'un service
+          infrastructurel critique (la recherche, cœur de la mémoire
+          collective).
+    Approbation CEO + write permit ciblant les affected_files requis.
+
+    Application de la préférence 4e5c109b (un invariant mécanique dur
+    plutôt qu'une discipline déléguée aux agents) : plutôt que d'ajouter
+    une règle "n'utilisez pas le filtre kind", on RETIRE le paramètre.
+    L'invariant devient impossible à violer.
+
+  proposal: >
+    Le RFC documente le QUOI et le POURQUOI au niveau des contrats. Les
+    noms exacts de fonctions, l'ordre des étapes et les détails de
+    suppression relèvent de l'implementation-plan dérivé.
+
+    --- DÉCISION 1 — RETRAIT PUR vs DEPRECATION GRACEFUL ---
+
+    DÉCISION : retrait PUR. Le paramètre kind (et author, project,
+    created_after, created_before) est supprimé de la struct SearchParams
+    de la surface MCP. Un appel qui passe encore kind=X reçoit le
+    comportement standard de désérialisation MCP d'un champ inconnu
+    (ignoré ou erreur selon le framework rmcp ; l'implementation-plan
+    vérifie le comportement effectif et le documente).
+
+    Rationale du retrait pur contre la deprecation graceful (accepté +
+    warning) :
+      (a) La surface MCP n'a pas de versioning sémantique ni de contrat
+          de stabilité externe : il n'y a pas de client tiers compilé
+          contre cette signature. Les seuls "callers" sont les agents qui
+          construisent l'appel à la volée à partir de la prose des
+          règles.
+      (b) Conserver kind "accepté mais ignoré avec warning" maintient
+          l'INVITATION à filtrer par kind dans le schéma du tool (le
+          champ reste visible dans la description JSON Schema exposée aux
+          agents). C'est exactement ce que le task-request veut supprimer.
+          Un champ déprécié-mais-présent continue d'être proposé par
+          l'auto-complétion du LLM.
+      (c) Préférence 4e5c109b : l'invariant "on ne peut pas filtrer par
+          kind dans search" est mieux garanti par l'absence du champ que
+          par un warning que l'agent peut ignorer.
+      (d) La migration des callers (prose shared-rules) est faite dans le
+          MÊME cycle (cf. DÉCISION 5), donc il n'y a pas de fenêtre de
+          transition à couvrir.
+
+    --- DÉCISION 2 — SORT DES SIX FILTRES ---
+
+    Groupe RETIRÉ de la surface MCP search :
+      - kind     : décision utilisateur + anti-pattern confirmé.
+      - author   : zéro usage, zéro mention, zéro workflow.
+      - project  : zéro usage. La navigation projet se fait par le
+                   file_placement projects/<slug>/, pas par search.
+      - created_after / created_before : zéro usage. La fraîcheur est
+                   déjà gérée par l'ORDER BY created_at DESC de la
+                   list-mode.
+
+    Groupe CONSERVÉ sur la surface MCP search :
+      - tags     : raffinement thématique OR, aligné retrieval.
+      - id_prefix: raccourci de lookup déterministe par UUID.
+      - query, limit, mode, explain, rerank, hyde : inchangés.
+
+    --- DÉCISION 3 — PÉRIMÈTRE DE SUPPRESSION DANS LE CŒUR ---
+
+    Le champ SearchFilters.kinds N'EST PAS supprimé du cœur. Il reste :
+      - utilisé par la branche list-mode de search_hybrid
+        (engine.rs:808-817 via list_with_filters) ;
+      - cohérent avec list_by_kind (db.rs:1226) utilisé pour les
+        roadmaps.
+    Seul le MAPPING depuis SearchParams.kind vers SearchFilters.kinds
+    disparaît (main.rs:986). Cela préserve la capacité de listing par
+    kind pour un futur tool list_artifacts (cf. DÉCISION 4) sans
+    re-câbler le cœur.
+
+    Les champs SearchFilters.author, SearchFilters.project,
+    SearchFilters.created_after, SearchFilters.created_before SONT
+    supprimés de la struct SearchFilters (db.rs:150-158), de la fonction
+    append_filter_clauses (db.rs:181-196), et du calcul has_filter de
+    search_hybrid (engine.rs:794-800). Rationale : les conserver inertes
+    dans SearchFilters serait à son tour du cargo-cult ; aucun caller ne
+    les alimente une fois retirés de la surface MCP. SearchFilters est une
+    API publique de crate (re-exportée par lib.rs ligne 12) : sa
+    réduction est un breaking change de crate, mais l'inventaire des
+    callers (cf. INVENTAIRE DES CALLERS ci-dessous) confirme que seul le
+    crate mcp-servers/orchestrator la consomme, dans le code modifié par
+    ce même RFC.
+
+    Le champ SearchFilters.tags et SearchFilters.id_prefix sont
+    CONSERVÉS (toujours alimentés depuis la surface MCP).
+
+    --- DÉCISION 4 — TOOL list_artifacts(kind) ---
+
+    HORS SCOPE de ce RFC, conformément à l'out_of_scope du task-request.
+    Constat technique pour un futur cycle : le besoin "lister tous les
+    artifacts d'un kind" est DÉJÀ couvert techniquement par la branche
+    list-mode (search avec query vide + filtre), mais cette branche perd
+    son entrée kind sur la surface MCP après ce RFC. Recommandation pour
+    la suite (à cadrer par le PM en task-request séparé si le besoin se
+    matérialise) : exposer un tool MCP dédié list_artifacts(kind, limit)
+    qui appelle list_by_kind / list_with_filters. La conservation du
+    champ interne SearchFilters.kinds (DÉCISION 3) garde cette porte
+    ouverte sans dette. Ce RFC ne crée PAS ce tool.
+
+    --- DÉCISION 5 — MISE À JOUR DES CALLERS PROSE ---
+
+    company/config/shared-rules.yml : les deux occurrences
+    search(query, kind="lesson-learned") (ligne 81 dans le catalogue
+    lesson-learned, ligne 180 dans la règle `lessons`) sont reformulées en
+    search(query) simple. Le message accompagnant est ajusté pour
+    expliciter que le rappel large remonte mieux les lessons proches
+    qu'un filtre par type. Aucune persona ne mentionne search(...kind...)
+    (vérifié), donc aucune persona n'est touchée.
+
+    --- DÉCISION 6 — NETTOYAGE DU CODE MORT ---
+
+    La fonction legacy engine.search(query, kind, limit)
+    (engine.rs:761-781) est confirmée code mort par le diagnostic
+    655f74d7 (zéro caller interne ; le MCP appelle search_hybrid
+    directement). Elle est SUPPRIMÉE. Rationale : conserver une fonction
+    morte dont l'unique argument structurant est kind (le filtre qu'on
+    retire) serait incohérent. Si un futur besoin de wrapper mono-mode
+    réapparaît, il sera recréé sans kind. L'implementation-plan vérifie
+    une dernière fois l'absence de caller via get_references LSP avant
+    suppression.
+
+    --- DÉCISION 7 — TESTS ---
+
+    - integration_search.rs:462 filters_push_down_kind (marqué #[ignore])
+      : conservé car il teste le push-down du champ INTERNE
+      SearchFilters.kinds, qui survit. Aucune modification fonctionnelle
+      requise ; l'implementation-plan vérifie qu'il compile toujours.
+    - db.rs tests unitaires qui construisent SearchFilters avec author/
+      project/dates (s'il en existe) : retirés ou ajustés. Les tests
+      2598/2718 construisent SearchFilters{kinds:...} et ne sont donc pas
+      touchés par le retrait des champs author/project/dates.
+    - Un test (unitaire ou intégration) est ajouté pour figer le contrat
+      post-RFC : la struct SearchParams n'expose plus kind/author/project/
+      dates, et tags + id_prefix continuent de filtrer correctement.
+    - Acceptance criterion empirique du task-request : les 3 queries du
+      symptôme original (search semantic embeddings vector ; recherche
+      memoire collective FTS ; lookup memoire faux negatif) retournent au
+      moins 5 résultats avec recall >= baseline 0.895. Le jeu de queries
+      de référence (constante Rust inline, cf. lesson 600307a4
+      arbitrage (d)) est vérifié ; aucune query du set ne dépend du
+      filtre kind (à confirmer dans l'implementation-plan).
+
+    --- DÉCISION 8 — DOCUMENTATION ---
+
+    docs/search-guide.md : section 2.4 (Filtres structurés) et section 4
+    (API du tool MCP search) mises à jour pour ne lister que tags et
+    id_prefix comme filtres MCP, retirer kind/author/project/dates de
+    l'exemple JSON, et documenter que le filtrage par kind relève d'un
+    futur tool list_artifacts (renvoi DÉCISION 4).
+
+    --- ANALYSE TRIAXIALE ---
+
+    CAS NOMINAL. Un agent appelle search("roadmap auto-sync"). Avant : un
+    agent tenté de faire search("roadmap", kind="rfc") rate le
+    task-request, le design-doc, l'implementation-plan et la lesson.
+    Après : impossible de filtrer par kind, le rappel hybride remonte
+    l'écosystème complet. Comportement attendu et désiré. tags et
+    id_prefix restent disponibles pour raffiner si le rappel est trop
+    large.
+
+    CAS NÉGATIF. Un agent (ou une prose non encore migrée) appelle
+    search(query, kind="lesson-learned") après le merge. Le champ kind
+    n'existe plus dans le schéma. Comportement : selon rmcp, le champ
+    inconnu est soit ignoré silencieusement (l'appel réussit avec un
+    rappel large, ce qui est le comportement souhaité), soit rejeté avec
+    une erreur de désérialisation. L'implementation-plan DOIT déterminer
+    empiriquement lequel des deux se produit et le documenter. Si c'est
+    une erreur dure, vérifier qu'AUCUNE prose résiduelle (au-delà des
+    deux lignes shared-rules migrées) ne passe kind, sous peine de casser
+    un workflow. La recension du diagnostic 655f74d7 confirme qu'il n'y a
+    que ces deux occurrences. Idem pour author/project/dates : zéro
+    occurrence prose, donc aucun risque de casse.
+
+    CAS EDGE. (a) Filtres combinés : search(query, tags=[...],
+    id_prefix="x"). Les deux filtres survivants se combinent en AND (tags
+    OR-interne, id_prefix LIKE), comportement inchangé par ce RFC. (b)
+    Query vide + tags seul : la branche list-mode (has_filter recalculé
+    sans author/project/dates) reste déclenchée par tags ou id_prefix ou
+    kinds interne. L'implementation-plan vérifie que has_filter
+    (engine.rs:794) compile après retrait des trois champs et que la
+    list-mode reste atteignable. (c) Query vide + AUCUN filtre : l'erreur
+    "empty query requires at least one filter" reste levée (inchangé).
+    (d) Filtre kinds interne via list-mode : préservé, mais plus
+    atteignable depuis la surface MCP search après ce RFC ; uniquement
+    via list_by_kind interne (roadmaps) en attendant list_artifacts.
+
+  impact: >
+    COMPOSANTS TOUCHÉS.
+
+    Surface MCP (crates/mcp-servers/orchestrator/src/main.rs) :
+      - struct SearchParams : suppression des champs kind, author,
+        project, created_after, created_before. Conservation de query,
+        limit, mode, tags, id_prefix, explain, rerank, hyde.
+      - handler search() : suppression du mapping de ces champs vers
+        SearchFilters.
+
+    Cœur (crates/orchestrator/src/db.rs) :
+      - struct SearchFilters : suppression des champs author, project,
+        created_after, created_before. Conservation de kinds, tags,
+        id_prefix.
+      - fn append_filter_clauses : suppression des clauses author,
+        project, dates. Conservation des clauses kinds, tags, id_prefix.
+      - tests unitaires construisant SearchFilters avec champs retirés :
+        ajustés.
+
+    Cœur (crates/orchestrator/src/engine.rs) :
+      - fn search (legacy) : supprimée (code mort).
+      - calcul has_filter dans search_hybrid : suppression des disjonctions
+        author/project/dates.
+
+    Tests (crates/orchestrator/tests/integration_search.rs) :
+      - filters_push_down_kind : conservé (teste le champ interne kinds),
+        vérification de compilation.
+      - éventuel nouveau test de contrat post-RFC.
+
+    Config (company/config/shared-rules.yml) :
+      - règle `lessons` (ligne ~180) et catalogue lesson-learned
+        (ligne ~81) : search(query, kind="lesson-learned") devient
+        search(query).
+
+    Documentation (docs/search-guide.md) :
+      - sections 2.4 et 4 mises à jour.
+
+    INVENTAIRE DES CALLERS (discipline RFC eb42a8de, rules.must Architect).
+    Symbole public de crate touché : SearchFilters (re-exporté
+    lib.rs:12). Recension via rg sur "SearchFilters" dans tout le
+    workspace :
+      - crates/orchestrator/src/db.rs : définition + append_filter_clauses
+        + search_lexical + search_semantic + list_with_filters + tests.
+      - crates/orchestrator/src/engine.rs : legacy search (supprimée) +
+        construction dans search_hybrid via les champs.
+      - crates/mcp-servers/orchestrator/src/main.rs:985 : construction
+        depuis SearchParams (modifiée par ce RFC).
+      - crates/orchestrator/tests/integration_search.rs : tests.
+    Aucun autre crate du workspace ne consomme SearchFilters. La fonction
+    legacy engine.search : zéro caller (confirmé diagnostic 655f74d7).
+    L'union callers + définition est couverte par les affected_files
+    ci-dessous. L'implementation-plan re-vérifie via get_references LSP
+    avant la suppression effective.
+
+    RISQUES.
+      R1 — Prose résiduelle non recensée passant kind/author/project/dates.
+      Mitigation : recension exhaustive faite (diagnostic 655f74d7) ;
+      seules 2 occurrences kind, 0 des autres. L'implementation-plan
+      refait un rg de confirmation avant merge.
+      R2 — Comportement rmcp sur champ inconnu (ignore vs erreur) non
+      déterminé à ce stade. Mitigation : l'implementation-plan le mesure
+      empiriquement et documente ; quel que soit le comportement, la
+      recension R1 garantit qu'aucun caller légitime n'envoie ces champs.
+      R3 — Régression de la list-mode si has_filter mal réduit.
+      Mitigation : test de la list-mode (query vide + tags) dans
+      l'implementation-plan.
+      R4 — Perte de la capacité de listing par kind depuis la surface MCP.
+      Acceptée et documentée : champ interne kinds conservé, futur tool
+      list_artifacts cadrable séparément (DÉCISION 4).
+
+  rollback_plan: >
+    Le changement est purement additif-inverse (retrait de champs) et
+    confiné à six fichiers. Rollback = git revert du commit
+    d'implémentation, qui restaure les champs SearchParams et
+    SearchFilters, la fonction legacy engine.search, les clauses
+    append_filter_clauses, et les deux lignes de shared-rules. Aucune
+    migration de données (la DB et l'index ne changent pas : seul le
+    câblage de l'API de recherche est modifié). Aucun rebuild de l'index
+    requis (les colonnes a.kind, a.author, a.project, a.created_at restent
+    dans la table artifacts, simplement plus filtrées depuis la surface
+    MCP search). Le revert recompile et restaure le comportement
+    pré-RFC sans effet de bord.
+
+  affected_files:
+    modified:
+      - crates/mcp-servers/orchestrator/src/main.rs
+      - crates/orchestrator/src/db.rs
+      - crates/orchestrator/src/engine.rs
+      - crates/orchestrator/tests/integration_search.rs
+      - company/config/shared-rules.yml
+      - docs/search-guide.md
