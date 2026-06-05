@@ -1,0 +1,153 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: b6ec1709-abe3-4415-a0ed-93b50c6a64c7
+  title: "Remonter une discipline de la mémoire passive (lesson) vers le contrat actif (persona rules.must) quand le jugement d'agent reste requis"
+  author: implementer
+  created_at: "2026-06-05"
+  description: >
+    Capitalisation de clôture après l'implémentation du RFC eb42a8de
+    (iteration 2, plan 1c590771) : la discipline « lister
+    exhaustivement les callers d'une API publique de crate avant de
+    figer ou modifier sa signature » est remontée de la mémoire passive
+    (lessons ea6e9dd1, 611fde3e) vers le contrat actif des agents
+    (rules.must des personas Architect et Implementer). Trois
+    enseignements : (a) le critère qui décide persona vs tool/algorithme
+    (application directe de la préférence 4e5c109b) ; (b) pourquoi une
+    recommandation en lesson ne suffit pas et a laissé deux incidents se
+    produire APRÈS sa rédaction ; (c) une friction de process observée
+    pendant l'exécution (le pre-commit make ci global sérialise des
+    chantiers parallèles disjoints).
+  tags:
+    - workflow
+    - api
+    - callers
+    - personas
+    - rules-must
+    - passive-vs-active-memory
+    - determinism
+    - companyos-internals
+    - lessons-from-implementation
+  related:
+    - id: 4e5c109b-ec35-46ff-98af-3714b1d7a36f
+      kind: lesson-learned
+      relationship: derived-from
+    - id: ea6e9dd1-93dc-4b19-9854-103328203489
+      kind: lesson-learned
+      relationship: derived-from
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+    - id: eb42a8de-e6a9-4f7b-81d1-c91d7120b626
+      kind: rfc
+      relationship: derived-from
+    - id: 56513173-dfc6-4c9b-b150-b84e921eeecf
+      kind: diagnostic-report
+      relationship: related
+
+spec:
+  context: >
+    Le diagnostic 56513173 recensait deux RFCs récents (062ebaa8,
+    bdee1af4) ayant omis un caller d'une API publique de crate dans leur
+    scope, chacun provoquant un round-trip CEO pour un permit
+    complémentaire en cours d'exécution. La recommandation « grepper les
+    callers avant de figer le scope » existait DÉJÀ dans les lessons
+    ea6e9dd1 (reco 4) et 611fde3e (reco 3), mais les deux incidents sont
+    POSTÉRIEURS à ces lessons. Une recommandation qui ne vit que dans la
+    mémoire passive est consultée à la discrétion de l'agent ; elle se
+    perd.
+
+    L'iteration 1 du RFC proposait une mécanisation : un tool MCP
+    list_callers, un champ schema caller_inventory, une règle
+    shared-rules. L'utilisateur a tranché « overkill » et a réduit le
+    scope à l'iteration 2 : instrumenter UNIQUEMENT les personas
+    Architect et Implementer via une entrée rules.must, en s'appuyant
+    sur les outils que les agents possèdent déjà (rg, get_references
+    LSP).
+
+    L'implémentation finale est purement YAML : deux entrées rules.must,
+    une par persona. Zéro code Rust, zéro schema, zéro tool.
+
+  insight: >
+    (1) LE CRITÈRE PERSONA vs TOOL/ALGORITHME (application directe de
+    4e5c109b). La production de la liste brute des callers est triviale
+    et déjà à portée d'agent (rg, get_references). Mais le travail NON
+    trivial — juger quels callers sont impactés par un changement de
+    signature donné, lesquels listés dans affected_files, lesquels
+    cassés ou pas — reste du jugement. Un tool MCP qui wrappe rg
+    n'automatise que l'étape triviale et laisse la partie non-triviale
+    au LLM : garantie seulement PARTIELLE, donc surface de maintenance
+    sans garantie de bout en bout. Règle dérivée : quand la propriété
+    visée exige du jugement irréductible, ne pas construire un demi-tool ;
+    instrumenter la persona via rules.must, qui est injecté dans le
+    contexte de l'agent à CHAQUE session (rappel actif), contrairement à
+    une lesson consultée à la discrétion (mémoire passive).
+
+    (2) POURQUOI LA LESSON NE SUFFISAIT PAS. C'est le point d'honnêteté
+    du sanity-check rétroactif du RFC : dans les deux incidents, l'agent
+    AVAIT déjà accès à rg ET aux lessons recommandant son usage, et ne
+    l'a pas fait. Remonter la discipline en rules.must ne SUPPRIME pas le
+    risque d'oubli — c'est une discipline déléguée à un agent, donc
+    faillible par construction (cf. 4e5c109b : une règle LLM peut être
+    oubliée, contrairement à un algorithme déterministe). Ce que la
+    remontée change : un DÉPLACEMENT DE PROBABILITÉ (rappel injecté à
+    chaque session + double passage Architect-au-RFC / Implementer-à-
+    l'exécution + le compilateur en filet final), pas une garantie. Le
+    risque résiduel est ASSUMÉ explicitement comme le coût de la
+    décision utilisateur de ne pas mécaniser. Si les oublis persistent
+    malgré la règle persona, le sujet pourra être ré-escaladé vers une
+    mécanisation déterministe avec coût/bénéfice réévalué.
+
+    (3) FRICTION DE PROCESS OBSERVÉE EN EXÉCUTION. Le commit a été
+    bloqué une première fois non par mon chantier (2 edits YAML validés)
+    mais par le pre-commit hook `make ci` qui compile TOUT le workspace
+    Rust et butait sur un WIP roadmap auto-sync non commité et cassé,
+    laissé par un chantier parallèle. Le hook global est un point de
+    SÉRIALISATION : tant qu'un WIP non compilable est dans le working
+    tree, AUCUN commit ne passe, même pour des chantiers travaillant sur
+    des fichiers totalement disjoints. La bonne réponse a été une pause
+    propre (agent-message au PM, permit laissé actif/non consommé, edits
+    persistés) plutôt qu'un forçage ou une intrusion dans le WIP d'un
+    autre. Reprise triviale une fois la CI verte.
+
+  recommendation: >
+    1. AVANT DE PROPOSER UN TOOL MCP pour une discipline de workflow,
+       appliquer le test de 4e5c109b : le tool produit-il une garantie
+       de bout en bout ? Si le tool ne fait qu'une étape qu'un agent
+       doit de toute façon raisonner derrière (le jugement reste requis),
+       NE PAS le construire. Instrumenter la persona via rules.must à la
+       place. Le verbatim utilisateur « overkill » est le signal direct
+       de ce cas.
+
+    2. POUR REMONTER UNE DISCIPLINE de la mémoire passive vers le
+       contrat actif : éditer rules.must de la ou des personas
+       concernées. rules.must est injecté à chaque session ; une lesson
+       ne l'est pas. Si une discipline recommandée en lesson échoue à
+       répétition (incidents POSTÉRIEURS à la lesson), c'est le signal
+       qu'elle doit migrer vers la persona. Garder la lesson comme trace
+       du rationale, ajouter la règle persona comme rappel opérationnel.
+
+    3. ASSUMER ET DOCUMENTER le risque résiduel d'une discipline
+       déléguée. Une règle persona réduit la fréquence des oublis sans
+       l'annuler. Si la donnée empirique montre que les oublis
+       persistent, ré-escalader vers une mécanisation déterministe via
+       un nouveau RFC — ne pas empiler des rappels en lesson.
+
+    4. EN CAS DE CONTENTION CI ENTRE CHANTIERS PARALLÈLES (pre-commit
+       make ci global bloqué par un WIP tiers non compilable) : ne PAS
+       forcer le commit, ne PAS toucher au WIP d'un autre chantier.
+       Pause propre : agent-message au PM, permit laissé actif (non
+       consommé), edits persistés et validés dans le working tree.
+       Demander au PM de relancer une fois le working tree vert et de
+       coordonner les autres chantiers touchés. Candidat RFC
+       d'amélioration si le pattern persiste : scoper la CI du
+       pre-commit aux fichiers réellement modifiés par le commit, ou
+       sérialiser explicitement les chantiers Rust concurrents.
+
+    5. POUR LE CHANTIER DE CALLER INVENTORY LUI-MÊME : l'Architect
+       recense désormais les callers (rg / get_references LSP) avant de
+       figer une signature au RFC/design-doc et liste l'union (callers +
+       définition) dans affected_files ; l'Implementer REFAIT le
+       recensement avant de modifier (callers ajoutés depuis le RFC) et
+       signale par agent-message AVANT toute écriture si la liste diverge
+       du permit. Ne jamais contourner un permit incomplet.
