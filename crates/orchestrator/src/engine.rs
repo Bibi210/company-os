@@ -754,32 +754,6 @@ impl OrchestratorEngine {
         Ok(artifact)
     }
 
-    /// Legacy single-mode search kept for direct callers that did not
-    /// migrate to [`Self::search_hybrid`]. Internally calls the new
-    /// hybrid pipeline with `mode = Hybrid` and falls back to lexical
-    /// if the embedder is unavailable.
-    pub fn search(
-        &self,
-        query: &str,
-        kind: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<ArtifactSummary>, OrchestratorError> {
-        let filters = crate::db::SearchFilters {
-            kinds: kind.map(|k| vec![k.to_string()]),
-            ..Default::default()
-        };
-        let req = SearchRequest {
-            query: query.to_string(),
-            mode: SearchMode::Hybrid,
-            filters,
-            limit,
-            rerank: false,
-            hyde: false,
-            explain: false,
-        };
-        Ok(self.search_hybrid(req)?.results)
-    }
-
     /// Hybrid search entry point. Drives the lexical + semantic + fusion
     /// pipeline per the request mode and filters.
     pub fn search_hybrid(&self, req: SearchRequest) -> Result<SearchResponse, OrchestratorError> {
@@ -792,11 +766,7 @@ impl OrchestratorEngine {
         // (1) Empty query handling
         let query_empty = req.query.trim().is_empty();
         let has_filter = req.filters.kinds.is_some()
-            || req.filters.author.is_some()
             || req.filters.tags.is_some()
-            || req.filters.project.is_some()
-            || req.filters.created_after.is_some()
-            || req.filters.created_before.is_some()
             || req.filters.id_prefix.is_some();
 
         if query_empty && !has_filter {

@@ -160,25 +160,12 @@ struct AuthenticateParams {
 struct SearchParams {
     #[schemars(description = "Full-text search query")]
     query: String,
-    #[schemars(
-        description = "Optional: filter by artifact kind (e.g., lesson-learned, design-doc). \
-                       Accepts a single string for backwards compatibility."
-    )]
-    kind: Option<String>,
     #[schemars(description = "Maximum number of results (default 10)")]
     limit: Option<usize>,
     #[schemars(description = "Optional: search mode 'lexical', 'semantic', or 'hybrid' (default)")]
     mode: Option<String>,
-    #[schemars(description = "Optional: filter by author persona id")]
-    author: Option<String>,
-    #[schemars(description = "Optional: filter by project slug")]
-    project: Option<String>,
     #[schemars(description = "Optional: filter by tag (OR semantics across the list)")]
     tags: Option<Vec<String>>,
-    #[schemars(description = "Optional: artifacts created on or after this RFC3339 timestamp")]
-    created_after: Option<String>,
-    #[schemars(description = "Optional: artifacts created on or before this RFC3339 timestamp")]
-    created_before: Option<String>,
     #[schemars(description = "Optional: filter by metadata.id prefix")]
     id_prefix: Option<String>,
     #[schemars(description = "Optional: when true, return scores and timing trace")]
@@ -982,13 +969,12 @@ impl OrchestratorServer {
                     .to_string());
             }
         };
+        // kinds is not wired from the MCP search surface (RFC 1d3a3581):
+        // filtering by kind belongs to a future list_artifacts tool. The
+        // internal field is preserved for the list-mode and list_by_kind.
         let filters = companyos_orchestrator::SearchFilters {
-            kinds: params.kind.map(|k| vec![k]),
-            author: params.author,
+            kinds: None,
             tags: params.tags,
-            project: params.project,
-            created_after: params.created_after,
-            created_before: params.created_before,
             id_prefix: params.id_prefix,
         };
         let req = companyos_orchestrator::engine::SearchRequest {

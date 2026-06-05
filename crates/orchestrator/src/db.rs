@@ -146,14 +146,16 @@ const META_MODEL_VERSION_KEY: &str = "model_version";
 /// Structured filters for `search_lexical` / `search_semantic`. All
 /// fields are optional and combined with AND in the SQL WHERE clause.
 /// `tags` and `kinds` use IN semantics (OR within a single field).
+///
+/// `kinds` is retained for the internal list-mode (and `list_by_kind`
+/// for roadmaps) but is no longer wired from the MCP `search` surface
+/// (RFC 1d3a3581). `author`, `project` and the `created_*` date filters
+/// were removed entirely: they had zero callers and were cargo-cult API
+/// (diagnostic 655f74d7).
 #[derive(Debug, Clone, Default)]
 pub struct SearchFilters {
     pub kinds: Option<Vec<String>>,
-    pub author: Option<String>,
     pub tags: Option<Vec<String>>,
-    pub project: Option<String>,
-    pub created_after: Option<String>,
-    pub created_before: Option<String>,
     pub id_prefix: Option<String>,
 }
 
@@ -177,22 +179,6 @@ fn append_filter_clauses(
             params_vec.push(Box::new(k.clone()));
         }
         sql.push(')');
-    }
-    if let Some(author) = &filters.author {
-        sql.push_str(" AND a.author = ?");
-        params_vec.push(Box::new(author.clone()));
-    }
-    if let Some(project) = &filters.project {
-        sql.push_str(" AND a.project = ?");
-        params_vec.push(Box::new(project.clone()));
-    }
-    if let Some(after) = &filters.created_after {
-        sql.push_str(" AND a.created_at >= ?");
-        params_vec.push(Box::new(after.clone()));
-    }
-    if let Some(before) = &filters.created_before {
-        sql.push_str(" AND a.created_at <= ?");
-        params_vec.push(Box::new(before.clone()));
     }
     if let Some(prefix) = &filters.id_prefix {
         sql.push_str(" AND a.id LIKE ?");
@@ -2611,6 +2597,63 @@ mod tests {
             .search_lexical("", &SearchFilters::default(), 10)
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    // RFC 1d3a3581: contract test for the surviving structured filters.
+    // After removing kind/author/project/dates from the MCP surface, only
+    // tags, id_prefix (and the internal kinds) remain. This pins that the
+    // two agent-facing survivors still push down correctly.
+
+    #[test]
+    fn test_search_lexical_filter_id_prefix_survives() {
+        let mut db = setup_db();
+        insert_test_artifact(&mut db, "abc12345", "rfc", "foo bar");
+        insert_test_artifact(&mut db, "xyz98765", "rfc", "foo bar");
+
+        let q = crate::query::sanitize_fts_query("foo", crate::query::QueryMode::Natural);
+        let filters = SearchFilters {
+            id_prefix: Some("abc".into()),
+            ..Default::default()
+        };
+        let results = db.search_lexical(&q, &filters, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "abc12345");
+    }
+
+    #[test]
+    fn test_search_lexical_filter_tags_survives() {
+        let mut db = setup_db();
+        let tagged = IndexedArtifact {
+            id: "tagged".into(),
+            kind: "rfc".into(),
+            title: "foo bar".into(),
+            description: String::new(),
+            tags: vec!["search".into(), "retrieval".into()],
+            file_path: "fixtures/tagged.yml".into(),
+            indexed_at: Utc::now().to_rfc3339(),
+        };
+        let untagged = IndexedArtifact {
+            id: "untagged".into(),
+            kind: "rfc".into(),
+            title: "foo bar".into(),
+            description: String::new(),
+            tags: vec!["unrelated".into()],
+            file_path: "fixtures/untagged.yml".into(),
+            indexed_at: Utc::now().to_rfc3339(),
+        };
+        db.upsert_artifact(&tagged, "foo bar", &dummy_embedding(1), &[])
+            .unwrap();
+        db.upsert_artifact(&untagged, "foo bar", &dummy_embedding(2), &[])
+            .unwrap();
+
+        let q = crate::query::sanitize_fts_query("foo", crate::query::QueryMode::Natural);
+        let filters = SearchFilters {
+            tags: Some(vec!["search".into()]),
+            ..Default::default()
+        };
+        let results = db.search_lexical(&q, &filters, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "tagged");
     }
 
     #[test]
