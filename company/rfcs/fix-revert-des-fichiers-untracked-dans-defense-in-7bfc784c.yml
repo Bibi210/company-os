@@ -5,6 +5,8 @@ metadata:
   title: "Fix revert des fichiers untracked dans defense-in-depth (scope complet)"
   author: architect
   created_at: "2026-03-15"
+  status: approved
+  approved_at: "2026-03-15T14:56:23.388043481+00:00"
   description: >
     Correction complète du bug de revert dans defense-in-depth-core.mjs :
     revertFile() et les deux autres sites d'appel inline (bash aftermath L308
@@ -23,8 +25,6 @@ metadata:
       relationship: related
 
 spec:
-  status: approved
-  approved_at: "2026-03-15T14:56:23.388043481+00:00"
   motivation: >
     La fonction revertFile() et deux autres sites dans defense-in-depth-core.mjs
     utilisent exclusivement `git checkout -- <file>` pour annuler des écritures

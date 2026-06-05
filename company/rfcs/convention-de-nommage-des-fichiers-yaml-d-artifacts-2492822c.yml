@@ -5,6 +5,8 @@ metadata:
   title: "Convention de nommage des fichiers YAML d'artifacts"
   author: architect
   created_at: "2026-03-15"
+  status: approved
+  approved_at: "2026-03-15T15:17:19.844899145+00:00"
   description: >
     Introduce une convention de nommage lisible pour tous les fichiers YAML d'artifacts
     CompanyOS : <slug-du-titre>-<8-premiers-chars-uuid>.yml. Interdit les noms UUID purs
@@ -24,9 +26,6 @@ metadata:
       relationship: related
 
 spec:
-  status: approved
-  approved_at: "2026-03-15T15:17:19.844899145+00:00"
-
   motivation: >
     Depuis la création de CompanyOS, les fichiers YAML d'artifacts sont nommés avec leur UUID
     complet (ex: ffe3306d-d703-43fd-b11a-d154f67bc719.yml). Ce choix avait l'avantage de

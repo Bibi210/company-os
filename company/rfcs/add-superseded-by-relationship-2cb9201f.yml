@@ -5,6 +5,8 @@ metadata:
   title: "Ajouter la relation superseded-by à l'enum des relations d'artifacts"
   author: architect
   created_at: "2026-03-15"
+  status: implemented
+  approved_at: "2026-03-15T17:22:17.196961218+00:00"
   description: >
     Ajoute superseded-by à l'enum des relations autorisées dans metadata.related de
     _base.schema.json. Corrige une lacune sémantique : la relation supersedes existe
@@ -19,9 +21,6 @@ metadata:
     - companyos
 
 spec:
-  status: implemented
-  approved_at: "2026-03-15T17:22:17.196961218+00:00"
-
   motivation: >
     L'enum actuel des relations dans metadata.related est :
     ["input", "derived-from", "supersedes", "related"]

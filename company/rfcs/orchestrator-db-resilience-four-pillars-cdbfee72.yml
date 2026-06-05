@@ -281,9 +281,6 @@ metadata:
         pas seulement 2.
 
 spec:
-  status: implemented
-  approved_at: "2026-05-27T16:36:25.846456959+00:00"
-  implemented_at: "2026-06-01"
   motivation: >
     La DB SQLite de l'orchestrator (company/data/orchestrator.db) se
     corrompt de manière récurrente et imprévisible (rowids

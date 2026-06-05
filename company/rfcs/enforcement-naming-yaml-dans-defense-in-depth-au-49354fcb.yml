@@ -5,6 +5,8 @@ metadata:
   title: "Enforcement naming YAML dans defense-in-depth au moment du write"
   author: architect
   created_at: "2026-03-15"
+  status: approved
+  approved_at: "2026-03-15T15:32:02.022386136+00:00"
   description: >
     Ajoute dans defense-in-depth-core.mjs un check de naming qui bloque l'écriture
     d'un artifact YAML dont le nom est un UUID pur, au moment du write/edit,
@@ -21,9 +23,6 @@ metadata:
       relationship: related
 
 spec:
-  status: approved
-  approved_at: "2026-03-15T15:32:02.022386136+00:00"
-
   motivation: >
     Le RFC 2492822c a établi la convention de nommage <slug>-<8chars-uuid>.yml et un script
     CI (make check-naming) qui rejette les UUID purs au moment du commit. Cette approche
