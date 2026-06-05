@@ -47,14 +47,25 @@ le top-N retourne avec les métadonnées des artifacts.
 
 ### 2.4. Filtres structurés (push-down)
 
-`SearchFilters` push down dans les deux chemins lexical et sémantique :
+`SearchFilters` push down dans les deux chemins lexical et sémantique.
+Depuis le RFC 1d3a3581, seuls deux filtres sont exposés sur la surface
+MCP `search` ; le filtre `kinds` survit en interne (list-mode et
+`list_by_kind` pour les roadmaps) mais n'est plus câblé depuis la
+surface MCP.
 
-- `kinds`: liste, semantic IN
-- `author`: persona id exacte
+Filtres exposés sur la surface MCP `search` :
+
 - `tags`: liste, semantic OR (EXISTS json_each)
-- `project`: project slug exact
-- `created_after` / `created_before`: RFC3339 timestamp
 - `id_prefix`: LIKE `<prefix>%`
+
+Filtre interne uniquement (non exposé MCP) :
+
+- `kinds`: liste, semantic IN. Réservé à la list-mode et à
+  `list_by_kind`. Le filtrage par kind depuis la surface relèvera d'un
+  futur tool `list_artifacts` (cf. section 4, et RFC 1d3a3581 DÉCISION 4).
+
+Les filtres `author`, `project`, `created_after` et `created_before` ont
+été retirés (zéro usage, cargo-cult d'API : diagnostic 655f74d7).
 
 ### 2.5. Couches optionnelles
 
@@ -84,20 +95,25 @@ tests integration_search.
 ```jsonc
 {
   "query": "embeddings sémantiques",        // string, required
-  "kind": "rfc",                            // string, optional (compat)
   "limit": 10,                              // int, optional, max 100
   "mode": "hybrid",                         // "lexical"|"semantic"|"hybrid", optional
-  "author": "implementer",                  // string, optional
   "tags": ["search", "rrf"],                // list, optional, OR-semantic
-  "project": "company-os",                  // string, optional
-  "created_after": "2026-05-01T00:00:00Z",  // RFC3339, optional
-  "created_before": "2026-12-31T23:59:59Z", // RFC3339, optional
   "id_prefix": "bdee1af4",                  // string, optional
   "explain": false,                         // bool, optional
   "rerank": false,                          // bool, reserved (étape 13)
   "hyde": false                             // bool, reserved (étape 13)
 }
 ```
+
+> Note (RFC 1d3a3581) : le tool `search` n'expose plus de filtre `kind`.
+> L'intention du retrieval hybride est de maximiser le rappel tous kinds
+> confondus ; restreindre à un type appauvrit le rappel. Pour LISTER tous
+> les artifacts d'un kind (qui est un listing, pas une recherche), un
+> futur tool `list_artifacts(kind)` sera l'outil adapté ; en attendant,
+> `list_roadmaps` couvre les roadmaps. Les filtres `author`, `project` et
+> `created_after`/`created_before` ont aussi été retirés (zéro usage).
+> Un argument `kind` (ou author/project/dates) résiduel passé à `search`
+> est silencieusement ignoré par la désérialisation serde (pas d'erreur).
 
 ### 4.1. Sémantique du mode
 

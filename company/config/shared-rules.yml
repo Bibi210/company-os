@@ -78,8 +78,11 @@ spec:
           Contient trois champs obligatoires : context (situation rencontrée), insight (ce qu'on a appris),
           et recommendation (quoi faire différemment à l'avenir).
           metadata.description et metadata.tags sont obligatoires pour permettre la recherche sémantique.
-          Avant d'en créer une, toujours chercher via search(query, kind="lesson-learned") si une lesson
-          similaire existe déjà — si oui, l'améliorer ou en créer une qui la supersede (avec related).
+          Avant d'en créer une, toujours chercher via search(query) si une lesson
+          similaire existe déjà. Le rappel large du retrieval hybride remonte les lessons
+          proches sémantiquement mieux qu'un filtre par type : raffiner avec tags si besoin,
+          pas par kind (le filtre kind a été retiré de search, RFC 1d3a3581).
+          Si une lesson proche existe, l'améliorer ou en créer une qui la supersede (avec related).
           Artifact global (vit dans company/lessons/), pas rattaché à un projet spécifique.
           Tout agent peut en produire. C'est la mémoire collective de l'organisation.
         schema: company/schemas/lesson-learned.schema.json
@@ -177,7 +180,10 @@ spec:
         Le titre de l'artifact reste lisible dans metadata.title — c'est lui qu'on lit, pas l'ID.
     lessons:
       description: >
-        Après chaque artifact produit ou problème résolu, cherche une lesson existante via search(query, kind="lesson-learned").
+        Après chaque artifact produit ou problème résolu, cherche une lesson existante via search(query).
+        Le rappel large du retrieval hybride remonte mieux les lessons proches sémantiquement
+        qu'un filtre par type ; raffine avec tags si le rappel est trop large, pas par kind
+        (le filtre kind a été retiré de search, RFC 1d3a3581).
         Si une lesson similaire existe : soit tu l'ameliore ou tu en crée une nouvelle améliorée,
         et lie les deux avec related (relationship: supersedes vers l'ancienne, derived-from depuis la nouvelle).
         Si aucune lesson similaire n'existe : crée-en une nouvelle via direct write.
