@@ -20,6 +20,22 @@ metadata:
     - companyos-system
     - infrastructure
     - meta
+  changelog:
+    - date: "2026-06-04"
+      author: pm
+      description: >
+        Mise à jour majeure suite à la résolution de cinq sujets
+        candidats en RFCs mergés. Items passés de future/planned à
+        past/done avec leur ref RFC : atomic-grant-permit (359f9162),
+        rfc-set-implemented-tool (1c0f2570), defense-in-depth-selective
+        (bde023e2), rfc-affected-files-categorize (a4eb3ee7),
+        schema-migration-discipline (973a5569). L'item
+        db-schema-migration-hotfix passe de present/done à past/done
+        (superseded par RFC 973a5569). L'item backup-strategy passe à
+        cancelled (couvert par git remote, sans chantier dédié).
+        Narrative mise à jour pour refléter que les frictions
+        opérationnelles initiales sont soldées. Un seul sujet reste
+        en future : api-callers-discoverability.
 
 spec:
   domain: companyos-system
@@ -63,21 +79,24 @@ spec:
     suivre les sujets sans parcourir manuellement le repo. La
     présente roadmap en est le premier exemple.
 
-    Côté présent, on a une dette opérationnelle bien identifiée : le
-    pattern grant_write_permit + scellement DB n'est pas atomique
-    côté MCP tool, ce qui a causé deux blockers répétés pendant la
-    refonte search. Le hook defense-in-depth a un comportement
-    nucléaire (revert TOUS les permits sur tampering détecté)
-    plutôt que sélectif. Plusieurs RFCs candidats sont identifiés
-    pour réduire ces frictions.
+    Côté frictions opérationnelles, la dette identifiée à la
+    création de cette roadmap a été soldée en cinq RFCs courts et
+    chirurgicaux (mise à jour du 2026-06-04) : atomicité de
+    l'émission de permit (RFC 359f9162), tool MCP rfc_set_implemented
+    pour clore les RFCs sans permit ad-hoc (RFC 1c0f2570), revert
+    sélectif du hook defense-in-depth au lieu du nuclear (RFC
+    bde023e2), schema RFC affected_files distinguant modified/created
+    (RFC a4eb3ee7), et discipline de migration SQL via PRAGMA
+    user_version + migrations numérotées (RFC 973a5569). Les
+    frictions qui rendaient le workflow write-permit fragile sont
+    désormais structurellement fermées.
 
-    Côté futur, plusieurs sujets candidats à formaliser : un tool
-    MCP `rfc_set_implemented(id)` pour éviter les permits ad-hoc à
-    chaque clôture de RFC, un mécanisme de migration de schéma SQL
-    plus robuste, et l'investigation des autres bugs latents
-    similaires au file watcher (par exemple le `db.rs` ALTER TABLE
-    ordering qui a déjà été fixé en hotfix mais qui est typique
-    d'une classe de bugs schema-migration à anticiper).
+    Côté futur, un sujet reste ouvert : la discipline "lister les
+    callers d'une API avant de changer sa signature", lesson
+    ea6e9dd1, qui demande encore à être formalisée soit comme
+    checklist obligatoire dans les implementation-plans soit via
+    tooling LSP automatique. Pas urgent, mais le pattern a déjà
+    causé deux extensions de permit imprévues.
 
     Le PM met à jour cette roadmap au fil de l'eau quand un item
     change d'état. Pas de bot, pas de synchronisation automatique.
@@ -192,25 +211,25 @@ spec:
         Sans ce fix, toute écriture YAML pendant une session était
         ignorée par l'index, dégradant silencieusement la mémoire.
 
-    # PRESENT - chantiers en cours ou à enchaîner immédiatement
+    # PAST (suite) - hotfix superseded par RFC 973a5569
 
     - key: db-schema-migration-hotfix
       title: "Hotfix ordre CREATE INDEX vs ALTER TABLE (db.rs)"
       ref:
         type: external
-        label: "Hotfix appliqué hors RFC (commit 57019e7), à généraliser comme pattern migration"
-      timeframe: present
+        label: "Hotfix appliqué hors RFC (commit 57019e7), superseded par RFC 973a5569"
+      timeframe: past
       status: done
       rationale: >
         Bug d'ordre SQL dans db.rs : les CREATE INDEX sur les
         colonnes ajoutées par ALTER TABLE étaient exécutés AVANT
         les ALTER TABLE eux-mêmes, crashant la migration sur toute
         DB pré-existante. Hotfix appliqué chirurgicalement, test
-        de régression ajouté. Le sujet général "comment éviter
-        cette classe de bugs schema-migration à l'avenir" reste
-        ouvert (cf. future schema-migration-discipline).
+        de régression ajouté. Le sujet général de discipline a
+        ensuite été pris en charge par le RFC 973a5569 (cf.
+        schema-migration-discipline ci-dessous).
 
-    # FUTURE - candidats identifiés à formaliser en RFC
+    # PAST (suite) - sujets candidats originaux désormais formalisés en RFC
 
     - key: atomic-grant-permit
       title: "Rendre grant_write_permit + scellement DB atomique côté MCP"
@@ -284,33 +303,47 @@ spec:
     - key: rfc-affected-files-categorize
       title: "RFC schema : distinguer affected_files.modified vs created"
       ref:
-        type: external
-        label: "Note CEO sur la refonte search, candidat RFC schema"
-      timeframe: future
-      status: planned
+        type: rfc
+        id: a4eb3ee7-45c1-4422-a43a-fbbc07d686f0
+      timeframe: past
+      status: done
+      target_date: "2026-Q2"
       rationale: >
-        Le pattern actuel "affected_files" liste tout sans
-        distinguer les fichiers à modifier (déjà existants) des
-        fichiers à créer (nouveaux). Deux blockers permits
-        documentés à cause de ça (Cargo.toml et types.rs oubliés
-        sur le RFC bdee1af4). Une catégorisation explicite dans
-        le schema RFC réduit cette classe d'oublis.
+        RÉSOLU (RFC a4eb3ee7, commit 5c3d289). Le bloc spec.affected_files
+        du schema RFC accepte désormais DEUX formes via un anyOf
+        rétro-compatible : FORME A legacy (array plat de strings,
+        identique à l'existant) et FORME B structurée
+        (objet {modified, created} avec deux listes optionnelles).
+        Les RFCs touchant du code sont encouragés à utiliser la FORME B
+        pour rendre la distinction modifier/créer explicite et
+        machine-readable, ce qui ferme la classe d'oublis qui avait
+        coûté deux blockers permits sur RFC bdee1af4 (Cargo.toml et
+        types.rs oubliés car non distingués). Aucun changement Rust,
+        purement schema + règle dans shared-rules.yml. Lesson de
+        capitalisation produite.
 
     - key: schema-migration-discipline
       title: "Discipline de migration de schéma SQL côté orchestrator"
       ref:
-        type: external
-        label: "Pattern identifié post-hotfix db.rs, candidat task-request ou RFC"
-      timeframe: future
-      status: planned
+        type: rfc
+        id: 973a5569-ec7e-4ee0-a868-2314e3cd5bd4
+      timeframe: past
+      status: done
+      target_date: "2026-Q2"
+      depends_on: [db-schema-migration-hotfix]
       rationale: >
-        Le hotfix sur db.rs (CREATE INDEX après ALTER TABLE) est
-        symptomatique d'une absence de discipline générale sur les
-        migrations SQL. Pas de mécanisme de versionning de schéma,
-        pas de tests qui exercent toutes les transitions (DB
-        vierge, DB legacy v1, DB legacy v2, etc.). Investigation
-        pour formaliser une approche : table schema_version,
-        migrations idempotentes, tests de transition.
+        RÉSOLU (RFC 973a5569, commit 7c7171d). PRAGMA user_version
+        + migrations numérotées idempotentes installées côté orchestrator.
+        Chaque migration porte un numéro de version, est exécutée
+        une seule fois (vérification du user_version courant avant
+        application), et la migration globale est elle-même
+        transactionnelle. Tests de transition couvrant DB vierge,
+        DB legacy sans colonnes filtre, et DB déjà migrée. Le hotfix
+        db.rs précédent est désormais une migration v_n du nouveau
+        système, ce qui ferme la classe de bugs ordre-DDL pour le
+        futur. Lesson capitalisée.
+
+    # FUTURE - sujets restant à formaliser
 
     - key: api-callers-discoverability
       title: "Discipline 'lister les callers avant changer une signature d'API'"
