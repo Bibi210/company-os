@@ -1,0 +1,150 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: c12ca551-f378-4fdb-a629-11563e8e4b72
+  title: "Auto-sync roadmap à la lecture : le calcul pur déterministe a tenu, mais l'auto-sync a révélé une dérive de données cachée (status RFC en spec vs metadata)"
+  author: implementer
+  created_at: "2026-06-05"
+  description: >
+    Capitalisation après l'implémentation du RFC a5f25718 (plan 590aa7a6) qui
+    transforme le status des items de roadmap en valeur CALCULÉE à la lecture
+    depuis l'artifact source, renversant la décision "pas d'auto-sync" du RFC
+    a49801aa (supersession partielle). Trois enseignements : (a) la décision
+    "calcul à la lecture, pas à l'indexation" s'est révélée triviale à
+    implémenter et zéro-friction côté résilience (aucune table, aucune
+    migration SQL, PILIER A/D intacts), confirmant le bon arbitrage du
+    design-doc ; (b) l'application concrète de la préférence déterministe
+    4e5c109b (fonction pure effective_status testable unité par unité) ; (c)
+    la SURPRISE majeure : dès le premier summarize post-déploiement, l'auto-sync
+    a fait émerger une dérive de données invisible jusque-là — le champ status
+    de certains RFCs vit dans spec.status et non metadata.status (canonique),
+    et un drift_warning l'a signalé. Le filet de sécurité a fonctionné exactement
+    comme conçu : il a transformé une incohérence latente en signal explicite.
+  tags:
+    - roadmap
+    - auto-sync
+    - determinism
+    - calcul-a-la-lecture
+    - drift-warning
+    - data-inconsistency
+    - rfc-status-canonique
+    - companyos-internals
+    - lessons-from-implementation
+    - critical-infra
+  related:
+    - id: 4e5c109b-ec35-46ff-98af-3714b1d7a36f
+      kind: lesson-learned
+      relationship: derived-from
+    - id: a5f25718-aecc-47d3-8652-36ec4747dcdd
+      kind: rfc
+      relationship: related
+    - id: a49801aa-911e-45d7-95a3-b21d6ea2bd2d
+      kind: rfc
+      relationship: supersedes
+    - id: b04f8838-84b5-4332-b3a4-5782a943d766
+      kind: lesson-learned
+      relationship: related
+    - id: 80f7b27a-9bc5-47b6-bdf4-65a18f7f5df9
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Le RFC a49801aa avait introduit le kind roadmap en tranchant explicitement
+    "pas d'auto-synchronisation : le status de chaque item est la vérité PM,
+    mise à jour manuellement" (risque 1 documenté, mitigation = convention
+    sociale). En moins d'une session, la seule roadmap existante (329da45f) a
+    dérivé du réel (diagnostic 04b06ad9 : 42% des items rfc en future/planned
+    alors que les RFCs étaient mergés, puis sur-correction manuelle à 8/12 done
+    pour des RFCs encore approved). L'utilisateur a tranché : auto-sync absolu
+    déterministe (task-request e8c4d628). Le RFC a5f25718 + design-doc 3b286da8
+    ont défini le calcul à la lecture (summarize/list) depuis l'artifact source.
+
+    Ce plan (590aa7a6) l'a implémenté en Rust : fonction pure effective_status
+    avec short-circuit blocked, mapping rfc/project déterministe, ref external
+    -> loose typé, drift_warnings dans summarize, migration de la roadmap
+    329da45f. CI interne verte (209 tests workspace, 0 failed ; clippy + fmt
+    propres). Permit 6a39e8ad consommé après commit c34ec24, dans l'ordre
+    write_permit_full_sequence (consume avant build/test/reload).
+
+  insight: >
+    TROIS ENSEIGNEMENTS.
+
+    (1) LE CALCUL À LA LECTURE EST QUASI-GRATUIT ET RÉSILIENT PAR CONSTRUCTION.
+    L'arbitrage du design-doc (décision 1 : calcul à la lecture, PAS à
+    l'indexation) s'est confirmé excellent à l'exécution. Aucune table
+    roadmap_items, aucune colonne status sur artifacts, aucune migration SQL.
+    engine.index_artifact n'a pas été touché, donc PILIER A (writer unique) et
+    PILIER D (rebuild déterministe) restent triviallement intacts. Le coût est
+    N lookups get_artifact + read+parse YAML par summarize, négligeable
+    (<200 items). Le status est TOUJOURS frais : un RFC qui change de status ne
+    rend stale aucune roadmap, parce que rien n'est matérialisé. La leçon
+    générale : quand une donnée dérivée est bon marché à recalculer et que sa
+    fraîcheur est critique, la calculer à la lecture bat la matérialisation à
+    l'indexation, qui réintroduit le problème de cohérence qu'on cherchait à
+    fuir.
+
+    (2) LA FONCTION PURE REND LE CŒUR TESTABLE TRIVIALEMENT (préférence 4e5c109b
+    appliquée). effective_status(item_ref, status_yaml, source) ne touche ni FS
+    ni DB : l'engine résout la source et la lui passe. Conséquence : 7 tests
+    unitaires purs couvrent toute la table de mapping (draft/approved/
+    implemented/rejected/hors-enum/absent x rfc/project/loose) + le
+    short-circuit blocked, sans aucun fixture FS. Les 9 tests d'intégration
+    moteur ne testent que le branchement (résolution source + drift). Cette
+    séparation pure/effets est exactement ce que la préférence déterministe
+    4e5c109b prescrit : un invariant mécanique (le mapping) ne doit pas dépendre
+    du jugement ni de l'environnement, et devient vérifiable exhaustivement.
+
+    (3) L'AUTO-SYNC A RÉVÉLÉ UNE DÉRIVE DE DONNÉES CACHÉE — ET C'EST UNE VICTOIRE,
+    PAS UN BUG. Dès le premier summarize post-déploiement, un drift_warning a
+    signalé que proxy-resilient (RFC d9399863) mappait vers "planned" au lieu de
+    "done". Investigation : le RFC d9399863 porte son status implemented dans
+    spec.status, PAS dans metadata.status (canonique selon diagnostic 04b06ad9
+    FAIT 5). Audit corpus : sur 27 RFCs, 20 sont canoniques (metadata.status
+    seul), 6 ont leur status UNIQUEMENT dans spec.status, 1 a les deux avec une
+    valeur CONTRADICTOIRE (cdbfee72 : metadata=approved, spec=implemented). Cette
+    incohérence existait AVANT l'auto-sync mais était invisible : tant que
+    personne ne lisait metadata.status programmatiquement, la divergence
+    dormait. L'auto-sync, en consommant la source canonique, a transformé une
+    dette de données latente en signal explicite via drift_warning. C'est
+    précisément la fonction d'un filet de sécurité : rendre visible ce qui
+    était silencieux. Le bon réflexe n'a PAS été de patcher le parser pour
+    accepter spec.status en fallback (ce qui aurait masqué le problème et
+    contredit la décision "metadata canonique"), mais de laisser le warning
+    parler et tracer la normalisation des 7 RFCs comme tâche data-hygiene
+    séparée.
+
+  recommendation: >
+    POUR LES FUTURS AUTO-SYNCS / DONNÉES DÉRIVÉES :
+    - Privilégier le calcul à la lecture quand le recalcul est bon marché et la
+      fraîcheur critique. Ne matérialiser que si un profil de perf mesuré
+      l'impose (porte ouverte design décision 2 : colonne status indexée
+      plus tard si le volume explose).
+    - Isoler le cœur en fonction pure alimentée par l'appelant (effets en
+      périphérie). Cela rend l'invariant exhaustivement testable et respecte la
+      préférence déterministe 4e5c109b.
+
+    POUR LE TRAITEMENT DES DRIFT/INCOHÉRENCES RÉVÉLÉES PAR UN NOUVEAU CALCUL :
+    - Quand un mécanisme d'auto-sync fait émerger une incohérence de données
+      préexistante, NE PAS l'absorber silencieusement dans le code (fallback
+      permissif). Le signal est précieux. Le traiter comme une tâche de
+      remédiation explicite et tracée.
+    - Ici concrètement : 7 RFCs ont un status non-canonique (6 spec-only :
+      d9399863, cc1beef6, 2cb9201f, 2492822c, 49354fcb, 7bfc784c ; 1
+      contradictoire : cdbfee72). Leur normalisation (déplacer status vers
+      metadata.status, retirer/aligner spec.status) est une tâche data-hygiene
+      qui nécessite un write permit sur company/rfcs/. Décision utilisateur de
+      cette session : normaliser. À exécuter sous permit dédié (signalé au PM/CEO).
+    - Recommandation structurelle complémentaire : envisager un RFC qui RETIRE
+      la possibilité d'écrire status sous spec.status dans le schéma RFC (ou qui
+      la valide identique à metadata.status), pour fermer définitivement cette
+      classe de dérive. Le schéma actuel ne contraint pas l'emplacement, d'où
+      la divergence historique.
+
+    NOTE DE SUIVI HÉRITÉE (toujours valable) : 8 RFCs sont approved mais mergés
+    (cdbfee72, f4fe8a04, 3cd72740, 359f9162, 1c0f2570, bde023e2, a4eb3ee7,
+    973a5569). Tant qu'ils ne sont pas clôturés via rfc_set_implemented, leur
+    auto-sync les affiche légitimement in_progress (vérité de leur
+    metadata.status). Les clôturer est une tâche distincte (cf. lesson 80f7b27a
+    sur le tool-list MCP qui peut nécessiter un restart de session pour
+    dogfooder rfc_set_implemented).
