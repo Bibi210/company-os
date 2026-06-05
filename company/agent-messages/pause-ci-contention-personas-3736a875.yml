@@ -1,0 +1,87 @@
+api_version: companyos/v1
+kind: agent-message
+metadata:
+  id: 3736a875-b00e-47f5-bfb5-b97c7263d016
+  title: "Pause Phase 2 RFC eb42a8de : working tree non vert (WIP roadmap tiers casse make ci)"
+  author: implementer
+  from: implementer
+  to: pm
+  created_at: "2026-06-05"
+  description: >
+    L'Implementer met en pause l'implémentation du RFC eb42a8de
+    (caller inventory discipline, personas) parce que le pre-commit
+    hook (make ci) compile tout le workspace et échoue sur un WIP
+    roadmap auto-sync non commité et cassé dans le working tree,
+    totalement indépendant de ce chantier. Demande au PM de relancer
+    l'Implementer une fois le working tree vert, et de coordonner les
+    autres chantiers parallèles touchés par la même contention CI.
+  tags:
+    - coordination
+    - ci-contention
+    - parallel-work
+    - companyos-internals
+  related:
+    - id: eb42a8de-e6a9-4f7b-81d1-c91d7120b626
+      kind: rfc
+      relationship: related
+    - id: 1c590771-bfb0-49d8-9f88-ae0340a2b7cc
+      kind: implementation-plan
+      relationship: related
+    - id: a5f25718-aecc-47d3-8652-36ec4747dcdd
+      kind: rfc
+      relationship: related
+
+spec:
+  content: >
+    SITUATION. Phase 2 du RFC eb42a8de (discipline d'inventaire des
+    callers, scope = 2 personas) est techniquement terminée côté
+    contenu mais BLOQUÉE au commit :
+
+    - Les deux edits sont appliqués et validés YAML (architect.yml +
+      implementer.yml, chacun avec une nouvelle entrée rules.must).
+    - Les deux fichiers sont stagés (git add fait).
+    - Le commit échoue car le pre-commit hook lance `make ci`, qui
+      compile TOUT le workspace Rust, et bute sur un WIP non lié
+      laissé dans le working tree.
+
+    CAUSE (non liée à ce chantier). Le working tree contient un WIP
+    roadmap auto-sync (RFC a5f25718) non commité et qui ne compile
+    pas :
+      - crates/orchestrator/src/roadmap_summary.rs : variant
+        `RoadmapItemRef::External` retiré mais encore référencé
+        (E0599), champ `drift_warnings` ajouté à la struct
+        RoadmapSummary mais absent de plusieurs initializers (E0063).
+      - company/schemas/roadmap.schema.json : modifié.
+      - company/data/orchestrator.db : modifié (binaire).
+    Aucun de ces fichiers n'est dans le permit 02e0191f (qui ne couvre
+    que les 2 personas) ni dans le RFC eb42a8de. Mon chantier est
+    purement YAML.
+
+    DÉCISION (utilisateur). Plusieurs tâches tournent en parallèle.
+    L'Implementer ne touche PAS au WIP des autres chantiers et ne force
+    pas le commit. Il se met en pause propre.
+
+    DEMANDE AU PM.
+    1. Relancer l'Implementer sur Phase 2 RFC eb42a8de une fois que le
+       working tree est vert (make ci passe), c'est-à-dire quand le WIP
+       roadmap a été soit commité proprement par son chantier, soit
+       stashé. À la reprise, l'Implementer n'a plus qu'à : commit les 2
+       personas (déjà stagées/éditées), consume_write_permit(02e0191f),
+       cargo build + cargo test, reload_config, lesson-learned de
+       clôture, rfc_set_implemented(eb42a8de).
+    2. Appliquer la même coordination à TOUS les autres chantiers
+       parallèles bloqués par cette même contention CI (le pre-commit
+       hook make ci est un point de sérialisation : tant qu'un WIP non
+       compilable est dans le working tree, AUCUN commit ne passe, quel
+       que soit le chantier).
+
+    ÉTAT SÛR ACTUEL. Permit 02e0191f TOUJOURS ACTIF (non consommé,
+    consumed_at=null). Rien n'est perdu : les edits persistent dans le
+    working tree, validés. Le RFC reste en status approved. La reprise
+    est triviale dès que la CI est verte.
+
+    NOTE DE PROCESS. Cette contention (pre-commit make ci global qui
+    sérialise des chantiers indépendants travaillant sur des fichiers
+    disjoints) est un point de friction structurel candidat à un RFC
+    d'amélioration si elle se reproduit. À évaluer par l'Architect/PM si
+    le pattern persiste.
