@@ -143,7 +143,7 @@ spec:
         type: rfc
         id: cdbfee72-59b9-449c-9e22-2666d8e591e0
       timeframe: past
-      status: in_progress
+      status: done
       target_date: "2026-Q2"
       depends_on: [proxy-resilient]
       rationale: >
@@ -151,9 +151,7 @@ spec:
         timeout, ce qui a fait apparaître une classe de corruptions
         SQLite jamais vue avant. Les 4 piliers (file lock POSIX,
         PRAGMA défensifs, graceful shutdown, autorepair PILIER D)
-        ferment cette classe de bugs. RFC encore approved (pas
-        implemented) : status auto-syncé en in_progress jusqu'à
-        clôture via rfc_set_implemented.
+        ferment cette classe de bugs.
 
     - key: memory-lookup-rule
       title: "Lookup mémoire obligatoire et lessons systématiques"
@@ -161,13 +159,13 @@ spec:
         type: rfc
         id: f4fe8a04-b654-42a1-b055-bf0b991bbb3a
       timeframe: past
-      status: in_progress
+      status: done
       rationale: >
         Pose la règle que tous les agents doivent consulter la
         mémoire collective avant chaque artifact et capitaliser
         après. Règle indispensable mais qui n'avait de sens que si
         search() marchait. Le sujet search a donc immédiatement
-        suivi. RFC encore approved : status auto-syncé en in_progress.
+        suivi.
 
     - key: roadmap-kind
       title: "Introduction du kind roadmap"
@@ -188,15 +186,14 @@ spec:
         type: rfc
         id: 3cd72740-1424-46ac-8ee6-96f714f3fa94
       timeframe: past
-      status: in_progress
+      status: done
       target_date: "2026-Q2"
       depends_on: [roadmap-kind]
       rationale: >
         Donne au PM les tools MCP pour répondre vite à "où en sont
         mes sujets ?" sans parcourir company/roadmaps/ à la main.
         Ce qui rend la présente roadmap utilisable au lieu d'être
-        un document statique. RFC encore approved : status auto-syncé
-        en in_progress.
+        un document statique.
 
     - key: hybrid-search
       title: "Refonte search() en hybrid retrieval (BM25 + embeddings + RRF)"
@@ -259,7 +256,7 @@ spec:
         type: rfc
         id: 359f9162-18f2-4b72-85b0-7d0e44608959
       timeframe: past
-      status: in_progress
+      status: done
       target_date: "2026-Q2"
       rationale: >
         grant_write_permit effectue désormais lui-même, dans la même
@@ -267,8 +264,7 @@ spec:
         commit du .db, avec rollback du permit si le commit échoue.
         Invariant : à la sortie du tool, soit le permit existe ET est
         scellé en HEAD, soit il n'existe pas. Lesson de capitalisation
-        d5c9c933. RFC encore approved : status auto-syncé en
-        in_progress jusqu'à clôture via rfc_set_implemented.
+        d5c9c933.
 
     - key: rfc-set-implemented-tool
       title: "Tool MCP rfc_set_implemented(id) pour clore les RFCs sans permit ad-hoc"
@@ -276,14 +272,13 @@ spec:
         type: rfc
         id: 1c0f2570-71e2-4f02-ac4f-81e406b22568
       timeframe: past
-      status: in_progress
+      status: done
       target_date: "2026-Q2"
       rationale: >
         Le tool MCP rfc_set_implemented(id) fait passer un RFC de
         approved à implemented par écriture serveur, sans write permit,
         exactement comme close_review_round met un RFC en approved.
-        12 tests triaxiaux verts. Lesson 80f7b27a. RFC encore approved :
-        status auto-syncé en in_progress.
+        12 tests triaxiaux verts. Lesson 80f7b27a.
 
     - key: defense-in-depth-selective
       title: "Hook defense-in-depth selective revert (vs nuclear actuel)"
@@ -291,15 +286,14 @@ spec:
         type: rfc
         id: bde023e2-8633-42c9-911a-80dcd5157c62
       timeframe: past
-      status: in_progress
+      status: done
       target_date: "2026-Q2"
       rationale: >
         Le revert sélectif est désormais le comportement par défaut :
         DELETE WHERE id NOT IN (baseline), où baseline = union du
         snapshot before et des permits scellés en HEAD git. Le wipe
         nucléaire est borné au seul cas résiduel où la baseline est
-        indéterminable. 46 tests JS verts. Lesson 85ad44d3. RFC encore
-        approved : status auto-syncé en in_progress.
+        indéterminable. 46 tests JS verts. Lesson 85ad44d3.
 
     - key: rfc-affected-files-categorize
       title: "RFC schema : distinguer affected_files.modified vs created"
@@ -307,14 +301,13 @@ spec:
         type: rfc
         id: a4eb3ee7-45c1-4422-a43a-fbbc07d686f0
       timeframe: past
-      status: in_progress
+      status: done
       target_date: "2026-Q2"
       rationale: >
         Le bloc spec.affected_files du schema RFC accepte désormais
         DEUX formes via un anyOf rétro-compatible : FORME A legacy
         (array plat) et FORME B structurée (objet {modified, created}).
         Ferme la classe d'oublis qui avait coûté deux blockers permits.
-        RFC encore approved : status auto-syncé en in_progress.
 
     - key: schema-migration-discipline
       title: "Discipline de migration de schéma SQL côté orchestrator"
@@ -322,15 +315,14 @@ spec:
         type: rfc
         id: 973a5569-ec7e-4ee0-a868-2314e3cd5bd4
       timeframe: past
-      status: in_progress
+      status: done
       target_date: "2026-Q2"
       depends_on: [db-schema-migration-hotfix]
       rationale: >
         PRAGMA user_version + migrations numérotées idempotentes
         installées côté orchestrator. Le hotfix db.rs précédent est
         désormais une migration v_n du nouveau système. Lesson
-        cf3c40a8. RFC encore approved : status auto-syncé en
-        in_progress.
+        cf3c40a8.
 
     # FUTURE - sujets restant à formaliser
 
