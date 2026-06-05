@@ -1,0 +1,129 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 5ecc2877-8f68-4542-9620-e59123bf90fe
+  title: "Aligner le Makefile sur les conventions actuelles de placement des artifacts (roadmaps, projects, kinds retirés)"
+  author: pm
+  created_at: "2026-06-05"
+  project: company-os
+  description: >
+    Le Makefile contient une cible `clean-company` qui n'est plus
+    alignée sur les conventions actuelles de CompanyOS. Trois
+    incohérences identifiées au moins :
+
+    (1) La cible mentionne `company/diagnostics/` et
+    `company/design-docs/` qui n'existent PAS. Selon la règle
+    file_placement de shared-rules, ces kinds sont des artifacts
+    PROJET et vivent dans `projects/<slug>/diagnostic-reports/`
+    et `projects/<slug>/design-docs/`. Le rm sur ces paths est
+    no-op.
+
+    (2) La cible ne mentionne PAS `company/roadmaps/` (introduit
+    par RFC a49801aa). Un `make clean-company` laisse donc les
+    roadmaps en place, ce qui n'est pas l'intent ("wipe all
+    generated artifacts").
+
+    (3) La cible ne mentionne PAS `company/agent-messages/` (qui
+    sera de toute façon retiré, cf. task-request 95e93649, mais
+    en attendant, il faut s'aligner).
+
+    Décision utilisateur : aligner le Makefile sur les
+    conventions actuelles, en particulier ajouter le clean
+    des roadmaps. Probablement aussi en profiter pour rendre la
+    cible robuste aux futurs changements de placement.
+  tags:
+    - makefile
+    - tooling
+    - cleanup
+    - conventions
+    - ci
+    - companyos-internals
+  related:
+    - id: 95e93649-70a0-4d9a-8453-61c49a5101f7
+      kind: task-request
+      relationship: related
+    - id: a49801aa-911e-45d7-95a3-b21d6ea2bd2d
+      kind: rfc
+      relationship: related
+
+spec:
+  priority: low
+  status: backlog
+
+  acceptance_criteria:
+    - >
+      Recensement de l'écart entre la convention actuelle (règle
+      file_placement de shared-rules) et le Makefile. Liste
+      explicite des kinds globaux et projet, et des paths que
+      chaque cible Make doit couvrir.
+
+    - >
+      La cible `clean-company` (ou son équivalent renommé) couvre
+      tous les artifacts générés par les agents en cours
+      d'utilisation. Au minimum :
+        - company/lessons/
+        - company/rfcs/
+        - company/roadmaps/ (manquant aujourd'hui)
+        - projects/<slug>/task-requests/
+        - projects/<slug>/design-docs/
+        - projects/<slug>/diagnostic-reports/
+        - projects/<slug>/implementation-plans/
+        - projects/<slug>/config/ (les project-config sont aussi
+          régénérés)
+      Et préserve : personas, config (shared-rules,
+      review-protocol, flow-control, etc.), schemas, plugins,
+      scripts.
+
+    - >
+      Si le kind agent-message est encore présent au moment de
+      l'exécution de ce task-request (task-request 95e93649 pas
+      encore mergé), la cible le couvre aussi pour cohérence
+      transitoire.
+
+    - >
+      La cible respecte l'invariant PILIER D du RFC cdbfee72 :
+      les YAML supprimés sont la source de vérité, la DB
+      orchestrator est cleanée séparément (déjà fait par
+      `clean`). Documenter dans le Makefile que
+      `clean-company` casse l'index orchestrator et nécessite
+      un boot suivant pour reconstruction depuis YAML
+      (logiquement vide, du coup).
+
+    - >
+      Optionnellement : factoriser les paths via une variable
+      Make ou une boucle pour rendre la cible robuste aux
+      futurs nouveaux kinds (si on en ajoute un demain, on n'a
+      pas à modifier la cible). À arbitrer par l'Architect.
+
+    - >
+      Tests : exécuter `make clean-company` sur un repo de test
+      ou en dry-run (echo des rm) et vérifier que tous les
+      paths attendus sont couverts, et que les paths préservés
+      (personas, etc.) ne sont pas touchés.
+
+  investigation_hints: >
+    Pistes.
+
+    (1) Le Makefile actuel est minimal et fonctionnel. Pas
+    besoin d'une refonte. Juste une mise à jour des paths.
+
+    (2) Possible approche dynamique : `find company/ projects/
+    -type d -name "<kind>s"` etc. au runtime de la cible, plutôt
+    qu'une liste codée en dur. Mais ça ajoute de la complexité.
+    Trade-off à arbitrer.
+
+    (3) Pourquoi ce task-request est priority=low : c'est de la
+    dette de tooling. Aucun workflow agent ne dépend de ce
+    Makefile fonctionnant correctement. Mais il pollue
+    l'expérience humaine quand on veut reset un état.
+
+    (4) Probablement pas besoin de RFC structurel. Le Makefile
+    est-il en zone protégée ? À vérifier. Si oui, un mini-RFC
+    suffit. Si non, design-doc simple + write permit ou pas du
+    tout.
+
+  out_of_scope: >
+    - Refactor majeur du Makefile (juste alignement).
+    - Introduction de nouvelles cibles inventées.
+    - Le retrait du kind agent-message lui-même (cf. task-request
+      95e93649).

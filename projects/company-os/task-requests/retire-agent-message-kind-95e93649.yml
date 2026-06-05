@@ -1,0 +1,130 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 95e93649-70a0-4d9a-8453-61c49a5101f7
+  title: "Retirer complètement le kind agent-message du système (kind legacy non utilisé)"
+  author: pm
+  created_at: "2026-06-05"
+  project: company-os
+  description: >
+    Décision utilisateur : le kind `agent-message` est un artefact
+    legacy non utilisé en pratique. Les sub-agents communiquent
+    avec le PM via leur retour de Task tool (sortie directe dans
+    le contexte du PM), pas via des YAML d'agent-messages. Les
+    agent-messages produits jusqu'ici sont des reliques d'un
+    workflow obsolète qui n'a jamais été exploité comme prévu.
+
+    Demande utilisateur : retirer toute trace de ce kind PARTOUT
+    dans le système. Schema, enum Rust, references shared-rules,
+    personas, et nettoyage des artifacts existants.
+
+    Recensement préliminaire (à compléter par l'Architect) :
+    - 10 fichiers existants dans company/agent-messages/
+    - company/schemas/agent-message.schema.json
+    - company/config/shared-rules.yml mentionne agent-message
+      dans artifact_catalog.kinds et file_placement.kinds globaux
+    - crates/config/src/types.rs : variant AgentMessage dans
+      l'enum ArtifactKind (lignes 139, 158, 191, 426, 457)
+    - Possibles références dans les personas, le code, la doc
+  tags:
+    - cleanup
+    - schema
+    - agent-message
+    - legacy-removal
+    - companyos-internals
+  related:
+    - id: 329da45f-e24f-4200-9e18-e2e47b5a4f27
+      kind: roadmap
+      relationship: related
+
+spec:
+  priority: medium
+  status: backlog
+
+  acceptance_criteria:
+    - >
+      Recensement exhaustif des références à `agent-message` dans
+      le repo : fichiers YAML, schema JSON, code Rust (enum +
+      branches + tests + matrices access_level), config et
+      personas YAML, documentation Markdown. La liste est
+      documentée dans le RFC.
+
+    - >
+      Le kind est retiré du schema (suppression de
+      agent-message.schema.json), de l'enum Rust (variant
+      AgentMessage + branches FromStr/as_str + matrice
+      access_level + tests qui itèrent sur le kind), et des
+      références dans shared-rules.yml (artifact_catalog +
+      file_placement).
+
+    - >
+      Les personas qui mentionnaient agent-message dans
+      produces/consumes voient ces entrées retirées.
+
+    - >
+      Les 10 fichiers existants dans company/agent-messages/ sont
+      soit supprimés, soit archivés (à arbitrer par l'Architect).
+      Si archivés, le dossier d'archive est documenté dans le
+      RFC. Le dossier company/agent-messages/ lui-même est
+      supprimé si vide.
+
+    - >
+      Le Makefile (`clean-company`) est mis à jour pour ne pas
+      mentionner ce kind (cf. task-request adjacent
+      5ecc2877 sur la mise à jour générale du Makefile).
+
+    - >
+      Tests Rust verts (la suite teste l'exhaustivité de l'enum
+      ArtifactKind, donc le retrait du variant doit ne casser
+      aucun test, ni en laisser un qui itère sur AgentMessage).
+
+    - >
+      Validation YAML globale verte (cargo run -p
+      companyos-yaml-validator -- --batch company/) : aucun
+      artifact ne référence agent-message comme kind, et l'index
+      orchestrator est cohérent après reindex_all.
+
+    - >
+      Lesson-learned de clôture chaînée avec 4e5c109b
+      (préférence déterministe vs LLM) : un kind legacy qui ne
+      sert plus est de la dette qu'on doit retirer activement,
+      pas un fossile à conserver.
+
+  investigation_hints: >
+    Pistes non prescriptives.
+
+    (1) Décision archivage vs suppression pure des 10 YAML existants
+    dans company/agent-messages/. Argument pour suppression :
+    cohérence avec "kind retiré", les artifacts ne valident plus
+    contre aucun schema. Argument pour archivage : valeur
+    historique éventuelle (traçabilité d'incidents). Si archivage,
+    où ? Hors company/, par exemple .archive/ à la racine ?
+
+    (2) Les references croisées dans metadata.related des autres
+    artifacts vers les agent-messages doivent être nettoyées ou
+    laissées tomber. Plusieurs lessons et diagnostics référencent
+    des agent-messages disparus. À arbitrer : nettoyer
+    proactivement (modif de zone protégée) ou laisser comme
+    références mortes (le système tolère un id manquant dans
+    related ? à vérifier dans le code de validation).
+
+    (3) Risque d'impact sur le code Rust : retirer le variant
+    AgentMessage peut casser des matches non-exhaustifs ailleurs
+    que les fichiers listés. Le compilateur Rust est strict sur
+    l'exhaustivité, donc un cargo build verbose listera tous les
+    points à corriger. À faire en cours d'implementation, pas en
+    RFC.
+
+    (4) Le RFC peut être bref si la liste des références est
+    bien recensée. C'est un retrait, pas une refonte.
+
+  out_of_scope: >
+    Ce task-request NE concerne PAS :
+    - L'introduction d'un mécanisme de remplacement pour la
+      communication inter-agents (les sub-agents communiquent
+      déjà via le retour de Task tool, suffisant).
+    - La mise à jour du Makefile au sens large (cf.
+      task-request 5ecc2877).
+    - Le nettoyage rétroactif des lessons / RFCs / diagnostics
+      qui mentionnent des agent-messages dans leur texte (juste
+      en metadata.related s'il faut, mais pas dans le corps).
