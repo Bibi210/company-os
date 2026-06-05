@@ -1,0 +1,155 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: ac9d40ff-466f-407a-9943-ec9b8ab88063
+  title: "Implementation-plan : retrait complet du kind agent-message (RFC 3d9f0b0c iteration 2)"
+  author: implementer
+  created_at: "2026-06-05"
+  description: >
+    Plan d'execution du RFC 3d9f0b0c iteration 2 (approuve). Retire
+    integralement le kind agent-message : variante de l'enum Rust
+    ArtifactKind et ses branches/tests, branche d'embedding sur string,
+    entree d'un test d'integration, trois passages de shared-rules.yml,
+    prefixe du plugin defense-in-depth, reformulation d'une rules.must de
+    la persona implementer (changement 10), suppression du schema JSON, et
+    suppression des 11 YAML + dossier company/agent-messages/. Permit
+    0f7ecea7 actif sur les 7 paths proteges. Aucune decision structurelle
+    additionnelle : tout est fige par le RFC. Le caller-inventory a ete
+    refait avant redaction : aucune occurrence de code hors les 7 paths du
+    permit (les autres occurrences sont des artifacts YAML historiques et
+    le Makefile, hors-scope par decisions 8 et 9 du RFC).
+  tags:
+    - cleanup
+    - agent-message
+    - legacy-removal
+    - artifact-kind
+    - rust
+    - schema
+    - companyos-internals
+  related:
+    - id: 3d9f0b0c-856d-4799-ac10-e25fad5d1965
+      kind: rfc
+      relationship: input
+    - id: e4ff736b-8ab9-45f2-b0ea-d0979d87a759
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: 4e5c109b-ec35-46ff-98af-3714b1d7a36f
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  steps:
+    - description: >
+        CODE RUST — enum ArtifactKind (crates/config/src/types.rs). Retirer
+        la variante AgentMessage (L139), la branche as_str
+        Self::AgentMessage => "agent-message" (L158), la branche FromStr
+        "agent-message" => Ok(Self::AgentMessage) (L191), l'entree
+        "agent-message" du tableau de test_artifact_kind_parse_valid (L426),
+        et l'entree ArtifactKind::AgentMessage du tableau de
+        test_artifact_kind_display_roundtrip (L457). Le match enum est
+        exhaustif : le compilateur garantit la coherence as_str/FromStr.
+        La matrice access_level n'a aucune ligne dediee (catch-all _ => Read)
+        : non touchee.
+      files:
+        - crates/config/src/types.rs
+    - description: >
+        CODE RUST — embedding (crates/orchestrator/src/embedding.rs).
+        Retirer la branche "agent-message" => spec_field(spec, &["content"])
+        (L258). Match sur string, non signale par le compilateur : retrait
+        manuel pour ne pas laisser de code mort. Le fallback _ => String::new()
+        couvre l'absence.
+      files:
+        - crates/orchestrator/src/embedding.rs
+    - description: >
+        CODE RUST — test d'integration (tests/integration/edge_cases.rs).
+        Retirer l'entree ArtifactKind::AgentMessage du tableau all_kinds de
+        test_access_matrix_no_panics (L220). Match enum : le compilateur
+        signalerait l'oubli.
+      files:
+        - tests/integration/edge_cases.rs
+    - description: >
+        get_diagnostics LSP sur les 3 fichiers Rust modifies pour valider
+        l'absence d'erreur de compilation avant le commit code.
+      files:
+        - crates/config/src/types.rs
+        - crates/orchestrator/src/embedding.rs
+        - tests/integration/edge_cases.rs
+    - description: >
+        Commit code Rust (commit chirurgical). Message :
+        "feat(orchestrator): retire AgentMessage variant".
+      files:
+        - crates/config/src/types.rs
+        - crates/orchestrator/src/embedding.rs
+        - tests/integration/edge_cases.rs
+    - description: >
+        CONFIG — shared-rules.yml. Supprimer l'entree complete agent-message:
+        de artifact_catalog.kinds (L97-106, description + ligne schema).
+        Retirer "agent-message" de la liste "Kinds globaux" de file_placement
+        (L217). Retirer la ligne d'exclusion agent-message de
+        lesson_after_every_artifact (L318). Les autres exclusions restent.
+      files:
+        - company/config/shared-rules.yml
+    - description: >
+        PLUGIN — defense-in-depth-core.mjs. Retirer l'entree
+        "company/agent-messages/" du tableau ARTIFACT_NAMING_PREFIXES (L50).
+        Maintient la coherence avec file_placement (dossier supprime).
+      files:
+        - company/plugins/defense-in-depth-core.mjs
+    - description: >
+        SCHEMA — supprimer company/schemas/agent-message.schema.json
+        (suppression en zone protegee, couverte par le permit). Le
+        SchemaRegistry scanne le dossier : aucun autre changement requis.
+      files:
+        - company/schemas/agent-message.schema.json
+    - description: >
+        Commit config + schema. Message :
+        "chore(config): retire agent-message from shared-rules + schema".
+      files:
+        - company/config/shared-rules.yml
+        - company/plugins/defense-in-depth-core.mjs
+        - company/schemas/agent-message.schema.json
+    - description: >
+        PERSONA — implementer.yml (changement 10). Reformuler la rules.must
+        caller-inventory (L49) : remplacer le segment "via agent-message" par
+        "via le canal de coordination (retour du Task tool)". Le reste de la
+        regle est inchange (recensement callers + arret si divergence permit).
+      files:
+        - company/personas/implementer.yml
+    - description: >
+        Commit persona. Message :
+        "feat(personas): reformulate caller-inventory rule (no agent-message ref)".
+      files:
+        - company/personas/implementer.yml
+    - description: >
+        ARTIFACTS — supprimer les 11 YAML de company/agent-messages/ puis le
+        dossier vide (zone NON protegee, pas de permit requis). Conserves
+        dans l'historique git (argument suppression vs archivage du RFC).
+      files:
+        - company/agent-messages/
+    - description: >
+        Commit suppression artifacts. Message :
+        "chore: remove obsolete agent-messages/ artifacts".
+      files:
+        - company/agent-messages/
+    - description: >
+        VERIFICATIONS FINALES. cargo build (sans --target-dir, declenche le
+        hot-reload), cargo test (0 failed), make validate (validation YAML
+        globale). Grep final "agent-message" dans crates/ pour confirmer
+        l'absence de match string residuel.
+      files: []
+    - description: >
+        CLOTURE dans l'ordre write_permit_full_sequence : consume_write_permit
+        (0f7ecea7) APRES tous les commits et le build/test verts, puis
+        lesson-learned chainee 4e5c109b, puis rfc_set_implemented(3d9f0b0c),
+        puis reload_config EN DERNIER.
+      files: []
+  dependencies:
+    - "RFC 3d9f0b0c iteration 2 approuve (status: approved)"
+    - "Write permit 0f7ecea7 actif sur les 7 paths proteges, scelle au commit a9fce47"
+    - "Permit consomme APRES les commits du code (jamais avant) — sinon hook rejette le commit"
+    - "cargo build/test verts AVANT reload_config (reload_config en derniere etape)"
+  risks:
+    - "Un match enum non recense provoquerait une erreur de compilation detectee au cargo build avant merge : filet compilateur, risque borne."
+    - "Branche string non-enum oubliee ailleurs qu'embedding.rs : caller-inventory n'en a trouve qu'une (embedding L258) ; grep final confirme l'absence d'autres matches string sur agent-message dans crates/."
+    - "Permit incomplet (caller hors target_paths) : caller-inventory effectue avant ecriture, aucune divergence detectee. Si un caller hors permit apparaissait, STOP et escalade pour extension."
+    - "YAML kind: agent-message oublie apres retrait : FromStr echouerait (unknown kind), skippe avec erreur explicite, pas un crash. La suppression du dossier previent ce cas."

@@ -47,7 +47,6 @@ const ARTIFACT_NAMING_PREFIXES = [
   "projects/",
   "company/rfcs/",
   "company/lessons/",
-  "company/agent-messages/",
 ];
 
 const C = "defense-in-depth";

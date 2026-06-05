@@ -255,7 +255,6 @@ pub fn build_embedding_view(yaml: &serde_json::Value, kind: &str) -> String {
                 })
                 .unwrap_or_default(),
         ]),
-        "agent-message" => spec_field(spec, &["content"]),
         _ => String::new(),
     };
     if !body.is_empty() {

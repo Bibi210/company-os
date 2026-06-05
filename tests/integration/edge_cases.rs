@@ -217,7 +217,6 @@ fn test_access_matrix_no_panics() {
         ArtifactKind::LessonLearned,
         ArtifactKind::DiagnosticReport,
         ArtifactKind::Persona,
-        ArtifactKind::AgentMessage,
         ArtifactKind::ProjectConfig,
         ArtifactKind::FlowControl,
         ArtifactKind::ReviewProtocol,

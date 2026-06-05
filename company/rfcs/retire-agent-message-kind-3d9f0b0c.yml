@@ -7,6 +7,27 @@ metadata:
   created_at: "2026-06-05"
   status: approved
   approved_at: "2026-06-05T10:11:07.937899433+00:00"
+  changelog:
+    - date: "2026-06-05"
+      author: architect
+      description: >
+        Iteration 2 (amendement pre-execution, discipline caller-inventory
+        RFC eb42a8de). Deux divergences traitees : (1) BLOQUANT — ajout de
+        company/personas/implementer.yml a affected_files.modified et nouveau
+        changement 10 (reformulation de la rules.must caller-inventory pour
+        ne plus mentionner agent-message comme canal, remplace par "via le
+        canal de coordination (retour du Task tool)") ; (2) MINEUR —
+        recensement YAML porte de 10 a 11 (ajout de
+        pause-ci-contention-personas-3736a875, cree apres le diagnostic
+        e4ff736b ; suppression du dossier entier donc impact fonctionnel
+        nul). Recheck exhaustif caller-inventory effectue sur crates/,
+        company/personas/, company/plugins/, company/schemas/ : aucune autre
+        occurrence non couverte (architect.yml propre, toutes les autres
+        occurrences deja dans les 6 paths initiaux).
+    - date: "2026-06-05"
+      author: architect
+      description: >
+        Iteration 1 — redaction initiale et approbation CEO.
   description: >
     Retire integralement le kind agent-message de CompanyOS. Decision
     utilisateur (task-request 95e93649) : ce kind est legacy, non utilise
@@ -16,10 +37,12 @@ metadata:
     d'embedding, reference dans un test d'integration, entrees dans
     shared-rules.yml (artifact_catalog, file_placement, exclusion
     lesson_after_every_artifact), prefixe dans le plugin defense-in-depth,
-    et supprime les 10 artifacts existants + leur dossier. S'appuie sur le
-    recensement exhaustif du diagnostic e4ff736b. Touche des zones
-    protegees (schema, crates/, config, plugin) : approbation CEO + write
-    permit requis.
+    reformulation d'une rules.must de la persona implementer (RFC eb42a8de)
+    qui mentionnait agent-message comme canal, et supprime les 11 artifacts
+    existants + leur dossier. S'appuie sur le recensement exhaustif du
+    diagnostic e4ff736b, complete par le recheck caller-inventory de
+    l'iteration 2. Touche des zones protegees (schema, crates/, config,
+    plugin, persona) : approbation CEO + write permit requis.
   tags:
     - cleanup
     - agent-message
@@ -143,9 +166,14 @@ spec:
 
     === 7. ARTIFACTS EXISTANTS — DECISION : SUPPRESSION PURE ===
 
-    ARBITRAGE ARCHITECT (hint 1 du task-request). Les 10 YAML de
+    ARBITRAGE ARCHITECT (hint 1 du task-request). Les 11 YAML de
     company/agent-messages/ sont SUPPRIMES (pas archives), et le dossier
-    company/agent-messages/ est supprime une fois vide.
+    company/agent-messages/ est supprime une fois vide. NOTE iteration 2 :
+    le recensement nominal du diagnostic e4ff736b listait 10 fichiers ; un
+    11e (pause-ci-contention-personas-3736a875) a ete cree pendant une
+    session ulterieure. Le dossier entier etant supprime, l'impact
+    fonctionnel est identique ; le recensement est mis a jour pour
+    exhaustivite.
 
     Rationale de la suppression vs archivage :
     - La valeur historique invoquee pour l'archivage est DEJA garantie
@@ -160,7 +188,7 @@ spec:
       garder de demi-etat. Soit le kind existe, soit il n'existe pas. Un
       dossier d'archive serait un demi-etat (le kind n'existe plus mais
       ses artifacts trainent).
-    Les 10 fichiers supprimes (diagnostic A.7) :
+    Les 11 fichiers supprimes (diagnostic A.7 + recheck iteration 2) :
     architect-to-pm-roadmap-autosync-artifacts-46b4f40c,
     blocker-2-permits-wipes-cargo-info-05224964,
     blocker-write-permit-9149f79e-disparu-4f000127,
@@ -170,7 +198,8 @@ spec:
     livraison-refonte-recherche-382cf805,
     permit-extension-needed-d64cc147,
     permit-extension-request-yaml-validator-4ade4e7c,
-    route-db-corruption-tr-to-architect-beae3581.
+    route-db-corruption-tr-to-architect-beae3581,
+    pause-ci-contention-personas-3736a875.
 
     === 8. CROSS-REFS metadata.related — DECISION : NE PAS NETTOYER ===
 
@@ -213,6 +242,35 @@ spec:
     company/agent-messages/ (dossier supprime) ; si traite AVANT ou en
     parallele, la couverture transitoire reste valide (AC3 de 5ecc2877
     l'anticipe). Point de suivi pour le PM, pas un blocage.
+
+    === 10. PERSONA implementer.yml — reformulation prose (iteration 2) ===
+
+    DIVERGENCE DETECTEE EN PRE-EXECUTION (discipline caller-inventory RFC
+    eb42a8de). La rules.must ajoutee a company/personas/implementer.yml par
+    le RFC eb42a8de (caller-inventory, iteration 2) contient dans sa PROSE
+    le mot "agent-message" comme canal de signalement : "...s'arreter et
+    signaler a l'Architect / au PM via agent-message AVANT toute ecriture,
+    pour extension du permit...". company/personas/ est une zone protegee :
+    cette occurrence n'est couverte par aucun des 6 paths initialement
+    recenses, et le retrait du kind rendrait la regle incoherente (elle
+    designerait comme canal un kind qui n'existe plus).
+
+    L'out_of_scope du task-request 95e93649 excluait le nettoyage retroactif
+    de la PROSE des autres artifacts. Cette occurrence est une EXCEPTION
+    justifiee : il ne s'agit pas d'une trace historique inoffensive (comme
+    les cross-refs metadata.related du changement 8), mais d'une regle
+    VIVANTE qui prescrit un canal de coordination. Laisser "agent-message"
+    designerait un mecanisme retire, induisant l'Implementer en erreur. La
+    nettoyer releve donc du meme cycle atomique que le retrait du kind.
+
+    ACTION : reformuler la rules.must pour ne plus mentionner agent-message
+    comme canal, sans changer le fond de la regle (recensement des callers
+    + arret en cas de divergence permit). Formulation cible :
+    "...s'arreter et signaler a l'Architect / au PM via le canal de
+    coordination (retour du Task tool) AVANT toute ecriture, pour extension
+    du permit. Ne jamais contourner un permit incomplet."
+    Seul le segment "via agent-message" devient "via le canal de
+    coordination (retour du Task tool)". Le reste de la regle est inchange.
 
     === ANALYSE TRIAXIALE ===
 
@@ -263,12 +321,12 @@ spec:
     ZONES PROTEGEES TOUCHEES (write permit requis apres approbation).
     Distinction modified/created/deleted explicitee. Note : le schema
     affected_files (RFC a4eb3ee7) modelise modified et created ; il n'a
-    pas de cle "deleted". Les suppressions de fichiers (schema + 10 YAML)
+    pas de cle "deleted". Les suppressions de fichiers (schema + 11 YAML)
     sont donc decrites en prose ci-dessous ET le fichier schema supprime
     est inclus dans affected_files.modified pour que son chemin figure
     dans les target_paths candidats du permit (la suppression d'un
     fichier en zone protegee requiert un permit couvrant ce chemin, au
-    meme titre qu'une modification). Les 10 YAML supprimes sont dans
+    meme titre qu'une modification). Les 11 YAML supprimes sont dans
     company/agent-messages/ (zone NON protegee : artifacts globaux), donc
     leur suppression ne requiert pas de permit, mais est listee pour
     exhaustivite.
@@ -290,11 +348,17 @@ spec:
     - company/plugins/defense-in-depth-core.mjs : retrait du prefixe
       "company/agent-messages/".
 
+    FICHIERS MODIFIES — PERSONA (zone protegee, ajout iteration 2) :
+    - company/personas/implementer.yml : reformulation de la rules.must
+      caller-inventory (ligne 49, ajoutee par RFC eb42a8de) pour remplacer
+      "via agent-message" par "via le canal de coordination (retour du
+      Task tool)". Cf. changement 10.
+
     FICHIERS SUPPRIMES — SCHEMA (zone protegee, permit requis) :
     - company/schemas/agent-message.schema.json : suppression complete.
 
     FICHIERS SUPPRIMES — ARTIFACTS (zone non protegee company/agent-messages/) :
-    - les 10 YAML listes au changement 7, puis le dossier vide.
+    - les 11 YAML listes au changement 7, puis le dossier vide.
 
     AUCUN FICHIER CREE. affected_files.created est vide (absent).
 
@@ -338,8 +402,9 @@ spec:
     materialise ce RFC. Le revert restaure : le schema
     agent-message.schema.json, la variante AgentMessage et ses branches
     dans types.rs, la branche d'embedding, la ligne edge_cases, les
-    entrees shared-rules, le prefixe defense-in-depth, et les 10 YAML +
-    le dossier company/agent-messages/.
+    entrees shared-rules, le prefixe defense-in-depth, la prose originale
+    de la rules.must implementer (segment "via agent-message"), et les
+    11 YAML + le dossier company/agent-messages/.
 
     Procedure manuelle equivalente (si revert git impossible), dans un
     ordre maintenant la coherence (enum et schema ensemble) :
@@ -350,12 +415,14 @@ spec:
     2. SCHEMA : restaurer company/schemas/agent-message.schema.json.
     3. CONFIG : restaurer les 3 passages de shared-rules.yml.
     4. PLUGIN : restaurer le prefixe dans defense-in-depth-core.mjs.
-    5. ARTIFACTS : restaurer les 10 YAML et le dossier
+    5. PERSONA : restaurer le segment "via agent-message" dans la
+       rules.must de company/personas/implementer.yml.
+    6. ARTIFACTS : restaurer les 11 YAML et le dossier
        company/agent-messages/.
-    6. BUILD & VALIDATION : cargo build + cargo test ; reload_config +
+    7. BUILD & VALIDATION : cargo build + cargo test ; reload_config +
        reload_schemas ; validate_file sur un agent-message restaure.
 
-    Aucune donnee perdue par le retrait au-dela des 10 YAML, eux-memes
+    Aucune donnee perdue par le retrait au-dela des 11 YAML, eux-memes
     conserves dans l'historique git (c'est precisement l'argument de la
     suppression vs archivage, changement 7). Le rollback les ressuscite a
     l'identique.
@@ -368,4 +435,5 @@ spec:
       - company/config/shared-rules.yml
       - company/plugins/defense-in-depth-core.mjs
       - company/schemas/agent-message.schema.json
+      - company/personas/implementer.yml
     created: []

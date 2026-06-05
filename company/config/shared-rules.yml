@@ -94,16 +94,6 @@ spec:
           Artifact projet (vit dans projects/<slug>/diagnostic-reports/).
           Peut être produit par tout agent confronté à un problème technique.
         schema: company/schemas/diagnostic-report.schema.json
-      agent-message:
-        description: >
-          Message asynchrone entre deux agents du système.
-          Contient un sender (metadata.from), un recipient (metadata.to), et un content (corps du message).
-          Utilisé pour la coordination inter-agents quand un échange direct n'est pas possible :
-          demandes de clarification, notifications de complétion, escalades, partage d'information.
-          Le thread de conversation est traçable via metadata.related (relationship: related).
-          Artifact global (vit dans company/agent-messages/).
-          Tout agent peut en produire et en consommer.
-        schema: company/schemas/agent-message.schema.json
       persona:
         description: >
           Définition complète d'un agent du système CompanyOS.
@@ -214,7 +204,7 @@ spec:
         Kinds projet  : task-request, design-doc, implementation-plan, review-report, diagnostic-report,
                         project-config
         Kinds globaux : lesson-learned, persona, rfc, flow-control, review-protocol,
-                        human-review-triggers, agent-message, roadmap
+                        human-review-triggers, roadmap
         Le project-slug doit être un identifiant kebab-case unique et immuable.
     review_protocol:
       description: >
@@ -315,7 +305,6 @@ spec:
 
         Kinds explicitement exclus (coordination pure, pas de résultat capitalisable) :
         - `review-report` — vote intermédiaire, pas un résultat en soi
-        - `agent-message` — échange de coordination, pas de connaissance à capitaliser
         - `task-request` — entrée du workflow, pas un résultat
         - `lesson-learned` — créer une lesson sur une lesson crée une récursivité sans fin
 
