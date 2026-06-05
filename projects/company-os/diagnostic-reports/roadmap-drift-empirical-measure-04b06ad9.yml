@@ -1,0 +1,237 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: 04b06ad9-cb50-4c27-a9ba-128ffaff8ddf
+  title: "Mesure empirique de la dérive roadmap 329da45f vs réel, et état du data model d'indexation des roadmaps"
+  author: architect
+  created_at: "2026-06-05"
+  project: company-os
+  description: >
+    Investigation cadrée par le task-request e8c4d628. Mesure
+    empiriquement de combien d'items de la roadmap companyos-system
+    (329da45f) ont dérivé de la vérité des artifacts sources AVANT la
+    mise à jour manuelle d'aujourd'hui, et analyse le pipeline
+    d'indexation actuel des roadmaps (engine.rs, db.rs,
+    roadmap_summary.rs) pour situer où l'auto-sync devra vivre. Établit
+    le constat structurel central : la table `artifacts` indexée ne
+    porte PAS de colonne `status`, donc le mapping rfc->status ne peut
+    pas se faire par simple lecture de l'index ; il faut soit lire le
+    YAML source soit matérialiser le status. Découvre aussi une seconde
+    dérive non anticipée : les RFCs sources eux-mêmes sont stale
+    (approved alors que mergés), ce qui change la nature du problème.
+  tags:
+    - roadmap
+    - auto-sync
+    - drift
+    - indexation
+    - data-model
+    - diagnostic
+    - critical-infra
+  related:
+    - id: e8c4d628-f2a4-424d-a643-83835ff719dc
+      kind: task-request
+      relationship: input
+    - id: 329da45f-e24f-4200-9e18-e2e47b5a4f27
+      kind: roadmap
+      relationship: related
+    - id: a49801aa-911e-45d7-95a3-b21d6ea2bd2d
+      kind: rfc
+      relationship: related
+
+spec:
+  status: resolved
+
+  symptom: >
+    Le RFC a49801aa avait tranché "pas d'auto-synchronisation : le
+    status d'un item de roadmap est la vérité PM, mise à jour
+    manuellement". Le risque 1 documenté ("duplication de vérité,
+    mitigation = convention sociale") s'est matérialisé en moins d'une
+    session : la roadmap companyos-system (329da45f) a dérivé du réel.
+    Quand l'utilisateur a demandé "où on en est ?", le PM a dû mettre
+    à jour 6 items à la main (changelog 2026-06-04, commit ba117b0).
+
+    Question posée par le task-request : combien d'items avaient
+    effectivement dérivé, et où vit aujourd'hui le pipeline qui devrait
+    porter l'auto-sync ?
+
+  root_cause: >
+    Investigation en deux volets : (A) mesure de la dérive, (B)
+    analyse du data model.
+
+    === VOLET A — MESURE EMPIRIQUE DE LA DÉRIVE ===
+
+    Inventaire des roadmaps (list_roadmaps) : UNE SEULE roadmap existe,
+    329da45f (domaine companyos-system, 15 items, status active). Pas
+    d'autre roadmap à mesurer.
+
+    Sur les 15 items : 13 ont une ref `rfc`, 2 ont une ref `external`
+    (db-schema-migration-hotfix et api-callers-discoverability ; le
+    troisième external mentionné dans le task-request, backup-strategy,
+    est aussi external). Re-comptage exact depuis le YAML : 12 items
+    ref=rfc + 3 items ref=external (db-schema-migration-hotfix,
+    api-callers-discoverability, backup-strategy) = 15.
+
+    Pour les 12 items ref=rfc, j'ai relevé le `metadata.status` réel de
+    chaque RFC source sur disque (rg "^  status:" sur company/rfcs/*),
+    puis appliqué le mapping cible du task-request (approved ->
+    in_progress, implemented -> done) et comparé au status porté par la
+    roadmap APRÈS la mise à jour manuelle d'aujourd'hui :
+
+      item (ref rfc)            | RFC.metadata.status | roadmap dit | mapping cible   | dérive ?
+      --------------------------|---------------------|-------------|-----------------|---------
+      proxy-resilient d9399863  | implemented         | done        | done            | non
+      db-resilience cdbfee72    | approved            | done        | in_progress     | OUI
+      memory-lookup f4fe8a04    | approved            | done        | in_progress     | OUI
+      roadmap-kind a49801aa     | implemented         | done        | done            | non
+      roadmap-tooling 3cd72740  | approved            | done        | in_progress     | OUI
+      hybrid-search bdee1af4    | implemented         | done        | done            | non
+      file-watcher 062ebaa8     | implemented         | done        | done            | non
+      atomic-grant 359f9162     | approved            | done        | in_progress     | OUI
+      rfc-set-impl 1c0f2570     | approved            | done        | in_progress     | OUI
+      defense-sel bde023e2      | approved            | done        | in_progress     | OUI
+      affected-files a4eb3ee7   | approved            | done        | in_progress     | OUI
+      schema-migr 973a5569      | approved            | done        | in_progress     | OUI
+
+    RÉSULTAT : 8 des 12 items ref=rfc dérivent du mapping cible MÊME
+    APRÈS la mise à jour manuelle d'aujourd'hui. La mise à jour
+    manuelle a corrigé la dérive present->past (les items qui étaient
+    encore future/planned alors que les RFCs étaient mergés), mais a
+    introduit une SUR-CORRECTION : le PM a marqué "done" 8 items dont
+    le RFC source est encore en `approved`, pas `implemented`.
+
+    DÉRIVE AVANT LA MISE À JOUR (reconstruction depuis le changelog
+    ba117b0) : les 5 items atomic-grant, rfc-set-impl, defense-sel,
+    affected-files, schema-migr étaient en `future/planned` alors que
+    les 5 RFCs correspondants étaient déjà mergés en code. C'est la
+    dérive que l'utilisateur a constatée ("5 RFCs candidats passés de
+    future planned à mergés sans que la roadmap soit mise à jour").
+    Soit 5/12 = 42% des items rfc en dérive franche (planned au lieu
+    de in_progress/done) au moment du "où on en est ?".
+
+    === SECONDE DÉRIVE DÉCOUVERTE (non anticipée par le task-request) ===
+
+    Les 8 RFCs marqués "done" par le PM mais encore `approved` sur
+    disque révèlent que les RFCs eux-mêmes sont STALE : leur code est
+    mergé mais leur cycle de vie n'a jamais été clôturé via
+    rfc_set_implemented (transition approved -> implemented). Cause
+    connue et documentée : lesson 80f7b27a (le tool rfc_set_implemented
+    n'est pas visible dans la session MCP où il a été créé car le proxy
+    ne relaie pas notifications/tools/list_changed ; la clôture était
+    "en attente d'un redémarrage de session"). Le changelog de la
+    roadmap le mentionne explicitement pour 359f9162 et 1c0f2570.
+
+    CONSÉQUENCE POUR L'AUTO-SYNC : si on déploie l'auto-sync avec le
+    mapping approved -> in_progress, les 8 items repasseront
+    automatiquement de "done" (vérité PM optimiste) à "in_progress"
+    (vérité RFC). C'est le COMPORTEMENT CORRECT et VOULU : l'auto-sync
+    dit la vérité de l'artifact source, pas l'optimisme du PM. Mais il
+    faut le documenter pour que la migration ne soit pas perçue comme
+    une régression. Le vrai correctif de fond est de clôturer les 8
+    RFCs (rfc_set_implemented), ce qui est hors scope de ce
+    task-request mais doit être tracé.
+
+    === VOLET B — ANALYSE DU DATA MODEL D'INDEXATION ===
+
+    Où vivent les items de roadmap aujourd'hui :
+
+    1. La table `artifacts` (crates/orchestrator/src/db.rs SCHEMA_SQL
+       lignes 77-88) stocke UNE ROW par roadmap, avec les colonnes :
+       id, kind, title, description, tags, file_path, indexed_at,
+       author, project, created_at. Les ITEMS de la roadmap ne sont
+       PAS éclatés en table dédiée : ils restent dans le YAML sur
+       disque. Il n'existe AUCUNE table roadmap_items.
+
+    2. CONSTAT CENTRAL : la table `artifacts` ne porte PAS de colonne
+       `status`. Le seul `status` indexé dans toute la DB concerne les
+       tables review_rounds et write_permits, pas les artifacts. Donc
+       le status d'un RFC (metadata.status) n'est PAS interrogeable par
+       SQL sur l'index : il faut lire le YAML source du RFC pour le
+       connaître.
+
+    3. Les deux tools roadmap actuels (engine.rs) lisent et parsent le
+       YAML à la volée à CHAQUE appel :
+       - list_roadmaps (engine.rs:992) : db.list_by_kind("roadmap")
+         puis pour chaque roadmap, read_to_string + parse_roadmap_yaml
+         + comptage par status. Pas de matérialisation.
+       - summarize_roadmap (engine.rs:1062) : résout la roadmap (par id
+         via db.get_artifact, ou par domain via list_by_kind + parse),
+         lit le YAML complet, regroupe les items. Pas de
+         matérialisation.
+       Les items de roadmap sont donc DÉJÀ traités "à la volée depuis
+       le YAML", jamais persistés en colonnes indexées. Le status porté
+       par chaque item est lu tel quel depuis spec.items[].status.
+
+    4. Le pipeline d'indexation (engine.index_artifact, engine.rs:668)
+       pour une roadmap fait exactement ce qu'il fait pour tout
+       artifact : valide, extrait metadata (titre, description, tags,
+       author, project, created_at), calcule l'embedding, upsert les 4
+       tables (artifacts, fts, vec, relations). Il ne touche PAS aux
+       items individuels. reindex_all (engine.rs:1191) appelle
+       index_artifact en boucle ; il est appelé synchrone au boot par
+       PILIER D et en background.
+
+    5. Le canonical du status RFC est metadata.status. Vérifié dans
+       engine.update_rfc_status_in_file (engine.rs:347) et
+       set_rfc_implemented (engine.rs:463) : les deux lisent
+       yaml/metadata/status. Le RFC porte aussi spec.status (miroir),
+       mais metadata.status est la voie d'écriture des transitions de
+       cycle de vie.
+
+    6. La détection "en review (round open)" pour un RFC nécessiterait
+       une requête review_rounds WHERE artifact_path = <path du RFC> AND
+       status = 'open'. Les review_rounds sont stockés (db.rs:52) mais
+       NE SONT PAS reconstruits par PILIER D (lesson 611fde3e : "les
+       tables review_rounds et write_permits sont perdues en cas de
+       rebuild"). Le signal "round open" est donc volatil et non
+       reconstructible. Implication d'arbitrage : la branche "review"
+       du mapping doit être best-effort, et l'absence de round open ne
+       doit jamais bloquer le calcul (fallback sur metadata.status).
+
+  resolution: >
+    Le diagnostic est clos. Il établit les faits qui driveront le
+    design-doc et le RFC dérivés de ce task-request :
+
+    FAIT 1 — Dérive mesurée : 5/12 items rfc en dérive franche
+    (planned au lieu d'in_progress/done) au moment du "où on en est ?",
+    8/12 encore en dérive vs mapping cible après la correction manuelle
+    (le PM a sur-corrigé en done ce qui n'est qu'approved). La
+    convention sociale a échoué exactement comme le risque 1 du RFC
+    a49801aa le craignait.
+
+    FAIT 2 — Une seule roadmap existe (329da45f). La migration est donc
+    bornée : 12 items rfc à laisser au mapping + 3 items external à
+    reclasser en loose (db-schema-migration-hotfix -> hotfix,
+    api-callers-discoverability -> idea, backup-strategy ->
+    observation ou exploration).
+
+    FAIT 3 — Data model : les items de roadmap ne sont PAS matérialisés
+    en table dédiée. Ils vivent dans le YAML et sont parsés à la volée
+    par list_roadmaps et summarize_roadmap. Aucune table roadmap_items.
+
+    FAIT 4 — La table `artifacts` ne porte pas de colonne `status`. Le
+    mapping rfc->status exige donc soit (a) lire le YAML source du RFC
+    référencé à la volée, soit (b) ajouter une colonne status à
+    artifacts (migration v3) pour rendre le mapping interrogeable par
+    SQL. Trade-off arbitré dans le design-doc.
+
+    FAIT 5 — metadata.status est le canonical du status RFC.
+
+    FAIT 6 — Le signal "round open" est volatil (non rebuildé par
+    PILIER D) : la branche review du mapping doit être best-effort,
+    jamais bloquante.
+
+    FAIT 7 — Seconde dérive non anticipée : 8 RFCs sont approved alors
+    que mergés (cycle non clôturé, cf. lesson 80f7b27a). L'auto-sync va
+    légitimement les afficher en in_progress, pas done. Le correctif de
+    fond (clôturer les 8 RFCs via rfc_set_implemented au prochain boot)
+    est hors scope de e8c4d628 mais doit être porté par le PM comme
+    sujet de suivi.
+
+    DÉCISION D'ARBITRAGE PRÉ-DESIGN (confirmée dans le design-doc) :
+    puisque les items sont DÉJÀ parsés à la volée et qu'aucune table
+    roadmap_items n'existe, l'auto-sync se fait naturellement À LA VOLÉE
+    au moment du summarize/list (option b du task-request hint 9), en
+    réutilisant le YAML déjà lu et en faisant un lookup ponctuel du
+    status de chaque RFC référencé. Aucune migration SQL n'est requise
+    pour le status. C'est cohérent avec l'avis PM non bloquant et avec
+    l'échelle (<200 items, 1 à 10 roadmaps).

@@ -1,0 +1,326 @@
+api_version: companyos/v1
+kind: design-doc
+metadata:
+  id: 3b286da8-6be6-4e0b-9119-5e726d05e569
+  title: "Architecture de l'auto-sync absolu du status de roadmap (à la volée) et typage strict du ref loose"
+  author: architect
+  created_at: "2026-06-05"
+  project: company-os
+  description: >
+    Définit l'architecture qui transforme le modèle "status manuel,
+    pas d'auto-sync" du RFC a49801aa en un auto-sync ABSOLU calculé à
+    la lecture (summarize/list) depuis le status de l'artifact source
+    référencé, avec le status `blocked` sacralisé comme seule exception
+    PM. Définit aussi le remplacement du ref type `external` par un type
+    `loose` avec catégorie typée par enum. Le QUOI et le POURQUOI : où
+    vit le calcul, le mapping par type de ref, le comportement aux cas
+    dégénérés (RFC pas encore indexé, orphan, blocked vs implemented),
+    et la structure des drift_warnings.
+  tags:
+    - roadmap
+    - auto-sync
+    - schema
+    - indexation
+    - typage
+    - loose
+    - design
+    - critical-infra
+  related:
+    - id: e8c4d628-f2a4-424d-a643-83835ff719dc
+      kind: task-request
+      relationship: input
+    - id: 04b06ad9-cb50-4c27-a9ba-128ffaff8ddf
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: a49801aa-911e-45d7-95a3-b21d6ea2bd2d
+      kind: rfc
+      relationship: supersedes
+    - id: 3cd72740-1424-46ac-8ee6-96f714f3fa94
+      kind: rfc
+      relationship: related
+    - id: 329da45f-e24f-4200-9e18-e2e47b5a4f27
+      kind: roadmap
+      relationship: related
+
+spec:
+  overview: >
+    Ce design répond au task-request e8c4d628, fondé sur le constat
+    (diagnostic 04b06ad9) que la règle "pas d'auto-sync" du RFC a49801aa
+    était intenable : la seule roadmap existante a dérivé du réel en
+    moins d'une session.
+
+    DEUX CHANTIERS DISTINCTS MAIS LIVRÉS ENSEMBLE.
+
+    Chantier 1 — AUTO-SYNC ABSOLU DU STATUS. Le status affiché d'un
+    item de roadmap n'est plus la vérité manuelle du PM mais une vérité
+    CALCULÉE depuis l'artifact source référencé (RFC ou projet). Le PM
+    perd le droit d'écrire le status librement, à UNE exception près :
+    `blocked`. Si un item porte explicitement status=blocked dans le
+    YAML, le calcul est court-circuité et blocked l'emporte. Tout autre
+    status YAML est ignoré au profit du status calculé.
+
+    Chantier 2 — TYPAGE STRICT DU REF LOOSE. Le ref type `external`
+    (champ libre `label` seul) est remplacé par un type `loose` qui
+    exige une `category` typée par enum (idea, exploration, hotfix,
+    observation, dependency) plus un `label`. Les items loose n'ont pas
+    d'artifact source, donc PAS d'auto-sync : leur status reste la
+    vérité manuelle du PM.
+
+    DÉCISION ARCHITECTURALE STRUCTURANTE : LE CALCUL VIT À LA LECTURE,
+    PAS À L'INDEXATION (détaillée dans decisions).
+
+    Ce design SUPERSEDE PARTIELLEMENT le RFC a49801aa : il renverse la
+    décision "pas d'auto-synchronisation" et remplace le ref type
+    external. Il NE touche PAS les autres décisions de a49801aa
+    (placement global, dimensions temporelle/causale/narrative,
+    depends_on, kind Roadmap dans l'enum Rust, access_level). C'est la
+    première fois qu'un RFC est superseded parce que sa décision s'est
+    avérée FAUSSE en pratique (le risque 1 "convention sociale" était
+    sous-estimé), pas parce qu'un meilleur design est apparu.
+
+  components:
+    - name: "1. Schéma roadmap : ref loose + sémantique du status réinterprétée"
+      description: >
+        Le ref.oneOf passe de 3 branches (project, rfc, external) à 3
+        branches (project, rfc, loose). La branche external est
+        REMPLACÉE par loose :
+          loose:
+            type: const "loose"
+            category: enum strict { idea, exploration, hotfix,
+                      observation, dependency }  (obligatoire)
+            label: string, maxLength ~200  (obligatoire)
+            additionalProperties: false
+        Catégories (task-request hint 6) : idea = sujet en réflexion ;
+        exploration = creusé activement sans engagement ; hotfix =
+        action ponctuelle hors RFC ; observation = constat à garder ;
+        dependency = dépendance externe non maîtrisée.
+
+        Le champ `status` de l'item RESTE dans le schéma (enum inchangé
+        planned/in_progress/done/blocked/cancelled) et reste REQUIS
+        (task-request décision 8). Mais sa description change : il n'est
+        plus "la VÉRITÉ portée par la roadmap" ; il devient "valeur
+        d'entrée respectée UNIQUEMENT si elle vaut blocked (droit PM) ou
+        si l'item est de type loose. Pour les items project/rfc non
+        blocked, le status YAML est ÉCRASÉ par le status calculé à la
+        lecture."
+
+        BREAKING SCHEMA CHANGE contrôlé : un YAML ref.type=external
+        devient invalide. Une seule roadmap existe (329da45f), migrée
+        dans le même cycle. additionalProperties:false sur loose rejette
+        les typos de category.
+
+    - name: "2. Fonction de mapping pure (effective_status)"
+      description: >
+        Coeur testable du chantier. Fonction PURE (ne lit ni FS ni DB ;
+        les statuts sources lui sont fournis par l'engine). Logique :
+          1. SHORT-CIRCUIT BLOCKED. Si item.status_yaml == "blocked"
+             -> retourner ("blocked", drift=false). Aucune autre branche
+             évaluée. Droit absolu du PM.
+          2. Selon item.ref.type :
+             a. loose   -> (status_yaml, drift=false). Status manuel
+                           respecté tel quel.
+             b. rfc     -> mapping depuis status du RFC source
+                           (composant 3). drift = (calculé != status_yaml).
+             c. project -> mapping depuis état projet (composant 3).
+                           drift = (calculé != status_yaml).
+        Pureté = testabilité unitaire triviale sur chaque combinaison
+        ref-type x status-source x status-yaml (task-request AC7).
+
+    - name: "3. Mapping par type de ref"
+      description: >
+        REF TYPE=RFC. Entrée : metadata.status du RFC source (canonical,
+        diagnostic FAIT 5) + signal best-effort "round open".
+          draft                  -> planned
+          en review (round open) -> in_progress  (best-effort, voir + bas)
+          approved               -> in_progress
+          implemented            -> done
+          rejected               -> cancelled
+        Note review : il n'existe PAS de metadata.status == "review"
+        dans le cycle RFC. L'état "en review" est porté par un
+        review_round ouvert (review_rounds WHERE artifact_path=<path RFC>
+        AND status='open'). Signal BEST-EFFORT, NON BLOQUANT (diagnostic
+        FAIT 6 : rounds non rebuildés par PILIER D). Politique : si round
+        open ET metadata.status encore "draft" -> in_progress ; sinon
+        mapping suit metadata.status seul. Le mapping reste correct sans
+        le signal (draft->planned, approved->in_progress de toute façon).
+
+        REF TYPE=PROJECT. Le project-config n'a pas de status (léger par
+        design). ARBITRAGE Architect (options a/b/c du hint 3) : fallback
+        explicite déterministe binaire, PAS de déduction d'activité.
+          dossier projects/<slug>/ ABSENT  -> planned
+          dossier projects/<slug>/ PRÉSENT -> in_progress
+        Pas de déduction done/cancelled depuis git ou les artifacts du
+        projet (signal bruité, coûteux, ambigu). Le PM garde blocked
+        (court-circuit). Porte ouverte : un RFC futur enrichira si un
+        champ status arrive au project-config.
+
+        REF TYPE=LOOSE. Pas d'auto-sync. Status YAML respecté (composant
+        2 étape 2.a). Aucun artifact source.
+
+    - name: "4. Intégration dans list_roadmaps et summarize_roadmap"
+      description: >
+        Les deux tools parsent DÉJÀ le YAML à la volée (diagnostic FAIT
+        3). L'auto-sync s'insère APRÈS le parse des items, AVANT le
+        comptage/regroupement :
+          1. Pour chaque item, l'engine résout le status source :
+             rfc -> db.get_artifact(id).file_path + read+parse
+             metadata.status ; project -> stat dossier
+             projects/<slug>/ ; loose -> aucun lookup.
+          2. effective_status(item, source_status) -> status calculé.
+          3. Comptages (by_status, blocked_count, in_progress_count) et
+             regroupements (items_by_status) utilisent le status CALCULÉ.
+             items_by_timeframe reste sur le timeframe YAML (non
+             auto-syncé : dimension de lecture PM).
+          4. Chaque item retourné porte son status calculé ; le status
+             YAML est conservé pour le calcul du drift.
+
+    - name: "5. Drift warnings (filet de sécurité)"
+      description: >
+        summarize_roadmap gagne un champ `drift_warnings` : liste des
+        items où status YAML != status calculé, ET ni blocked ni loose
+        (exclus par construction). Structure minimale (task-request
+        AC5) :
+          drift_warnings:
+            - key: <item.key>
+              yaml_status: <status dans le YAML sur disque>
+              mapped_status: <status calculé>
+              ref: <ref typé de l'item, pour localiser la source>
+        Sémantique : signale une écriture YAML hors pipeline (édition
+        manuelle ou roadmap stale d'avant l'auto-sync). NON bloquant :
+        le status affiché reste le calculé (l'auto-sync gagne toujours).
+        Sert au PM à nettoyer le YAML stale. list_roadmaps n'en a pas
+        besoin (vue de listing léger) ; le champ vit dans summarize.
+
+    - name: "6. Migration de la roadmap 329da45f"
+      description: >
+        Une seule roadmap existe (diagnostic FAIT 2). Migration même
+        cycle :
+        - 3 items ref=external reclassés en ref=loose + category :
+            db-schema-migration-hotfix  -> hotfix
+            api-callers-discoverability -> idea
+            backup-strategy             -> observation
+          (backup-strategy : observation, pas exploration : c'est un
+           constat tranché et clos "couvert par git remote", pas un
+           sujet creusé.)
+        - 12 items ref=rfc : status YAML devient cosmétique (écrasé par
+          le calcul). On l'aligne sur le mapping attendu pour éviter un
+          drift_warning bruyant day-1 : les 4 items dont le RFC est
+          implemented restent "done" ; les 8 items dont le RFC est
+          approved passent en "in_progress" dans le YAML (matche le
+          calcul). Conséquence assumée de la seconde dérive (diagnostic
+          FAIT 7) : tant que les 8 RFCs ne sont pas clôturés via
+          rfc_set_implemented, ils sont légitimement in_progress, pas
+          done.
+
+  decisions:
+    - decision: >
+        DÉCISION 1 — Le calcul de l'auto-sync vit À LA LECTURE
+        (summarize/list), PAS à l'indexation. Aucune matérialisation en
+        DB, aucune table roadmap_items, aucune migration SQL.
+      rationale: >
+        Le diagnostic 04b06ad9 (FAIT 3) montre que les items ne sont PAS
+        matérialisés : list_roadmaps et summarize_roadmap parsent déjà le
+        YAML à la volée à chaque appel. La table artifacts n'a pas de
+        colonne status (FAIT 4). L'option a (matérialiser à l'indexation)
+        imposerait soit une table roadmap_items (migration lourde,
+        nouveau writer, recalcul à chaque indexation), soit une colonne
+        status + champ matérialisé par item, PLUS un problème de
+        FRAÎCHEUR : le status mappé deviendrait stale dès qu'un RFC
+        référencé change sans ré-indexation de la roadmap, forçant un
+        couplage inverse coûteux (ré-indexer toutes les roadmaps
+        référençant un RFC à chaque transition). L'option b est TOUJOURS
+        FRAÎCHE par construction et coûte N lookups par clé primaire +
+        read+parse, négligeable à l'échelle (<200 items, 1-10 roadmaps).
+        Elle ne touche pas engine.index_artifact, donc préserve
+        trivialement PILIER A (writer unique, cdbfee72) et PILIER D
+        (rebuild déterministe) : rien de nouveau à matérialiser ni
+        reconstruire. Avantage de résilience majeur.
+    - decision: >
+        DÉCISION 2 — Le status source est lu depuis le YAML du RFC, PAS
+        depuis une colonne indexée. Pas de migration v3 pour ajouter une
+        colonne status à artifacts.
+      rationale: >
+        Corollaire de la décision 1. db.get_artifact(rfc_id) donne le
+        file_path, puis read+parse metadata.status. Ajouter une colonne
+        status indexée serait une optimisation prématurée : le gain
+        (SELECT vs read+parse) est négligeable à l'échelle, le coût
+        (migration, extraction du status à l'indexation de CHAQUE
+        artifact, cohérence) est réel. Porte ouverte : un RFC ultérieur
+        pourra ajouter la colonne et basculer en SQL sans changer le
+        contrat fonctionnel si le volume explose.
+    - decision: >
+        DÉCISION 3 — blocked est un short-circuit AVANT tout mapping.
+        C'est la seule valeur de status que le PM peut écrire et qui
+        sera respectée pour un item project/rfc.
+      rationale: >
+        Conforme au task-request AC4 et hint 4. effective_status teste
+        blocked en premier et retourne immédiatement. Edge case "item
+        blocked dont le RFC source est implemented" : blocked l'emporte
+        (le PM affirme un blocage opérationnel que le status de
+        l'artifact ne capture pas, ex. RFC implemented mais déploiement
+        gelé). Test d'invariance obligatoire (AC7).
+    - decision: >
+        DÉCISION 4 — La détection "round open" est best-effort et jamais
+        bloquante. Le mapping reste correct sans ce signal.
+      rationale: >
+        Diagnostic FAIT 6 : les review_rounds ne sont pas rebuildés par
+        PILIER D, donc le signal "round open" est volatil. Le mapping rfc
+        est déjà correct sans lui (draft->planned, approved->in_progress).
+        Le round ne raffine que draft+round->in_progress. Si la requête
+        review_rounds échoue ou retourne vide, fallback systématique sur
+        metadata.status. L'absence du signal ne doit jamais faire échouer
+        le summarize ni produire un status erroné.
+    - decision: >
+        DÉCISION 5 — Mapping project par existence de dossier
+        (présent -> in_progress, absent -> planned), pas de déduction
+        d'activité.
+      rationale: >
+        Les options déduction-commits (a) et déduction-artifacts (b)
+        introduisent une heuristique fragile et coûteuse pour un signal
+        ambigu (un projet calme est-il done, blocked ou juste calme ?).
+        L'option (c) "n'auto-sync que rfc" crée une asymétrie de règle
+        déroutante. Le fallback existence-dossier est binaire,
+        déterministe, gratuit (un stat) et honnête. Le PM garde blocked.
+        Porte ouverte pour un champ status au project-config plus tard.
+        Suffisamment simple pour être inclus sans risque plutôt que
+        différé (l'out_of_scope autorisait à différer).
+    - decision: >
+        DÉCISION 6 — external -> loose est un breaking schema change
+        assumé et borné.
+      rationale: >
+        Le ref type external disparaît ; tout YAML le portant devient
+        invalide. Une seule roadmap existe et est migrée dans le même
+        cycle. additionalProperties:false sur loose rejette les typos de
+        category. Breaking contrôlé.
+    - decision: >
+        DÉCISION 7 — Supersession PARTIELLE de a49801aa. Renverse deux
+        décisions (pas d'auto-sync ; ref external) ; préserve tout le
+        reste.
+      rationale: >
+        Premier cas de supersession motivée par une décision avérée
+        FAUSSE en pratique (risque 1 "convention sociale" mal arbitré, le
+        risque s'est matérialisé en moins d'une session), pas par une
+        meilleure idée. Le RFC dérivé portera supersedes vers a49801aa.
+        La lesson de clôture documentera ce précédent (changement de cap
+        fondé sur l'expérience empirique, pas sur la théorie).
+
+  open_questions:
+    - >
+      OQ1 — Forme du fallback "source introuvable" (RFC pas indexé /
+      orphan / supprimé) : status "planned" + drift_warning, OU un champ
+      dédié `orphan_refs` dans summarize. Recommandation : réutiliser
+      drift_warnings avec mapped_status="planned" et un marqueur de cause,
+      pour ne pas multiplier les champs. À trancher dans le plan selon la
+      lisibilité côté PM.
+    - >
+      OQ2 — Détection "round open" : requête exacte sur review_rounds par
+      artifact_path = file_path du RFC, status='open'. Le plan vérifiera
+      que le file_path stocké en review_rounds matche le file_path indexé
+      du RFC. Si l'appariement est fragile, abandonner le raffinement
+      draft+round->in_progress et se contenter de metadata.status seul
+      (mapping reste correct, décision 4).
+    - >
+      OQ3 — Emplacement de la fonction de mapping : module
+      roadmap_summary existant (cohérent, c'est là que vivent les types
+      roadmap) ou nouveau module. Recommandation : roadmap_summary, pour
+      la cohésion. Décision plan.

@@ -1,0 +1,504 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: a5f25718-aecc-47d3-8652-36ec4747dcdd
+  title: "Auto-sync absolu du status de roadmap (calcul à la lecture) et remplacement du ref external par loose typé"
+  author: architect
+  created_at: "2026-06-05"
+  status: draft
+  description: >
+    Renverse la décision "pas d'auto-synchronisation" du RFC a49801aa,
+    qui s'est avérée intenable en pratique (la seule roadmap existante a
+    dérivé du réel en moins d'une session, diagnostic 04b06ad9). Met en
+    place un auto-sync ABSOLU du status des items de roadmap : le status
+    affiché est CALCULÉ à la lecture (summarize_roadmap / list_roadmaps)
+    depuis le status de l'artifact source référencé (RFC via
+    metadata.status, projet via existence du dossier), avec le status
+    `blocked` sacralisé comme seule exception PM (short-circuit). Remplace
+    aussi le ref type `external` (label libre seul) par un type `loose`
+    typé (category enum strict + label). Ajoute des drift_warnings à
+    summarize_roadmap comme filet de sécurité. Le calcul vit à la lecture
+    (pas de matérialisation DB, pas de migration SQL) car les items sont
+    déjà parsés à la volée et la table artifacts n'a pas de colonne
+    status. Touche le schéma roadmap, le code Rust de l'orchestrator
+    (crates/), shared-rules.yml, et migre la roadmap 329da45f. Supersede
+    PARTIELLEMENT le RFC a49801aa. Approbation CEO + write permit requis.
+  tags:
+    - roadmap
+    - auto-sync
+    - schema
+    - indexation
+    - typage
+    - loose
+    - supersedes
+    - critical-infra
+  related:
+    - id: e8c4d628-f2a4-424d-a643-83835ff719dc
+      kind: task-request
+      relationship: input
+    - id: 3b286da8-6be6-4e0b-9119-5e726d05e569
+      kind: design-doc
+      relationship: derived-from
+    - id: 04b06ad9-cb50-4c27-a9ba-128ffaff8ddf
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: a49801aa-911e-45d7-95a3-b21d6ea2bd2d
+      kind: rfc
+      relationship: supersedes
+    - id: 3cd72740-1424-46ac-8ee6-96f714f3fa94
+      kind: rfc
+      relationship: related
+
+spec:
+  motivation: >
+    Le RFC a49801aa (introduction du kind roadmap) avait tranché :
+    "Pas d'auto-synchronisation avec les artifacts référencés : le status
+    de chaque item est la vérité portée par la roadmap, mise à jour
+    manuellement par le PM." Le risque 1 documenté dans ce RFC
+    ("DUPLICATION DE VÉRITÉ, mitigation = convention sociale") s'est
+    matérialisé immédiatement.
+
+    Le diagnostic 04b06ad9 mesure la dérive empiriquement sur la seule
+    roadmap existante (companyos-system, 329da45f) :
+    - 5 items sur 12 items ref=rfc étaient en future/planned alors que
+      les RFCs correspondants étaient déjà mergés en code, au moment où
+      l'utilisateur a demandé "où on en est ?" (dérive franche de 42%).
+    - Le PM a dû corriger 6 items à la main (changelog 2026-06-04). En
+      corrigeant, il a SUR-corrigé : 8 items sur 12 portent désormais
+      "done" alors que le RFC source est encore "approved" (pas
+      "implemented"). Soit 8/12 items encore en dérive vs le mapping
+      cible APRÈS la correction manuelle.
+
+    Constat : la convention sociale a échoué exactement comme craint.
+    Maintenir le status à la main ne tient pas dès qu'il y a plus de
+    quelques sujets actifs. Décision utilisateur (task-request e8c4d628) :
+    passer à un auto-sync ABSOLU.
+
+    Pourquoi un RFC plutôt qu'un design-doc simple :
+    (1) Modifie company/schemas/roadmap.schema.json (breaking schema
+        change : ref external -> loose).
+    (2) Modifie le code Rust de l'orchestrator dans la zone protégée
+        crates/ (roadmap_summary.rs, engine.rs).
+    (3) Modifie company/config/shared-rules.yml (zone protégée config :
+        la description du catalogue roadmap affirme aujourd'hui "pas
+        d'auto-synchronisation", ce qui devient faux).
+    (4) Renverse une décision d'un RFC précédent (supersession partielle
+        de a49801aa) : changement structurel du contrat de l'artifact
+        roadmap.
+    Tous les critères du shared-rules.yml pour un RFC sont réunis.
+
+    PRÉCÉDENT NOTABLE. C'est la PREMIÈRE supersession motivée par une
+    décision avérée FAUSSE en pratique (le risque 1 mal arbitré), pas par
+    l'apparition d'une meilleure idée. Le système apprend de son propre
+    usage : une décision théorique raisonnable ("pas de magie fragile")
+    s'est révélée moins coûteuse à inverser qu'à maintenir. La lesson de
+    clôture documentera ce changement de cap.
+
+  proposal: >
+    Cinq changements coordonnés. Le QUOI/POURQUOI au niveau des
+    invariants et contrats ; le COMMENT (ordre des étapes, signatures
+    exactes) relève de l'implementation-plan dérivé.
+
+    === 1. SCHÉMA roadmap : ref external -> loose, sémantique du status ===
+
+    Dans company/schemas/roadmap.schema.json, la troisième branche du
+    ref.oneOf (aujourd'hui `external` avec un seul champ `label`) est
+    REMPLACÉE par une branche `loose` :
+
+      {
+        "properties": {
+          "type": { "const": "loose" },
+          "category": {
+            "type": "string",
+            "enum": ["idea", "exploration", "hotfix", "observation", "dependency"],
+            "description": "Nature du sujet tracé sans artifact formel. idea = en réflexion ; exploration = creusé activement sans engagement de livraison ; hotfix = action ponctuelle hors RFC ; observation = constat à garder en mémoire ; dependency = dépendance externe non maîtrisée."
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "Description courte et lisible du sujet loose."
+          }
+        },
+        "required": ["type", "category", "label"],
+        "additionalProperties": false
+      }
+
+    Les branches project et rfc restent INCHANGÉES.
+
+    La description du champ item.status est RÉÉCRITE (le champ et son
+    enum restent identiques, status reste REQUIS) :
+      "État de l'item. AUTO-SYNCHRONISÉ : pour les items à ref project ou
+       rfc, ce champ est ÉCRASÉ à la lecture par le status calculé depuis
+       l'artifact source (cf. RFC a5f25718). La SEULE valeur que le PM
+       peut écrire et qui sera respectée pour ces items est `blocked`
+       (droit absolu du PM, court-circuite l'auto-sync). Pour les items à
+       ref loose (pas d'artifact source), le status est manuel et
+       respecté tel quel."
+
+    BREAKING SCHEMA CHANGE contrôlé : un YAML portant ref.type=external
+    devient invalide après ce changement. Une seule roadmap existe
+    (329da45f), migrée dans le même cycle (changement 5).
+    additionalProperties:false sur loose rejette les typos de category.
+
+    === 2. CODE RUST — enum RoadmapItemRef et fonction de mapping ===
+
+    Dans crates/orchestrator/src/roadmap_summary.rs :
+
+    2.a. La variante `External { label }` de l'enum `RoadmapItemRef`
+         (ligne 51) est REMPLACÉE par `Loose { category, label }`. Le
+         serde tag reste `#[serde(tag = "type", rename_all = "snake_case")]`
+         donc la variante sérialise/désérialise `type: loose`. `category`
+         est une String (l'enum strict est enforcé par le JSON Schema à
+         la validation, pas besoin d'un enum Rust dédié ; cohérent avec
+         le choix existant de garder status/timeframe en String,
+         roadmap_summary.rs:28).
+
+    2.b. Ajout d'une fonction PURE `effective_status` (emplacement
+         recommandé : roadmap_summary.rs, cf. design-doc OQ3) :
+
+           Entrées : ref typé de l'item, status YAML de l'item, et le
+                     status source résolu (Option<SourceStatus>, fourni
+                     par l'engine).
+           Sortie  : (status_effectif: String, drift: bool).
+           Logique :
+             1. si status_yaml == "blocked" -> ("blocked", false).
+                Short-circuit AVANT tout mapping (droit PM absolu).
+             2. selon ref.type :
+                - loose   -> (status_yaml, false).
+                - rfc     -> map_rfc_status(source) ; drift = (mappé != yaml).
+                - project -> map_project_status(source) ; drift = (mappé != yaml).
+
+         map_rfc_status(rfc_metadata_status, round_open_best_effort) :
+           "draft"        -> "planned"
+           draft + round open (best-effort) -> "in_progress"
+           "approved"     -> "in_progress"
+           "implemented"  -> "done"
+           "rejected"     -> "cancelled"
+           source absente / status hors enum -> "planned" (fallback neutre)
+
+         map_project_status(dossier_existe: bool) :
+           true  -> "in_progress"
+           false -> "planned"
+
+         La fonction est PURE (ne lit ni FS ni DB). Les statuts sources
+         lui sont fournis par l'engine, ce qui la rend testable unité par
+         unité sur chaque combinaison ref-type x status-source x
+         status-yaml.
+
+    2.c. Ajout des types pour les drift_warnings (cf. changement 4) :
+         une struct DriftWarning { key, yaml_status, mapped_status, ref_ }
+         sérialisable, et l'extension de RoadmapSummary avec
+         `drift_warnings: Vec<DriftWarning>`.
+
+    === 3. CODE RUST — résolution du status source dans l'engine ===
+
+    Dans crates/orchestrator/src/engine.rs, list_roadmaps (ligne 992) et
+    summarize_roadmap (ligne 1062) appliquent l'auto-sync APRÈS le parse
+    des items et AVANT le comptage/regroupement. Pour chaque item :
+
+    - ref=rfc : db.get_artifact(rfc_id) -> file_path -> read_to_string +
+      parse du metadata.status. Best-effort sur "round open" : requête
+      review_rounds par artifact_path = file_path, status='open' (NON
+      bloquante, cf. design-doc décision 4 et OQ2). Si get_artifact
+      retourne None (RFC pas indexé / orphan / supprimé) ou si le read
+      échoue : source absente -> fallback "planned" + drift_warning
+      marquant la cause.
+    - ref=project : std::fs check de l'existence de projects/<slug>/.
+    - ref=loose : aucun lookup.
+
+    Puis appel de effective_status(item, source) -> status calculé. Les
+    comptages (by_status, blocked_count, in_progress_count dans
+    list_roadmaps ; by_status, blocked_count, items_by_status,
+    blocked_items dans summarize) utilisent le status CALCULÉ.
+    items_by_timeframe reste sur le timeframe YAML (non auto-syncé :
+    dimension de lecture PM, pas opérationnelle).
+
+    DÉCISION D'EMPLACEMENT DU CALCUL : À LA LECTURE, PAS À L'INDEXATION.
+    engine.index_artifact n'est PAS modifié pour les roadmaps. Aucune
+    table roadmap_items, aucune colonne status sur artifacts, aucune
+    migration SQL. Justification (design-doc décisions 1 et 2,
+    diagnostic FAITS 3 et 4) : les items sont déjà parsés à la volée, la
+    table artifacts n'a pas de colonne status, et le calcul à la lecture
+    est toujours frais par construction (le status d'un RFC qui change ne
+    rend aucune roadmap stale). Préserve trivialement PILIER A (writer
+    unique, RFC cdbfee72) et PILIER D (rebuild déterministe depuis YAML)
+    car rien de nouveau n'est matérialisé ni à reconstruire.
+
+    === 4. summarize_roadmap : champ drift_warnings ===
+
+    summarize_roadmap retourne un nouveau champ `drift_warnings` : liste
+    des items où le status YAML diffère du status calculé, ET qui ne sont
+    ni blocked ni loose (exclus par construction). Structure (minimum
+    task-request AC5) :
+      drift_warnings:
+        - key: <item.key>
+          yaml_status: <status présent dans le YAML sur disque>
+          mapped_status: <status calculé par l'auto-sync>
+          ref: <ref typé de l'item>
+    NON bloquant : le status affiché reste le calculé (l'auto-sync gagne
+    toujours). Le warning signale au PM une écriture YAML hors pipeline
+    (édition manuelle ou roadmap stale d'avant l'auto-sync) à nettoyer.
+    list_roadmaps n'a PAS de drift_warnings (vue de listing léger).
+
+    PAS DE NOUVEAU TOOL MCP. Les deux tools list_roadmaps et
+    summarize_roadmap existent déjà (RFC 3cd72740). Seule la FORME de la
+    sortie summarize_roadmap évolue (ajout du champ drift_warnings et
+    réinterprétation des status dans les groupements). C'est une release
+    minor du contrat JSON, pas un breaking : les consommateurs lisent du
+    JSON, un champ ajouté ne casse rien. Le binaire MCP
+    (crates/mcp-servers/orchestrator/src/main.rs) n'a PAS besoin de
+    nouvelle struct Params ni de nouveau #[tool] ; il sérialise le
+    RoadmapSummary enrichi tel quel (le tool summarize_roadmap renvoie
+    déjà serde_json du RoadmapSummary). Aucune modification de main.rs
+    n'est attendue, MAIS le fichier est inclus dans affected_files par
+    prudence (asymétrie favorable, lesson 611fde3e) au cas où la
+    sérialisation exigerait un ajustement mineur.
+
+    === 5. MIGRATION de la roadmap 329da45f ===
+
+    company/roadmaps/companyos-system-329da45f.yml est réécrite dans le
+    même cycle :
+    - Les 3 items ref=external sont reclassés en ref=loose + category :
+        db-schema-migration-hotfix  -> category: hotfix
+        api-callers-discoverability -> category: idea
+        backup-strategy             -> category: observation
+      (backup-strategy : observation, pas exploration : c'est un constat
+       tranché et clos "couvert par git remote", pas un sujet creusé.)
+    - Les 12 items ref=rfc : le status YAML est aligné sur le mapping
+      attendu pour éviter des drift_warnings bruyants day-1 :
+        - 4 items dont le RFC est implemented (proxy-resilient d9399863,
+          roadmap-kind a49801aa, hybrid-search bdee1af4, file-watcher
+          062ebaa8) -> restent "done".
+        - 8 items dont le RFC est approved (db-resilience cdbfee72,
+          memory-lookup f4fe8a04, roadmap-tooling 3cd72740, atomic-grant
+          359f9162, rfc-set-impl 1c0f2570, defense-sel bde023e2,
+          affected-files a4eb3ee7, schema-migr 973a5569) -> passent à
+          "in_progress" dans le YAML (matche le calcul).
+      Conséquence assumée de la seconde dérive (diagnostic FAIT 7) : tant
+      que les 8 RFCs ne sont pas clôturés via rfc_set_implemented, ils
+      sont légitimement in_progress, pas done. Le correctif de fond
+      (clôturer les 8 RFCs au prochain boot de session, cf. lesson
+      80f7b27a sur le tool-list MCP non rafraîchi) est HORS SCOPE de ce
+      RFC mais tracé pour le PM.
+    - Le narrative de la roadmap est mis à jour pour refléter que le
+      status est désormais auto-syncé (suppression du paragraphe "Pas de
+      bot, pas de synchronisation automatique").
+
+    === 6. shared-rules.yml : description du catalogue roadmap ===
+
+    company/config/shared-rules.yml, entrée artifact_catalog.kinds.roadmap :
+    le passage "Pas d'auto-synchronisation avec les artifacts référencés :
+    le status de chaque item est la vérité portée par la roadmap, mise à
+    jour manuellement par le PM." devient :
+    "Le status des items à ref project/rfc est AUTO-SYNCHRONISÉ à la
+    lecture depuis l'artifact source (RFC a5f25718) ; le PM ne peut
+    écrire manuellement que `blocked` (droit absolu). Les items à ref
+    loose (sans artifact source) gardent un status manuel."
+
+    === ANALYSE TRIAXIALE ===
+
+    CAS NOMINAL. Item ref=rfc dont le RFC source est indexé,
+    metadata.status=implemented. summarize fait db.get_artifact(id) ->
+    parse metadata.status=implemented -> mapping -> "done". Compté et
+    regroupé en done. Item ref=project dont projects/<slug>/ existe ->
+    in_progress. Item ref=loose category=idea -> status YAML respecté.
+
+    CAS NÉGATIF.
+    - RFC référencé PAS ENCORE INDEXÉ (race boot ou orphan) :
+      get_artifact -> None -> fallback "planned" + drift_warning marquant
+      "source introuvable". PAS d'erreur bloquante : un RFC manquant ne
+      casse pas le summarize de toute la roadmap.
+    - RFC SUPPRIMÉ (orphan ref) : idem (get_artifact -> None).
+    - category enum INVALIDE dans un item loose : rejeté à la VALIDATION
+      du schéma (enum strict + additionalProperties:false). Le YAML
+      n'est jamais indexé ; list/summarize le skippe avec warning
+      (comportement existant pour YAML invalide, engine.rs:1012).
+    - YAML source du RFC illisible au moment du read (supprimé entre
+      index et summarize) : traité comme source introuvable (fallback
+      planned + warning). Non bloquant.
+    - metadata.status du RFC hors enum attendu : fallback "planned" +
+      warning. Ne plante pas.
+
+    EDGE CASES.
+    - Item blocked dont l'artifact source est implemented : blocked
+      l'emporte (short-circuit). L'item reste blocked, pas de
+      drift_warning (blocked exclu du calcul de drift). TEST
+      D'INVARIANCE OBLIGATOIRE (AC7).
+    - Drift YAML vs calcul : un agent édite le YAML (status=done sur un
+      item dont le RFC est approved). summarize affiche in_progress (le
+      calcul gagne) ET émet drift_warning {key, yaml_status=done,
+      mapped_status=in_progress, ref}. TEST OBLIGATOIRE (AC7, via
+      injection sqlite ou édition YAML hors pipeline).
+    - Race au boot avec reindex_all SYNCHRONE du PILIER D : PILIER D
+      rebuild l'index AVANT de servir les requêtes MCP (RFC cdbfee72),
+      donc au moment d'un summarize tous les YAML sont déjà indexés. Le
+      cas "RFC pas indexé" ne survient qu'en steady-state (RFC écrit, pas
+      encore debounce 500ms du watcher) ; couvert par le fallback. Le
+      calcul à la lecture NE DÉPEND PAS de l'ordre d'indexation (il lit
+      le YAML source à l'appel, pas un état matérialisé) : robuste à la
+      race par construction.
+    - PLUSIEURS roadmaps référençant le même RFC : chacune calcule
+      indépendamment à la lecture depuis la source unique
+      (metadata.status du RFC). Cohérence garantie, aucun état partagé.
+    - Roadmap à 0 item ou tous loose : aucun lookup, calcul trivial. Pas
+      de régression.
+
+  impact: >
+    ZONES PROTÉGÉES TOUCHÉES (write permit requis après approbation).
+    Distinction modified/created explicitée dans spec.affected_files
+    (FORME B structurée, RFC a4eb3ee7) :
+
+    FICHIERS MODIFIÉS — SCHÉMA :
+    - company/schemas/roadmap.schema.json : branche ref external ->
+      loose (category enum + label maxLength), réécriture de la
+      description du champ item.status.
+
+    FICHIERS MODIFIÉS — CONFIG :
+    - company/config/shared-rules.yml : réécriture de la description du
+      catalogue roadmap (l'auto-sync remplace "pas de synchronisation").
+
+    FICHIERS MODIFIÉS — CODE RUST (zone protégée crates/) :
+    - crates/orchestrator/src/roadmap_summary.rs : variante
+      RoadmapItemRef::External -> Loose { category, label } ; fonction
+      pure effective_status + map_rfc_status + map_project_status ;
+      struct DriftWarning ; extension de RoadmapSummary avec
+      drift_warnings ; mise à jour des tests unitaires du module
+      (make_item, test_parse_roadmap_yaml_minimal, le test
+      test_roadmap_item_ref_serializes_with_type_tag qui asserte
+      "external").
+    - crates/orchestrator/src/engine.rs : list_roadmaps et
+      summarize_roadmap résolvent le status source (get_artifact + read
+      YAML pour rfc, fs check pour project) et appliquent
+      effective_status ; comptages/regroupements sur le status calculé ;
+      construction des drift_warnings ; mise à jour du helper de test
+      write_roadmap (ligne 1604, le ref_block "external" devient "loose"
+      avec une category) et de TOUTES les fixtures de test qui passent
+      "external" (lignes 1794-1810, 1868-1871, 1961-1963) ; nouveaux
+      tests d'auto-sync (mapping, invariance blocked, drift_warning).
+    - crates/orchestrator/src/lib.rs : re-export du nouveau type
+      DriftWarning si exposé publiquement (le re-export de RoadmapItemRef
+      reste, la variante change mais le type est le même).
+    - crates/mcp-servers/orchestrator/src/main.rs : inclus par prudence
+      (lesson 611fde3e). Aucune modification attendue (summarize_roadmap
+      sérialise déjà le RoadmapSummary tel quel) ; couvert au cas où la
+      sortie enrichie exige un ajustement de sérialisation ou de la
+      description du tool.
+
+    FICHIERS MODIFIÉS — ARTIFACT (migration) :
+    - company/roadmaps/companyos-system-329da45f.yml : 3 items external
+      -> loose + category ; 8 items rfc approved alignés en in_progress ;
+      narrative mis à jour.
+
+    AUCUN FICHIER CRÉÉ. Tous les changements sont des modifications de
+    fichiers existants. spec.affected_files.created est donc vide
+    (absent). Aucune nouvelle table, aucune migration SQL (décision
+    architecturale : calcul à la lecture).
+
+    CATÉGORIE D'ESCALADE. Ce RFC ne modifie PAS la matrice access_level
+    (l'enum ArtifactKind n'est pas étendu, aucune branche access_level
+    ajoutée), ne modifie pas la persona CEO, ne supprime pas de persona.
+    Il introduit un BREAKING SCHEMA CHANGE (ref external -> loose) :
+    selon le review-protocol, un breaking schema change peut relever de
+    ceo_cannot_approve_alone. À vérifier au round de review ; le RFC
+    reste de toute façon soumis au protocole standard rfc:[all] (PM +
+    Architect + Implementer + CEO) pour la pluralité d'analyse.
+
+    SUPERSESSION PARTIELLE de a49801aa. Ce RFC renverse deux décisions de
+    a49801aa : (1) "pas d'auto-synchronisation" (description du champ
+    status, risque 1), (2) le ref type external. Il PRÉSERVE tout le
+    reste de a49801aa (placement global company/roadmaps/, dimensions
+    temporelle/causale/narrative, depends_on, variante Rust
+    ArtifactKind::Roadmap, matrice access_level, tools MCP de 3cd72740).
+    a49801aa reste en status implemented ; la relation supersedes
+    (partielle) est portée par metadata.related de ce RFC. Le risque 2 de
+    a49801aa ("roadmaps zombies") devient caduc pour les items rfc/project
+    (l'auto-sync les maintient frais) mais reste actif pour les items
+    loose (la convention sociale s'applique encore là, comme prévu).
+
+    IMPACT COMPORTEMENTAL.
+    - Le PM perd le droit d'écrire librement le status des items rfc/
+      project ; il ne peut écrire que blocked. Pour le reste, la roadmap
+      dit la vérité fraîche de l'artifact source.
+    - Au déploiement, les 8 items dont le RFC est approved passeront de
+      done à in_progress (vérité RFC). Anticipé par la migration
+      (changement 5) qui aligne le YAML day-1 pour éviter 8 warnings. Le
+      PM doit clôturer les 8 RFCs via rfc_set_implemented (hors scope,
+      sujet de suivi).
+    - Aucun impact pour les autres personas (ils lisent les roadmaps via
+      Read, inchangé).
+
+    IMPACT RUNTIME.
+    - Chaque summarize/list fait N lookups RFC (get_artifact par clé
+      primaire + read+parse YAML), N = nombre d'items rfc. Négligeable à
+      l'échelle (<200 items, 1-10 roadmaps, quelques ms). Pas de cache
+      (cohérent avec la fraîcheur ; un cache réintroduirait la dérive).
+    - Aucun overhead à l'indexation (engine.index_artifact inchangé).
+
+    RISQUES RÉSIDUELS.
+    - Coût par appel si le volume explose un jour : RFC ultérieur pourra
+      ajouter une colonne status indexée (porte ouverte, design-doc
+      décision 2). Pas un risque à notre échelle.
+    - Le status YAML devient cosmétique pour les items rfc/project non
+      blocked : risque de confusion ("pourquoi mon status est ignoré ?").
+      Mitigation : description du champ réécrite (changement 1) +
+      drift_warnings qui rendent l'écart visible.
+    - Appariement file_path en review_rounds fragile : si le matching
+      pour la détection round-open est peu fiable, abandonner le
+      raffinement draft+round->in_progress (le mapping reste correct sans
+      lui, décision design 4). Tranché en implementation-plan.
+
+  rollback_plan: >
+    Rollback réversible par git revert sur le commit (ou la série) qui
+    matérialise ce RFC. Procédure manuelle équivalente, dans un ordre qui
+    maintient la cohérence (schéma et code ensemble pour éviter qu'un
+    binaire attendant `loose` rencontre un schéma qui exige `external`) :
+
+    1. CODE RUST : restaurer crates/orchestrator/src/roadmap_summary.rs
+       (variante Loose -> External { label }, retirer effective_status /
+       map_rfc_status / map_project_status / DriftWarning / le champ
+       drift_warnings de RoadmapSummary, restaurer les tests du module).
+    2. CODE RUST : restaurer crates/orchestrator/src/engine.rs
+       (list_roadmaps et summarize_roadmap reviennent au comptage sur le
+       status YAML brut, sans résolution de source ; restaurer le helper
+       write_roadmap et les fixtures "external" ; retirer les tests
+       d'auto-sync).
+    3. CODE RUST : restaurer crates/orchestrator/src/lib.rs (retirer le
+       re-export de DriftWarning si ajouté).
+    4. CODE MCP : restaurer crates/mcp-servers/orchestrator/src/main.rs
+       si modifié (sinon no-op).
+    5. SCHÉMA : restaurer company/schemas/roadmap.schema.json (branche
+       loose -> external, ancienne description du champ status).
+    6. CONFIG : restaurer company/config/shared-rules.yml (ancienne
+       description du catalogue roadmap).
+    7. ARTIFACT : restaurer company/roadmaps/companyos-system-329da45f.yml
+       (items loose -> external, status rfc revenus à done, narrative
+       d'origine). ATTENTION : après rollback, les 3 items loose
+       redeviennent invalides s'ils gardent une category (le schéma
+       restauré n'accepte que external+label). Le revert git restaure
+       l'état d'origine du YAML donc ce point est automatiquement géré
+       par git revert ; en rollback manuel, bien restaurer external+label
+       sur les 3 items.
+    8. BUILD & VALIDATION : recompiler crates orchestrator et
+       orchestrator-mcp ; cargo test complet ; valider la roadmap
+       329da45f restaurée contre le schéma restauré (validate_file).
+
+    Aucune donnée n'est perdue par le rollback : aucune table n'est
+    créée, aucune migration SQL n'est appliquée, le status calculé
+    n'était jamais persisté (calcul à la lecture). Le seul effet
+    fonctionnel du rollback est le retour au modèle "status manuel" et le
+    risque de dérive qu'il porte (l'état d'avant ce RFC).
+
+    Dépendance sortante : si après merge un agent ou le PM s'appuie sur
+    drift_warnings dans la sortie summarize, un rollback les ferait
+    disparaître. Pas de couplage dur (les agents lisent du JSON ;
+    l'absence d'un champ ne casse pas un consommateur tolérant).
+
+  affected_files:
+    modified:
+      - company/schemas/roadmap.schema.json
+      - company/config/shared-rules.yml
+      - crates/orchestrator/src/roadmap_summary.rs
+      - crates/orchestrator/src/engine.rs
+      - crates/orchestrator/src/lib.rs
+      - crates/mcp-servers/orchestrator/src/main.rs
+      - company/roadmaps/companyos-system-329da45f.yml

@@ -1,0 +1,156 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 4e5c109b-ec35-46ff-98af-3714b1d7a36f
+  title: "Préférence utilisateur : un algorithme déterministe qui garantit une propriété > une règle qui demande aux agents de la respecter"
+  author: pm
+  created_at: "2026-06-04"
+  description: >
+    Préférence explicite de l'utilisateur, énoncée comme principe
+    général de conception : chaque fois qu'il existe un algorithme
+    déterministe (ou un mécanisme automatique structurel) qui peut
+    garantir une propriété, le préférer à une règle déléguée au
+    LLM ou à une discipline humaine. Le LLM (et donc les agents
+    CompanyOS) ne doit recevoir un degré de liberté que sur les
+    décisions qui requièrent un jugement (intent, scope, design),
+    pas sur des invariants mécaniques.
+  tags:
+    - design-principle
+    - user-preference
+    - automation
+    - determinism
+    - llm-trust
+    - companyos-internals
+    - meta
+  related:
+    - id: e8c4d628-f2a4-424d-a643-83835ff719dc
+      kind: task-request
+      relationship: related
+    - id: a49801aa-911e-45d7-95a3-b21d6ea2bd2d
+      kind: rfc
+      relationship: related
+    - id: dabc159c-f6f7-4d56-913a-e7e83830977a
+      kind: task-request
+      relationship: related
+
+spec:
+  context: >
+    Observation faite à plusieurs reprises pendant la session 2026-06-04 :
+
+    (1) La roadmap 329da45f a dérivé du réel parce que sa mise à
+    jour reposait sur la diligence du PM (convention sociale,
+    arbitrage explicite du RFC original a49801aa risque 1). Cinq
+    RFCs candidats sont passés en mergé sans que la roadmap ne soit
+    mise à jour, jusqu'à ce que l'utilisateur demande "où on en
+    est ?". L'utilisateur a alors décidé de remplacer la convention
+    sociale par un auto-sync absolu déterministe calculé par le
+    pipeline d'indexation (task-request e8c4d628). Verbatim
+    utilisateur : "Nan je veux un auto_sync absolue qui marche.
+    Jpense faut modifier l'auto index pour sa".
+
+    (2) Sur le task-request api-callers-discoverability (dabc159c),
+    l'Architect a proposé un tool MCP `list_callers(symbol)` qui
+    exécute rg et retourne la liste des call sites avant tout
+    changement de signature d'API publique. L'utilisateur a refusé
+    le tool MCP comme "overkill" et a tranché pour une simple mise
+    à jour des personas Architect et Implementer ajoutant
+    l'inventaire des callers comme étape de leur workflow.
+
+    À première lecture ces deux décisions semblent contradictoires
+    (l'une demande PLUS d'automatisation, l'autre MOINS). En réalité
+    elles découlent du même principe lu correctement : préférer un
+    mécanisme qui garantit la propriété par construction, et ne
+    pas inventer une couche de tooling supplémentaire quand le
+    jugement de l'agent suffit déjà à produire le résultat correct
+    de façon fiable.
+
+  insight: >
+    Le critère discriminant de l'utilisateur est : "peut-on
+    concevoir un algorithme déterministe qui garantit la propriété
+    ?". Si oui, l'algorithme l'emporte sur la règle déléguée au
+    LLM. Si non (parce que la propriété requiert du jugement, du
+    contexte, ou parce que l'algorithme serait moins fiable que
+    l'agent), on garde la délégation au LLM.
+
+    Cas 1 (roadmap auto-sync) : la propriété "le status d'un item
+    reflète l'état de l'artifact source" est PARFAITEMENT
+    algorithmisable. Mapping pur, table de correspondance
+    artifact.status → item.status. Aucun jugement requis. Donc
+    automatiser. La règle "le PM met à jour à la main" est un
+    mauvais usage du LLM : on lui demande de jouer le rôle d'une
+    fonction pure qu'il oublie de jouer.
+
+    Cas 2 (callers inventory) : produire la liste des callers d'un
+    symbole est algorithmisable (rg ou get_references). Mais le
+    JUGEMENT qui en découle (lesquels sont impactés par un
+    changement de signature donné, lesquels doivent être listés
+    dans affected_files, lesquels seront cassés ou pas) reste un
+    travail d'agent. Si on construit un tool MCP qui retourne la
+    liste brute, on n'a déchargé qu'une fraction du travail
+    (l'invocation de rg), et on a ajouté une surface de
+    maintenance. L'agent doit de toute façon faire le travail de
+    jugement derrière. Donc l'algorithme n'apporte pas une
+    garantie de bout en bout : il automatise une étape triviale en
+    laissant la partie non-triviale au LLM. Préférable :
+    instrumenter le LLM via persona pour qu'il fasse les deux
+    (invocation rg + jugement) au lieu de scinder.
+
+    Principe général : automatiser COMPLÈTEMENT (l'algorithme
+    garantit la propriété sans intervention d'agent) ou PAS DU
+    TOUT (laisser l'agent faire le travail complet avec la
+    discipline appropriée). Ne pas mi-automatiser : ce sont les
+    mi-automatismes qui ajoutent de la maintenance sans ajouter de
+    garantie.
+
+    Le rôle légitime du LLM dans CompanyOS, dans cette grille
+    de lecture :
+      - Clarifier l'intent (PM)
+      - Concevoir l'architecture, arbitrer les décisions
+        structurelles (Architect)
+      - Implémenter, tester, debugger (Implementer)
+      - Trancher les conflits (CEO)
+    Le rôle ILLÉGITIME du LLM :
+      - Tenir à jour des invariants mécaniques (synchronisation,
+        validation de schéma, calcul de mapping)
+      - Exécuter une fonction pure qu'un algorithme ferait sans
+        erreur
+
+  recommendation: >
+    Pour tout future RFC ou task-request qui propose une règle
+    déléguée à un agent (PM, Architect, Implementer, CEO), poser
+    la question :
+
+      "Existe-t-il un algorithme déterministe qui pourrait
+       garantir cette propriété sans intervention d'agent ?"
+
+    Si OUI et que la garantie est de bout en bout : préférer
+    l'algorithme. Exemples : auto-sync de status, validation de
+    schéma, vérification d'invariants, ordonnancement de tâches
+    avec dépendances.
+
+    Si OUI mais que la garantie est partielle (l'algorithme ne
+    fait qu'une étape intermédiaire) : NE PAS construire le
+    tool intermédiaire. Renforcer la persona ou la discipline du
+    workflow à la place. Exemples : recherche de callers
+    (l'agent fait déjà ça avec ses outils LSP/grep), suggestions
+    de refactor (le jugement architectural reste essentiel).
+
+    Si NON (la propriété requiert un jugement contextuel) :
+    déléguer à l'agent via persona/règle, en sachant que la
+    règle peut être oubliée et qu'il faut un mécanisme de
+    rappel (review, lookup mémoire, lesson).
+
+    En pratique pour les Architects de CompanyOS : avant de
+    proposer un nouveau tool MCP, vérifier que le tool produit
+    une garantie de bout en bout. Si le tool ne fait qu'une
+    étape qu'un agent doit de toute façon raisonner derrière, il
+    introduit de la complexité sans valeur. Le verbatim
+    utilisateur "overkill" sur le tool list_callers en est un
+    signal direct.
+
+    Cette préférence n'est pas une règle absolue : si un tool
+    automatise une étape pénible même sans garantie de bout en
+    bout (par exemple sur une opération fréquente coûteuse en
+    temps humain), le coût/bénéfice peut justifier le tool. Mais
+    le défaut est : pas de tool sans garantie automatique
+    complète.

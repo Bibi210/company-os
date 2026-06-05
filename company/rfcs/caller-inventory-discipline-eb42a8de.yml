@@ -1,0 +1,303 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: eb42a8de-e6a9-4f7b-81d1-c91d7120b626
+  title: "Discipline d'inventaire des callers d'API publique : instrumentation des personas Architect et Implementer"
+  author: architect
+  created_at: "2026-06-05"
+  status: draft
+  description: >
+    Formalise la discipline « lister exhaustivement les callers avant
+    de changer une signature d'API publique de crate » en l'inscrivant
+    directement dans les personas Architect et Implementer, sans tool
+    MCP ni modification de schema. L'Architect recense les callers
+    (rg / get_references LSP) avant de figer une signature dans un
+    design-doc ou RFC, pour garantir l'exhaustivité d'affected_files.
+    L'Implementer refait le recensement avant de modifier la signature,
+    pour capter les callers ajoutés depuis le RFC, et signale toute
+    divergence avec le périmètre du permit. Ferme la classe d'incidents
+    recensée par le diagnostic 56513173 (callers oubliés dans 062ebaa8
+    et bdee1af4) en attribuant la discipline aux agents qui font déjà
+    le raisonnement, sans couche d'outillage intermédiaire.
+  tags:
+    - workflow
+    - api
+    - callers
+    - rfc-discipline
+    - permits
+    - friction-reduction
+    - personas
+    - companyos-internals
+  related:
+    - id: dabc159c-f6f7-4d56-913a-e7e83830977a
+      kind: task-request
+      relationship: input
+    - id: 56513173-dfc6-4c9b-b150-b84e921eeecf
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: ea6e9dd1-93dc-4b19-9854-103328203489
+      kind: lesson-learned
+      relationship: derived-from
+    - id: 4e5c109b-ec35-46ff-98af-3714b1d7a36f
+      kind: lesson-learned
+      relationship: derived-from
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+    - id: a4eb3ee7-45c1-4422-a43a-fbbc07d686f0
+      kind: rfc
+      relationship: related
+
+spec:
+  changelog: >
+    ITERATION 2 (2026-06-05) — RÉDUCTION DE SCOPE sur décision
+    utilisateur. L'iteration 1 proposait l'option (d) combinaison :
+    un tool MCP `list_callers` côté orchestrator, une section
+    `spec.caller_inventory` ajoutée au schema implementation-plan, et
+    une règle dédiée dans shared-rules. L'utilisateur a jugé le tool
+    MCP « overkill » et a tranché pour une instrumentation des seules
+    personas Architect et Implementer, en s'appuyant sur les outils
+    (rg / get_references LSP) que les agents possèdent déjà.
+
+    Cette décision applique directement la lesson 4e5c109b (préférence
+    utilisateur formalisée le 2026-06-04) : un tool intermédiaire qui
+    n'apporte qu'une garantie PARTIELLE (invoquer rg) en laissant à
+    l'agent le travail de jugement (quels callers sont impactés,
+    lesquels listés dans affected_files) introduit de la surface de
+    maintenance sans garantie de bout en bout. Puisque l'agent doit de
+    toute façon raisonner derrière, instrumenter la persona suffit.
+    Principe : automatiser COMPLÈTEMENT ou PAS DU TOUT, ne pas
+    mi-automatiser.
+
+    SUPPRIMÉ par rapport à l'iteration 1 :
+    - le tool MCP list_callers (crates/mcp-servers/orchestrator/src/main.rs) ;
+    - la propriété spec.caller_inventory du schema implementation-plan ;
+    - la règle caller_inventory_before_signature_change de shared-rules.
+    CONSERVÉ et désormais unique scope : la mise à jour des personas
+    Architect et Implementer.
+
+  motivation: >
+    Le diagnostic 56513173 recense deux RFCs récents qui ont omis un
+    caller d'une API publique de crate dans leur scope, chacun
+    provoquant un cycle d'extension de permit en cours d'exécution :
+    RFC 062ebaa8 (yaml/main.rs oublié pour la fonction spawn_watcher,
+    détecté au cargo build) et RFC bdee1af4 (types.rs oublié pour le
+    type SearchParams, détecté à la review du plan). Coût observé :
+    agent-messages au CEO, permits complémentaires, iterations de
+    re-review, interruption du flux d'exécution avec risque de perte
+    de permit sur restart du binaire.
+
+    Les lessons ea6e9dd1 (recommandation 4) et 611fde3e
+    (recommandation 3) recommandent déjà de grepper les callers avant
+    de figer le scope. Mais ces recommandations vivent dans la mémoire
+    passive : aucun maillon du workflow ne les rend obligatoires, et
+    les deux incidents sont POSTÉRIEURS à la lesson 611fde3e. Une
+    recommandation qui ne vit que dans une lesson-learned est consultée
+    à la discrétion de l'agent ; elle se perd.
+
+    L'objectif est de remonter cette discipline de la mémoire passive
+    (lesson) vers le contrat actif des agents (persona). Une règle dans
+    rules.must d'une persona est injectée dans le contexte de l'agent à
+    chaque session : elle a un poids opérationnel qu'une lesson n'a pas.
+    C'est le bon niveau d'instrumentation pour une discipline qui exige
+    du jugement (quels callers sont réellement impactés) et que l'agent
+    sait exécuter avec ses outils existants (rg, get_references LSP).
+
+  proposal: >
+    SCOPE UNIQUE (iteration 2) : ajouter une règle de discipline dans
+    rules.must de chacune des deux personas concernées. Aucun tool,
+    aucun schema, aucune règle shared-rules.
+
+    --- PERSONA ARCHITECT (company/personas/architect.yml) ---
+
+    Ajout dans rules.must d'une entrée du type :
+
+      "Avant de figer la signature d'une API publique de crate (un
+      symbole `pub` qui traverse une frontière de crate : fonction OU
+      type) dans un design-doc ou un RFC, recenser tous ses callers
+      existants dans le workspace via rg ou get_references LSP. L'union
+      des fichiers retournés (callers + fichier de définition) doit
+      figurer dans affected_files (forme structurée modified/created,
+      RFC a4eb3ee7) afin que le target_paths du permit soit exhaustif.
+      Si la liste n'est pas triviale, la documenter dans le RFC ou le
+      design-doc. Ne concerne pas les symboles internes (`pub(crate)`,
+      helpers privés) ni les RFCs purement YAML/config."
+
+    --- PERSONA IMPLEMENTER (company/personas/implementer.yml) ---
+
+    Ajout dans rules.must d'une entrée du type :
+
+      "Avant de modifier la signature d'une API publique de crate,
+      refaire le recensement des callers (rg ou get_references LSP) au
+      cas où des callers auraient été ajoutés depuis la rédaction du
+      RFC. Si la liste diverge du périmètre couvert par le write permit
+      (un caller hors target_paths), s'arrêter et signaler à
+      l'Architect / au PM via agent-message AVANT toute écriture, pour
+      extension du permit. Ne jamais contourner un permit incomplet."
+
+    --- RATIONALE (pourquoi persona et pas tool/schema/règle) ---
+
+    Application de la lesson 4e5c109b. Trois constats :
+
+    (1) La production de la liste brute des callers est triviale et
+    déjà à portée d'agent (rg, get_references). Un tool MCP qui ne fait
+    que wrapper rg n'automatise qu'une étape triviale.
+
+    (2) Le travail NON trivial (juger quels callers sont impactés par
+    un changement de signature donné, lesquels listés dans
+    affected_files, lesquels cassés ou pas) reste du jugement d'agent.
+    Le tool ne le déchargeait pas. Garantie seulement partielle.
+
+    (3) Donc, par le principe « automatiser complètement ou pas du
+    tout », on instrumente l'agent pour qu'il fasse les deux (invocation
+    rg + jugement) plutôt que de scinder en un demi-outil maintenu.
+
+    La persona est le bon véhicule parce que rules.must est injecté
+    dans le contexte à chaque session : c'est un rappel actif, pas une
+    mémoire passive comme une lesson. C'est l'écart exact qui a laissé
+    les deux incidents se produire.
+
+  impact: >
+    ZONES PROTÉGÉES TOUCHÉES (approbation CEO + write permit requis ;
+    une modification de persona est un changement structurel) :
+
+    1. company/personas/architect.yml (MODIFIÉ) : ajout d'une entrée
+       dans rules.must. Quelques lignes YAML.
+
+    2. company/personas/implementer.yml (MODIFIÉ) : ajout d'une entrée
+       dans rules.must. Quelques lignes YAML.
+
+    PAS de tool MCP. PAS de modification de crates/. PAS de
+    modification de schema. PAS de modification de shared-rules.yml.
+    PAS de modification du review-protocol.yml. PAS de code Rust.
+
+    Conséquence sur le review-protocol : la responsabilité de
+    vérification reste portée par l'Architect dans son review du plan
+    (reviewers_by_artifact_type.implementation-plan = [architect],
+    inchangé) et par tout reviewer du RFC (rfc = all) qui peut
+    constater que affected_files est exhaustif. Aucune entrée de
+    matrice n'est modifiée.
+
+    SURFACE DE MAINTENANCE : quasi nulle. Deux entrées de texte dans
+    deux personas. Pas de code à maintenir, pas de dépendance, pas de
+    test Rust. La régénération de company/config/personas.yml (fichier
+    auto-généré depuis company/personas/*.yml) suivra le pipeline
+    existant si applicable ; pas un fichier édité à la main par ce RFC.
+
+    Note : ce RFC ne modifiant aucune signature d'API publique de
+    crate (il ne touche que du YAML), la discipline qu'il introduit ne
+    s'applique pas à lui-même. Aucun inventaire de callers requis pour
+    ce RFC.
+
+    --- ANALYSE TRIAXIALE ---
+
+    AXE NOMINAL. Un RFC futur modifie la signature de spawn_watcher.
+    L'Architect, appliquant sa nouvelle règle must, lance
+    `rg "spawn_watcher" crates/`, obtient les deux callers
+    (orchestrator/main.rs, yaml/main.rs) + le fichier de définition
+    (watcher.rs), et les liste tous dans affected_files (forme B). Le
+    target_paths du permit est exhaustif. L'Implementer refait le
+    recensement avant d'écrire, confirme l'absence de divergence, et
+    exécute sans blocker. Acceptance criteria 1, 2, 3 du task-request
+    satisfaits.
+
+    AXE NÉGATIF.
+    (N1) get_references LSP indisponible (VSCode fermé, environnement
+    headless) : la règle propose explicitement rg comme alternative
+    toujours disponible. La discipline ne dépend pas d'un seul outil.
+    (N2) signature pas encore figée au moment du design-doc (RFC qui
+    tranche la forme « selon arbitrage ») : le recensement porte sur le
+    symbole EXISTANT (son nom ne change pas, seuls ses arguments
+    changent), donc les call sites actuels sont listables même si la
+    forme finale n'est pas tranchée. Si le symbole est renommé,
+    recenser l'ancien nom.
+    (N3) RISQUE PRINCIPAL — la règle est oubliée. C'est une discipline
+    déléguée à un agent, donc faillible par construction (cf. lesson
+    4e5c109b : une règle déléguée au LLM peut être oubliée, contrairement
+    à un algorithme déterministe). Voir la section RISQUE RÉSIDUEL du
+    sanity-check ci-dessous : le présent RFC ASSUME ce risque, c'est le
+    coût explicite de la décision utilisateur de ne pas mécaniser.
+    Mitigations en place : double recensement (Architect AU RFC +
+    Implementer À L'EXÉCUTION), review du plan par l'Architect, review
+    du RFC par all, et le compilateur en dernier filet.
+
+    AXE EDGE.
+    (E1) changement rétro-compatible (champ optionnel ajouté à un
+    struct public, argument à valeur par défaut) : le compilateur ne
+    casse PAS sur ces callers. C'est le cas où le recensement amont a le
+    plus de valeur : l'agent liste les callers à revoir sémantiquement
+    même s'ils compilent. rg les trouve tous ; l'agent juge lesquels
+    nécessitent une vraie modification.
+    (E2) type public re-exporté sous alias (`pub use crate::X as Y`) :
+    un rg sur X ne trouve pas les usages de Y. LIMITE de tout grep
+    textuel. Mitigation : get_references LSP la capte (il connaît les
+    re-exports) ; quand le LSP est dispo, le préférer pour les types
+    re-exportés. La règle mentionne les deux outils précisément pour
+    ce genre de cas.
+    (E3) callers dans tests/benches/examples : rg sur crates/ les
+    inclut s'ils vivent sous crates/**. La règle vise « tous les
+    callers du workspace », sans exclure les tests : un test qui
+    appelle l'ancienne signature casse aussi le build et doit être dans
+    le permit.
+    (E4) faux positif via macro / appel indirect : un appel assemblé en
+    macro peut ne pas ressortir en rg. Risque résiduel borné ; aucun
+    des deux cas observés n'était de cette nature. Le compilateur reste
+    le filet final. Inversement, rg peut produire des faux positifs
+    (commentaire, string) : non bloquant, l'agent les écarte par
+    jugement, un permit couvrant un fichier finalement non modifié est
+    acceptable (asymétrie favorable, ea6e9dd1 reco 4).
+
+    --- SANITY-CHECK RÉTROACTIF (acceptance criterion 6) ---
+
+    Question : si la discipline avait été dans les personas au moment
+    de bdee1af4 et 062ebaa8, l'Architect aurait-il listé types.rs et
+    yaml/main.rs ?
+
+    CAS 1 (062ebaa8, spawn_watcher / yaml/main.rs) : EN PRINCIPE OUI.
+    Un Architect appliquant la règle aurait lancé
+    `rg "spawn_watcher" crates/`, qui liste yaml/main.rs (vérifié
+    empiriquement aujourd'hui). Le fichier aurait été dans
+    affected_files.
+
+    CAS 2 (bdee1af4, SearchParams / types.rs) : EN PRINCIPE OUI. Un
+    `rg "SearchParams" crates/` aurait listé types.rs.
+
+    MAIS — et c'est l'honnêteté exigée par l'AC6 — c'est EXACTEMENT le
+    pattern qui a échoué deux fois. Dans les deux incidents, l'agent
+    AVAIT déjà accès à rg et aux lessons recommandant son usage, et ne
+    l'a pas fait (ou pas exhaustivement). La discipline en persona
+    NE SUPPRIME PAS le risque d'oubli : elle le RÉATTRIBUE et le rend
+    plus saillant (rules.must injecté à chaque session, vs lesson
+    consultée à la discrétion). La différence entre l'état actuel
+    (lesson passive) et l'état post-RFC (règle persona active) est un
+    déplacement de probabilité, pas une garantie.
+
+    RISQUE RÉSIDUEL ASSUMÉ. C'est le coût explicite de la décision
+    utilisateur (lesson 4e5c109b) de ne pas mécaniser. La seule
+    garantie de bout en bout aurait été un mécanisme déterministe (un
+    hook qui refuse le permit si un caller grep n'est pas dans
+    target_paths, par exemple), mais ce mécanisme aurait sa propre
+    complexité et ses faux positifs (macros, re-exports). L'utilisateur
+    a tranché : la garantie partielle d'un tool ne justifie pas sa
+    surface, et le jugement de l'agent reste requis de toute façon.
+    Le RFC documente donc honnêtement : ce mécanisme RÉDUIT la fréquence
+    des oublis (rappel actif + double passage Architect/Implementer)
+    sans l'annuler. Si les oublis persistent malgré la règle persona,
+    le sujet pourra être ré-escaladé vers une mécanisation déterministe
+    via un futur RFC, avec le coût/bénéfice réévalué à la lumière de
+    nouvelles données empiriques.
+
+  rollback_plan: >
+    Rollback trivial : retirer les deux entrées ajoutées dans
+    rules.must de company/personas/architect.yml et
+    company/personas/implementer.yml, régénérer
+    company/config/personas.yml si nécessaire. Retour à la discipline
+    passive des lessons ea6e9dd1 / 611fde3e. Aucun code, aucun schema,
+    aucune dépendance touchés : le rollback ne peut laisser le système
+    dans aucun état incohérent.
+
+  affected_files:
+    modified:
+      - company/personas/architect.yml
+      - company/personas/implementer.yml
+    created: []

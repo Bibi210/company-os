@@ -1,0 +1,252 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: 56513173-dfc6-4c9b-b150-b84e921eeecf
+  title: "Recensement empirique des callers oubliés dans les RFCs touchant une API publique de crate"
+  author: architect
+  created_at: "2026-06-05"
+  project: company-os
+  description: >
+    Investigation préalable au task-request dabc159c. Recense les
+    occurrences documentées où un RFC modifiant une signature d'API
+    publique de crate (fonction OU type) a omis un caller, le coût
+    de cette omission, l'étape à laquelle elle a été détectée, et
+    l'état de l'outillage disponible aujourd'hui pour produire un
+    inventaire exhaustif des callers AVANT cargo build. Inclut le
+    sanity-check rétroactif (acceptance criterion 6 du task-request) :
+    le mécanisme proposé par le RFC eb42a8de aurait-il détecté les
+    deux callers oubliés ?
+  tags:
+    - workflow
+    - api
+    - callers
+    - rfc-discipline
+    - permits
+    - friction-reduction
+    - companyos-internals
+  related:
+    - id: dabc159c-f6f7-4d56-913a-e7e83830977a
+      kind: task-request
+      relationship: input
+    - id: ea6e9dd1-93dc-4b19-9854-103328203489
+      kind: lesson-learned
+      relationship: derived-from
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+    - id: 062ebaa8-8876-42e4-b1a7-8ed3655238e2
+      kind: rfc
+      relationship: related
+    - id: bdee1af4-4944-4bee-b7c0-18efd6c7961f
+      kind: rfc
+      relationship: related
+    - id: 4ade4e7c-3156-4a98-9bd3-492f658b91d9
+      kind: agent-message
+      relationship: related
+
+spec:
+  status: resolved
+
+  symptom: >
+    Deux RFCs récents touchant du code Rust en zone protégée ont
+    omis un caller d'une API publique de crate dans leur scope
+    (affected_files), provoquant dans les deux cas un blocage en
+    cours d'exécution et un cycle d'extension de permit. Le pattern
+    est documenté par les lessons ea6e9dd1 et 611fde3e mais sans
+    mécanisme actionnable pour le prévenir : l'exhaustivité de
+    l'inventaire des callers est aujourd'hui laissée à la diligence
+    de l'Architect (rédaction du RFC) et de l'Implementer (rédaction
+    du plan), sans étape outillée ni contrôle de review explicite.
+
+    RECENSEMENT EMPIRIQUE — DEUX CAS DOCUMENTÉS.
+
+    CAS 1 — RFC 062ebaa8 (fix file watcher orchestrator).
+    Type de changement : signature de FONCTION publique de crate.
+    La fonction `spawn_watcher` (crates/config/src/watcher.rs:127)
+    est passée de 2 à 3 arguments (ajout d'un Arc<AtomicBool>
+    is_shutting_down). Le RFC iteration 2 (approved) listait dans
+    affected_files le caller crates/mcp-servers/orchestrator/src/main.rs
+    mais OMETTAIT le second caller
+    crates/mcp-servers/yaml/src/main.rs (ligne 178), qui appelle la
+    même fonction avec exactement le même pattern de bug.
+    Étape de détection : CARGO BUILD (premier build de la phase 2
+    du plan 18b72353). Le workspace ne compilait plus (arité de
+    spawn_watcher passée de 2 à 3). Détection donc tardive, en
+    pleine exécution, après que le permit eut été émis.
+    Coût : un agent-message au CEO (4ade4e7c) demandant l'extension
+    du permit 05b33c22 d'un path supplémentaire, l'attente de la
+    décision CEO, le grant du permit complémentaire (référencé
+    10d5eb41 dans la lesson ea6e9dd1). Round-trip Implementer -> PM
+    -> CEO -> Implementer. Estimation : quelques minutes de
+    coordination + interruption du flux d'exécution + risque de
+    perte de permit sur restart du binaire (le permit étant tenu
+    en RAM/WAL, un cargo build qui redémarre le serveur peut le
+    perdre — risque explicitement mentionné dans 4ade4e7c).
+
+    CAS 2 — RFC bdee1af4 (refonte search hybrid retrieval).
+    Type de changement : structure d'un TYPE public de crate.
+    Le changement touchait l'API search() et les types associés
+    (SearchParams et la couche d'indexation). Le fichier
+    crates/config/src/types.rs a été oublié du scope initial.
+    Étape de détection : REVIEW DU PLAN (iteration 1). Le finding
+    F-plan-1 de la review a identifié que types.rs manquait ;
+    le plan 640e2894 référence explicitement le permit
+    complémentaire fb2a5053-3a29-4ba5-a125-f0b23cdbcf4b « ajouté
+    en réponse au finding F-plan-1 de l'iteration 1 », en plus
+    du permit original a0b34bcd (15 paths). Détection donc plus
+    précoce que le CAS 1 (au review, pas au build), mais au prix
+    d'un second permit et d'une iteration de review supplémentaire.
+    Coût : un permit complémentaire + une iteration de re-review.
+
+    SYNTHÈSE TABULAIRE.
+    - Cas 1 (062ebaa8, fonction spawn_watcher) : oubli yaml/main.rs,
+      détecté au CARGO BUILD, coût = 1 agent-message CEO +
+      1 permit étendu + interruption exécution.
+    - Cas 2 (bdee1af4, type SearchParams/types.rs) : oubli types.rs,
+      détecté à la REVIEW DU PLAN, coût = 1 permit complémentaire
+      (fb2a5053) + 1 iteration re-review.
+
+    Les deux types de changement (fonction ET type) sont couverts
+    par le recensement, ce qui satisfait l'acceptance criterion 3
+    du task-request (le mécanisme doit couvrir les deux contextes).
+
+    AUTRES RFCs INSPECTÉS (pas de caller oublié, contrôle négatif).
+    - RFC 973a5569 (migration SQL user_version) : le plan 3422e8eb
+      note explicitement « la signature publique pub fn migrate()
+      est CONSERVÉE : aucun des 4 sites d'appel n'est adapté ».
+      Aucun changement de signature = aucun risque d'oubli de
+      caller. Contrôle négatif valide : quand la signature ne
+      change pas, le problème n'existe pas.
+    - RFC a4eb3ee7 (affected_files modified/created) : pur YAML,
+      grep "affected_files" sur crates/ = 0, aucun code Rust
+      touché. Hors périmètre du problème.
+    - RFC 1c0f2570 (rfc_set_implemented) : ajout d'un tool MCP
+      nouveau, pas de modification de signature existante. Hors
+      périmètre.
+    Conclusion du contrôle : le problème se manifeste UNIQUEMENT
+    quand un RFC modifie la signature (arité, type des arguments,
+    forme d'un struct/enum public) d'un symbole `pub` qui traverse
+    une frontière de crate. Les ajouts de symboles neufs et les
+    changements purement internes (`pub(crate)`, helpers privés)
+    ne sont pas concernés.
+
+  root_cause: >
+    TROIS FACTEURS SUPERPOSÉS.
+
+    FACTEUR 1 — Aucune étape outillée d'inventaire. Le workflow
+    actuel ne comporte aucun point où l'on produit, de manière
+    déterministe, la liste de tous les call sites d'un symbole
+    avant de figer le scope du RFC et du permit. La lesson ea6e9dd1
+    recommande déjà « grep -rn "<symbol>" crates/ ou get_references
+    LSP AVANT d'écrire l'implementation-plan », mais cette
+    recommandation vit dans une lesson-learned (mémoire passive
+    consultée à la discrétion de l'agent), pas dans une règle ou
+    un outil invoqué dans le flux. Une recommandation non outillée
+    et non contrôlée en review se perd.
+
+    FACTEUR 2 — affected_files n'est pas le mécanisme de permit.
+    Le RFC a4eb3ee7 a établi (et la lesson 611fde3e le confirme)
+    que affected_files est PUREMENT DOCUMENTAIRE : aucun code Rust
+    ne le lit, et le mécanisme de permit repose exclusivement sur
+    les target_paths littéraux fournis par le CEO. Conséquence :
+    même si affected_files était parfait, un oubli dans la
+    traduction affected_files -> target_paths reproduirait le
+    blocage. Le maillon réel à sécuriser est l'inventaire AMONT
+    qui nourrit À LA FOIS affected_files ET le target_paths du
+    permit. Sécuriser uniquement le champ documentaire serait
+    traiter le symptôme, pas la cause.
+
+    FACTEUR 3 — Le compilateur détecte trop tard. Rust échoue à
+    la compilation sur un caller oublié si la signature change de
+    manière incompatible (CAS 1). Mais cette détection arrive APRÈS
+    l'émission du permit, en pleine exécution, donc trop tard pour
+    éviter le round-trip de permit. Le task-request le dit
+    explicitement (out_of_scope) : le sujet est l'inventaire AVANT
+    cargo build, pour anticiper les besoins de permit. Le
+    compilateur n'est pas une ligne de défense suffisante car
+    (a) il intervient trop tard et (b) il NE détecte PAS un
+    changement rétro-compatible (ajout d'argument avec valeur par
+    défaut côté struct, champ optionnel) qui laisserait certains
+    callers compiler tout en étant sémantiquement à mettre à jour.
+
+    ÉTAT DE L'OUTILLAGE EXISTANT.
+    Ce qu'on peut faire AUJOURD'HUI :
+    - grep / ripgrep (`rg`) sur crates/ : disponible
+      (/usr/bin/rg confirmé). Produit une liste fichier:ligne
+      textuelle. Limite : faux positifs (commentaires, strings,
+      symboles homonymes dans d'autres scopes) et faux négatifs
+      (appel via macro, re-export sous un alias).
+    - get_references via vscode-mcp (LSP rust-analyzer) :
+      sémantiquement précis, connaît les scopes et re-exports.
+      MAIS dépend de VSCode ouvert avec l'extension bridge active.
+      Indisponible en exécution headless / CI. Ne peut PAS être
+      appelé par le serveur orchestrator (transport stdio
+      mono-process, cf. lesson 611fde3e ENSEIGNEMENT 2 : un tool
+      MCP serveur ne peut pas joindre cross-process un autre
+      serveur MCP).
+    - L'orchestrator exécute DÉJÀ des sous-process via
+      std::process::Command (4 call sites `git` dans main.rs).
+      Donc un tool MCP serveur PEUT exécuter `rg` en sous-process.
+      C'est la base technique réaliste de l'option (c).
+
+    Ce qui MANQUE :
+    - Un point d'inventaire déterministe, invocable dans le flux,
+      qui matérialise la liste nominative des callers et la
+      consigne dans un artifact traçable (le task-request,
+      anti-pattern (8), exige une LISTE fichier:ligne, pas un
+      « j'ai regardé »).
+    - Une règle qui rende cet inventaire obligatoire pour la
+      classe de RFC concernée, et un reviewer responsable de
+      vérifier sa présence.
+
+  resolution: >
+    Le mécanisme retenu est défini par le RFC eb42a8de (option d,
+    combinaison) :
+    (c) un tool MCP `list_callers` côté orchestrator qui exécute
+        `rg` en sous-process sur crates/ (sur le modèle des call
+        sites git existants) et retourne une liste nominative
+        fichier:ligne des callers d'un symbole, fonctions ET types ;
+    (a) une section `spec.caller_inventory` ajoutée au schema
+        implementation-plan, qui consigne l'output du tool ;
+    (b) une règle dans shared-rules qui rend l'inventaire
+        obligatoire pour tout RFC modifiant une signature publique
+        cross-crate, l'Architect (reviewer du plan déjà désigné
+        par le review-protocol) étant responsable de vérifier sa
+        présence et sa cohérence avec affected_files + target_paths.
+
+    SANITY-CHECK RÉTROACTIF (acceptance criterion 6).
+    Question : si le mécanisme avait existé, aurait-il détecté les
+    deux callers oubliés ?
+
+    CAS 1 — spawn_watcher / yaml/main.rs. OUI. Vérifié
+    empiriquement : `rg "spawn_watcher" crates/` retourne
+    aujourd'hui le call site crates/mcp-servers/yaml/src/main.rs
+    parmi les hits (le fichier est toujours un caller au moment
+    de la rédaction de ce diagnostic). Au moment du RFC 062ebaa8,
+    le même grep aurait listé les DEUX callers (orchestrator/main.rs
+    ET yaml/main.rs), rendant l'oubli impossible si l'inventaire
+    avait été produit et consigné. DÉTECTION CONFIRMÉE.
+
+    CAS 2 — SearchParams / types.rs. OUI, avec une nuance. Le
+    changement portait sur un TYPE (SearchParams) et la couche
+    d'indexation. Un `rg "SearchParams" crates/` aurait listé
+    types.rs parmi les fichiers référençant le type. La nuance :
+    pour un type, le symbole pertinent à grepper est le nom du
+    type ET ses sites de définition/usage (champs, variantes).
+    Le tool list_callers doit donc accepter un nom de type et
+    grepper ses occurrences, pas seulement les appels de fonction.
+    Le RFC eb42a8de spécifie explicitement cette granularité
+    (fonctions ET types). Sous cette condition, DÉTECTION
+    CONFIRMÉE.
+
+    VERDICT DU SANITY-CHECK : le mécanisme proposé aurait détecté
+    les DEUX callers oubliés. Il est donc suffisant pour fermer
+    la classe d'incidents observée. La limite résiduelle (faux
+    négatifs sur appels via macro ou re-export sous alias) est
+    documentée dans l'analyse négative du RFC et acceptée comme
+    risque résiduel borné : un grep textuel ne capture pas une
+    indirection macro, mais aucun des deux cas observés n'était
+    de cette nature (les deux étaient des appels textuels directs).
+    Pour ces cas résiduels, le compilateur reste le dernier filet
+    (FACTEUR 3), et la règle impose une asymétrie favorable
+    (permit large plutôt qu'étroit, cf. ea6e9dd1 recommandation 4).
