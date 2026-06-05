@@ -1,0 +1,134 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: e362e438-e550-4c98-9cdd-2af21b5d8978
+  title: "Retirer le paramètre kind du tool MCP search (le filtrage par kind appauvrit la recherche)"
+  author: pm
+  created_at: "2026-06-05"
+  project: company-os
+  description: >
+    Décision utilisateur explicite : retirer le paramètre `kind` du
+    tool MCP `search`. La présence de ce filtre incite les agents
+    (et le PM) à restreindre la recherche à un type d'artifact
+    précis, ce qui appauvrit le rappel. Or l'intention du retrieval
+    hybride (RFC bdee1af4 implémenté) est précisément de retourner
+    BEAUCOUP de résultats pertinents tous kinds confondus, pour que
+    le lookup mémoire expose l'écosystème complet d'un sujet :
+    task-request + design-doc + RFC + lesson + diagnostic etc.
+
+    Le filtrage par kind reste utile dans certains cas (par exemple
+    « liste tous les RFCs actifs »), mais ce n'est pas une
+    recherche : c'est un listing. Pour ce besoin, le tool MCP
+    `list_roadmaps` existe pour les roadmaps, et un éventuel
+    `list_artifacts(kind)` séparé serait l'outil adapté. Le tool
+    `search` doit rester focalisé sur sa mission : retrieval
+    sémantique + lexical large.
+
+    Sont aussi à examiner les autres filtres structurés introduits
+    par RFC bdee1af4 (`author`, `tags`, `project`, `created_after`,
+    `created_before`, `id_prefix`). Mon avis PM (non bloquant) :
+    `tags` et `id_prefix` ont un cas d'usage légitime
+    (raffinement quand le rappel est trop large), les autres sont
+    discutables. L'Architect arbitre.
+  tags:
+    - search
+    - retrieval
+    - api
+    - simplification
+    - companyos-internals
+  related:
+    - id: bdee1af4-4944-4bee-b7c0-18efd6c7961f
+      kind: rfc
+      relationship: related
+    - id: 600307a4-74f6-43dd-95e1-4dee3d2326c1
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  priority: medium
+  status: backlog
+
+  acceptance_criteria:
+    - >
+      Le paramètre `kind` est retiré du tool MCP `search` :
+      signature MCP, code Rust côté engine + db, documentation
+      éventuelle. Les appels existants qui passent kind=X reçoivent
+      soit un comportement de filtre ignoré (avec warning), soit
+      une erreur claire de paramètre inconnu (breaking change
+      contrôlé, à arbitrer par l'Architect).
+
+    - >
+      L'Architect statue sur les autres filtres structurés
+      introduits par RFC bdee1af4. Au minimum : `author`,
+      `project`, `created_after`, `created_before`. Position PM :
+      `tags` et `id_prefix` à garder, le reste à challenger. Mais
+      c'est l'Architect qui tranche selon utilisation observée.
+
+    - >
+      Mise à jour cohérente du jeu de queries de référence
+      (`search_eval`) si présent. Vérifier qu'aucune query ne
+      dépendait du filtre kind. Si oui, refactor.
+
+    - >
+      Mise à jour des appelants connus : `memory_lookup_before_acting`
+      dans shared-rules invite explicitement les agents à appeler
+      search(query, kind=...) — la formulation doit être adaptée.
+      Les personas peuvent aussi mentionner search(...kind...) dans
+      leur prose, à grep.
+
+    - >
+      Tests : tests unitaires + intégration du `search` post-refactor.
+      Acceptance criterion empirique : les 3 queries du symptôme
+      original (search semantic embeddings vector, recherche memoire
+      collective FTS, lookup memoire faux negatif) retournent
+      toujours au moins 5 résultats top-pertinents avec recall
+      équivalent ou supérieur à la baseline post-bdee1af4 (recall@10
+      = 0.895).
+
+    - >
+      Lesson-learned de clôture chaînée 600307a4 (refonte search) et
+      4e5c109b (préférence déterministe vs LLM). Capter la
+      réflexion : un filtre qui appauvrit le rappel n'a pas sa place
+      dans le tool de retrieval principal.
+
+  investigation_hints: >
+    Pistes non prescriptives.
+
+    (1) Lookup mémoire. RFC bdee1af4 (refonte search hybrid) qui
+    a introduit les filtres structurés. Lesson 600307a4 qui
+    documente l'implémentation. shared-rules.yml règle
+    memory_lookup_before_acting qui mentionne explicitement
+    search(query, kind=...). Lessons sur le cargo-cult des
+    paramètres optionnels (02b8e1ce) — adjacent.
+
+    (2) Décision breaking change vs deprecation graceful.
+    Retrait pur (l'argument kind n'est plus reconnu) est plus
+    propre mais casse les appels existants. Deprecation graceful
+    (kind accepté mais ignoré avec warning) laisse une transition.
+    À arbitrer.
+
+    (3) Le besoin "liste tous les artifacts d'un kind" reste
+    légitime. Soit on l'adresse via un nouveau tool
+    `list_artifacts(kind)` séparé, soit on accepte que ce besoin
+    n'est pas dans le scope du retrieval principal. L'Architect
+    décide.
+
+    (4) Sanity check empirique sur ma roadmap actuelle (329da45f) :
+    search("roadmap auto-sync") devrait retourner le task-request +
+    le RFC + le design-doc + l'implementation-plan + la lesson en
+    top. Si kind est retiré, ce serait beaucoup plus lisible.
+
+    (5) Le filtre est probablement encore utile pour les filtres
+    qui RESTREIGNENT par méta-données précises (id_prefix pour
+    cibler un artifact, tags pour raffiner par thématique). À
+    distinguer de kind qui filtre par TYPE — sous-cas du listing,
+    pas du retrieval.
+
+  out_of_scope: >
+    - Refonte plus large de l'API search() au-delà du retrait des
+      filtres. Le mode hybrid/lexical/semantic reste.
+    - Introduction d'un nouveau tool list_artifacts (peut être
+      proposé en suite par l'Architect, mais hors de ce
+      task-request).
+    - Modification du pipeline d'indexation (l'index reste tel
+      quel, c'est juste la signature du search qui change).
