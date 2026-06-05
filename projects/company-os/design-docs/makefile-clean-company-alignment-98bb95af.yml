@@ -1,0 +1,223 @@
+api_version: companyos/v1
+kind: design-doc
+metadata:
+  id: 98bb95af-9667-4625-8817-d28fb3c0e1f7
+  title: "Architecture du realignement de la cible Makefile clean-company sur la convention file_placement"
+  author: architect
+  created_at: "2026-06-05"
+  project: company-os
+  description: >
+    Definit l'architecture du realignement de la cible clean-company du
+    Makefile sur la regle file_placement de shared-rules. Repond au QUOI
+    et au POURQUOI : quels paths la cible doit couvrir, quelle approche
+    (statique vs dynamique) retenir pour la robustesse, et comment gerer
+    la dependance transitoire au retrait du kind agent-message. Fonde sur
+    le recensement d'ecart du diagnostic fed2cac0. Le Makefile n'etant pas
+    en zone protegee, ce realignement ne necessite NI RFC NI write permit :
+    un design-doc + implementation-plan suffisent.
+  tags:
+    - makefile
+    - tooling
+    - cleanup
+    - conventions
+    - file-placement
+    - companyos-internals
+  related:
+    - id: 5ecc2877-8f68-4542-9620-e59123bf90fe
+      kind: task-request
+      relationship: input
+    - id: fed2cac0-3e41-4be1-8815-e8c0e755b384
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: a49801aa-911e-45d7-95a3-b21d6ea2bd2d
+      kind: rfc
+      relationship: related
+    - id: 3d9f0b0c-856d-4799-ac10-e25fad5d1965
+      kind: rfc
+      relationship: related
+
+spec:
+  overview: >
+    Ce design repond au task-request 5ecc2877, fonde sur le constat
+    (diagnostic fed2cac0) que la cible clean-company du Makefile a derive
+    de la convention file_placement : elle reference deux dossiers
+    inexistants (company/diagnostics/, company/design-docs/), oublie deux
+    kinds globaux (company/roadmaps/, company/agent-messages/), et donne
+    une fausse impression de couverture exhaustive.
+
+    DECISION DE PERIMETRE STRUCTURANTE. Le Makefile n'est PAS en zone
+    protegee (diagnostic FAIT ZONE PROTEGEE). Ce realignement ne passe
+    donc PAS par un RFC : c'est de la dette de tooling hors zone protegee.
+    Le cycle est design-doc (ce document) -> implementation-plan ->
+    edition directe du Makefile (sans write permit). C'est l'arbitrage
+    explicite demande par l'investigation_hint 4 du task-request.
+
+    DEUX PRINCIPES DIRECTEURS.
+    (1) La cible clean-company doit refleter la convention file_placement
+        comme SOURCE DE VERITE : tout kind genere par les agents doit etre
+        couvert, tout dossier preserve (personas, config, schemas, plugins,
+        scripts, data) doit rester intact.
+    (2) Robustesse aux futurs kinds : le diagnostic note que la derive
+        vient precisement de l'ajout du kind roadmap APRES la redaction du
+        Makefile. L'architecture doit reduire la probabilite qu'un futur
+        kind global soit a nouveau oublie.
+
+  components:
+    - name: "1. Couverture des kinds globaux company/ (le coeur du fix)"
+      description: >
+        La cible doit nettoyer TOUS les dossiers d'artifacts GENERES par
+        les agents sous company/. Selon file_placement, les kinds globaux
+        generables (hors config systeme) sont :
+          - company/lessons/   (lesson-learned)  -- deja couvert
+          - company/rfcs/       (rfc)             -- deja couvert
+          - company/roadmaps/   (roadmap)         -- A AJOUTER (E2)
+          - company/agent-messages/ (agent-message) -- transitoire (E3),
+            cf. composant 4
+        Les kinds globaux de CONFIG SYSTEME (flow-control, review-protocol,
+        human-review-triggers) vivent dans company/config/ et NE sont PAS
+        des artifacts generes a wiper : ils sont preserves (composant 3).
+        persona vit dans company/personas/ : preserve. Retrait des 2 lignes
+        no-op company/diagnostics/ et company/design-docs/ (E1 : ces kinds
+        sont projet, deja couverts par rm -rf projects/*/).
+
+    - name: "2. Couverture des kinds projet (deja complete)"
+      description: >
+        `rm -rf projects/*/` supprime recursivement tous les sous-dossiers
+        de chaque projet : task-requests/, design-docs/,
+        diagnostic-reports/, implementation-plans/, review-reports/,
+        config/. Le cote projet est donc DEJA integralement couvert
+        (diagnostic E4). Aucun ajout projet requis. L'AC du task-request
+        qui liste projects/<slug>/config/ et consorts est satisfait par ce
+        seul rm -rf global. Ce composant ne change pas ; il est documente
+        pour lever l'ambiguite de l'AC2 du task-request.
+
+    - name: "3. Invariant de preservation"
+      description: >
+        Tout realignement DOIT preserver, sans jamais les toucher :
+          - company/personas/   (definitions d'agents)
+          - company/config/     (shared-rules, review-protocol,
+                                  flow-control, human-review-triggers,
+                                  personas.yml genere, protected-zones.json)
+          - company/schemas/    (schemas JSON)
+          - company/plugins/    (defense-in-depth, mcp-proxy, etc.)
+          - company/scripts/    (check-artifact-naming.sh, etc.)
+          - company/data/       (la DB, nettoyee separement par la cible
+                                  clean dont depend clean-company)
+        Aucun rm de clean-company ne doit cibler ces chemins, ni un glob
+        company/*.yml trop large qui les capterait. La cible reste une
+        liste EXPLICITE de sous-dossiers d'artifacts generes, pas un wipe
+        de company/.
+
+    - name: "4. Gestion transitoire de company/agent-messages/"
+      description: >
+        Le kind agent-message est en cours de retrait (RFC 3d9f0b0c, non
+        merge au moment de ce design). Deux scenarios d'ordre :
+          (a) Le retrait agent-message (3d9f0b0c) est merge AVANT ce
+              realignement : le dossier company/agent-messages/ n'existe
+              plus. La cible NE doit PAS le mentionner (un rm -f sur un
+              dossier absent est un no-op, mais autant ne pas reintroduire
+              une ligne obsolete).
+          (b) Ce realignement est merge AVANT ou EN PARALLELE du retrait :
+              le dossier existe encore, la cible doit le couvrir pour
+              coherence transitoire (AC3 du task-request).
+        DECISION D'ORDRE recommandee : traiter ce realignement Makefile
+        APRES le merge du retrait agent-message, pour livrer un Makefile
+        directement propre (scenario a) sans ligne transitoire a retirer
+        ensuite. Si l'ordre inverse se produit, l'implementation-plan
+        ajoutera la ligne agent-messages avec un commentaire la marquant
+        comme transitoire. C'est un point de coordination PM, pas un
+        blocage technique.
+
+    - name: "5. Documentation de l'invariant PILIER D"
+      description: >
+        Ajouter un commentaire dans la cible expliquant qu'apres
+        clean-company, l'index orchestrator (company/data/orchestrator.db,
+        deja wipe par la cible clean) est incoherent jusqu'au prochain
+        boot, qui le reconstruit depuis les YAML restants (logiquement
+        vides cote artifacts generes). C'est le comportement voulu du RFC
+        cdbfee72 (YAML source de verite, rebuild deterministe), pas un bug.
+        Le commentaire previent toute confusion humaine ("pourquoi l'index
+        est vide ?").
+
+  decisions:
+    - decision: >
+        DECISION 1 — Pas de RFC ni write permit. Le realignement passe par
+        design-doc + implementation-plan + edition directe du Makefile.
+      rationale: >
+        Le Makefile racine n'est pas dans protected-zones.json (prefixes :
+        company/config|personas|schemas|plugins, crates/ ; fichier :
+        opencode.json). Le hook defense-in-depth ne bloque pas son edition.
+        Imposer un RFC pour un fichier non protege ajouterait de la
+        ceremonie sans contrepartie (approbation CEO, permit, scellement).
+        C'est de la dette de tooling priority=low, pas un changement
+        structurel du contrat d'un artifact ou d'une zone protegee. Le
+        design-doc capture le QUOI/POURQUOI et passe en review PM +
+        Implementer (review-protocol design-doc), ce qui suffit a la
+        qualite.
+    - decision: >
+        DECISION 2 — Approche STATIQUE (liste explicite de paths codee en
+        dur dans la cible), PAS d'approche dynamique (find au runtime).
+      rationale: >
+        Le task-request (AC optionnel + hint 2) ouvre la porte a une
+        approche dynamique (find company/ projects/ -type d -name "<kind>s"
+        au runtime) pour la robustesse aux futurs kinds. ARBITRAGE : rester
+        statique. Une approche find dynamique introduit : (1) un risque de
+        sur-suppression (un find trop large pourrait capter company/config/
+        ou company/scripts/ si un dossier y finissait par un nom
+        ressemblant a un kind), (2) une complexite de lecture (la cible
+        devient un script shell non trivial), (3) une fragilite aux
+        differences d'environnement (find BSD vs GNU). Le gain (ne pas
+        editer la cible quand on ajoute un kind) est faible : ajouter un
+        kind est deja un evenement RFC lourd (lesson 3f507271) ou la mise a
+        jour d'une ligne de Makefile est negligeable et naturellement
+        groupee. Le defaut statique est plus sur, plus lisible, et la
+        derive est mieux prevenue par la DECISION 3 (commentaire d'ancrage)
+        que par du find magique. Coherent avec la lesson 4e5c109b lue dans
+        l'autre sens : ne pas ajouter de mecanique (find) quand une liste
+        explicite suffit et est plus auditable.
+    - decision: >
+        DECISION 3 — Ancrer la cible a la convention file_placement par un
+        commentaire de synchronisation explicite.
+      rationale: >
+        La cause racine de la derive (diagnostic) est que le Makefile et
+        shared-rules.file_placement ont evolue independamment. Mitigation
+        structurelle legere : un commentaire dans la cible clean-company
+        indiquant "Keep in sync with spec.rules.file_placement in
+        company/config/shared-rules.yml" (meme pattern que le commentaire
+        deja present dans defense-in-depth-core.mjs L44-45 pour
+        ARTIFACT_NAMING_PREFIXES). Ce commentaire ne garantit rien
+        mecaniquement, mais il rend le couplage VISIBLE pour le prochain
+        agent qui ajoute un kind, exactement la ou il editera. C'est le
+        bon niveau d'instrumentation pour une dette de tooling : un rappel
+        au point d'edition, pas un mecanisme.
+    - decision: >
+        DECISION 4 — Conserver le nom clean-company (pas de renommage).
+      rationale: >
+        Le task-request evoque "ou son equivalent renomme". ARBITRAGE :
+        garder clean-company. La cible est referencee telle quelle dans
+        l'habitude des operateurs et eventuellement dans de la doc/scripts.
+        Un renommage ajouterait une rupture sans valeur (le nom decrit
+        correctement l'intent : nettoyer les artifacts de company + les
+        projets). Hors scope du realignement (qui aligne les PATHS, pas la
+        nomenclature des cibles).
+
+  open_questions:
+    - >
+      OQ1 — Ordre de merge vis-a-vis du retrait agent-message (RFC
+      3d9f0b0c). Le composant 4 recommande de merger ce realignement APRES
+      le retrait pour livrer un Makefile directement propre. Si le PM
+      ordonnance l'inverse, l'implementation-plan doit inclure la ligne
+      transitoire company/agent-messages/ avec commentaire. A trancher par
+      le PM selon l'ordonnancement reel des deux task-requests (95e93649 et
+      5ecc2877). Sans impact technique : les deux ordres sont corrects, le
+      choix optimise seulement le nombre d'editions du Makefile.
+    - >
+      OQ2 — Faut-il ajouter une cible de verification (dry-run / echo des
+      rm) comme le suggere l'AC6 du task-request pour tester la couverture
+      sans destruction ? Recommandation : oui, une cible clean-company-dry
+      optionnelle ou une variable VERBOSE peut etre utile, mais c'est un
+      ajout (le task-request out_of_scope interdit d'inventer de nouvelles
+      cibles au sens large). A trancher en implementation-plan : soit un
+      simple test manuel documente, soit une cible dry-run minimale. Penche
+      vers le test manuel documente pour rester dans le scope "alignement,
+      pas refonte".

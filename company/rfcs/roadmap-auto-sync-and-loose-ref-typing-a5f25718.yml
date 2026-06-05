@@ -5,7 +5,8 @@ metadata:
   title: "Auto-sync absolu du status de roadmap (calcul à la lecture) et remplacement du ref external par loose typé"
   author: architect
   created_at: "2026-06-05"
-  status: draft
+  status: approved
+  approved_at: "2026-06-05T09:44:48.345421151+00:00"
   description: >
     Renverse la décision "pas d'auto-synchronisation" du RFC a49801aa,
     qui s'est avérée intenable en pratique (la seule roadmap existante a

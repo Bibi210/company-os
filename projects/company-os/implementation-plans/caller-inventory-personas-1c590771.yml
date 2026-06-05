@@ -1,0 +1,100 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 1c590771-bfb0-49d8-9f88-ae0340a2b7cc
+  title: "Plan d'implémentation RFC eb42a8de : discipline d'inventaire des callers dans les personas Architect et Implementer"
+  author: implementer
+  created_at: "2026-06-05"
+  project: company-os
+  description: >
+    Plan d'implémentation chirurgical du RFC eb42a8de (iteration 2).
+    Ajout d'une entrée rules.must dans chacune des deux personas
+    Architect et Implementer formalisant la discipline d'inventaire
+    exhaustif des callers d'une API publique de crate avant de figer
+    (Architect, au RFC/design-doc) ou de modifier (Implementer, à
+    l'exécution) une signature. Aucun code Rust, aucun schema, aucun
+    tool MCP. Deux edits YAML en zone protégée (company/personas/),
+    couverts par le write permit 02e0191f.
+  tags:
+    - workflow
+    - api
+    - callers
+    - personas
+    - companyos-internals
+  related:
+    - id: eb42a8de-e6a9-4f7b-81d1-c91d7120b626
+      kind: rfc
+      relationship: input
+    - id: 56513173-dfc6-4c9b-b150-b84e921eeecf
+      kind: diagnostic-report
+      relationship: related
+    - id: ea6e9dd1-93dc-4b19-9854-103328203489
+      kind: lesson-learned
+      relationship: related
+    - id: 4e5c109b-ec35-46ff-98af-3714b1d7a36f
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  overview: >
+    Le RFC est intentionnellement minimal (scope réduit à l'iteration 2
+    sur décision utilisateur : pas de tool MCP, pas de schema, pas de
+    règle shared-rules). L'implémentation consiste à insérer une seule
+    chaîne dans rules.must de chaque persona, dont le texte est dérivé
+    quasi verbatim de la section proposal du RFC. La régénération de
+    company/config/personas.yml n'est PAS dans le scope de ce permit
+    (target_paths = uniquement les deux fichiers sources) ; ce fichier
+    auto-généré ne contient que role/produces/consumes/review, pas les
+    rules.must, donc il n'est pas affecté par cet ajout.
+
+  steps:
+    - step: 1
+      description: >
+        Éditer company/personas/architect.yml. Ajouter une nouvelle entrée
+        en fin de liste rules.must (après l'entrée memory_lookup_before_acting,
+        ligne 25). Texte de la règle (dérivé de la section proposal du RFC,
+        bloc PERSONA ARCHITECT) : avant de figer la signature d'une API
+        publique de crate (symbole `pub` traversant une frontière de crate :
+        fonction OU type) dans un design-doc ou un RFC, recenser tous ses
+        callers via rg ou get_references LSP ; l'union (callers + fichier de
+        définition) doit figurer dans affected_files (forme structurée
+        modified/created, RFC a4eb3ee7) pour que target_paths soit exhaustif ;
+        documenter la liste si non triviale ; exclure les symboles internes
+        (`pub(crate)`, helpers privés) et les RFCs purement YAML/config.
+      file: company/personas/architect.yml
+      validation: validate_file après edit (doit rester conforme au schema persona)
+
+    - step: 2
+      description: >
+        Éditer company/personas/implementer.yml. Ajouter une nouvelle entrée
+        en fin de liste rules.must (après l'entrée CI, ligne 48). Texte de la
+        règle (dérivé de la section proposal du RFC, bloc PERSONA IMPLEMENTER) :
+        avant de modifier la signature d'une API publique de crate, refaire le
+        recensement des callers (rg ou get_references LSP) pour capter ceux
+        ajoutés depuis la rédaction du RFC ; si la liste diverge du périmètre
+        du write permit (un caller hors target_paths), s'arrêter et signaler à
+        l'Architect / au PM via agent-message AVANT toute écriture, pour
+        extension du permit ; ne jamais contourner un permit incomplet.
+      file: company/personas/implementer.yml
+      validation: validate_file après edit (doit rester conforme au schema persona)
+
+    - step: 3
+      description: >
+        Commit du code (git add des deux personas + git commit), puis
+        consume_write_permit(02e0191f). CI interne CompanyOS = cargo build
+        + cargo test (cas 3 de la règle CI : aucun code Rust touché, mais la
+        séquence reste exécutée pour valider l'intégrité du workspace).
+        reload_config() en dernier si build/test verts.
+      file: "(workflow, pas de fichier)"
+      validation: cargo build && cargo test verts, permit consumed
+
+  acceptance_criteria:
+    - "architect.yml contient une règle rules.must imposant l'inventaire des callers avant de figer une signature d'API publique dans un design-doc/RFC."
+    - "implementer.yml contient une règle rules.must imposant le ré-inventaire des callers avant de modifier une signature, avec signalement par agent-message si divergence du permit."
+    - "Les deux fichiers restent conformes au schema persona (validate_file vert)."
+    - "Aucun fichier hors des deux target_paths du permit n'est modifié."
+    - "cargo build + cargo test verts (CI interne CompanyOS)."
+
+  risks:
+    - "Risque résiduel assumé par le RFC lui-même (section RISQUE RÉSIDUEL) : une discipline déléguée à un agent reste faillible. Hors scope du plan : le RFC documente que c'est le coût explicite de la décision utilisateur de ne pas mécaniser."
+    - "Divergence de wording entre les deux personas : mitigé en dérivant chaque texte directement de la section proposal du RFC."

@@ -1,0 +1,128 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: fed2cac0-3e41-4be1-8815-e8c0e755b384
+  title: "Recensement de l'ecart entre la cible Makefile clean-company et la convention file_placement actuelle"
+  author: architect
+  created_at: "2026-06-05"
+  project: company-os
+  description: >
+    Investigation cadree par le task-request 5ecc2877. Recense l'ecart
+    precis entre la cible clean-company du Makefile (etat HEAD) et la
+    regle file_placement de shared-rules. Tranche la question de la zone
+    protegee (le Makefile n'y est PAS), ce qui determine qu'aucun RFC ni
+    write permit n'est requis : un design-doc + implementation-plan
+    suffisent. Pilote le design-doc 98bb95af.
+  tags:
+    - makefile
+    - tooling
+    - cleanup
+    - conventions
+    - file-placement
+    - companyos-internals
+  related:
+    - id: 5ecc2877-8f68-4542-9620-e59123bf90fe
+      kind: task-request
+      relationship: input
+    - id: 98bb95af-9667-4625-8817-d28fb3c0e1f7
+      kind: design-doc
+      relationship: related
+
+spec:
+  symptom: >
+    La cible clean-company du Makefile (censee "wipe all generated
+    artifacts" tout en preservant personas/config/schemas/plugins) n'est
+    plus alignee sur la convention de placement actuelle. Un
+    make clean-company laisse des artifacts generes en place (roadmaps)
+    et tente de supprimer des dossiers inexistants (no-op trompeurs).
+
+  root_cause: >
+    ETAT ACTUEL de la cible (Makefile lignes 55-61) :
+      clean-company: clean
+        rm -rf projects/*/
+        rm -f company/lessons/*.yml
+        rm -f company/rfcs/*.yml
+        rm -f company/diagnostics/*.yml
+        rm -f company/design-docs/*.yml
+
+    CONVENTION ACTUELLE (shared-rules, regle file_placement) :
+      Kinds projet  (vivent dans projects/<slug>/<kind>s/) :
+        task-request, design-doc, implementation-plan, review-report,
+        diagnostic-report, project-config.
+      Kinds globaux (vivent dans company/<folder>/) :
+        lesson-learned (company/lessons/), persona (company/personas/),
+        rfc (company/rfcs/), flow-control, review-protocol,
+        human-review-triggers, agent-message (company/agent-messages/),
+        roadmap (company/roadmaps/).
+
+    ECARTS PRECIS :
+
+    E1 — Paths inexistants (no-op silencieux). La cible fait
+    `rm -f company/diagnostics/*.yml` et `rm -f company/design-docs/*.yml`.
+    Ces dossiers N'EXISTENT PAS : diagnostic-report et design-doc sont des
+    kinds PROJET (projects/<slug>/diagnostic-reports/ et
+    projects/<slug>/design-docs/). Le rm est un no-op qui donne une fausse
+    impression de couverture. A SUPPRIMER de la cible (redondant : deja
+    couverts par rm -rf projects/*/).
+
+    E2 — Roadmaps non nettoyees. La cible ne mentionne PAS
+    company/roadmaps/ (kind introduit par RFC a49801aa, posterieur a la
+    redaction du Makefile). Un make clean-company laisse les roadmaps en
+    place, contredisant l'intent "wipe all generated artifacts". A
+    AJOUTER : rm -f company/roadmaps/*.yml.
+
+    E3 — agent-messages non nettoyes (transitoire). La cible ne mentionne
+    PAS company/agent-messages/. Tant que le kind existe (cf. task-request
+    95e93649 et RFC 3d9f0b0c de retrait, non encore merge au moment de ce
+    diagnostic), la cible devrait le couvrir pour coherence. APRES le
+    merge du retrait agent-message, ce dossier disparaitra et la ligne
+    correspondante deviendra inutile. Dependance d'ordre a gerer dans le
+    design-doc.
+
+    E4 — Couverture projet deja complete. `rm -rf projects/*/` supprime
+    TOUS les sous-dossiers de chaque projet (task-requests, design-docs,
+    diagnostic-reports, implementation-plans, config). Le cote projet est
+    donc deja integralement couvert ; aucun ajout cote projet n'est
+    requis (l'AC du task-request listant projects/<slug>/config/ etc. est
+    deja satisfait par le rm -rf global). Les seuls ecarts reels sont
+    cote company/ (kinds globaux).
+
+    E5 — Preservation correcte aujourd'hui. La cible preserve bien
+    company/personas/, company/config/, company/schemas/,
+    company/plugins/, company/scripts/, company/data/ (ce dernier nettoye
+    separement par la cible clean dont depend clean-company). Aucun de ces
+    chemins n'est touche par les rm de clean-company. Cet invariant doit
+    etre conserve par tout realignement.
+
+    FAIT ZONE PROTEGEE — DECISIF. Le fichier Makefile (racine du repo)
+    n'est PAS en zone protegee. protected-zones.json couvre les prefixes
+    company/config/, company/personas/, company/schemas/, company/plugins/,
+    crates/, plus le fichier opencode.json. Le Makefile racine n'y figure
+    pas. CONSEQUENCE : modifier le Makefile ne necessite NI RFC NI write
+    permit. Le hook defense-in-depth ne bloquera pas l'edition. Un
+    design-doc (QUOI/POURQUOI du realignement) suivi d'un
+    implementation-plan (COMMENT) suffit. C'est coherent avec
+    investigation_hint 4 du task-request ("probablement pas besoin de RFC
+    structurel").
+
+    FAIT PILIER D. Le task-request (AC4) rappelle l'invariant du RFC
+    cdbfee72 : les YAML sont la source de verite, la DB orchestrator est
+    nettoyee separement (deja fait par la cible clean). Apres
+    clean-company, l'index orchestrator est incoherent jusqu'au prochain
+    boot qui reconstruit depuis les YAML (logiquement vide). Ce
+    comportement est correct et doit etre DOCUMENTE dans le Makefile (pas
+    corrige : c'est le design voulu).
+
+  resolution: >
+    Ecart recense et borne aux kinds globaux company/. Pas de RFC requis
+    (Makefile hors zone protegee). Le design-doc 98bb95af definit
+    l'architecture du realignement : (1) retrait des 2 lignes no-op
+    (company/diagnostics, company/design-docs), (2) ajout de
+    company/roadmaps/, (3) gestion transitoire de company/agent-messages/
+    avec dependance d'ordre vs le RFC 3d9f0b0c, (4) decision sur
+    l'approche statique vs dynamique (liste codee en dur vs find au
+    runtime) pour la robustesse aux futurs kinds, (5) documentation de
+    l'invariant PILIER D dans le Makefile. L'implementation-plan derive
+    executera l'edition directe (pas de permit).
+
+  status: resolved

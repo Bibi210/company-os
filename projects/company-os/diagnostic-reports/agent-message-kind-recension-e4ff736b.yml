@@ -1,0 +1,225 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: e4ff736b-8ab9-45f2-b0ea-d0979d87a759
+  title: "Recensement exhaustif des references au kind agent-message dans le repo (preparatoire au retrait)"
+  author: architect
+  created_at: "2026-06-05"
+  project: company-os
+  description: >
+    Investigation cadree par le task-request 95e93649 (retrait complet
+    du kind agent-message). Recense de maniere exhaustive toutes les
+    references a agent-message / AgentMessage dans le repo, les classe
+    en references ACTIVES (machinerie du kind, a retirer) vs PASSIVES
+    (mentions historiques en prose et cross-refs metadata.related, hors
+    scope), et tranche les points techniques qui conditionnent la
+    securite du retrait : ordre de suppression schema+enum, absence
+    d'integrite referentielle sur metadata.related, comportement du
+    SchemaRegistry au fichier schema manquant, et absence de ligne
+    dediee AgentMessage dans la matrice access_level. Pilote le RFC
+    3d9f0b0c.
+  tags:
+    - cleanup
+    - agent-message
+    - legacy-removal
+    - recension
+    - artifact-kind
+    - rust
+    - schema
+    - companyos-internals
+  related:
+    - id: 95e93649-70a0-4d9a-8453-61c49a5101f7
+      kind: task-request
+      relationship: input
+    - id: 3f507271-70ba-49ac-9a08-eeb833fb6063
+      kind: lesson-learned
+      relationship: related
+    - id: 3d9f0b0c-856d-4799-ac10-e25fad5d1965
+      kind: rfc
+      relationship: related
+
+spec:
+  symptom: >
+    Le kind agent-message est un kind legacy non utilise en pratique
+    (decision utilisateur, task-request 95e93649). Les sub-agents
+    communiquent avec le PM via le retour du Task tool, pas via des YAML
+    d'agent-messages. Avant de retirer le kind, il faut un recensement
+    EXHAUSTIF de ses references pour : (1) garantir qu'aucune branche de
+    code non-exhaustive ne casse a la compilation Rust, (2) ne rien
+    oublier dans le permit du RFC (lesson 611fde3e : un fichier oublie
+    bloque le hook), (3) distinguer ce qui doit etre retire de ce qui
+    est hors scope (prose historique). Le recensement preliminaire du
+    task-request (types.rs lignes 139/158/191/426/457) etait incomplet :
+    il manquait deux references code (embedding.rs et un test
+    d'integration) et plusieurs references config/plugin.
+
+  root_cause: >
+    RECENSEMENT EXHAUSTIF (etat HEAD au 2026-06-05). Total : 42 fichiers
+    contiennent une occurrence de agent-message / AgentMessage. Ils se
+    repartissent en DEUX classes nettes.
+
+    === CLASSE A : REFERENCES ACTIVES (machinerie du kind, A RETIRER) ===
+
+    A.1 SCHEMA (1 fichier, suppression complete) :
+    - company/schemas/agent-message.schema.json (27 lignes). C'est le
+      seul schema du kind. SUPPRESSION du fichier.
+
+    A.2 CODE RUST enum ArtifactKind (crates/config/src/types.rs) :
+    - L139 : variante `AgentMessage,` de l'enum (declaration).
+    - L158 : branche as_str `Self::AgentMessage => "agent-message",`.
+    - L191 : branche FromStr `"agent-message" => Ok(Self::AgentMessage),`.
+    - L426 : tableau du test test_artifact_kind_parse_valid (string
+      "agent-message").
+    - L457 : tableau du test test_artifact_kind_display_roundtrip
+      (ArtifactKind::AgentMessage).
+    NOTE IMPORTANTE matrice access_level (L214-245) : il n'existe AUCUNE
+    ligne dediee a AgentMessage. Toutes les personas tombent sur leur
+    arm catch-all `(_, _) => Read` (ou `(Pm, _) => Read`, etc.). Le
+    retrait de la variante ne touche donc PAS la matrice access_level :
+    aucune ligne a retirer la-bas. Le compilateur Rust etant exhaustif
+    sur le match enum, retirer la variante forcera la suppression des
+    branches as_str et FromStr (sinon erreur de compilation : variante
+    inexistante), ce qui est le filet automatique attendu.
+
+    A.3 CODE RUST embedding (crates/orchestrator/src/embedding.rs) :
+    - L258 : branche d'extraction du corps pour l'embedding
+      `"agent-message" => spec_field(spec, &["content"]),`. C'est un
+      match sur une STRING (kind.as_str()), pas sur l'enum, donc le
+      compilateur ne signalera PAS son obsolescence (la branche
+      deviendra du code mort inatteignable, le fallback `_ =>
+      String::new()` la couvre). A RETIRER manuellement. ABSENTE du
+      recensement preliminaire du task-request.
+
+    A.4 CODE RUST test d'integration (tests/integration/edge_cases.rs) :
+    - L220 : `ArtifactKind::AgentMessage,` dans le tableau all_kinds du
+      test test_access_matrix_no_panics. Match sur l'enum : le
+      compilateur signalera l'erreur si la variante est retiree sans
+      retirer cette ligne. A RETIRER. ABSENTE du recensement
+      preliminaire du task-request.
+
+    A.5 CONFIG shared-rules.yml (company/config/shared-rules.yml) :
+    - L97-106 : entree complete `agent-message:` du
+      artifact_catalog.kinds (description + schema). A SUPPRIMER.
+    - L214 : ligne "Kinds globaux" de la regle file_placement listant
+      "agent-message" parmi les kinds globaux. A RETIRER de la liste.
+    - L315 : regle lesson_after_every_artifact, ligne d'exclusion
+      "`agent-message` echange de coordination, pas de connaissance a
+      capitaliser". Apres retrait du kind, cette exclusion reference un
+      kind inexistant. A RETIRER (la ligne d'exclusion entiere).
+
+    A.6 PLUGIN defense-in-depth-core.mjs :
+    - L50 : entree "company/agent-messages/" du tableau
+      ARTIFACT_NAMING_PREFIXES (enforcement de la convention de nommage
+      des YAML). Le commentaire L44-45 indique "Keep in sync with
+      spec.rules.file_placement". Apres retrait du dossier, ce prefixe
+      ne matchera plus rien. A RETIRER pour coherence. NOTE : ce plugin
+      est en zone protegee (company/plugins/), donc dans le permit.
+
+    A.7 ARTIFACTS YAML existants (company/agent-messages/, 10 fichiers) :
+    - architect-to-pm-roadmap-autosync-artifacts-46b4f40c.yml
+    - blocker-2-permits-wipes-cargo-info-05224964.yml
+    - blocker-write-permit-9149f79e-disparu-4f000127.yml
+    - caller-inventory-livrables-pm-828abe55.yml
+    - db-corruption-design-ready-for-review-f29b94ac.yml
+    - file-watcher-diagnostic-and-rfc-ready-99089963.yml
+    - livraison-refonte-recherche-382cf805.yml
+    - permit-extension-needed-d64cc147.yml
+    - permit-extension-request-yaml-validator-4ade4e7c.yml
+    - route-db-corruption-tr-to-architect-beae3581.yml
+    Le sort de ces 10 fichiers (archivage vs suppression) est arbitre
+    dans le RFC 3d9f0b0c. Le dossier company/agent-messages/ est
+    supprime une fois vide.
+
+    === CLASSE B : REFERENCES PASSIVES (HORS SCOPE, prose historique) ===
+
+    Le task-request 95e93649 (out_of_scope) exclut explicitement le
+    nettoyage retroactif des lessons / RFCs / diagnostics qui mentionnent
+    des agent-messages dans leur TEXTE. Ces fichiers contiennent
+    "agent-message" en prose narrative (recit d'incidents passes,
+    description de workflows historiques) et NE sont PAS de la
+    machinerie du kind. Liste (a NE PAS modifier) :
+    - company/rfcs/ : atomic-grant-write-permit-seal-359f9162,
+      caller-inventory-discipline-eb42a8de,
+      defense-in-depth-selective-revert-bde023e2,
+      enforcement-naming-yaml-dans-defense-in-depth-au-49354fcb,
+      file-watcher-fix-disjoint-capture-062ebaa8,
+      introduce-roadmap-kind-a49801aa,
+      memoire-collective-active-lookup-et-lessons-f4fe8a04,
+      reclassifier-project-config-comme-artifact-projet-e1ebf14b,
+      refonte-recherche-hybride-bdee1af4,
+      review-findings-honesty-enforce-83007d00.
+    - company/lessons/ : affected-files-modified-created-anyof-23de8594,
+      sqlite-wal-multi-process-coordination-611fde3e.
+    - projects/company-os/ : plusieurs design-docs, diagnostic-reports,
+      implementation-plans, task-requests (api-callers-discoverability,
+      file-watcher, search-hybrid, db-resilience, mcp-proxy, etc.).
+    Ces mentions restent valides : le kind d'un artifact et le champ
+    metadata.related[].kind sont des STRINGS LIBRES dans
+    _base.schema.json (pas d'enum), donc une mention de "agent-message"
+    en prose ou meme une cross-ref related vers un agent-message
+    supprime ne casse AUCUNE validation.
+
+    === FAITS TECHNIQUES TRANCHANTS POUR LA SECURITE DU RETRAIT ===
+
+    FAIT 1 — SchemaRegistry tolere le schema manquant. load()
+    (crates/validation/src/schema_registry.rs L19-62) SCANNE le dossier
+    schemas/ et n'enregistre que les fichiers presents ; il n'itere PAS
+    sur ArtifactKind en exigeant un fichier par variante. Supprimer
+    agent-message.schema.json est donc sans danger : la registry n'aura
+    simplement pas d'entree pour ce kind. Aucun test ne casse de ce fait.
+
+    FAIT 2 — Pas d'integrite referentielle sur metadata.related.
+    _base.schema.json (L38-62) definit related[].kind comme un string
+    SANS enum, et kind n'est meme pas requis (seuls id et relationship
+    le sont). Le validator (crates/validation) ne resout PAS les ids de
+    related (aucun check de reference croisee). Une cross-ref vers un
+    agent-message supprime devient une reference morte INOFFENSIVE. Le
+    nettoyage proactif des cross-refs est donc OPTIONNEL, pas requis
+    pour la correction. Seule cross-ref active recensee :
+    projects/company-os/diagnostic-reports/caller-inventory-empirical-recension-56513173.yml
+    L43-45 (related vers l'agent-message 4ade4e7c).
+
+    FAIT 3 — Ordre de suppression schema + enum. Tant que la variante
+    AgentMessage existe dans l'enum, FromStr parse encore "agent-message"
+    avec succes (types.rs L191). L'ordre safe est : retirer la variante
+    enum ET les branches as_str/FromStr ET les 2 tableaux de test ET les
+    2 references code (embedding L258, edge_cases L220) DANS LE MEME
+    commit que la suppression du schema et du dossier YAML. Un cargo
+    build entre-deux serait incoherent. C'est un changement atomique.
+
+    FAIT 4 — Filet compilateur partiel. Le compilateur Rust attrapera
+    les matches EXHAUSTIFS sur l'enum (types.rs as_str/FromStr,
+    edge_cases all_kinds, types.rs tests). Il n'attrapera PAS les
+    matches sur STRING (embedding.rs L258, qui deviendra du code mort
+    silencieux). D'ou l'importance de ce recensement manuel pour
+    embedding.rs et les 3 references config/plugin (shared-rules x3,
+    defense-in-depth x1) qui ne sont pas du Rust.
+
+    FAIT 5 — Makefile. Le task-request 95e93649 (AC5) demande que la
+    cible clean-company du Makefile ne mentionne plus ce kind. Le
+    Makefile n'est PAS en zone protegee (verifie : protected-zones.json
+    couvre company/config|personas|schemas|plugins et crates/, plus
+    opencode.json ; le Makefile racine n'y figure pas). Coordination
+    avec le task-request 5ecc2877 (alignement Makefile) : ce point peut
+    etre traite soit dans le retrait agent-message, soit delegue au
+    5ecc2877. Arbitrage porte dans le RFC.
+
+  resolution: >
+    Recensement clos et exhaustif. Le retrait est un changement
+    STRUCTUREL atomique touchant zones protegees (schema, crates/,
+    config, plugin) + suppression d'artifacts globaux. Il passe par le
+    RFC 3d9f0b0c (approbation CEO + write permit), qui :
+    (1) liste en affected_files la forme structuree modified/created
+        (RFC a4eb3ee7) couvrant l'union exhaustive des 6 fichiers
+        modifies (types.rs, embedding.rs, edge_cases.rs, shared-rules.yml,
+        defense-in-depth-core.mjs) + 1 fichier schema supprime + 10 YAML
+        supprimes/archives + le dossier ;
+    (2) tranche archivage vs suppression des 10 YAML ;
+    (3) tranche le nettoyage (ou non) des cross-refs related ;
+    (4) coordonne avec le Makefile (5ecc2877).
+    Le diagnostic confirme qu'aucune machinerie active ne depend
+    fonctionnellement du kind (pas de ligne access_level dediee, schema
+    registry tolerant, pas d'integrite referentielle), ce qui rend le
+    retrait propre et reversible par git revert.
+
+  status: resolved
