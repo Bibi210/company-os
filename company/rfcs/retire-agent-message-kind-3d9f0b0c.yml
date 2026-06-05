@@ -5,7 +5,8 @@ metadata:
   title: "Retrait complet du kind agent-message (kind legacy non utilise)"
   author: architect
   created_at: "2026-06-05"
-  status: draft
+  status: approved
+  approved_at: "2026-06-05T10:11:07.937899433+00:00"
   description: >
     Retire integralement le kind agent-message de CompanyOS. Decision
     utilisateur (task-request 95e93649) : ce kind est legacy, non utilise
