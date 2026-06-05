@@ -45,7 +45,7 @@
                   },
                   "ref": {
                     "type": "object",
-                    "description": "Référence vers l'artifact ou le sujet tracé. Trois types supportés : project, rfc, external. Le type discrimine le contenu attendu.",
+                    "description": "Référence vers l'artifact ou le sujet tracé. Trois types supportés : project, rfc, loose. Le type discrimine le contenu attendu.",
                     "oneOf": [
                       {
                         "properties": {
@@ -73,13 +73,19 @@
                       },
                       {
                         "properties": {
-                          "type": { "const": "external" },
+                          "type": { "const": "loose" },
+                          "category": {
+                            "type": "string",
+                            "enum": ["idea", "exploration", "hotfix", "observation", "dependency"],
+                            "description": "Nature du sujet tracé sans artifact formel. idea = en réflexion ; exploration = creusé activement sans engagement de livraison ; hotfix = action ponctuelle hors RFC ; observation = constat à garder en mémoire ; dependency = dépendance externe non maîtrisée."
+                          },
                           "label": {
                             "type": "string",
-                            "description": "Label libre pour un sujet pas encore formalisé en projet ou RFC (ex: idée en exploration, dépendance externe). Encourage à formaliser plus tard, mais ne bloque pas le tracking."
+                            "maxLength": 200,
+                            "description": "Description courte et lisible du sujet loose."
                           }
                         },
-                        "required": ["type", "label"],
+                        "required": ["type", "category", "label"],
                         "additionalProperties": false
                       }
                     ]
@@ -92,7 +98,7 @@
                   "status": {
                     "type": "string",
                     "enum": ["planned", "in_progress", "done", "blocked", "cancelled"],
-                    "description": "État opérationnel de l'item dans la roadmap. C'est la VÉRITÉ portée par la roadmap (mise à jour manuellement par le PM). Une roadmap n'auto-synchronise PAS avec les artifacts sources — éviter une magie fragile."
+                    "description": "État de l'item. AUTO-SYNCHRONISÉ : pour les items à ref project ou rfc, ce champ est ÉCRASÉ à la lecture par le status calculé depuis l'artifact source (cf. RFC a5f25718). La SEULE valeur que le PM peut écrire et qui sera respectée pour ces items est `blocked` (droit absolu du PM, court-circuite l'auto-sync). Pour les items à ref loose (pas d'artifact source), le status est manuel et respecté tel quel."
                   },
                   "target_date": {
                     "type": "string",

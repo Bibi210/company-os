@@ -41,14 +41,37 @@ pub struct SetImplementedOutcome {
 use crate::db::OrchestratorDb;
 use crate::error::OrchestratorError;
 use crate::roadmap_summary::{
-    self, ALL_STATUSES, ALL_TIMEFRAMES, RoadmapCounters, RoadmapHeader, RoadmapListEntry,
-    RoadmapSelector, RoadmapSummary,
+    self, ALL_STATUSES, ALL_TIMEFRAMES, DriftWarning, RoadmapCounters, RoadmapHeader, RoadmapItem,
+    RoadmapItemRef, RoadmapListEntry, RoadmapSelector, RoadmapSummary, SourceStatus,
+    effective_status,
 };
 use crate::types::*;
 
 /// Kind discriminator used everywhere the engine needs to scope operations
 /// to roadmap artifacts. Keep in sync with crates/config/src/types.rs.
 const ROADMAP_KIND: &str = "roadmap";
+
+/// Minimal projection of an artifact YAML used to extract `metadata.status`
+/// without deserializing the whole document. Tolerant by design: a missing
+/// `status` (or unreadable YAML) yields `None`, which the caller maps to the
+/// neutral `planned` fallback.
+#[derive(serde::Deserialize)]
+struct MetadataStatusProbe {
+    metadata: MetadataStatusInner,
+}
+
+#[derive(serde::Deserialize)]
+struct MetadataStatusInner {
+    status: Option<String>,
+}
+
+/// Parse `metadata.status` from an RFC YAML content. Returns `None` if the
+/// YAML is unparseable or carries no status field.
+fn parse_rfc_metadata_status(content: &str) -> Option<String> {
+    serde_yaml::from_str::<MetadataStatusProbe>(content)
+        .ok()
+        .and_then(|p| p.metadata.status)
+}
 
 /// Top-K candidate set size per axis BEFORE fusion. The RRF then selects
 /// the top `limit` from the union. 50 is the canonical choice from the
@@ -981,6 +1004,38 @@ impl OrchestratorEngine {
 
     // --- Roadmap tools ---
 
+    /// Resolve the [`SourceStatus`] of a roadmap item's referenced artifact.
+    ///
+    /// - `rfc`: look up the indexed artifact by id, read its YAML and parse
+    ///   `metadata.status`. Not indexed / unreadable -> [`SourceStatus::None`].
+    /// - `project`: stat `projects/<slug>/` under `root`.
+    /// - `loose`: no source -> [`SourceStatus::None`] (callers never map it).
+    ///
+    /// Pure FS/DB lookup, never fails: a missing source degrades to `None` so
+    /// a single orphan ref cannot poison the whole summary (design CAS NÉGATIF).
+    fn resolve_source_status(&self, root: &str, item_ref: &RoadmapItemRef) -> SourceStatus {
+        match item_ref {
+            RoadmapItemRef::Rfc { id } => match self.db.get_artifact(id) {
+                Ok(Some(a)) => {
+                    let full_path = format!("{root}/{}", a.file_path);
+                    match std::fs::read_to_string(&full_path) {
+                        Ok(content) => match parse_rfc_metadata_status(&content) {
+                            Some(status) => SourceStatus::Rfc(status),
+                            None => SourceStatus::None,
+                        },
+                        Err(_) => SourceStatus::None,
+                    }
+                }
+                _ => SourceStatus::None,
+            },
+            RoadmapItemRef::Project { project_slug } => {
+                let dir = format!("{root}/projects/{project_slug}");
+                SourceStatus::Project(Path::new(&dir).is_dir())
+            }
+            RoadmapItemRef::Loose { .. } => SourceStatus::None,
+        }
+    }
+
     /// List indexed roadmaps with light-weight per-roadmap counters.
     /// Filterable by `status` ("active"/"archived") and/or `domain`.
     ///
@@ -1019,9 +1074,21 @@ impl OrchestratorEngine {
                 }
             };
 
+            // Compute the effective status of each item (auto-sync at read
+            // time) so the counters reflect the source artifacts, not the
+            // possibly-stale YAML status.
             let items = &parsed.spec.items;
-            let blocked_count = items.iter().filter(|i| i.status == "blocked").count();
-            let in_progress_count = items.iter().filter(|i| i.status == "in_progress").count();
+            let mut blocked_count = 0usize;
+            let mut in_progress_count = 0usize;
+            for item in items {
+                let source = self.resolve_source_status(root, &item.ref_);
+                let (eff, _drift) = effective_status(&item.ref_, &item.status, &source);
+                match eff.as_str() {
+                    "blocked" => blocked_count += 1,
+                    "in_progress" => in_progress_count += 1,
+                    _ => {}
+                }
+            }
 
             entries.push(RoadmapListEntry {
                 id: parsed.metadata.id,
@@ -1139,19 +1206,56 @@ impl OrchestratorEngine {
             }
         })?;
 
-        // 3. Build aggregations.
+        // 3. Auto-sync: compute the effective status of each item at read
+        // time from its source artifact, collect drift warnings, and build
+        // aggregations on the COMPUTED status (not the possibly-stale YAML).
         let items = parsed.spec.items;
-        let blocked_items: Vec<_> = items
+        let mut effective_items: Vec<RoadmapItem> = Vec::with_capacity(items.len());
+        let mut drift_warnings: Vec<DriftWarning> = Vec::new();
+
+        for item in &items {
+            let source = self.resolve_source_status(root, &item.ref_);
+            let (eff_status, drift) = effective_status(&item.ref_, &item.status, &source);
+
+            // Drift warnings exclude blocked (short-circuit -> drift=false)
+            // and loose (no source -> drift=false) by construction.
+            if drift {
+                let cause = match (&item.ref_, &source) {
+                    (RoadmapItemRef::Rfc { .. }, SourceStatus::None) => Some(
+                        "source RFC introuvable (non indexée, illisible ou orpheline)".to_string(),
+                    ),
+                    _ => None,
+                };
+                drift_warnings.push(DriftWarning {
+                    key: item.key.clone(),
+                    yaml_status: item.status.clone(),
+                    mapped_status: eff_status.clone(),
+                    ref_: item.ref_.clone(),
+                    cause,
+                });
+            }
+
+            // Clone the item with its status substituted by the effective one
+            // so the existing pure helpers aggregate on the computed status.
+            let mut eff_item = item.clone();
+            eff_item.status = eff_status;
+            effective_items.push(eff_item);
+        }
+
+        let blocked_items: Vec<_> = effective_items
             .iter()
             .filter(|i| i.status == "blocked")
             .cloned()
             .collect();
 
-        let mut by_status = roadmap_summary::count_by_status(&items);
-        let mut by_timeframe = roadmap_summary::count_by_timeframe(&items);
-        let mut items_by_status = roadmap_summary::group_items_by(&items, |i| i.status.clone());
+        let mut by_status = roadmap_summary::count_by_status(&effective_items);
+        // Timeframe stays on the YAML timeframe (NOT auto-synced: it is a PM
+        // reading dimension). effective_items preserves the original timeframe.
+        let mut by_timeframe = roadmap_summary::count_by_timeframe(&effective_items);
+        let mut items_by_status =
+            roadmap_summary::group_items_by(&effective_items, |i| i.status.clone());
         let mut items_by_timeframe =
-            roadmap_summary::group_items_by(&items, |i| i.timeframe.clone());
+            roadmap_summary::group_items_by(&effective_items, |i| i.timeframe.clone());
 
         // Zero-init canonical keys so the output JSON shape is stable.
         for s in ALL_STATUSES {
@@ -1172,7 +1276,7 @@ impl OrchestratorEngine {
                 narrative: parsed.spec.narrative,
             },
             summary: RoadmapCounters {
-                items_total: items.len(),
+                items_total: effective_items.len(),
                 blocked_count: blocked_items.len(),
                 by_status,
                 by_timeframe,
@@ -1180,6 +1284,7 @@ impl OrchestratorEngine {
             blocked_items,
             items_by_timeframe,
             items_by_status,
+            drift_warnings,
         })
     }
 
@@ -1615,7 +1720,9 @@ mod tests {
                     let ref_block = match *rtype {
                         "project" => format!("    ref:\n      type: project\n      project_slug: {rval}"),
                         "rfc" => format!("    ref:\n      type: rfc\n      id: {rval}"),
-                        _ => format!("    ref:\n      type: external\n      label: \"{rval}\""),
+                        _ => format!(
+                            "    ref:\n      type: loose\n      category: idea\n      label: \"{rval}\""
+                        ),
                     };
                     format!(
                         "  - key: {key}\n    title: \"Item {key}\"\n{ref_block}\n    timeframe: {tf}\n    status: {st}\n"
@@ -1791,9 +1898,9 @@ mod tests {
             "d",
             "active",
             &[
-                ("b1", "external", "x", "present", "blocked"),
-                ("b2", "external", "x", "present", "blocked"),
-                ("b3", "external", "x", "past", "done"),
+                ("b1", "loose", "x", "present", "blocked"),
+                ("b2", "loose", "x", "present", "blocked"),
+                ("b3", "loose", "x", "past", "done"),
             ],
         );
         // C: archived, 5 blocked, title "Gamma"
@@ -1803,11 +1910,11 @@ mod tests {
             "d",
             "archived",
             &[
-                ("c1", "external", "x", "past", "blocked"),
-                ("c2", "external", "x", "past", "blocked"),
-                ("c3", "external", "x", "past", "blocked"),
-                ("c4", "external", "x", "past", "blocked"),
-                ("c5", "external", "x", "past", "blocked"),
+                ("c1", "loose", "x", "past", "blocked"),
+                ("c2", "loose", "x", "past", "blocked"),
+                ("c3", "loose", "x", "past", "blocked"),
+                ("c4", "loose", "x", "past", "blocked"),
+                ("c5", "loose", "x", "past", "blocked"),
             ],
         );
         index_roadmap_directly(&mut engine, &root, id_a, &p_a);
@@ -1865,10 +1972,10 @@ mod tests {
             "d",
             "active",
             &[
-                ("i1", "external", "x", "past", "done"),
-                ("i2", "external", "x", "past", "done"),
-                ("i3", "external", "x", "present", "in_progress"),
-                ("i4", "external", "x", "future", "blocked"),
+                ("i1", "loose", "x", "past", "done"),
+                ("i2", "loose", "x", "past", "done"),
+                ("i3", "loose", "x", "present", "in_progress"),
+                ("i4", "loose", "x", "future", "blocked"),
             ],
         );
         index_roadmap_directly(&mut engine, &root, id, &p);
@@ -1958,9 +2065,9 @@ mod tests {
             "d",
             "active",
             &[
-                ("b1", "external", "x", "present", "blocked"),
-                ("b2", "external", "x", "future", "blocked"),
-                ("d1", "external", "x", "past", "done"),
+                ("b1", "loose", "x", "present", "blocked"),
+                ("b2", "loose", "x", "future", "blocked"),
+                ("d1", "loose", "x", "past", "done"),
             ],
         );
         index_roadmap_directly(&mut engine, &root, id, &p);
@@ -2278,4 +2385,291 @@ mod tests {
     // NOTE: malformed id is rejected at the MCP deserializer level
     // (RfcSetImplementedParams.id: Uuid + with="String"), so no engine-level
     // test is possible — the method always receives a valid Uuid.
+
+    // --- Auto-sync integration tests (RFC a5f25718) ---
+
+    /// RFC source = implemented -> item mapped to "done" even when the YAML
+    /// roadmap status is stale ("planned"). A drift warning is emitted.
+    #[test]
+    fn test_autosync_rfc_implemented_maps_to_done() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+
+        let rfc_id = "e0000000-0000-4000-8000-000000000001";
+        let rfc_path = write_rfc(
+            &root,
+            rfc_id,
+            "implemented",
+            Some("2026-06-01T00:00:00+00:00"),
+        );
+        index_rfc(&mut engine, rfc_id, &rfc_path);
+
+        let rm_id = "f0000000-0000-4000-8000-000000000001";
+        let p = root.write_roadmap(
+            rm_id,
+            "RFC implemented",
+            "autosync",
+            "active",
+            &[("a", "rfc", rfc_id, "future", "planned")],
+        );
+        index_roadmap_directly(&mut engine, &root, rm_id, &p);
+
+        let summary = engine
+            .summarize_roadmap(root.root_str(), RoadmapSelector::ById(rm_id.into()))
+            .expect("summarize ok");
+
+        assert_eq!(summary.items_by_status.get("done").unwrap().len(), 1);
+        assert_eq!(summary.items_by_status.get("planned").unwrap().len(), 0);
+        assert_eq!(summary.drift_warnings.len(), 1);
+        let w = &summary.drift_warnings[0];
+        assert_eq!(w.key, "a");
+        assert_eq!(w.yaml_status, "planned");
+        assert_eq!(w.mapped_status, "done");
+        assert!(w.cause.is_none());
+    }
+
+    /// RFC source = approved -> item mapped to "in_progress".
+    #[test]
+    fn test_autosync_rfc_approved_maps_to_in_progress() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+
+        let rfc_id = "e0000000-0000-4000-8000-000000000002";
+        let rfc_path = write_rfc(&root, rfc_id, "approved", None);
+        index_rfc(&mut engine, rfc_id, &rfc_path);
+
+        let rm_id = "f0000000-0000-4000-8000-000000000002";
+        let p = root.write_roadmap(
+            rm_id,
+            "RFC approved",
+            "autosync",
+            "active",
+            &[("a", "rfc", rfc_id, "present", "in_progress")],
+        );
+        index_roadmap_directly(&mut engine, &root, rm_id, &p);
+
+        let summary = engine
+            .summarize_roadmap(root.root_str(), RoadmapSelector::ById(rm_id.into()))
+            .expect("summarize ok");
+
+        assert_eq!(summary.items_by_status.get("in_progress").unwrap().len(), 1);
+        // YAML already matched the computed status -> no drift.
+        assert_eq!(summary.drift_warnings.len(), 0);
+    }
+
+    /// AC4 invariance: a YAML status=blocked item stays blocked regardless of
+    /// the source (here implemented), and emits NO drift warning.
+    #[test]
+    fn test_autosync_blocked_short_circuits() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+
+        let rfc_id = "e0000000-0000-4000-8000-000000000003";
+        let rfc_path = write_rfc(
+            &root,
+            rfc_id,
+            "implemented",
+            Some("2026-06-01T00:00:00+00:00"),
+        );
+        index_rfc(&mut engine, rfc_id, &rfc_path);
+
+        let rm_id = "f0000000-0000-4000-8000-000000000003";
+        let p = root.write_roadmap(
+            rm_id,
+            "Blocked wins",
+            "autosync",
+            "active",
+            &[("a", "rfc", rfc_id, "present", "blocked")],
+        );
+        index_roadmap_directly(&mut engine, &root, rm_id, &p);
+
+        let summary = engine
+            .summarize_roadmap(root.root_str(), RoadmapSelector::ById(rm_id.into()))
+            .expect("summarize ok");
+
+        assert_eq!(summary.blocked_items.len(), 1);
+        assert_eq!(summary.items_by_status.get("blocked").unwrap().len(), 1);
+        assert_eq!(summary.items_by_status.get("done").unwrap().len(), 0);
+        assert_eq!(
+            summary.drift_warnings.len(),
+            0,
+            "blocked never drifts (AC4)"
+        );
+    }
+
+    /// AC6: an RFC ref whose id is NOT indexed -> fallback "planned" + drift
+    /// warning with a cause. summarize must still succeed (non blocking).
+    #[test]
+    fn test_autosync_rfc_source_missing_falls_back_planned() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+
+        let rm_id = "f0000000-0000-4000-8000-000000000004";
+        let orphan_rfc = "e9999999-0000-4000-8000-000000000099";
+        let p = root.write_roadmap(
+            rm_id,
+            "Orphan ref",
+            "autosync",
+            "active",
+            &[("a", "rfc", orphan_rfc, "present", "done")],
+        );
+        index_roadmap_directly(&mut engine, &root, rm_id, &p);
+
+        let summary = engine
+            .summarize_roadmap(root.root_str(), RoadmapSelector::ById(rm_id.into()))
+            .expect("summarize must succeed despite orphan ref");
+
+        assert_eq!(summary.items_by_status.get("planned").unwrap().len(), 1);
+        assert_eq!(summary.drift_warnings.len(), 1);
+        let w = &summary.drift_warnings[0];
+        assert_eq!(w.mapped_status, "planned");
+        assert!(
+            w.cause.as_deref().unwrap_or("").contains("introuvable"),
+            "cause must mark the missing source: {:?}",
+            w.cause
+        );
+    }
+
+    /// Project ref whose `projects/<slug>/` exists -> "in_progress".
+    #[test]
+    fn test_autosync_project_dir_present_in_progress() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+
+        // Create projects/my-proj/ under the test root.
+        std::fs::create_dir_all(root.path.join("projects/my-proj")).expect("mkdir project");
+
+        let rm_id = "f0000000-0000-4000-8000-000000000005";
+        let p = root.write_roadmap(
+            rm_id,
+            "Project present",
+            "autosync",
+            "active",
+            &[("a", "project", "my-proj", "present", "planned")],
+        );
+        index_roadmap_directly(&mut engine, &root, rm_id, &p);
+
+        let summary = engine
+            .summarize_roadmap(root.root_str(), RoadmapSelector::ById(rm_id.into()))
+            .expect("summarize ok");
+
+        assert_eq!(summary.items_by_status.get("in_progress").unwrap().len(), 1);
+        // YAML was "planned", computed "in_progress" -> drift.
+        assert_eq!(summary.drift_warnings.len(), 1);
+        assert!(summary.drift_warnings[0].cause.is_none());
+    }
+
+    /// Project ref whose directory is absent -> "planned".
+    #[test]
+    fn test_autosync_project_dir_absent_planned() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+
+        let rm_id = "f0000000-0000-4000-8000-000000000006";
+        let p = root.write_roadmap(
+            rm_id,
+            "Project absent",
+            "autosync",
+            "active",
+            &[("a", "project", "ghost-proj", "future", "planned")],
+        );
+        index_roadmap_directly(&mut engine, &root, rm_id, &p);
+
+        let summary = engine
+            .summarize_roadmap(root.root_str(), RoadmapSelector::ById(rm_id.into()))
+            .expect("summarize ok");
+
+        assert_eq!(summary.items_by_status.get("planned").unwrap().len(), 1);
+        // YAML "planned" == computed "planned" -> no drift.
+        assert_eq!(summary.drift_warnings.len(), 0);
+    }
+
+    /// Loose ref: status respected verbatim, never a drift warning.
+    #[test]
+    fn test_autosync_loose_status_respected() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+
+        let rm_id = "f0000000-0000-4000-8000-000000000007";
+        let p = root.write_roadmap(
+            rm_id,
+            "Loose item",
+            "autosync",
+            "active",
+            &[("a", "loose", "an idea", "future", "in_progress")],
+        );
+        index_roadmap_directly(&mut engine, &root, rm_id, &p);
+
+        let summary = engine
+            .summarize_roadmap(root.root_str(), RoadmapSelector::ById(rm_id.into()))
+            .expect("summarize ok");
+
+        assert_eq!(summary.items_by_status.get("in_progress").unwrap().len(), 1);
+        assert_eq!(summary.drift_warnings.len(), 0, "loose never drifts");
+    }
+
+    /// AC5/AC7: a manual YAML edit (status=done) on an item whose RFC is only
+    /// approved -> displayed in_progress (computed wins) + drift warning.
+    #[test]
+    fn test_drift_warning_on_manual_yaml_edit() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+
+        let rfc_id = "e0000000-0000-4000-8000-000000000008";
+        let rfc_path = write_rfc(&root, rfc_id, "approved", None);
+        index_rfc(&mut engine, rfc_id, &rfc_path);
+
+        let rm_id = "f0000000-0000-4000-8000-000000000008";
+        let p = root.write_roadmap(
+            rm_id,
+            "Manual edit",
+            "autosync",
+            "active",
+            &[("a", "rfc", rfc_id, "past", "done")],
+        );
+        index_roadmap_directly(&mut engine, &root, rm_id, &p);
+
+        let summary = engine
+            .summarize_roadmap(root.root_str(), RoadmapSelector::ById(rm_id.into()))
+            .expect("summarize ok");
+
+        // Computed wins: in_progress, not done.
+        assert_eq!(summary.items_by_status.get("in_progress").unwrap().len(), 1);
+        assert_eq!(summary.items_by_status.get("done").unwrap().len(), 0);
+        assert_eq!(summary.drift_warnings.len(), 1);
+        let w = &summary.drift_warnings[0];
+        assert_eq!(w.yaml_status, "done");
+        assert_eq!(w.mapped_status, "in_progress");
+    }
+
+    /// list_roadmaps counters also reflect the computed status: an RFC=approved
+    /// item with YAML "planned" must count as in_progress, not planned.
+    #[test]
+    fn test_autosync_list_roadmaps_counters_use_computed_status() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+
+        let rfc_id = "e0000000-0000-4000-8000-000000000009";
+        let rfc_path = write_rfc(&root, rfc_id, "approved", None);
+        index_rfc(&mut engine, rfc_id, &rfc_path);
+
+        let rm_id = "f0000000-0000-4000-8000-000000000009";
+        let p = root.write_roadmap(
+            rm_id,
+            "List counters",
+            "autosync-list",
+            "active",
+            &[("a", "rfc", rfc_id, "future", "planned")],
+        );
+        index_roadmap_directly(&mut engine, &root, rm_id, &p);
+
+        let entries = engine
+            .list_roadmaps(root.root_str(), None, Some("autosync-list"))
+            .expect("list ok");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].in_progress_count, 1,
+            "computed status drives the counter"
+        );
+    }
 }

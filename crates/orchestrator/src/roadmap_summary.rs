@@ -43,12 +43,113 @@ pub struct RoadmapItem {
 }
 
 /// A roadmap item reference. Tagged enum matching the JSON Schema `oneOf`.
+///
+/// `category` on `Loose` is kept as `String` (not a dedicated Rust enum): the
+/// strict enum is enforced by the JSON Schema at validation time, consistent
+/// with the existing choice of keeping `status`/`timeframe` as `String`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RoadmapItemRef {
     Project { project_slug: String },
     Rfc { id: String },
-    External { label: String },
+    Loose { category: String, label: String },
+}
+
+/// Resolved status of the source artifact referenced by a roadmap item.
+///
+/// Built by the engine (which performs the FS/DB lookups) and fed to the PURE
+/// [`effective_status`] mapping function. Keeping the lookups out of the
+/// mapping makes it trivially unit-testable on each combination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceStatus {
+    /// The referenced RFC was found; carries its raw `metadata.status`.
+    Rfc(String),
+    /// The referenced project: `true` if `projects/<slug>/` exists.
+    Project(bool),
+    /// No source could be resolved (RFC not indexed / unreadable / orphan).
+    None,
+}
+
+/// PURE mapping from (item ref, YAML status, resolved source status) to the
+/// effective status displayed by the roadmap tools, plus a `drift` flag
+/// signalling that the YAML status diverged from the computed one.
+///
+/// Invariants (order is non-negotiable):
+/// 1. `blocked` short-circuits BEFORE any mapping (absolute PM right).
+/// 2. `loose` items keep their manual YAML status (no source, no drift).
+/// 3. `rfc` / `project` items are computed from the source; drift = mapped != yaml.
+pub fn effective_status(
+    item_ref: &RoadmapItemRef,
+    status_yaml: &str,
+    source: &SourceStatus,
+) -> (String, bool) {
+    // 1. Short-circuit: the PM's explicit `blocked` always wins.
+    if status_yaml == "blocked" {
+        return ("blocked".to_string(), false);
+    }
+    match item_ref {
+        // 2. Loose items have no source artifact: manual status respected.
+        RoadmapItemRef::Loose { .. } => (status_yaml.to_string(), false),
+        // 3. RFC / project items are computed from the source.
+        RoadmapItemRef::Rfc { .. } => {
+            let mapped = map_rfc_status(source);
+            let drift = mapped != status_yaml;
+            (mapped, drift)
+        }
+        RoadmapItemRef::Project { .. } => {
+            let mapped = map_project_status(source);
+            let drift = mapped != status_yaml;
+            (mapped, drift)
+        }
+    }
+}
+
+/// Deterministic mapping table from an RFC's `metadata.status` to a roadmap
+/// item status. Source absent or status outside the known enum falls back to
+/// `planned` (neutral). No best-effort "round open" refinement (the design-doc
+/// OQ2 was resolved by abandoning it: review_rounds/file_path matching is
+/// fragile, and the mapping is correct without it).
+pub fn map_rfc_status(source: &SourceStatus) -> String {
+    match source {
+        SourceStatus::Rfc(s) => match s.as_str() {
+            "draft" => "planned",
+            "approved" => "in_progress",
+            "implemented" => "done",
+            "rejected" => "cancelled",
+            _ => "planned",
+        },
+        _ => "planned",
+    }
+    .to_string()
+}
+
+/// Deterministic binary mapping for project refs: the `projects/<slug>/`
+/// directory exists -> `in_progress`, absent (or wrong source variant) ->
+/// `planned`. No activity deduction (design decision 5).
+pub fn map_project_status(source: &SourceStatus) -> String {
+    match source {
+        SourceStatus::Project(true) => "in_progress",
+        _ => "planned",
+    }
+    .to_string()
+}
+
+/// A drift warning emitted by `summarize_roadmap` when an item's YAML status
+/// diverges from the computed status. Blocked and loose items are excluded by
+/// construction (they never drift). Non blocking: the displayed status remains
+/// the computed one; the warning flags a YAML written outside the pipeline
+/// (manual edit or stale pre-auto-sync roadmap) for the PM to clean up.
+#[derive(Debug, Clone, Serialize)]
+pub struct DriftWarning {
+    pub key: String,
+    pub yaml_status: String,
+    pub mapped_status: String,
+    #[serde(rename = "ref")]
+    pub ref_: RoadmapItemRef,
+    /// Optional cause when the source could not be resolved (RFC not indexed /
+    /// unreadable). `None` for an ordinary status divergence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
 }
 
 // --- list_roadmaps output ---
@@ -78,6 +179,9 @@ pub struct RoadmapSummary {
     pub blocked_items: Vec<RoadmapItem>,
     pub items_by_timeframe: BTreeMap<String, Vec<RoadmapItem>>,
     pub items_by_status: BTreeMap<String, Vec<RoadmapItem>>,
+    /// Items whose YAML status diverged from the computed status (excludes
+    /// blocked and loose items by construction). Filet de sécurité for the PM.
+    pub drift_warnings: Vec<DriftWarning>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -171,8 +275,9 @@ mod tests {
         RoadmapItem {
             key: key.into(),
             title: format!("Item {key}"),
-            ref_: RoadmapItemRef::External {
-                label: format!("ext-{key}"),
+            ref_: RoadmapItemRef::Loose {
+                category: "idea".into(),
+                label: format!("loose-{key}"),
             },
             timeframe: timeframe.into(),
             status: status.into(),
@@ -292,6 +397,7 @@ spec:
             blocked_items: blocked,
             items_by_timeframe,
             items_by_status,
+            drift_warnings: Vec::new(),
         };
 
         let json = serde_json::to_value(&summary).expect("serialize");
@@ -304,6 +410,7 @@ spec:
             "blocked_items",
             "items_by_timeframe",
             "items_by_status",
+            "drift_warnings",
         ] {
             assert!(obj.contains_key(k), "missing top-level key '{k}'");
         }
@@ -355,13 +462,142 @@ spec:
             project_slug: "p".into(),
         };
         let rfc = RoadmapItemRef::Rfc { id: "u".into() };
-        let ext = RoadmapItemRef::External { label: "l".into() };
+        let loose = RoadmapItemRef::Loose {
+            category: "hotfix".into(),
+            label: "l".into(),
+        };
         let pv = serde_json::to_value(&project).unwrap();
         assert_eq!(pv["type"].as_str(), Some("project"));
         assert_eq!(pv["project_slug"].as_str(), Some("p"));
         let rv = serde_json::to_value(&rfc).unwrap();
         assert_eq!(rv["type"].as_str(), Some("rfc"));
-        let ev = serde_json::to_value(&ext).unwrap();
-        assert_eq!(ev["type"].as_str(), Some("external"));
+        let lv = serde_json::to_value(&loose).unwrap();
+        assert_eq!(lv["type"].as_str(), Some("loose"));
+        assert_eq!(lv["category"].as_str(), Some("hotfix"));
+        assert_eq!(lv["label"].as_str(), Some("l"));
+    }
+
+    #[test]
+    fn test_roadmap_item_ref_loose_roundtrips() {
+        // type: loose must deserialize back into the Loose variant.
+        let yaml = "type: loose\ncategory: observation\nlabel: a constat\n";
+        let parsed: RoadmapItemRef = serde_yaml::from_str(yaml).expect("parse loose");
+        match parsed {
+            RoadmapItemRef::Loose { category, label } => {
+                assert_eq!(category, "observation");
+                assert_eq!(label, "a constat");
+            }
+            _ => panic!("expected loose variant"),
+        }
+    }
+
+    // --- effective_status / mapping unit tests (pure, exhaustive) ---
+
+    #[test]
+    fn test_map_rfc_status_table() {
+        assert_eq!(
+            map_rfc_status(&SourceStatus::Rfc("draft".into())),
+            "planned"
+        );
+        assert_eq!(
+            map_rfc_status(&SourceStatus::Rfc("approved".into())),
+            "in_progress"
+        );
+        assert_eq!(
+            map_rfc_status(&SourceStatus::Rfc("implemented".into())),
+            "done"
+        );
+        assert_eq!(
+            map_rfc_status(&SourceStatus::Rfc("rejected".into())),
+            "cancelled"
+        );
+        // Status outside the known enum -> neutral fallback.
+        assert_eq!(
+            map_rfc_status(&SourceStatus::Rfc("weird".into())),
+            "planned"
+        );
+        // Source absent -> neutral fallback.
+        assert_eq!(map_rfc_status(&SourceStatus::None), "planned");
+        // Wrong variant -> neutral fallback.
+        assert_eq!(map_rfc_status(&SourceStatus::Project(true)), "planned");
+    }
+
+    #[test]
+    fn test_map_project_status_binary() {
+        assert_eq!(
+            map_project_status(&SourceStatus::Project(true)),
+            "in_progress"
+        );
+        assert_eq!(map_project_status(&SourceStatus::Project(false)), "planned");
+        assert_eq!(map_project_status(&SourceStatus::None), "planned");
+        // Wrong variant -> planned.
+        assert_eq!(
+            map_project_status(&SourceStatus::Rfc("implemented".into())),
+            "planned"
+        );
+    }
+
+    #[test]
+    fn test_effective_status_blocked_short_circuits() {
+        // blocked wins regardless of ref type or source status.
+        let rfc = RoadmapItemRef::Rfc { id: "x".into() };
+        let (st, drift) =
+            effective_status(&rfc, "blocked", &SourceStatus::Rfc("implemented".into()));
+        assert_eq!(st, "blocked");
+        assert!(!drift, "blocked never drifts");
+
+        let proj = RoadmapItemRef::Project {
+            project_slug: "p".into(),
+        };
+        let (st, drift) = effective_status(&proj, "blocked", &SourceStatus::Project(true));
+        assert_eq!(st, "blocked");
+        assert!(!drift);
+
+        let loose = RoadmapItemRef::Loose {
+            category: "idea".into(),
+            label: "l".into(),
+        };
+        let (st, drift) = effective_status(&loose, "blocked", &SourceStatus::None);
+        assert_eq!(st, "blocked");
+        assert!(!drift);
+    }
+
+    #[test]
+    fn test_effective_status_loose_respects_yaml() {
+        let loose = RoadmapItemRef::Loose {
+            category: "exploration".into(),
+            label: "l".into(),
+        };
+        for yaml in ["planned", "in_progress", "done", "cancelled"] {
+            let (st, drift) = effective_status(&loose, yaml, &SourceStatus::None);
+            assert_eq!(st, yaml, "loose respects manual status");
+            assert!(!drift, "loose never drifts");
+        }
+    }
+
+    #[test]
+    fn test_effective_status_rfc_computes_and_flags_drift() {
+        let rfc = RoadmapItemRef::Rfc { id: "x".into() };
+        // YAML matches computed -> no drift.
+        let (st, drift) = effective_status(&rfc, "done", &SourceStatus::Rfc("implemented".into()));
+        assert_eq!(st, "done");
+        assert!(!drift);
+        // YAML diverges from computed -> drift.
+        let (st, drift) = effective_status(&rfc, "done", &SourceStatus::Rfc("approved".into()));
+        assert_eq!(st, "in_progress");
+        assert!(drift, "approved RFC with done YAML drifts");
+    }
+
+    #[test]
+    fn test_effective_status_project_computes_and_flags_drift() {
+        let proj = RoadmapItemRef::Project {
+            project_slug: "p".into(),
+        };
+        let (st, drift) = effective_status(&proj, "in_progress", &SourceStatus::Project(true));
+        assert_eq!(st, "in_progress");
+        assert!(!drift);
+        let (st, drift) = effective_status(&proj, "done", &SourceStatus::Project(false));
+        assert_eq!(st, "planned");
+        assert!(drift);
     }
 }

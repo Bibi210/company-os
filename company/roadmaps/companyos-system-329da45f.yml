@@ -10,17 +10,35 @@ metadata:
     structurelle de CompanyOS lui-même : les RFCs qui ont façonné
     l'infrastructure (mémoire collective, persistence, résilience,
     indexation), ce qui est en cours, et les chantiers identifiés
-    comme candidats à formaliser. Cette roadmap est vivante et
-    maintenue manuellement par le PM. Elle ne se synchronise PAS
-    automatiquement avec les artifacts référencés (le status que
-    porte un item ici est la vérité PM, pas le status courant de
-    l'artifact).
+    comme candidats à formaliser. Cette roadmap est vivante. Depuis le
+    RFC a5f25718, le status des items à ref project/rfc est
+    AUTO-SYNCHRONISÉ à la lecture depuis l'artifact source ; le PM ne
+    peut écrire manuellement que `blocked` (droit absolu). Les items à
+    ref loose (sans artifact source) gardent un status manuel.
   tags:
     - roadmap
     - companyos-system
     - infrastructure
     - meta
   changelog:
+    - date: "2026-06-05"
+      author: implementer
+      description: >
+        Migration RFC a5f25718 (auto-sync absolu du status à la lecture).
+        Les 3 items à ref `external` sont reclassés en ref `loose` avec une
+        category typée : db-schema-migration-hotfix -> hotfix,
+        api-callers-discoverability -> idea, backup-strategy -> observation.
+        Les 12 items à ref `rfc` voient leur status YAML aligné sur le mapping
+        auto-syncé de l'état RÉEL de chaque RFC : 4 RFCs implemented restent
+        `done` (proxy-resilient, db-resilience était approved -> in_progress,
+        cf. ci-dessous), les 8 RFCs encore `approved` passent en `in_progress`
+        (db-resilience cdbfee72, memory-lookup-rule f4fe8a04, roadmap-tooling
+        3cd72740, atomic-grant-permit 359f9162, rfc-set-implemented-tool
+        1c0f2570, defense-in-depth-selective bde023e2,
+        rfc-affected-files-categorize a4eb3ee7, schema-migration-discipline
+        973a5569). À partir de maintenant le status des items rfc/project est
+        calculé à la lecture ; ce YAML n'est qu'un alignement day-1 pour
+        éviter des drift_warnings bruyants.
     - date: "2026-06-04"
       author: pm
       description: >
@@ -77,7 +95,11 @@ spec:
     Enfin, le kind roadmap lui-même (RFC a49801aa, outillage MCP
     3cd72740) qui permet au PM de raconter cette histoire et de
     suivre les sujets sans parcourir manuellement le repo. La
-    présente roadmap en est le premier exemple.
+    présente roadmap en est le premier exemple. Le RFC a5f25718 a
+    ensuite renversé la décision initiale "pas d'auto-sync" : le
+    status des items rfc/project est désormais calculé à la lecture
+    depuis l'artifact source, parce que la convention sociale de mise
+    à jour manuelle avait dérivé en moins d'une session.
 
     Côté frictions opérationnelles, la dette identifiée à la
     création de cette roadmap a été soldée en cinq RFCs courts et
@@ -97,11 +119,6 @@ spec:
     checklist obligatoire dans les implementation-plans soit via
     tooling LSP automatique. Pas urgent, mais le pattern a déjà
     causé deux extensions de permit imprévues.
-
-    Le PM met à jour cette roadmap au fil de l'eau quand un item
-    change d'état. Pas de bot, pas de synchronisation automatique.
-    Le status d'un item ici est la vérité que le PM affirme à
-    l'instant t, pas une lecture en temps réel de l'artifact source.
 
   items:
     # PAST - chantiers structurels majeurs livrés
@@ -126,7 +143,7 @@ spec:
         type: rfc
         id: cdbfee72-59b9-449c-9e22-2666d8e591e0
       timeframe: past
-      status: done
+      status: in_progress
       target_date: "2026-Q2"
       depends_on: [proxy-resilient]
       rationale: >
@@ -134,7 +151,9 @@ spec:
         timeout, ce qui a fait apparaître une classe de corruptions
         SQLite jamais vue avant. Les 4 piliers (file lock POSIX,
         PRAGMA défensifs, graceful shutdown, autorepair PILIER D)
-        ferment cette classe de bugs.
+        ferment cette classe de bugs. RFC encore approved (pas
+        implemented) : status auto-syncé en in_progress jusqu'à
+        clôture via rfc_set_implemented.
 
     - key: memory-lookup-rule
       title: "Lookup mémoire obligatoire et lessons systématiques"
@@ -142,13 +161,13 @@ spec:
         type: rfc
         id: f4fe8a04-b654-42a1-b055-bf0b991bbb3a
       timeframe: past
-      status: done
+      status: in_progress
       rationale: >
         Pose la règle que tous les agents doivent consulter la
         mémoire collective avant chaque artifact et capitaliser
         après. Règle indispensable mais qui n'avait de sens que si
         search() marchait. Le sujet search a donc immédiatement
-        suivi.
+        suivi. RFC encore approved : status auto-syncé en in_progress.
 
     - key: roadmap-kind
       title: "Introduction du kind roadmap"
@@ -161,6 +180,7 @@ spec:
       rationale: >
         Schéma JSON + extension de l'enum ArtifactKind Rust + mise à
         jour des personas. Permet au PM de tracker les sujets.
+        Partiellement superseded par a5f25718 (auto-sync + ref loose).
 
     - key: roadmap-tooling
       title: "Outillage MCP list_roadmaps + summarize_roadmap"
@@ -168,14 +188,15 @@ spec:
         type: rfc
         id: 3cd72740-1424-46ac-8ee6-96f714f3fa94
       timeframe: past
-      status: done
+      status: in_progress
       target_date: "2026-Q2"
       depends_on: [roadmap-kind]
       rationale: >
         Donne au PM les tools MCP pour répondre vite à "où en sont
         mes sujets ?" sans parcourir company/roadmaps/ à la main.
         Ce qui rend la présente roadmap utilisable au lieu d'être
-        un document statique.
+        un document statique. RFC encore approved : status auto-syncé
+        en in_progress.
 
     - key: hybrid-search
       title: "Refonte search() en hybrid retrieval (BM25 + embeddings + RRF)"
@@ -216,7 +237,8 @@ spec:
     - key: db-schema-migration-hotfix
       title: "Hotfix ordre CREATE INDEX vs ALTER TABLE (db.rs)"
       ref:
-        type: external
+        type: loose
+        category: hotfix
         label: "Hotfix appliqué hors RFC (commit 57019e7), superseded par RFC 973a5569"
       timeframe: past
       status: done
@@ -237,20 +259,16 @@ spec:
         type: rfc
         id: 359f9162-18f2-4b72-85b0-7d0e44608959
       timeframe: past
-      status: done
+      status: in_progress
       target_date: "2026-Q2"
       rationale: >
-        RÉSOLU (RFC 359f9162, commit 09757aa). grant_write_permit
-        effectue désormais lui-même, dans la même opération MCP, le
-        checkpoint WAL + git add -f ciblé + git commit du .db, avec
-        rollback du permit si le commit échoue. Invariant : à la
-        sortie du tool, soit le permit existe ET est scellé en HEAD,
-        soit il n'existe pas. La fenêtre non-atomique est fermée à la
-        source, neutralisant les deux mécanismes qui tuaient le permit
-        (check tampering du hook, PILIER D autorepair). Grant rendu
-        idempotent par clé (rfc_id + granted_to + target_paths) sur
-        décision CEO. Contournement manuel (seal step) retiré de la
-        persona Implementer. Lesson de capitalisation d5c9c933.
+        grant_write_permit effectue désormais lui-même, dans la même
+        opération MCP, le checkpoint WAL + git add -f ciblé + git
+        commit du .db, avec rollback du permit si le commit échoue.
+        Invariant : à la sortie du tool, soit le permit existe ET est
+        scellé en HEAD, soit il n'existe pas. Lesson de capitalisation
+        d5c9c933. RFC encore approved : status auto-syncé en
+        in_progress jusqu'à clôture via rfc_set_implemented.
 
     - key: rfc-set-implemented-tool
       title: "Tool MCP rfc_set_implemented(id) pour clore les RFCs sans permit ad-hoc"
@@ -258,23 +276,14 @@ spec:
         type: rfc
         id: 1c0f2570-71e2-4f02-ac4f-81e406b22568
       timeframe: past
-      status: done
+      status: in_progress
       target_date: "2026-Q2"
       rationale: >
-        RÉSOLU (RFC 1c0f2570, commit 3c25889). Le tool MCP
-        rfc_set_implemented(id) fait passer un RFC de approved à
-        implemented par écriture serveur (std::fs::write via
-        update_rfc_status_in_file étendu avec implemented_at), sans
-        write permit, exactement comme close_review_round met un RFC
-        en approved. Validation stricte (transition autorisée
-        uniquement depuis approved), idempotence sur déjà-implemented
-        (décision CEO), ouvert à tout agent sans token (décision CEO).
-        12 tests triaxiaux verts. Lesson 80f7b27a. NOTE : le dogfooding
-        (utiliser le tool pour clore les RFCs du chantier) est en
-        attente d'un redémarrage de session opencode car le proxy MCP
-        ne relaye pas notifications/tools/list_changed (limitation
-        découverte, candidate RFC future). Les RFCs 359f9162 et
-        1c0f2570 restent en approved jusqu'au prochain boot session.
+        Le tool MCP rfc_set_implemented(id) fait passer un RFC de
+        approved à implemented par écriture serveur, sans write permit,
+        exactement comme close_review_round met un RFC en approved.
+        12 tests triaxiaux verts. Lesson 80f7b27a. RFC encore approved :
+        status auto-syncé en in_progress.
 
     - key: defense-in-depth-selective
       title: "Hook defense-in-depth selective revert (vs nuclear actuel)"
@@ -282,23 +291,15 @@ spec:
         type: rfc
         id: bde023e2-8633-42c9-911a-80dcd5157c62
       timeframe: past
-      status: done
+      status: in_progress
       target_date: "2026-Q2"
       rationale: >
-        RÉSOLU (RFC bde023e2, commit 4f803b6). Le revert sélectif est
-        désormais le comportement par défaut : DELETE WHERE id NOT IN
-        (baseline), où baseline = union du snapshot before (Source A) et
-        des permits scellés en HEAD git (Source B, fondée sur le
-        scellement du RFC 359f9162). Le wipe nucléaire est borné au seul
-        cas résiduel où la baseline est indéterminable (Source A null ET
-        Source B inexploitable). Diagnostic clé : l'ancien critère
-        nucléaire before===null amalgamait vraie absence de baseline et
-        simple recréation du fichier DB, d'où les permits légitimes
-        détruits. La faille préexistante du sous-cas silencieux L230 (un
-        permit injecté survivait quand before listait 0 id) est aussi
-        fermée. Invariant de sécurité validé par le CEO : aucun permit
-        frauduleux ne survit. 46 tests JS verts. Lesson 85ad44d3
-        (supersede partiellement ed7776fb).
+        Le revert sélectif est désormais le comportement par défaut :
+        DELETE WHERE id NOT IN (baseline), où baseline = union du
+        snapshot before et des permits scellés en HEAD git. Le wipe
+        nucléaire est borné au seul cas résiduel où la baseline est
+        indéterminable. 46 tests JS verts. Lesson 85ad44d3. RFC encore
+        approved : status auto-syncé en in_progress.
 
     - key: rfc-affected-files-categorize
       title: "RFC schema : distinguer affected_files.modified vs created"
@@ -306,21 +307,14 @@ spec:
         type: rfc
         id: a4eb3ee7-45c1-4422-a43a-fbbc07d686f0
       timeframe: past
-      status: done
+      status: in_progress
       target_date: "2026-Q2"
       rationale: >
-        RÉSOLU (RFC a4eb3ee7, commit 5c3d289). Le bloc spec.affected_files
-        du schema RFC accepte désormais DEUX formes via un anyOf
-        rétro-compatible : FORME A legacy (array plat de strings,
-        identique à l'existant) et FORME B structurée
-        (objet {modified, created} avec deux listes optionnelles).
-        Les RFCs touchant du code sont encouragés à utiliser la FORME B
-        pour rendre la distinction modifier/créer explicite et
-        machine-readable, ce qui ferme la classe d'oublis qui avait
-        coûté deux blockers permits sur RFC bdee1af4 (Cargo.toml et
-        types.rs oubliés car non distingués). Aucun changement Rust,
-        purement schema + règle dans shared-rules.yml. Lesson de
-        capitalisation produite.
+        Le bloc spec.affected_files du schema RFC accepte désormais
+        DEUX formes via un anyOf rétro-compatible : FORME A legacy
+        (array plat) et FORME B structurée (objet {modified, created}).
+        Ferme la classe d'oublis qui avait coûté deux blockers permits.
+        RFC encore approved : status auto-syncé en in_progress.
 
     - key: schema-migration-discipline
       title: "Discipline de migration de schéma SQL côté orchestrator"
@@ -328,27 +322,23 @@ spec:
         type: rfc
         id: 973a5569-ec7e-4ee0-a868-2314e3cd5bd4
       timeframe: past
-      status: done
+      status: in_progress
       target_date: "2026-Q2"
       depends_on: [db-schema-migration-hotfix]
       rationale: >
-        RÉSOLU (RFC 973a5569, commit 7c7171d). PRAGMA user_version
-        + migrations numérotées idempotentes installées côté orchestrator.
-        Chaque migration porte un numéro de version, est exécutée
-        une seule fois (vérification du user_version courant avant
-        application), et la migration globale est elle-même
-        transactionnelle. Tests de transition couvrant DB vierge,
-        DB legacy sans colonnes filtre, et DB déjà migrée. Le hotfix
-        db.rs précédent est désormais une migration v_n du nouveau
-        système, ce qui ferme la classe de bugs ordre-DDL pour le
-        futur. Lesson capitalisée.
+        PRAGMA user_version + migrations numérotées idempotentes
+        installées côté orchestrator. Le hotfix db.rs précédent est
+        désormais une migration v_n du nouveau système. Lesson
+        cf3c40a8. RFC encore approved : status auto-syncé en
+        in_progress.
 
     # FUTURE - sujets restant à formaliser
 
     - key: api-callers-discoverability
       title: "Discipline 'lister les callers avant changer une signature d'API'"
       ref:
-        type: external
+        type: loose
+        category: idea
         label: "Lesson ea6e9dd1, formaliser comme checklist plan ou via tooling LSP"
       timeframe: future
       status: planned
@@ -365,8 +355,9 @@ spec:
     - key: backup-strategy
       title: "Stratégie de sauvegarde mémoire collective"
       ref:
-        type: external
-        label: "Sujet jamais ouvert formellement, à scoper"
+        type: loose
+        category: observation
+        label: "Couvert par git remote (PILIER D + push) ; sujet fermé sans chantier dédié"
       timeframe: future
       status: cancelled
       rationale: >

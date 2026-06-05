@@ -17,8 +17,8 @@ pub use fusion::{DEFAULT_RRF_K, FusedResult, RankedResult, rrf_fuse};
 pub use lock::{DbLockGuard, acquire_exclusive_blocking, try_acquire_exclusive};
 pub use query::{QueryMode, sanitize_fts_query};
 pub use roadmap_summary::{
-    RoadmapCounters, RoadmapHeader, RoadmapItem, RoadmapItemRef, RoadmapListEntry, RoadmapSelector,
-    RoadmapSummary,
+    DriftWarning, RoadmapCounters, RoadmapHeader, RoadmapItem, RoadmapItemRef, RoadmapListEntry,
+    RoadmapSelector, RoadmapSummary,
 };
 pub use types::{
     ArtifactPath, ArtifactSummary, ConsensusResult, Finding, IndexedArtifact, PathPattern,

@@ -166,14 +166,17 @@ spec:
           ou trimestres), causale (dépendances entre items), narrative (récit du
           pourquoi).
           Référence des éléments hétérogènes : projets (via project_slug),
-          RFCs (via id UUID), ou sujets en exploration (type external).
+          RFCs (via id UUID), ou sujets sans artifact formel (type loose, avec
+          une category typée : idea/exploration/hotfix/observation/dependency).
           Une roadmap est un artifact GLOBAL : elle vit dans company/roadmaps/
           et porte un `domain` qui identifie son périmètre (ex: 'companyos-system',
           'puissance4-verus'). Plusieurs roadmaps coexistent, une par domaine.
           Statut : `active` (vivante, mise à jour) ou `archived` (historique).
-          Produite et maintenue par le PM. Pas d'auto-synchronisation avec les
-          artifacts référencés : le `status` de chaque item est la vérité portée par
-          la roadmap, mise à jour manuellement par le PM. Sert au PM à répondre à
+          Produite et maintenue par le PM. Le status des items à ref
+          project/rfc est AUTO-SYNCHRONISÉ à la lecture depuis l'artifact
+          source (RFC a5f25718) ; le PM ne peut écrire manuellement que
+          `blocked` (droit absolu). Les items à ref loose (sans artifact
+          source) gardent un status manuel. Sert au PM à répondre à
           "où en sont mes sujets ?".
         schema: company/schemas/roadmap.schema.json
   rules:
