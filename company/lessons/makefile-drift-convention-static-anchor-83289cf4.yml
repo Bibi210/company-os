@@ -1,0 +1,115 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 83289cf4-8dba-4cd7-acba-40a6a2d882e5
+  title: "Un outil de tooling (Makefile, hook) qui duplique une convention derive silencieusement quand un nouveau kind arrive : ancrer par commentaire de sync au point d'edition"
+  author: implementer
+  created_at: "2026-06-05"
+  description: >
+    Capitalisation apres l'implementation du plan 7d54f0b3 (design-doc
+    98bb95af) qui realigne la cible Makefile clean-company sur la regle
+    file_placement de shared-rules. La cible avait derive : elle referencait
+    deux dossiers inexistants (company/diagnostics/, company/design-docs/,
+    des kinds en realite PROJET) et oubliait deux kinds globaux ajoutes
+    apres sa redaction (roadmap, agent-message). Trois enseignements : (a)
+    la cause racine generique (un outil qui ENUMERE une convention sans la
+    LIRE derive a chaque ajout de kind), (b) pourquoi l'approche statique a
+    ete preferee au find dynamique ici malgre la preference deterministe
+    4e5c109b, (c) le traitement d'une ligne transitoire vers un retrait en
+    cours dans une autre unite de travail.
+  tags:
+    - makefile
+    - tooling
+    - cleanup
+    - conventions
+    - file-placement
+    - technical-debt
+    - companyos-internals
+    - lessons-from-implementation
+  related:
+    - id: 98bb95af-9667-4625-8817-d28fb3c0e1f7
+      kind: design-doc
+      relationship: derived-from
+    - id: 4e5c109b-ec35-46ff-98af-3714b1d7a36f
+      kind: lesson-learned
+      relationship: related
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: related
+    - id: 3f507271-70ba-49ac-9a08-eeb833fb6063
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    La cible clean-company du Makefile etait censee "wipe all generated
+    artifacts" en preservant personas/config/schemas/plugins. Avec le temps,
+    deux kinds globaux (roadmap via RFC a49801aa, agent-message) ont ete
+    ajoutes a la convention file_placement de shared-rules SANS que la cible
+    soit mise a jour, et deux lignes pointaient vers des dossiers qui
+    n'existaient pas (company/diagnostics/, company/design-docs/) parce que
+    ces kinds avaient migre vers le scope projet. Resultat : un
+    make clean-company laissait des roadmaps en place et executait des rm
+    no-op trompeurs donnant une fausse impression de couverture exhaustive.
+    Point cle de perimetre : le Makefile racine n'est PAS en zone protegee,
+    donc le realignement n'a demande NI RFC NI write permit, juste
+    design-doc + implementation-plan + edition directe.
+  insight: >
+    (a) CAUSE RACINE GENERIQUE. Tout outil de tooling qui RECOPIE une
+    convention au lieu de la LIRE derive mecaniquement a chaque evolution de
+    la convention. Ici la convention vit dans shared-rules.file_placement
+    (source de verite) et le Makefile en tenait une copie figee. La copie et
+    la source ont evolue independamment. C'est exactement le meme couplage
+    que ARTIFACT_NAMING_PREFIXES dans defense-in-depth-core.mjs, deja annote
+    d'un commentaire de sync. La classe de bug n'est pas propre au Makefile :
+    elle touche tout enumerateur de kinds (hooks, scripts, validateurs).
+
+    (b) STATIQUE vs DYNAMIQUE, l'arbitrage fin. La preference utilisateur
+    4e5c109b dit "un algorithme deterministe qui garantit une propriete >
+    une regle qui demande aux agents de la respecter". On aurait pu rendre
+    la cible dynamique (find company/ projects/ -type d -name "<kind>s" au
+    runtime) pour qu'elle ne derive plus jamais. Le design-doc a TRANCHE
+    POUR LE STATIQUE, et c'est coherent avec 4e5c109b lue finement : le find
+    dynamique introduit un RISQUE DE SUR-SUPPRESSION (un find trop large
+    pourrait capter company/config/ ou company/scripts/) qui est PIRE que la
+    derive qu'il evite. Quand le mecanisme "automatique" ne garantit pas
+    proprement la propriete (ici : preserver les dossiers systeme) mais
+    ajoute un risque destructeur, la liste explicite + commentaire d'ancrage
+    au point d'edition est le bon niveau. La preference deterministe ne veut
+    pas dire "toujours du code magique" : elle veut dire "preferer ce qui
+    garantit la propriete", et une liste auditable garantit mieux la
+    NON-suppression des dossiers preserves qu'un find. Le cout de
+    maintenance (editer une ligne quand on ajoute un kind) est negligeable
+    car ajouter un kind est deja un evenement RFC lourd (lesson 3f507271).
+
+    (c) LIGNE TRANSITOIRE vers un retrait en cours. Le kind agent-message
+    est en cours de retrait par le RFC 3d9f0b0c (autre unite de travail, en
+    parallele). Plutot que d'attendre son merge (option a), on a inclus la
+    ligne company/agent-messages/ marquee TRANSITOIRE avec lien related vers
+    le RFC (option b, arbitrage PM pour le parallelisme). C'est compatible
+    avec be16dc46 (retirer le contournement dans la meme unite) PAR
+    DELEGATION EXPLICITE : le retrait n'est pas oublie, il est nommement
+    confie au RFC 3d9f0b0c (AC5 de son task-request 95e93649) et trace par
+    le commentaire + le related. La cle pour ne pas violer be16dc46 quand on
+    laisse une ligne transitoire : la rendre VISIBLE et NOMMER l'unite de
+    travail qui la retirera, jamais une intention vague "plus tard".
+  recommendation: >
+    1. Quand un outil de tooling (Makefile, hook, script, validateur)
+    ENUMERE des kinds ou des chemins issus d'une convention centrale,
+    ajouter au point d'edition un commentaire "Keep in sync with <source de
+    verite>". Ne pas se fier a la memoire des agents : le couplage doit etre
+    visible LA OU on edite.
+    2. Lors de l'ajout d'un nouveau kind GLOBAL (deja un evenement RFC, cf.
+    3f507271), inclure dans le perimetre la mise a jour des enumerateurs qui
+    listent les kinds : la cible clean-company du Makefile en fait partie.
+    Les kinds PROJET ne demandent aucune ligne (rm -rf projects/*/ les couvre
+    tous recursivement).
+    3. Privilegier une liste statique auditable a un balayage dynamique
+    quand l'operation est destructive et que le dynamique risque de capter
+    des chemins a preserver. La preference deterministe 4e5c109b se mesure a
+    la propriete GARANTIE, pas a la quantite de code automatique.
+    4. Si une ligne doit etre laissee transitoirement en attendant un
+    retrait gere ailleurs, la marquer explicitement (commentaire inline
+    nommant le RFC/plan responsable) et poser un lien related vers cette
+    unite de travail. Une ligne transitoire non nommee est une dette
+    oubliee (violation de be16dc46).
