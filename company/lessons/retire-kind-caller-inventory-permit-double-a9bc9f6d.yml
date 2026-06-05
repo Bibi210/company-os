@@ -1,0 +1,139 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: a9bc9f6d-19f3-47f3-b752-f39e7a44046c
+  title: "Retirer un kind d'artifact (agent-message) : la discipline caller-inventory paie au premier passage, et l'amendement d'un RFC en cours coûte un permit en double"
+  author: implementer
+  created_at: "2026-06-05"
+  description: >
+    Capitalisation de clôture après l'implémentation du RFC 3d9f0b0c
+    (plan ac9d40ff) qui retire intégralement le kind agent-message de
+    CompanyOS : variant Rust AgentMessage, schema agent-message.schema.json,
+    références dans shared-rules.yml (artifact_catalog + file_placement +
+    exclusion lesson), prefixe dans defense-in-depth-core.mjs, mention
+    "via agent-message" dans personas/implementer.yml, 11 YAML
+    company/agent-messages/ + dossier, et nettoyages embedding.rs /
+    edge_cases.rs. Deux enseignements opérationnels : (a) la discipline
+    caller-inventory remontée en rules.must par le RFC eb42a8de (lesson
+    b6ec1709) a produit un effet concret AU PREMIER PASSAGE en faisant
+    repérer la mention résiduelle "via agent-message" dans implementer.yml
+    ligne 49, qui aurait sinon survécu au retrait du kind ; (b)
+    l'amendement du périmètre RFC en iteration 2 (ajout de
+    implementer.yml) a entraîné l'émission de DEUX write permits
+    successifs (6 puis 7 paths) sur le même RFC, les deux restés actifs,
+    surface de friction au moment de la clôture.
+  tags:
+    - workflow
+    - kind-removal
+    - agent-message
+    - caller-inventory
+    - rules-must
+    - write-permit
+    - friction-permits
+    - companyos-internals
+    - lessons-from-implementation
+  related:
+    - id: b6ec1709-abe3-4415-a0ed-93b50c6a64c7
+      kind: lesson-learned
+      relationship: derived-from
+    - id: 4e5c109b-ec35-46ff-98af-3714b1d7a36f
+      kind: lesson-learned
+      relationship: related
+    - id: 3d9f0b0c-856d-4799-ac10-e25fad5d1965
+      kind: rfc
+      relationship: derived-from
+
+spec:
+  context: >
+    Le RFC 3d9f0b0c retire le kind agent-message, devenu obsolète depuis
+    que la coordination inter-agents passe par le retour du Task tool
+    plutôt que par des artifacts YAML dédiés. Le retrait touche une
+    surface hétérogène : un variant d'enum Rust dans crates/config, un
+    schema JSON, plusieurs sections de shared-rules.yml, un plugin .mjs,
+    une persona YAML, et 11 instances de données + leur dossier. C'est
+    typiquement le genre de chantier où une référence textuelle résiduelle
+    (une string "agent-message" oubliée quelque part) passe inaperçue
+    parce qu'elle ne casse aucune compilation.
+
+    Le chantier a été exécuté en deux iterations de RFC. L'iteration 1
+    couvrait 6 fichiers ; l'iteration 2 a ajouté personas/implementer.yml
+    au scope après qu'on a constaté que la persona Implementer contenait
+    encore une mention "via agent-message" dans sa règle caller-inventory
+    (rules.must, ligne 49 : "signaler à l'Architect / au PM via
+    agent-message"). Le CEO a donc émis un second write permit étendu à 7
+    paths (0f7ecea7) en plus du premier à 6 paths (38642098).
+
+  insight: >
+    (1) LA DISCIPLINE CALLER-INVENTORY PAIE AU PREMIER PASSAGE. La lesson
+    b6ec1709 documentait la remontée du caller-inventory en rules.must des
+    personas Architect/Implementer en assumant explicitement un risque
+    résiduel d'oubli (discipline déléguée à un agent, donc faillible).
+    Ce chantier est une donnée empirique POSITIVE : le recensement
+    exhaustif des références à "agent-message" — au-delà des callers de
+    code, étendu ici aux mentions textuelles dans les artifacts YAML et
+    les personas — a fait remonter la mention de implementer.yml ligne 49
+    AVANT qu'elle ne devienne une référence morte à un kind supprimé.
+    Sans ce recensement, le retrait aurait laissé une persona pointant
+    vers un canal de coordination inexistant. La leçon de b6ec1709
+    ("instrumenter la persona plutôt que mécaniser") tient : ici aucun
+    tool n'aurait attrapé une string dans un commentaire de règle YAML,
+    seul le recensement discipliné l'a fait. La reformulation retenue
+    ("via le canal de coordination (retour du Task tool)") est
+    intentionnellement agnostique du mécanisme, pour ne pas recréer le
+    même couplage à un kind nommé.
+
+    (2) AMENDER LE SCOPE D'UN RFC EN COURS = PERMIT EN DOUBLE. L'ajout de
+    implementer.yml en iteration 2 a produit DEUX permits actifs sur le
+    même RFC (38642098 à 6 paths, puis 0f7ecea7 à 7 paths), au lieu d'un
+    seul permit à jour. Les deux pointaient le même rfc_id, les deux
+    étaient "active" au moment de la clôture, et le premier n'était pas un
+    sous-ensemble formellement révoqué du second : il fallait consommer
+    les DEUX pour ne pas laisser de permit fantôme. C'est cohérent avec la
+    friction permits déjà documentée (600307a4 "2 cycles de re-émission",
+    80f7b27a, d5c9c933) : chaque fois que le périmètre bouge après
+    l'émission initiale, le permit se dédouble plutôt que de se réviser
+    in-place. Le modèle actuel n'a pas de notion de "révision de permit"
+    qui supersede l'ancien ; un amendement = un nouveau grant qui coexiste.
+
+    (3) LE RETRAIT D'UN KIND EST MÉCANIQUEMENT SÛR CÔTÉ CODE, RISQUÉ CÔTÉ
+    PROSE. La partie Rust (variant d'enum, embedding.rs, edge_cases.rs)
+    est protégée par le compilateur : retirer un variant casse tout caller
+    non mis à jour, donc make ci est un filet fiable. La partie prose
+    (shared-rules.yml artifact_catalog, file_placement, exclusion lesson ;
+    defense-in-depth prefixe ; mention persona) n'a AUCUN filet
+    automatique : une référence oubliée reste un YAML valide. C'est là que
+    le recensement discipliné est irremplaçable, et c'est exactement la
+    zone où il a payé ici.
+
+  recommendation: >
+    1. POUR TOUT RETRAIT DE KIND OU DE CONCEPT TRANSVERSE : étendre le
+       caller-inventory au-delà du code. Recenser les mentions TEXTUELLES
+       du nom (rg sur la string littérale) dans : shared-rules.yml
+       (artifact_catalog, file_placement, toute règle d'exclusion), les
+       schemas, les plugins .mjs, et surtout les personas YAML. Le
+       compilateur ne couvre que le Rust ; la prose n'a pas de filet.
+       Lister l'union de ces fichiers dans affected_files AVANT de figer
+       le scope du RFC.
+
+    2. QUAND UNE REFERENCE RESIDUELLE EST TROUVEE DANS UNE PERSONA :
+       reformuler de façon AGNOSTIQUE du mécanisme retiré ("canal de
+       coordination" plutôt que de nommer un nouveau kind), pour ne pas
+       recréer immédiatement le même couplage qu'on est en train de
+       supprimer.
+
+    3. EVITER L'AMENDEMENT DE SCOPE APRES EMISSION DU PERMIT quand c'est
+       possible : faire le recensement prose COMPLET avant la première
+       demande de permit, pour que le CEO émette un seul grant couvrant
+       l'union finale. Si un amendement est inévitable (caller découvert
+       en cours), assumer qu'il y aura deux permits actifs et les consumer
+       TOUS les deux à la clôture (check_write_permit sur un path
+       exclusif de chaque permit pour confirmer lequel répond). Candidat
+       RFC d'amélioration si le pattern persiste : une notion de révision
+       de permit qui supersede l'ancien grant in-place plutôt que de le
+       laisser coexister, fermant la classe de bug "permit fantôme".
+
+    4. A LA CLOTURE, NE PAS SE FIER A UN SEUL check_write_permit : un path
+       partagé par plusieurs permits ne révèle qu'un seul des permits
+       actifs (le premier qui répond). Pour détecter tous les permits d'un
+       RFC amendé, interroger un path EXCLUSIF à chaque permit suspecté
+       (ici implementer.yml, exclusif au permit étendu).
