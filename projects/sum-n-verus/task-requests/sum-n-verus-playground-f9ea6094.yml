@@ -1,0 +1,87 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: f9ea6094-8646-483a-a28f-e6ce838baada
+  title: "sum-n-verus — Terrain de jeu Verus : sum_n prouvé = n(n+1)/2"
+  author: pm
+  created_at: "2026-06-05"
+  project: sum-n-verus
+  description: >
+    Projet d'exercice minimal pour s'entraîner à la vérification formelle avec Verus.
+    L'objectif principal n'est PAS le contenu fonctionnel (un simple sum_n) mais la mise
+    en place de TOUTE l'architecture de compilation/vérification autour : scaffolding Cargo,
+    Makefile avec cible verify, et installation de la toolchain Verus. Le code se réduit à
+    une fonction sum_n itérative et à sa preuve Verus que sum_n(n) == n*(n+1)/2.
+  tags:
+    - rust
+    - verus
+    - formal-verification
+    - playground
+    - scaffolding
+    - sum-n
+  related:
+    - id: b2c68c30-29ab-4150-90b3-df02b6c616aa
+      kind: lesson-learned
+      relationship: input
+    - id: 016e47c4-ec14-4194-bd60-15f115248cd8
+      kind: lesson-learned
+      relationship: input
+
+spec:
+  priority: medium
+  status: backlog
+
+  context: >
+    L'utilisateur veut un terrain de jeu pour s'exercer à la vérification formelle déductive
+    avec Verus. Le coeur de la demande est l'INFRASTRUCTURE : que toute la tuyauterie de
+    compilation et de vérification soit en place et fonctionne d'un seul make verify. Le
+    contenu prouvé est volontairement trivial (sum_n) pour que l'effort porte sur le
+    scaffolding et la chaîne d'outils, pas sur la complexité de la preuve.
+
+    Contrainte d'emplacement : les artifacts CompanyOS (task-request, design-doc, etc.)
+    vivent dans company-os sous projects/sum-n-verus/. Le CODE SOURCE du projet vit en dehors
+    de company-os, dans /home/bibux/Compagny/sum-n-verus/.
+
+    Contrainte d'installation : la toolchain Verus doit être installée en priorité via paru
+    (AUR), avec cargo install accepté en complément. Éviter le téléchargement direct de
+    binaires sauf nécessité absolue, et dans ce cas demander confirmation à l'utilisateur
+    avant. Si aucune méthode propre (paru / cargo install) n'aboutit, s'arrêter sur l'install
+    et le signaler plutôt que de contourner.
+
+  what_to_build:
+    - Scaffolding Cargo complet dans /home/bibux/Compagny/sum-n-verus/ (Cargo.toml, src/)
+    - Une fonction exec sum_n(n) qui calcule itérativement la somme des entiers de 1 à n
+    - Une preuve Verus que sum_n(n) == n*(n+1)/2 (formule fermée de Gauss)
+    - Un Makefile à la racine du projet avec une cible verify qui lance la vérification Verus
+    - Un README documentant l'installation de la toolchain et l'usage (make verify)
+    - Installation effective de la toolchain Verus sur la machine (paru puis cargo install)
+
+  formal_verification_scope:
+    propriete_a_prouver:
+      - sum_n(n) == n*(n+1)/2 pour tout n dans le domaine supporté
+      - Absence d'overflow arithmétique sur le domaine choisi (type entier à fixer dans le design)
+      - Terminaison de la boucle itérative (variant decreases)
+    note_methode:
+      - La spec doit exprimer la formule fermée n*(n+1)/2 à un niveau abstrait, pas recopier le code
+      - L'invariant de boucle est le coeur de la preuve : à l'itération i, l'accumulateur == i*(i+1)/2
+
+  acceptance_criteria:
+    - Le code source vit dans /home/bibux/Compagny/sum-n-verus/, pas dans company-os
+    - make verify lance la vérification Verus et passe sans erreur sur la preuve de sum_n
+    - La preuve établit sum_n(n) == n*(n+1)/2 (formule fermée, pas une simple égalité avec la somme récursive)
+    - L'absence d'overflow et la terminaison sont prouvées sur le domaine choisi
+    - Le projet compile (build exec) sans warning
+    - Le README documente précisément comment installer Verus (paru / cargo install) et comment lancer make verify
+    - La toolchain Verus est effectivement installée et fonctionnelle sur la machine
+
+  out_of_scope:
+    - Toute logique métier au-delà de sum_n
+    - Comparaison de performance entre approches
+    - Toute UI ou CLI interactive
+    - Téléchargement direct de binaires sans accord préalable de l'utilisateur
+
+  installation_constraints:
+    - Priorité absolue à paru (AUR) pour l'installation système
+    - cargo install accepté en complément si paru ne suffit pas
+    - Téléchargement direct de binaires GitHub : seulement en dernier recours ET après accord explicite de l'utilisateur
+    - En cas d'échec de toutes les méthodes propres, s'arrêter et signaler — ne pas contourner

@@ -1,0 +1,249 @@
+api_version: companyos/v1
+kind: design-doc
+metadata:
+  id: 52c413d8-1584-4147-86b2-b1921bdd3e9a
+  title: "sum-n-verus — Architecture : infrastructure de vérification Verus pour sum_n = n(n+1)/2"
+  author: architect
+  created_at: "2026-06-05"
+  project: sum-n-verus
+  description: >
+    Architecture du terrain de jeu Verus sum-n-verus. Le coeur du design est
+    l'INFRASTRUCTURE de compilation/vérification (scaffolding Cargo, Makefile avec
+    cible verify, stratégie d'installation de la toolchain Verus sur Arch via paru),
+    le contenu prouvé étant volontairement trivial : une fonction exec sum_n(n)
+    itérative et sa preuve Verus que sum_n(n) == n*(n+1)/2 (formule fermée de Gauss).
+    Tranche les types entiers et le domaine de n (borne overflow), la forme abstraite
+    de la spec (anti-pattern "spec qui répète le code"), l'invariant de boucle clé
+    et le variant de terminaison, la gestion de la division entière par 2 et de la
+    non-linéarité, et la stratégie d'installation avec fallback et arrêt propre.
+  tags:
+    - rust
+    - verus
+    - formal-verification
+    - playground
+    - scaffolding
+    - sum-n
+    - toolchain
+    - arch-linux
+    - paru
+  related:
+    - id: f9ea6094-8646-483a-a28f-e6ce838baada
+      kind: task-request
+      relationship: input
+    - id: b2c68c30-29ab-4150-90b3-df02b6c616aa
+      kind: lesson-learned
+      relationship: input
+    - id: 016e47c4-ec14-4194-bd60-15f115248cd8
+      kind: lesson-learned
+      relationship: input
+
+spec:
+  overview: >
+    sum-n-verus est un projet d'exercice dont l'objectif premier est de valider une
+    CHAÎNE D'OUTILS de vérification formelle déductive bout-en-bout, pas de prouver une
+    propriété complexe. Le livrable architectural est une infrastructure reproductible :
+    un projet Cargo minimal vivant HORS de company-os (dans /home/bibux/Compagny/sum-n-verus/),
+    pilotable par un Makefile dont la cible `verify` invoque le vérifieur Verus, et une
+    toolchain Verus installée proprement sur la machine Arch.
+
+    Le contenu vérifié se réduit à une fonction d'exécution sum_n(n) qui calcule
+    itérativement la somme des entiers de 1 à n, accompagnée d'une preuve Verus
+    établissant l'égalité avec la formule fermée de Gauss n*(n+1)/2. Trois propriétés
+    sont à garantir formellement : (1) correction fonctionnelle vis-à-vis de la formule
+    fermée exprimée abstraitement, (2) absence d'overflow arithmétique sur le domaine de
+    n choisi, (3) terminaison de la boucle.
+
+    Ce document tranche le QUOI et le POURQUOI au niveau architectural. Il ne fixe ni
+    noms de fichiers de code, ni code, ni ordre d'exécution : ces choix relèvent de
+    l'implementation-plan. Le design laisse délibérément à l'Implementer la liberté de
+    choisir l'invocation concrète de Verus (binaire standalone `verus` vs sous-commande
+    cargo selon ce que la distribution rend disponible), mais cadre l'attente
+    invariante : `make verify` DOIT déclencher la vérification statique Verus et échouer
+    si une preuve ne passe pas.
+
+  components:
+    - name: "Scaffolding Cargo (projet hors company-os)"
+      description: >
+        Un crate Rust unique et minimal, racine /home/bibux/Compagny/sum-n-verus/,
+        contenant un Cargo.toml et un répertoire src/. C'est un projet binaire ou
+        bibliothèque simple : pas de workspace multi-crate, pas de dépendance applicative.
+        Le code Verus (modes spec/proof/exec) vit dans le crate via la macro `verus! {}`
+        et la dépendance vstd. La frontière forte est l'emplacement : AUCUN fichier de
+        code ne doit être créé sous company-os ; seuls les artifacts CompanyOS (cette
+        design-doc, l'implementation-plan, etc.) vivent dans projects/sum-n-verus/.
+        La séparation physique entre dépôt de code et dépôt d'artifacts est un invariant
+        du projet, pas une commodité.
+    - name: "Fonction exec sum_n et son contrat"
+      description: >
+        Une fonction d'exécution qui prend n et calcule itérativement l'accumulateur de
+        la somme 1+2+...+n via une boucle. Elle porte un contrat Verus : une pré-condition
+        bornant n au domaine supporté (garantie d'absence d'overflow), et une post-condition
+        exprimant l'égalité au résultat de la spécification abstraite. Le corps contient
+        l'invariant de boucle et le variant de terminaison. C'est l'unique morceau de code
+        exec compilé du projet ; tout le reste (spec, lemmes) est erasé à la compilation.
+    - name: "Spécification abstraite (mode spec)"
+      description: >
+        Une ou des fonctions `spec fn` mathématiques décrivant CE QUE sum_n doit calculer,
+        à un niveau d'abstraction supérieur au code exec. Deux rôles distincts à ne pas
+        confondre : (a) une définition de référence de la somme (récurrence mathématique
+        sum_spec(n) = n + sum_spec(n-1), sum_spec(0)=0) qui sert de vérité de terrain
+        indépendante de la boucle exec ; (b) la formule fermée n*(n+1)/2 comme cible de la
+        post-condition. La preuve relie (a) et (b) ; elle ne se contente PAS de réénoncer
+        le calcul de la boucle (cf. piège "spec qui répète le code", lesson b2c68c30).
+    - name: "Appareil de preuve (mode proof : invariant, variant, lemmes)"
+      description: >
+        L'invariant de boucle, le variant de terminaison, et les lemmes nécessaires pour
+        guider Z3 sur les pas non-linéaires (le produit n*(n+1) et la division par 2).
+        Cet appareil est le coeur intellectuel de la preuve mais reste petit par construction
+        car le problème est volontairement trivial. Il inclut le raisonnement qui justifie
+        que n*(n+1) est toujours pair, donc que la division entière par 2 coïncide avec la
+        division mathématique exacte.
+    - name: "Makefile (orchestration de la vérification)"
+      description: >
+        Un Makefile à la racine du projet exposant au minimum une cible `verify` qui lance
+        la vérification Verus, et conventionnellement une cible de build exec et une cible
+        d'aide. La cible `verify` est le point d'entrée unique du critère d'acceptation :
+        un seul `make verify` doit suffire à vérifier le projet. Le Makefile encapsule la
+        commande concrète d'invocation de Verus (laissée au choix de l'Implementer) derrière
+        une interface stable.
+    - name: "README (documentation de la toolchain et de l'usage)"
+      description: >
+        Documentation décrivant précisément comment installer la toolchain Verus sur Arch
+        (procédure paru en priorité, fallback cargo install, conduite à tenir en cas d'échec),
+        et comment utiliser le projet (make verify, build). Le README est le contrat humain
+        de reproductibilité : un lecteur doit pouvoir reproduire l'environnement de zéro.
+    - name: "Toolchain Verus installée (livrable d'environnement)"
+      description: >
+        L'installation effective et fonctionnelle de Verus sur la machine est un composant
+        du livrable, pas un pré-requis tacite. Verus est un compilateur Rust modifié couplé
+        à un solveur SMT (Z3) ; son installation comporte donc le binaire de vérification
+        ET le solveur. La stratégie d'acquisition est tranchée dans les décisions ci-dessous.
+
+  decisions:
+    - decision: >
+        Type entier : utiliser un type d'entier machine non signé de largeur fixe pour n
+        et pour l'accumulateur (par défaut u64 pour l'accumulateur), et borner n par
+        pré-condition à un domaine où n*(n+1)/2 ne déborde pas le type de l'accumulateur.
+        Ne PAS utiliser les entiers mathématiques non bornés (int/nat) pour le code exec.
+      rationale: >
+        Le code exec doit être du Rust réel compilable et exécutable, ce qui exclut int/nat
+        (réservés au mode spec). Un type non signé évite d'avoir à raisonner sur des n
+        négatifs, ce qui aligne le domaine sur la sémantique de "somme des entiers de 1 à n"
+        (n ≥ 0 ; sum_n(0) = 0). La largeur fixe rend l'absence d'overflow une propriété
+        concrète et prouvable : c'est précisément ce que Verus excelle à vérifier
+        (arithmétique critique, lesson b2c68c30). Le choix u64 pour l'accumulateur donne une
+        marge confortable ; le domaine admissible de n s'en déduit comme la plus grande
+        valeur telle que n*(n+1)/2 tienne dans le type. L'Implementer fixe la borne exacte
+        comme constante de pré-condition et la documente ; le design impose seulement que la
+        borne soit explicite, que sum_n(0)=0 soit dans le domaine, et que la pré-condition
+        ne soit ni triviale (requires false interdit, lesson b2c68c30) ni inutilement
+        restrictive.
+    - decision: >
+        Forme de la spec : définir une vérité de terrain RÉCURSIVE indépendante du code
+        (somme mathématique sum_spec) ET viser la formule fermée n*(n+1)/2 dans la
+        post-condition exec. La post-condition publique exprime l'égalité à la formule
+        fermée ; un lemme relie la formule fermée à la définition récursive.
+      rationale: >
+        Le piège central identifié dans la lesson b2c68c30 est la "spec qui répète le code" :
+        si la spec calque la boucle, la preuve ne démontre rien d'utile. En définissant
+        sum_spec comme récurrence mathématique pure (abstraction supérieure, niveau Gauss et
+        non niveau accumulateur impératif), on obtient une référence sémantique distincte de
+        l'implémentation. La formule fermée n*(n+1)/2 est encore plus abstraite et constitue
+        le contrat réellement intéressant pour un appelant. La structure à deux niveaux
+        (récurrence ↔ formule fermée ↔ boucle exec) maximise la post-condition (ensures
+        maximaux, lesson b2c68c30) tout en gardant chaque pas de preuve modulaire.
+    - decision: >
+        Invariant de boucle : à l'itération où le compteur vaut i, l'accumulateur est égal
+        à i*(i+1)/2 (de façon équivalente, à sum_spec(i)). Le variant de terminaison est la
+        distance décroissante entre le compteur courant et la borne n (par exemple n - i),
+        bornée inférieurement par zéro.
+      rationale: >
+        L'invariant est explicitement désigné par le task-request et par la lesson b2c68c30
+        comme le coeur de la preuve. Formulé sur la formule fermée partielle i*(i+1)/2, il
+        se combine trivialement avec la condition de sortie (i == n) pour impliquer la
+        post-condition n*(n+1)/2. Le variant n - i décroît strictement à chaque itération et
+        est minoré, ce qui prouve la terminaison (decreases). Documenter l'invariant
+        explicitement est une exigence non négociable du design (lesson b2c68c30,
+        recommandation 5). Le sens exact du compteur (départ à 0 ou à 1, borne incluse/exclue)
+        est un détail d'implémentation laissé à l'Implementer, tant que l'invariant
+        correspondant reste cohérent et documenté.
+    - decision: >
+        Division entière par 2 : traiter n*(n+1)/2 en prouvant d'abord que le produit
+        n*(n+1) est TOUJOURS pair (l'un des deux entiers consécutifs est pair), puis en
+        établissant que la division entière par 2 coïncide alors avec la division exacte.
+        Introduire un lemme dédié à la parité plutôt que de compter sur Z3 pour l'inférer.
+      rationale: >
+        La lesson b2c68c30 (piège "non-linéarité") prévient que le solveur SMT peine sur la
+        multiplication de deux variables et sur le modulo. n*(n+1) est non-linéaire et la
+        division entière introduit une perte d'information que Z3 ne franchit pas seul. La
+        stratégie sûre est de découper : un lemme de parité (n*(n+1) est pair) transforme le
+        problème en une division exacte, ce qui linéarise le raisonnement aval. Des assertions
+        intermédiaires (checkpoints, lesson b2c68c30 piège "timeout") et, au besoin, les
+        lemmes d'arithmétique non-linéaire de vstd, sont les leviers attendus. Le design
+        impose la STRATÉGIE (isoler la parité, ne pas laisser Z3 deviner la non-linéarité) ;
+        le choix précis des lemmes vstd ou des annotations decreases/reveal revient à
+        l'Implementer (lesson 016e47c4, pièges #4, #7).
+    - decision: >
+        Structure du scaffolding : crate Cargo unique, code Verus inline via la macro
+        verus! {} avec dépendance vstd, sans workspace multi-crate. La frontière
+        code/artifacts est physique : code dans /home/bibux/Compagny/sum-n-verus/, artifacts
+        CompanyOS dans projects/sum-n-verus/.
+      rationale: >
+        Le problème étant trivial et mono-fonction, un crate unique est l'architecture la
+        plus simple qui satisfasse tous les critères ; un workspace multi-crate serait de la
+        sur-ingénierie injustifiée pour un terrain de jeu. La macro verus! {} et vstd sont le
+        modèle standard de structuration d'un projet Verus (lesson 016e47c4). La séparation
+        physique des dépôts répond à une contrainte forte du task-request et évite que du code
+        ne pollue l'arbre company-os ou ne déclenche des hooks de zone protégée.
+    - decision: >
+        Invocation de Verus : `make verify` DOIT appeler le vérifieur Verus et échouer en cas
+        de preuve non satisfaite. Le moyen concret (binaire standalone `verus <fichier>` vs
+        sous-commande cargo de type cargo-verus) est laissé au choix de l'Implementer selon
+        ce que l'installation rend disponible, à condition que l'interface `make verify`
+        reste stable et que le code COMPILE aussi en build exec sans warning.
+      rationale: >
+        Selon la distribution et la méthode d'installation, Verus s'expose tantôt comme
+        binaire standalone, tantôt via une intégration cargo ; figer l'un ou l'autre dans le
+        design risquerait d'entrer en conflit avec la réalité de l'environnement Arch au
+        moment de l'install. Ce qui est architecturalement invariant, c'est le CONTRAT :
+        une cible verify unique, une vérification statique réelle, un échec propre si une
+        preuve casse. La lesson 016e47c4 montre par ailleurs que build exec (cargo build) et
+        vérification (cargo verus verify) peuvent diverger (piège #5, cfg(verus_only)) : le
+        Makefile doit donc couvrir les deux usages pour satisfaire le critère "compile sans
+        warning" en plus de "verify passe".
+    - decision: >
+        Stratégie d'installation de la toolchain : (1) priorité absolue à paru (AUR) ;
+        (2) fallback cargo install si paru ne fournit pas une toolchain fonctionnelle ;
+        (3) téléchargement direct de binaires GitHub UNIQUEMENT en dernier recours et
+        APRÈS accord explicite de l'utilisateur ; (4) si aucune méthode propre n'aboutit,
+        S'ARRÊTER sur l'installation et signaler, sans contourner. La procédure retenue est
+        documentée dans le README.
+      rationale: >
+        Cette gradation est imposée par les installation_constraints du task-request et reflète
+        une politique de reproductibilité et d'hygiène système : les paquets AUR sont intégrés
+        au gestionnaire de paquets de la machine (mises à jour, désinstallation propres),
+        cargo install reste dans l'écosystème Rust maîtrisé, tandis qu'un binaire téléchargé
+        à la main est opaque et non traçable. L'arrêt propre en cas d'échec total est
+        préférable à un contournement qui produirait un environnement non reproductible et
+        invaliderait le critère "toolchain effectivement installée et fonctionnelle". Verus
+        embarquant un solveur Z3, l'install doit vérifier la présence des deux ; le README
+        doit rendre la procédure rejouable de zéro.
+
+  open_questions:
+    - >
+      Borne numérique exacte du domaine de n : le design impose un type d'accumulateur u64 et
+      une borne explicite par pré-condition, mais la valeur précise (plus grand n tel que
+      n*(n+1)/2 < 2^64) est à fixer par l'Implementer et à documenter dans le contrat.
+    - >
+      Disponibilité réelle d'un paquet Verus sur l'AUR au moment de l'installation : si paru
+      n'expose pas de paquet maintenu, le fallback cargo install devient le chemin nominal.
+      À constater empiriquement lors de l'implémentation ; en cas d'échec des deux, appliquer
+      la règle d'arrêt et signaler.
+    - >
+      Forme concrète de l'invocation Verus (standalone vs cargo) : dépend de la méthode
+      d'installation qui aura abouti. Décision déléguée à l'implementation-plan, sous la
+      contrainte de contrat « make verify lance la vérification ».
+    - >
+      Nécessité d'un lemme de parité explicite vs résolution directe par un lemme vstd
+      d'arithmétique non-linéaire : à trancher empiriquement selon le comportement de Z3 ;
+      la stratégie (isoler la non-linéarité) est fixée, l'outil précis ne l'est pas.

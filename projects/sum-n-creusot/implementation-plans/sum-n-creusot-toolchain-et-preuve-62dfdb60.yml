@@ -1,0 +1,265 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 62dfdb60-1651-4de3-b327-7c83aa88cc07
+  title: "sum-n-creusot — Plan d'implémentation : toolchain Creusot + scaffolding + preuve sum_n = n(n+1)/2"
+  author: implementer
+  created_at: "2026-06-05"
+  project: sum-n-creusot
+  description: >
+    Plan d'exécution concret du design-doc 85f38442 : COMMENT et DANS QUEL ORDRE construire
+    le terrain de jeu Creusot. Couvre l'installation effective de la toolchain (creusot 0.11.0
+    via le script officiel ./INSTALL = opam local switch pour why3/why3find + solveurs SMT),
+    le scaffolding Cargo dans /home/bibux/Compagny/sum-n-creusot/ (HORS company-os), le code
+    sum_n + contrat Pearlite (requires/ensures dans Int, invariant, variant), le Makefile verify,
+    le README, et les 3 points de fragilité. IMPORTANT : ce plan acte une divergence de
+    stratégie d'installation par rapport au design-doc (le design supposait `cargo install creusot`
+    + `why3-bin` AUR + `why3 config detect` global ; la réalité Creusot 0.11.0 est un opam local
+    switch versionné + solveurs gérés par creusot-setup). La divergence est documentée comme
+    décision d'implémentation déléguée et signalée pour validation. Sondage environnement réalisé
+    (cargo 1.94, opam 2.5.1, curl, rustup présents ; z3 4.16 dans extra ; why3-bin 1.8 et cvc5
+    sur AUR ; creusot ABSENT d'AUR et de crates.io comme binaire ; alt-ergo absent d'AUR).
+  tags:
+    - rust
+    - creusot
+    - why3
+    - smt
+    - formal-verification
+    - implementation-plan
+    - scaffolding
+    - sum-n
+    - toolchain
+    - opam
+  changelog:
+    - date: "2026-06-06"
+      author: implementer
+      description: >
+        TERMINÉ. Plan exécuté intégralement et avec succès. Toolchain installée
+        (creusot 0.11.0, why3 1.8.2+git, why3find 1.3.0+dev, alt-ergo 2.6.2, cvc4 1.8,
+        cvc5 1.3.1 ; z3 4.16 système rejeté par why3, sans impact). Scaffolding via
+        `cargo creusot new`, code sum_n + contrat (requires/ensures dans Int via @,
+        invariant acc@==i@*(i@+1)/2 + i@<=n@, variant n@-i@), BORNE=4_000_000_000.
+        `make verify` => Proved ✔ (exit 0), preuve déchargée par alt-ergo SANS lemme
+        manuel ni assume/admit. `cargo build` sans warning. Makefile + README livrés.
+        Divergence d'install vs design-doc signalée et documentée (diagnostic-report
+        e10d745f, résolu par décision utilisateur). Lesson 8628f4b4 capitalisée.
+        Projet vit dans /home/bibux/Compagny/sum-n-creusot/ (HORS company-os).
+  related:
+    - id: 85f38442-8560-4201-bd3b-72c7d8c7c659
+      kind: design-doc
+      relationship: derived-from
+    - id: fa6d4d91-8fd8-4bdc-86fa-dc79d619f288
+      kind: task-request
+      relationship: input
+    - id: b2c68c30-29ab-4150-90b3-df02b6c616aa
+      kind: lesson-learned
+      relationship: input
+    - id: 00f2f2cc-472b-483a-a8e8-77d1a28e07c3
+      kind: lesson-learned
+      relationship: related
+    - id: e10d745f-35ab-4817-9bbf-9ccf62489904
+      kind: diagnostic-report
+      relationship: related
+    - id: 8628f4b4-005f-4c13-bb16-0ad36d88da9c
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  steps:
+    - description: >
+        ÉTAPE 0 — PRÉ-INSTALLATION : déterminer le couple de versions et trancher la voie
+        d'installation (point de fragilité n°1). Décision tranchée par ce plan : retenir la
+        release STABLE Creusot v0.11.0 (dernière release, avril 2026) plutôt que la branche
+        master dev. Rationale : une version X.Y.Z stable permet de dépendre de creusot-contracts
+        depuis crates.io sans le patch `[patch.crates-io] creusot-std = { path = ... }` exigé par
+        les versions `-dev` (cf. guide Creusot, section "Creusot versions"). cargo-creusot et
+        creusot-rustc sont installés depuis le dépôt git cloné à ce tag, PAS depuis crates.io
+        (creusot CLI n'existe ni sur AUR ni sur crates.io — constat de sondage). why3 et why3find
+        sont fournis par un opam local switch dont les versions sont ÉPINGLÉES par le fichier
+        creusot-deps.opam du dépôt au tag v0.11.0 : c'est ce mécanisme qui garantit l'alignement
+        creusot ↔ why3 par construction, ce qui DISSOUT le point de fragilité n°1 (pas d'alignement
+        manuel à faire, contrairement à l'hypothèse `why3-bin` AUR du design-doc).
+      files:
+        - "(aucun fichier projet — étape de décision et de préparation)"
+    - description: >
+        ÉTAPE 1 — INSTALLATION TOOLCHAIN (creusot + why3 + solveurs). Pré-requis présents (sondés) :
+        cargo 1.94.0, rustup 1.29.0, opam 2.5.1, curl 8.20.0. Procédure :
+        (a) `git clone https://github.com/creusot-rs/creusot` dans un emplacement de travail HORS
+            company-os ET HORS du projet (ex: /home/bibux/Compagny/creusot-src ou /tmp), puis
+            `git checkout v0.11.0`.
+        (b) Installer Z3 via paru/pacman (z3 4.16.0 est dans le dépôt EXTRA officiel — voie la plus
+            propre, conforme "paru en priorité") : `paru -S z3` (ou `sudo pacman -S z3`).
+        (c) Lancer l'installation Creusot en mode --external pour Z3 afin que creusot-setup crée un
+            SYMLINK vers le z3 système au lieu de TÉLÉCHARGER un binaire (respecte la contrainte
+            "pas de download de binaires sans accord") : `./INSTALL --external z3`. NB : le script
+            délègue à `cargo run --bin creusot-install`. Pour CVC5/CVC4/Alt-Ergo, deux options à
+            trancher avec l'utilisateur AVANT l'install (cf. POINT DE FRAGILITÉ download dans risks) :
+            soit `--skip-extra-tools` partiel n'existe pas par solveur, donc soit on installe cvc5
+            via paru (aur/cvc5) puis `--external z3 --external cvc5`, soit on laisse creusot-setup
+            télécharger via curl (binaires hash-vérifiés) APRÈS accord explicite de l'utilisateur,
+            soit on se contente de Z3 seul (suffisant pour une preuve aussi triviale). Décision par
+            défaut de ce plan, à confirmer : Z3 système via paru + Z3 seul d'abord ; ajouter cvc5/
+            alt-ergo seulement si une obligation résiste à Z3.
+        (d) Vérifier : `cargo creusot --help` doit répondre. Le switch opam local est créé sous
+            ~/.local/share/creusot/_opam, les binaires (why3, why3find, z3) sous
+            ~/.local/share/creusot/bin, et les configs why3 sous ~/.config/creusot/ et
+            ~/.local/share/creusot/creusot_why3.conf (générées automatiquement par creusot-setup —
+            DISSOUT le point de fragilité n°2 "why3 config detect oublié", car c'est creusot-setup
+            qui génère la config why3, pas un `why3 config detect` manuel).
+      files:
+        - "(installation système — aucun fichier du projet sum-n-creusot)"
+    - description: >
+        ÉTAPE 2 — SCAFFOLDING CARGO. Créer le répertoire projet /home/bibux/Compagny/sum-n-creusot/
+        (HORS company-os, exigence d'emplacement). Privilégier `cargo creusot new sum-n-creusot`
+        (ou `cargo creusot init` dans un dossier existant) plutôt qu'un `cargo new` nu : la commande
+        Creusot génère le Cargo.toml avec la dépendance creusot-contracts correctement versionnée ET
+        copie le why3find.json nécessaire à `cargo creusot` (sans ce fichier, why3find ne trouve pas
+        sa config et la vérification échoue). Si `cargo creusot new` n'est pas disponible dans la
+        version installée, fallback : `cargo new --lib sum-n-creusot`, puis ajouter à la main
+        `creusot-contracts = "0.11"` (aligné sur la release CLI) en dépendance NORMALE (pas
+        dev-dependency : ses macros doivent être visibles en compilation standard où elles
+        s'effacent en no-op, exigence "compile sans warning"), et copier le why3find.json depuis
+        ~/.local/share/creusot/why3find.json. Layout plat, crate unique de type lib (pas de
+        workspace — périmètre d'une seule fonction, cf. décision design "scaffolding plat").
+      files:
+        - "/home/bibux/Compagny/sum-n-creusot/Cargo.toml"
+        - "/home/bibux/Compagny/sum-n-creusot/why3find.json"
+        - "/home/bibux/Compagny/sum-n-creusot/src/lib.rs"
+    - description: >
+        ÉTAPE 3 — CODE EXEC sum_n SANS CONTRAT D'ABORD. Écrire dans src/lib.rs la fonction
+        `pub fn sum_n(n: u64) -> u64` : boucle itérative `for i in 1..=n { acc += i; }` (ou while),
+        renvoyant l'accumulateur. Type u64 pour n et acc (décision design : non signé borné,
+        domaine indépendant de l'architecture). NE PAS encore mettre le contrat : valider d'abord
+        que `cargo build` passe sans warning (acceptance criterion "compile sans warning"). Cette
+        séparation suit le workflow lesson b2c68c30 point 6 (écrire exec, puis specs, puis preuve).
+      files:
+        - "/home/bibux/Compagny/sum-n-creusot/src/lib.rs"
+    - description: >
+        ÉTAPE 4 — CONTRAT PEARLITE (le coeur, partie la plus difficile, lesson b2c68c30 point 2).
+        Ajouter les attributs creusot-contracts sur sum_n :
+        (a) `#[requires(n@ <= BORNE)]` où BORNE est une constante statique choisie LARGEMENT sous le
+            seuil d'overflow de n*(n+1) en u64 (n*(n+1) déborde vers n ≈ 2^32 ; fixer p.ex.
+            BORNE = 3_000_000_000 reste sous 2^32 ≈ 4.29e9 mais pour une marge confortable et une
+            preuve d'absence d'overflow triviale, retenir une borne ronde nettement inférieure, p.ex.
+            1_000_000 ; valeur exacte = décision d'implémentation déléguée par le design, à figer et
+            justifier dans le code + README). Requires NON VIDE (éviter ex falso, lesson b2c68c30).
+        (b) `#[ensures(result@ == n@ * (n@ + 1) / 2)]` : formule fermée exprimée dans le modèle
+            logique Int via l'opérateur de modèle @ (pas en arithmétique machine u64). C'est la
+            "spec de niveau supérieur au code" (lesson b2c68c30 point 1 anti-pattern "spec qui répète
+            le code") : formule fermée, PAS une égalité avec une somme récursive (acceptance criterion
+            explicite).
+        Syntaxe exacte de @ / Int selon creusot-contracts 0.11 à vérifier sur place (Int, Int::new,
+        ou pearlite `Int`), c'est une délégation explicite du design.
+      files:
+        - "/home/bibux/Compagny/sum-n-creusot/src/lib.rs"
+    - description: >
+        ÉTAPE 5 — INVARIANT DE BOUCLE + VARIANT. Ajouter dans le corps de la boucle :
+        (a) invariant fonctionnel : à l'itération où l'on s'apprête à traiter i, l'accumulateur en Int
+            vaut (i-1)*i/2 (somme de 1..i-1), OU formulé sur l'indice déjà traité : acc@ == k@*(k@+1)/2
+            avec k l'indice courant. La forme précise dépend de l'écriture de la boucle (1..=n vs
+            compteur explicite) ; le CONTENU mathématique est fixé par le design (à l'itération i,
+            acc == i*(i+1)/2).
+        (b) invariant de bornage : l'indice <= n (nécessaire pour relier l'état de sortie au ensures
+            ET pour la preuve d'absence d'overflow, cf. design).
+        (c) variant de terminaison : quantité décroissante n - i (decreases), bornée par 0 (prouve la
+            terminaison, acceptance criterion).
+        Syntaxe `#[invariant(...)]` et variant/`#[variant]`/`proof_assert` selon la version : déléguée.
+      files:
+        - "/home/bibux/Compagny/sum-n-creusot/src/lib.rs"
+    - description: >
+        ÉTAPE 6 — MAKEFILE. Écrire un Makefile à la racine du projet avec au minimum :
+        (a) cible `verify` : invoque la chaîne Creusot complète (`cargo creusot prove` ou
+            `cargo creusot` selon la version 0.11 — résoudre sur place) qui génère le coma et décharge
+            via why3/why3find + solveurs. La cible DOIT propager un code de sortie binaire (0 si tout
+            prouvé, non nul sinon) pour que "make verify passe" soit un signal fiable (acceptance
+            criterion + contrat de cible figé par le design).
+        (b) cible `build` : `cargo build` (vérifie compile standard sans warning).
+        (c) cible `clean` : `cargo clean` + nettoyage des artefacts coma/why3 générés (target/creusot).
+        (d) cible `help` (par défaut) documentant les cibles.
+        Ne PAS figer la sous-commande creusot exacte dans ce plan (volatile selon version) : la
+        résoudre via `cargo creusot --help` à l'étape 1(d) et la consigner dans le Makefile + README.
+      files:
+        - "/home/bibux/Compagny/sum-n-creusot/Makefile"
+    - description: >
+        ÉTAPE 7 — README. Documenter de façon reproductible : (a) installation toolchain (clone
+        creusot v0.11.0, paru -S z3, ./INSTALL --external z3, éventuels cvc5/alt-ergo), (b) le couple
+        de versions retenu (creusot 0.11.0 ↔ why3/why3find via opam switch — consigner les versions
+        EXACTES relevées post-install via `why3 --version` et `cargo creusot --version`, point de
+        fragilité n°1), (c) usage : `make verify`, `make build`, (d) note sur les solveurs réellement
+        détectés (point de fragilité n°3 : consigner la table des provers vus par why3find, et quels
+        solveurs ont effectivement déchargé les obligations). Le README est un livrable de premier
+        ordre (le coeur du projet est l'infra, sa reproductibilité documentée EST la valeur).
+      files:
+        - "/home/bibux/Compagny/sum-n-creusot/README.md"
+    - description: >
+        ÉTAPE 8 — VÉRIFICATION ITÉRATIVE DE LA PREUVE (stratégie incrémentale, design décision
+        non-linéarité). Lancer `make verify`. Attaque SMT d'abord, SANS lemme. Si Z3 décharge tout :
+        terminé. Si une obligation timeout/échoue (probablement le pas inductif i*(i+1)/2 + (i+1) =
+        (i+1)*(i+2)/2 ou la parité du produit de deux consécutifs, non-linéarité — lesson b2c68c30
+        point 4) : (a) ajouter des assertions intermédiaires `proof_assert!`/checkpoints découpant la
+        preuve ; (b) si insuffisant, activer cvc5/alt-ergo en renfort (multi-solveur via why3find) ;
+        (c) en dernier recours, petit lemme de parité ou d'identité algébrique. JAMAIS d'`assume`/
+        `admit` pour maquiller (interdit explicite design + acceptance). RÈGLE D'ARRÊT : si après
+        alignement versions + solveurs aucune obligation ne se décharge ou si creusot/why3 refusent de
+        cohabiter, produire un diagnostic-report et signaler — ne pas contourner.
+      files:
+        - "/home/bibux/Compagny/sum-n-creusot/src/lib.rs"
+    - description: >
+        ÉTAPE 9 — VALIDATION FINALE (la CI du projet = source de vérité du done, règle Implementer).
+        Le projet sum-n-creusot est un projet OWNED sans CI distante configurée ; la CI locale est :
+        (1) `cargo build` sans warning (acceptance criterion), (2) `make verify` qui passe (code 0,
+        toutes obligations déchargées), (3) revue manuelle des 7 acceptance criteria du task-request
+        fa6d4d91. Le done n'est prononcé que lorsque ces trois passent intégralement. Si la preuve ne
+        passe pas, l'implémentation N'EST PAS done : diagnostic-report + escalade, pas de done partiel.
+      files:
+        - "/home/bibux/Compagny/sum-n-creusot/"
+  dependencies:
+    - "Toolchain installée et fonctionnelle (étape 1) AVANT tout scaffolding/code/preuve (étapes 2+)"
+    - "Scaffolding + why3find.json en place (étape 2) AVANT le code (étape 3) — why3find a besoin de sa config"
+    - "Code exec compilable (étape 3) AVANT l'ajout du contrat (étape 4) — valider compile sans warning d'abord"
+    - "Contrat requires/ensures (étape 4) AVANT invariant/variant (étape 5) — le contrat définit la cible de preuve"
+    - "Makefile (étape 6) AVANT la vérification itérative (étape 8) — make verify est le point d'entrée"
+    - "z3 installé via paru (extra) AVANT ./INSTALL --external z3 — sinon le symlink external échoue"
+    - "Accord explicite de l'utilisateur sur la voie solveurs (download curl vs paru vs Z3 seul) AVANT étape 1(c)"
+  risks:
+    - >
+      POINT DE FRAGILITÉ N°1 — COMPATIBILITÉ DE VERSIONS creusot ↔ why3 : c'est LE risque principal
+      de la chaîne Creusot (plus fragile que Verus qui embarque Z3). MITIGATION RETENUE : ne PAS
+      mélanger why3-bin AUR (1.8.0) avec un creusot de version indépendante. Utiliser EXCLUSIVEMENT
+      l'opam local switch créé par ./INSTALL au tag v0.11.0, dont creusot-deps.opam épingle la version
+      why3/why3find compatible. Cela dissout le risque par construction. Le why3-bin d'AUR n'est PAS
+      utilisé. Consigner les versions exactes post-install dans le README.
+    - >
+      POINT DE FRAGILITÉ N°2 — DÉTECTION/CONFIG DES PROVERS : avec Creusot 0.11, ce n'est PAS un
+      `why3 config detect` manuel (hypothèse du design-doc) mais creusot-setup qui génère
+      creusot_why3.conf et ~/.config/creusot/why3.conf automatiquement pendant ./INSTALL. RISQUE
+      RÉSIDUEL : si un solveur est ajouté APRÈS l'install (ex: cvc5 ajouté plus tard), il faut
+      régénérer la config (`cargo creusot why3-conf` ou relancer ./INSTALL --external z3 --external
+      cvc5). MITIGATION : décider du jeu de solveurs AVANT l'install ; sinon régénérer la conf et
+      vérifier la table des provers détectés avant de lancer make verify.
+    - >
+      POINT DE FRAGILITÉ N°3 — VERSIONS DE SOLVEURS / DOWNLOAD vs PARU : tension entre la contrainte
+      task-request (paru prioritaire, pas de download de binaires sans accord) et la réalité Creusot
+      (creusot-setup télécharge par défaut des binaires solveurs hash-vérifiés via curl, à des versions
+      précises connues de ses drivers). MITIGATION : utiliser --external pour les solveurs déjà
+      packagés (z3 dans extra ; cvc5 sur AUR) afin d'éviter le download ET d'aligner sur des versions
+      système. RISQUE : un z3 système trop récent (4.16) peut ne pas matcher exactement la version que
+      les drivers why3 de l'opam switch attendent (why3 a des drivers par version de solveur). Si le
+      z3 external n'est pas reconnu ou échoue, fallback documenté : accepter le download curl du z3
+      à la version attendue APRÈS accord explicite de l'utilisateur, ou se rabattre sur cvc5. Pour une
+      preuve aussi triviale, un seul solveur fonctionnel suffit.
+    - >
+      RISQUE EMPLACEMENT : le code source ne doit JAMAIS résider sous company-os (acceptance criterion).
+      Le clone du dépôt creusot (pour ./INSTALL) ne doit pas non plus polluer company-os ni le projet :
+      le cloner dans un emplacement tiers (ex: /home/bibux/Compagny/creusot-src ou /tmp). Le projet vit
+      strictement dans /home/bibux/Compagny/sum-n-creusot/.
+    - >
+      RISQUE SYNTAXE PEARLITE : la syntaxe exacte des attributs (#[requires]/#[ensures]/#[invariant]/
+      variant), de l'opérateur de modèle (@), et du type Int de creusot-contracts évolue entre versions.
+      Le plan fige le CONTENU mathématique (délégué par le design) mais la syntaxe précise sera résolue
+      sur place via les exemples du dépôt creusot (examples/ et tests/should_succeed) et la doc de
+      creusot-contracts 0.11. Risque de drift si on suppose une syntaxe master/dev sur une install stable.
+    - >
+      RISQUE DÉLAI D'INSTALL : ./INSTALL crée un opam switch local et compile de nombreuses dépendances
+      OCaml de why3 (plusieurs minutes annoncées par la doc). Prévoir un timeout généreux sur la commande
+      d'installation et ne pas l'interrompre.

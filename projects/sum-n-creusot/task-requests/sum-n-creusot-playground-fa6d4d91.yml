@@ -1,0 +1,92 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: fa6d4d91-8fd8-4bdc-86fa-dc79d619f288
+  title: "sum-n-creusot — Terrain de jeu Creusot : sum_n prouvé = n(n+1)/2"
+  author: pm
+  created_at: "2026-06-05"
+  project: sum-n-creusot
+  description: >
+    Projet d'exercice minimal pour s'entraîner à la vérification formelle avec Creusot.
+    L'objectif principal n'est PAS le contenu fonctionnel (un simple sum_n) mais la mise
+    en place de TOUTE l'architecture de compilation/vérification autour : scaffolding Cargo,
+    Makefile avec cible verify, et installation de la toolchain Creusot (creusot + why3 +
+    solveurs SMT). Le code se réduit à une fonction sum_n itérative et à son contrat Creusot
+    prouvé établissant sum_n(n) == n*(n+1)/2.
+  tags:
+    - rust
+    - creusot
+    - why3
+    - formal-verification
+    - playground
+    - scaffolding
+    - sum-n
+  related:
+    - id: b2c68c30-29ab-4150-90b3-df02b6c616aa
+      kind: lesson-learned
+      relationship: input
+
+spec:
+  priority: medium
+  status: backlog
+
+  context: >
+    L'utilisateur veut un terrain de jeu pour s'exercer à la vérification formelle déductive
+    avec Creusot. Creusot traduit le code Rust annoté en obligations de preuve déchargées via
+    why3 et un ensemble de solveurs SMT (Z3, CVC4/CVC5, Alt-Ergo). Le coeur de la demande est
+    l'INFRASTRUCTURE : que toute la tuyauterie de compilation et de vérification soit en place
+    et fonctionne d'un seul make verify. Le contenu prouvé est volontairement trivial (sum_n)
+    pour que l'effort porte sur le scaffolding et la chaîne d'outils.
+
+    Note importante : Creusot a une chaîne d'outils plus lourde que Verus (why3 + solveurs SMT
+    + configuration de session why3). Aucune trace de Creusot n'existe dans la mémoire CompanyOS
+    à ce jour — ce projet défriche le terrain.
+
+    Contrainte d'emplacement : les artifacts CompanyOS vivent dans company-os sous
+    projects/sum-n-creusot/. Le CODE SOURCE du projet vit en dehors de company-os, dans
+    /home/bibux/Compagny/sum-n-creusot/.
+
+    Contrainte d'installation : la toolchain Creusot (creusot, why3, solveurs SMT) doit être
+    installée en priorité via paru (AUR), avec cargo install accepté en complément. Éviter le
+    téléchargement direct de binaires sauf nécessité absolue, et dans ce cas demander
+    confirmation à l'utilisateur avant. Si aucune méthode propre n'aboutit, s'arrêter sur
+    l'install et le signaler plutôt que de contourner.
+
+  what_to_build:
+    - Scaffolding Cargo complet dans /home/bibux/Compagny/sum-n-creusot/ (Cargo.toml, src/)
+    - Une fonction sum_n(n) qui calcule itérativement la somme des entiers de 1 à n
+    - Un contrat Creusot (#[requires] / #[ensures]) prouvant sum_n(n) == n*(n+1)/2 (formule fermée)
+    - Un Makefile à la racine du projet avec une cible verify qui lance la vérification Creusot
+    - Un README documentant l'installation de la toolchain (creusot + why3 + solveurs SMT) et l'usage
+    - Installation effective de la toolchain Creusot sur la machine (paru puis cargo install)
+
+  formal_verification_scope:
+    propriete_a_prouver:
+      - sum_n(n) == n*(n+1)/2 pour tout n dans le domaine supporté
+      - Absence d'overflow arithmétique sur le domaine choisi (type entier à fixer dans le design)
+      - Terminaison de la boucle itérative (variant)
+    note_methode:
+      - Le contrat ensures exprime la formule fermée n*(n+1)/2 (modèle logique des entiers Creusot)
+      - L'invariant de boucle est le coeur de la preuve : à l'itération i, l'accumulateur == i*(i+1)/2
+      - La décharge des obligations passe par why3 + solveurs SMT, à intégrer dans make verify
+
+  acceptance_criteria:
+    - Le code source vit dans /home/bibux/Compagny/sum-n-creusot/, pas dans company-os
+    - make verify lance la vérification Creusot (génération + décharge via why3/SMT) et passe sans erreur
+    - La preuve établit sum_n(n) == n*(n+1)/2 (formule fermée, pas une simple égalité avec la somme récursive)
+    - L'absence d'overflow et la terminaison sont prouvées sur le domaine choisi
+    - Le projet compile (cargo build) sans warning
+    - Le README documente précisément comment installer creusot/why3/solveurs SMT (paru / cargo install) et comment lancer make verify
+    - La toolchain Creusot est effectivement installée et fonctionnelle sur la machine
+
+  out_of_scope:
+    - Toute logique métier au-delà de sum_n
+    - Comparaison de performance entre approches
+    - Toute UI ou CLI interactive
+    - Téléchargement direct de binaires sans accord préalable de l'utilisateur
+
+  installation_constraints:
+    - Priorité absolue à paru (AUR) pour l'installation système (why3, solveurs SMT)
+    - cargo install accepté en complément si paru ne suffit pas (notamment pour creusot lui-même)
+    - Téléchargement direct de binaires : seulement en dernier recours ET après accord explicite de l'utilisateur
+    - En cas d'échec de toutes les méthodes propres, s'arrêter et signaler — ne pas contourner

@@ -1,0 +1,274 @@
+api_version: companyos/v1
+kind: design-doc
+metadata:
+  id: 85f38442-8560-4201-bd3b-72c7d8c7c659
+  title: "sum-n-creusot — Architecture du terrain de jeu Creusot (sum_n prouvé = n(n+1)/2)"
+  author: architect
+  created_at: "2026-06-05"
+  project: sum-n-creusot
+  description: >
+    Design architectural d'un terrain de jeu minimal pour la vérification déductive avec
+    Creusot. Le coeur est l'INFRASTRUCTURE de compilation/vérification (scaffolding Cargo,
+    Makefile verify, toolchain creusot + why3 + solveurs SMT). Le contenu prouvé se réduit
+    à une fonction sum_n(n) itérative dont le contrat établit la formule fermée n*(n+1)/2.
+    Tranche les choix de typage entier (exec borné vs modèle logique Int), la forme du
+    contrat (requires/ensures/invariant/variant), la gestion de la non-linéarité et de la
+    division entière côté SMT, le câblage de make verify, et la stratégie d'installation
+    de la toolchain sur Arch (paru en priorité, cargo install en complément). Ce projet
+    défriche : aucune trace de Creusot n'existe dans la mémoire CompanyOS.
+  tags:
+    - rust
+    - creusot
+    - why3
+    - smt
+    - formal-verification
+    - deductive-verification
+    - playground
+    - scaffolding
+    - sum-n
+    - architecture
+  related:
+    - id: fa6d4d91-8fd8-4bdc-86fa-dc79d619f288
+      kind: task-request
+      relationship: input
+    - id: b2c68c30-29ab-4150-90b3-df02b6c616aa
+      kind: lesson-learned
+      relationship: input
+
+spec:
+  overview: >
+    Ce design-doc définit l'architecture d'un projet d'exercice Rust + Creusot dont la
+    finalité réelle est la MISE EN PLACE D'UNE CHAÎNE DE VÉRIFICATION FORMELLE FONCTIONNELLE,
+    pas la richesse fonctionnelle. La preuve cible est volontairement triviale (somme des
+    entiers de 1 à n) afin que l'effort porte sur la tuyauterie : scaffolding Cargo,
+    dépendance creusot-contracts, cible make verify déchargeant les obligations via why3 et
+    des solveurs SMT, et installation effective de la toolchain sur une machine Arch.
+
+    Creusot fonctionne par traduction : il prend du Rust annoté de contrats (macros et
+    attributs de creusot-contracts) et produit une représentation intermédiaire (MLCFG /
+    coma) consommée par why3, qui génère à son tour des obligations de preuve déchargées
+    par des solveurs SMT (Z3, CVC4/CVC5, Alt-Ergo). Le modèle de raisonnement est analogue à
+    Verus (vérification déductive : pré-conditions, post-conditions, invariant de boucle,
+    variant de terminaison ; cf. lesson b2c68c30), mais la chaîne d'outils est plus lourde et
+    plus fragile : why3 est un composant séparé qui doit être installé, versionné et configuré
+    (détection des provers via une session why3), là où Verus embarque Z3.
+
+    Le périmètre architectural couvert ici : (1) le modèle de typage entier et son lien avec
+    le modèle logique d'entiers mathématiques de Creusot ; (2) la forme du contrat de sum_n
+    (requires / ensures / invariant / variant) ; (3) la stratégie de décharge de la
+    non-linéarité et de la division entière côté SMT ; (4) la structure du scaffolding et le
+    câblage de make verify ; (5) la stratégie d'installation et de configuration de la
+    toolchain. Ce document reste au niveau QUOI/POURQUOI : il ne fige ni les noms de fichiers
+    de code, ni les commandes exactes, ni l'ordre d'exécution (délégués à l'implementation-plan).
+
+  components:
+    - name: "Crate Rust vérifiable (le contenu prouvé)"
+      description: >
+        Un unique crate binaire ou bibliothèque Cargo hébergeant la fonction sum_n et son
+        contrat. Le code exec est du Rust standard : une boucle itérative accumulant la somme
+        des entiers de 1 à n. Le contrat (requires / ensures / invariant / variant) est porté
+        par les attributs de creusot-contracts. Aucune logique supplémentaire : c'est un
+        squelette de preuve, pas une bibliothèque. Le crate dépend de creusot-contracts (la
+        crate qui expose les macros de spécification) en dépendance normale, car ces macros se
+        compilent en no-op hors du mode vérification (le code reste compilable par cargo build
+        standard, exigence des acceptance criteria : compile sans warning ET se vérifie).
+        La preuve est tightly coupled au code : l'invariant de boucle vit dans le corps de la
+        fonction, à côté de la boucle qu'il décrit.
+
+    - name: "Couche de contrat / spécification logique"
+      description: >
+        La frontière entre le monde exec (types Rust bornés) et le monde logique (entiers
+        mathématiques Int de Creusot). Le ensures exprime la propriété cible dans le modèle
+        logique : result vu comme un entier mathématique égale n*(n+1)/2 calculé dans Int.
+        Cette couche est purement déclarative : elle n'existe qu'à la vérification et n'a aucun
+        coût runtime. C'est ici que se concentre la difficulté de preuve (non-linéarité,
+        division entière, lien exec/logique), pas dans le code exec.
+
+    - name: "Scaffolding Cargo"
+      description: >
+        Layout Cargo minimal et plat : un Cargo.toml déclarant le crate et la dépendance
+        creusot-contracts, et un répertoire src/ contenant le code. Pas de workspace
+        multi-crate (le périmètre ne le justifie pas — un seul crate suffit). Le scaffolding
+        doit garantir deux modes coexistants : compilation Rust standard (cargo build) ET
+        vérification Creusot (via l'outil creusot / cargo creusot), sans duplication de code.
+
+    - name: "Pipeline make verify"
+      description: >
+        Le Makefile à la racine du projet expose au minimum une cible verify qui déclenche la
+        chaîne complète : invocation de l'outil Creusot sur le crate (génération de la
+        représentation intermédiaire MLCFG/coma), puis décharge des obligations de preuve via
+        why3 et les solveurs SMT configurés. La cible doit retourner un code de sortie non nul
+        si une obligation échoue (pour que make verify « passe » soit un signal binaire fiable,
+        exigence des acceptance criteria). Des cibles auxiliaires (build, clean, et idéalement
+        une cible d'aide à la configuration why3) sont attendues mais leur forme exacte est
+        laissée à l'Implementer. Le pipeline encapsule la commande Creusot réelle (cargo creusot
+        ou équivalent) sans la figer ici : elle dépend de la version installée.
+
+    - name: "Toolchain de vérification (creusot + why3 + solveurs SMT)"
+      description: >
+        Composant externe au code mais critique pour le projet : l'ensemble creusot (le
+        traducteur Rust→MLCFG/coma), why3 (la plateforme d'obligations de preuve), et au moins
+        un solveur SMT (Z3 prioritaire, Alt-Ergo et CVC4/CVC5 en complément pour couvrir les
+        obligations que Z3 ne décharge pas seul). La toolchain doit être installée ET
+        configurée : why3 maintient une session de détection des provers (why3 config detect)
+        qui associe les binaires SMT présents à des drivers why3. Sans cette configuration,
+        why3 ne « voit » aucun prover et toute obligation échoue, même si les solveurs sont
+        installés. Ce composant est le principal facteur de risque du projet.
+
+    - name: "README de toolchain et d'usage"
+      description: >
+        Documentation reproductible de l'installation (paru pour why3 et solveurs SMT, cargo
+        install pour creusot si nécessaire), de la configuration why3 (détection des provers),
+        et de l'usage (make verify). Le README est un livrable de premier ordre ici : le coeur
+        du projet étant l'infrastructure, sa reproductibilité documentée fait partie de la
+        valeur. Il doit aussi consigner les versions retenues (creusot ↔ why3 compatibles),
+        point de fragilité connu de la chaîne Creusot.
+
+  decisions:
+    - decision: >
+        Type entier exec : utiliser un type non signé borné (u64) pour n et pour l'accumulateur,
+        avec un domaine de n contraint par #[requires] pour exclure tout overflow.
+      rationale: >
+        La somme vaut n*(n+1)/2. L'accumulateur et le produit intermédiaire n*(n+1) doivent
+        tenir dans le type exec sans déborder. Avec u64, n*(n+1) déborde au-delà d'environ
+        n ≈ 2^32. Plutôt que de viser le domaine maximal exact, on borne n par une pré-condition
+        explicite (#[requires(n <= BORNE)]) où BORNE est choisie largement sous le seuil
+        d'overflow du produit n*(n+1) en u64 (par exemple un seuil rond et confortable bien
+        inférieur à 2^32). Ce choix : (a) rend l'absence d'overflow prouvable trivialement par
+        le SMT puisque la borne est connue statiquement ; (b) garde la fonction réellement
+        appelable (la pré-condition n'est pas vide, ex falso quodlibet évité — piège signalé
+        par la lesson b2c68c30) ; (c) évite d'avoir à raisonner sur les cas limites du type.
+        u64 plutôt que usize pour un domaine indépendant de l'architecture (déterminisme de la
+        preuve). u64 plutôt que i64 car n est une quantité naturelle (somme 1..n) : le non-signé
+        élimine d'emblée le cas négatif et simplifie le contrat. La BORNE numérique précise est
+        une décision d'implémentation (l'Implementer fixe la valeur) ; le design fige le principe :
+        borne statique, non vide, sous le seuil d'overflow du produit.
+
+    - decision: >
+        Lien exec ↔ logique : le contrat ensures s'exprime sur le modèle d'entiers mathématiques
+        (Int) de Creusot, et le pont entre le résultat exec (u64) et la valeur logique se fait
+        via la conversion model/@ de Creusot, pas par une égalité directe sur le type exec.
+      rationale: >
+        Creusot raisonne en arithmétique exacte non bornée (Int) côté spécification, tandis que
+        le code manipule des u64 dont l'arithmétique est modulaire (wrapping) au niveau machine.
+        Exprimer ensures directement comme result == n*(n+1)/2 en u64 mélangerait deux
+        sémantiques et exposerait au piège du wrapping. La forme correcte projette result et n
+        dans Int (opérateur de modèle de Creusot, conventionnellement @ ou .model()), puis énonce
+        l'égalité dans Int : result@ == n@ * (n@ + 1) / 2. C'est ce que la lesson b2c68c30 appelle
+        une spec « de niveau d'abstraction supérieur au code » : la formule fermée vit dans le
+        domaine mathématique, pas dans le domaine machine. La syntaxe exacte de l'opérateur de
+        modèle dépend de la version de creusot-contracts et est laissée à l'Implementer ; le
+        design fige le principe : ensures dans Int, pas en arithmétique machine.
+
+    - decision: >
+        Forme du contrat : #[requires(n <= BORNE)] (domaine non débordant), #[ensures(result@ ==
+        n@ * (n@ + 1) / 2)] (formule fermée dans Int). Invariant de boucle clé : à l'itération
+        d'indice i, l'accumulateur (en Int) vaut i*(i+1)/2 ; plus un invariant de bornage
+        i <= n. Variant de terminaison : la quantité décroissante n - i (ou indice complémentaire).
+      rationale: >
+        C'est le coeur de la preuve, et c'est la partie la plus difficile à écrire (lesson
+        b2c68c30, point 2). Le ensures exprime la formule fermée et non une simple égalité avec
+        une somme récursive — exigence explicite des acceptance criteria (« formule fermée, pas
+        une simple égalité avec la somme récursive »). L'invariant de boucle doit être : (a) vrai
+        avant la boucle (i = 0, acc = 0, et 0*(0+1)/2 = 0) ; (b) préservé par chaque itération
+        (passer de i à i+1 ajoute i+1 à l'accumulateur, et i*(i+1)/2 + (i+1) = (i+1)*(i+2)/2) ;
+        (c) combiné à la condition de sortie (i == n), il implique le ensures. L'invariant de
+        bornage i <= n est nécessaire pour que le SMT puisse relier l'état de sortie au ensures
+        et pour la preuve d'absence d'overflow. Le variant n - i décroît strictement et est borné
+        inférieurement par 0, prouvant la terminaison. La syntaxe précise des attributs
+        (#[invariant(...)], decreases ou variant selon la version) est déléguée ; le design fige
+        le CONTENU mathématique de l'invariant et du variant.
+
+    - decision: >
+        Stratégie de preuve pour la non-linéarité (n*(n+1)) et la division entière par 2 :
+        s'appuyer d'abord sur le SMT seul, et n'introduire des lemmes / assertions intermédiaires
+        que si une obligation échoue ou timeout. La division par 2 est traitée en restant dans le
+        domaine où n*(n+1) est pair (produit de deux entiers consécutifs), ce qui rend la division
+        exacte.
+      rationale: >
+        La lesson b2c68c30 (point 4, « non-linéarité ») avertit que les solveurs SMT peinent sur
+        la multiplication de deux variables. Ici la non-linéarité est concentrée dans n*(n+1) et
+        dans le pas inductif i*(i+1)/2 + (i+1) = (i+1)*(i+2)/2. Deux propriétés rendent la chose
+        tractable : (1) le produit de deux entiers consécutifs est toujours pair, donc la division
+        entière par 2 dans Int est exacte (pas de perte de reste) — c'est l'argument clé qui
+        légitime d'écrire la formule avec une division entière et non rationnelle ; (2) le pas
+        inductif est une identité polynomiale de degré 2 que les SMT modernes (Z3, CVC5) déchargent
+        souvent directement sur Int, surtout guidée par un invariant fort. STRATÉGIE INCRÉMENTALE :
+        commencer sans lemme ; si Z3 timeout sur le pas inductif ou sur la parité, ajouter des
+        assertions intermédiaires (« checkpoints » découpant la preuve, lesson b2c68c30 point 4)
+        ou un petit lemme de parité / d'identité algébrique. Le multi-solveur (Alt-Ergo et CVC5 en
+        renfort de Z3 via why3) augmente les chances de décharge automatique sans lemme manuel.
+        Le design ne fige pas le détail des lemmes (cela relève de l'itération de preuve) mais fixe
+        l'ordre d'attaque : SMT d'abord, lemmes en réaction à un échec constaté.
+
+    - decision: >
+        Scaffolding : un crate Cargo unique et plat (pas de workspace), creusot-contracts en
+        dépendance Cargo normale, deux modes de compilation coexistants (cargo build standard et
+        vérification Creusot) sans duplication de code.
+      rationale: >
+        Le périmètre (une fonction) ne justifie aucune segmentation en plusieurs crates : un
+        workspace multi-crate ajouterait de la complexité sans bénéfice. creusot-contracts en
+        dépendance normale (et non dev-dependency) car ses macros doivent être visibles à la
+        compilation standard où elles s'effacent (no-op), ce qui satisfait l'exigence « compile
+        sans warning » tout en gardant les contrats dans le source. Un seul source de vérité pour
+        le code, annoté de contrats, vérifié et compilé depuis le même fichier : c'est le modèle
+        Creusot/Verus standard (le code proof/spec est erasé hors vérification, cf. lesson b2c68c30
+        point 6).
+
+    - decision: >
+        Câblage de make verify : la cible encapsule l'invocation de l'outil Creusot (cargo creusot
+        ou équivalent) qui génère la représentation intermédiaire puis pilote why3 pour la décharge
+        SMT, et propage un code de sortie binaire (0 si tout est prouvé, non nul sinon). La commande
+        exacte n'est pas figée ; elle est résolue par l'Implementer selon la version installée.
+      rationale: >
+        Les acceptance criteria exigent qu'« un seul make verify » lance toute la chaîne et
+        « passe sans erreur ». L'interface (la cible verify, son contrat de code de sortie) est une
+        décision d'architecture stable ; l'implémentation (nom exact du sous-outil Creusot, flags,
+        chemin de session why3) est volatile car dépendante de la version de Creusot installée — la
+        figer dans le design la rendrait obsolète. Le design fige donc le CONTRAT de la cible
+        (entrée : le crate ; sortie : verdict binaire ; effet : génération + décharge), pas son
+        corps. C'est aussi pourquoi le README doit consigner la version retenue.
+
+    - decision: >
+        Stratégie d'installation de la toolchain sur Arch : why3 et solveurs SMT (Z3, Alt-Ergo,
+        CVC4/CVC5) via paru (AUR) en priorité ; creusot via cargo install si paru ne le fournit pas
+        ou pas dans une version compatible ; configuration obligatoire de why3 via why3 config detect
+        après installation des solveurs. Téléchargement direct de binaires interdit sans accord
+        explicite de l'utilisateur. En cas d'échec de toutes les voies propres : s'arrêter et signaler,
+        ne pas contourner.
+      rationale: >
+        Contrainte directe du task-request. paru en priorité car il fournit des paquets intégrés à
+        la gestion système (why3, Z3, Alt-Ergo, CVC sont packagés sur Arch/AUR). creusot lui-même est
+        rarement packagé et suit le rythme de l'écosystème Rust : cargo install est la voie attendue.
+        POINT DE FRAGILITÉ N°1 — COMPATIBILITÉ DE VERSIONS : Creusot est lié à une version PRÉCISE de
+        why3 (Creusot est plus fragile que Verus sur ce point, le task-request le souligne). Installer
+        la dernière why3 d'AUR et le dernier creusot de cargo peut produire une incompatibilité de
+        version why3. Mitigation : déterminer la version de why3 attendue par le creusot retenu AVANT
+        d'installer, et aligner explicitement (épingler la version why3 si nécessaire). POINT DE
+        FRAGILITÉ N°2 — DÉTECTION DES PROVERS : installer les solveurs SMT ne suffit pas ; why3 ne les
+        utilise qu'après why3 config detect, qui scanne les binaires et écrit une configuration de
+        session. Omettre cette étape fait échouer toutes les obligations malgré des solveurs présents.
+        POINT DE FRAGILITÉ N°3 — VERSIONS DE SOLVEURS : why3 a des drivers par version de solveur ; une
+        version de Z3 trop récente ou trop ancienne peut ne pas être reconnue par les drivers de la why3
+        installée. Mitigation : privilégier les versions packagées (cohérentes entre elles) et vérifier
+        la table des provers détectés. RÈGLE D'ARRÊT : si après alignement des versions et why3 config
+        detect aucune obligation ne se décharge, ou si creusot/why3 refusent de cohabiter, l'Implementer
+        s'arrête, produit un diagnostic-report, et signale — il ne télécharge pas de binaires hors AUR/cargo
+        sans accord, et ne maquille pas un échec (pas d'assume / pas de admit pour faire passer make verify).
+
+  open_questions:
+    - >
+      Version exacte de Creusot à retenir et version de why3 correspondante : à déterminer par
+      l'Implementer au moment de l'installation (la compatibilité creusot ↔ why3 est le risque
+      principal). Le design recommande de figer ce couple dans le README une fois validé.
+    - >
+      Commande de vérification réelle (cargo creusot vs binaire creusot dédié vs cargo creusot prove) :
+      dépend de la version installée ; à trancher par l'Implementer et à documenter dans le Makefile et
+      le README.
+    - >
+      Valeur numérique exacte de la BORNE sur n dans le #[requires] : décision d'implémentation, à fixer
+      largement sous le seuil d'overflow de n*(n+1) en u64. Le design fige le principe (borne statique,
+      non vide, non débordante), pas le chiffre.
+    - >
+      Disponibilité réelle de CVC4/CVC5 et Alt-Ergo sur AUR au moment de l'install : si certains solveurs
+      manquent, Z3 seul peut suffire pour une preuve aussi simple ; à valider empiriquement et à consigner.

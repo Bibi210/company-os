@@ -1,0 +1,152 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 1f8423e6-6ba8-4aec-906a-74dac710576b
+  title: "sum-n-verus — Implementation Plan : scaffolding, install toolchain, code+preuve sum_n"
+  author: implementer
+  created_at: "2026-06-05"
+  project: sum-n-verus
+  changelog:
+    - date: "2026-06-06"
+      author: implementer
+      description: >
+        TERMINÉ (DONE). Plan exécuté de bout en bout. Toolchain Rust 1.95.0 installée via
+        rustup (verus-bin + Z3 4.12.5 déjà présents via AUR). Projet créé dans
+        /home/bibux/Compagny/sum-n-verus/ (Cargo.toml, src/main.rs, Makefile, README.md,
+        .gitignore). `make verify` passe : 17 verified, 0 errors, avec --no-cheating (aucun
+        assume/admit). `cargo build` compile sans warning. Borne overflow N_MAX=6_074_000_999
+        vérifiée formellement par lemma_bound_fits (by compute). Lesson 475911ee créée
+        (pièges nonlinear_arith parité + overflow accumulateur). Le schema implementation-plan
+        n'ayant pas de champ status, l'état DONE est consigné ici.
+    - date: "2026-06-05"
+      author: implementer
+      description: >
+        Review round 23694be2 (Architect, request_changes) : ÉTAPE 4-d corrigée. Retrait de
+        la valeur de borne chiffrée présentée à tort comme « vérifiée » alors qu'elle débordait
+        u64 (référence trompeuse pour l'axe absence d'overflow). Remplacée par la MÉTHODE de
+        calcul n_max = floor((-1+sqrt(1+8*(2^64-1)))/2), avec mention d'une borne ronde sûre
+        en-dessous comme alternative acceptable, et l'exigence de ne poser aucun chiffre comme
+        vérifié sans l'avoir réellement été.
+  description: >
+    Plan d'exécution concret du terrain de jeu Verus sum-n-verus. Détaille la séquence
+    ordonnée : préparation toolchain (Rust 1.95.0 manquant, à installer via rustup ;
+    verus-bin et z3 4.12.5 déjà présents via paru/AUR), scaffolding Cargo hors company-os
+    dans /home/bibux/Compagny/sum-n-verus/, écriture du code exec sum_n + spec récursive +
+    formule fermée + invariant/variant + lemme de parité, Makefile (cibles verify/build/help),
+    README de reproductibilité, et boucle de vérification make verify jusqu'au vert.
+  tags:
+    - rust
+    - verus
+    - formal-verification
+    - implementation
+    - sum-n
+    - scaffolding
+    - toolchain
+    - arch-linux
+  related:
+    - id: 52c413d8-1584-4147-86b2-b1921bdd3e9a
+      kind: design-doc
+      relationship: derived-from
+    - id: f9ea6094-8646-483a-a28f-e6ce838baada
+      kind: task-request
+      relationship: input
+    - id: 016e47c4-ec14-4194-bd60-15f115248cd8
+      kind: lesson-learned
+      relationship: input
+    - id: b2c68c30-29ab-4150-90b3-df02b6c616aa
+      kind: lesson-learned
+      relationship: input
+    - id: 475911ee-4ed8-44ba-a572-6e2eea4fd278
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  dependencies:
+    - "Toolchain Verus : verus-bin 0.2026.05.31 déjà installé via paru (AUR), binaire /usr/bin/verus -> /opt/verus/verus"
+    - "Z3 4.12.5 bundlé dans /opt/verus/z3 — aucune install système z3 séparée requise"
+    - "Rust toolchain 1.95.0-x86_64-unknown-linux-gnu MANQUANT — requis par verus-bin, à installer via rustup toolchain install (in-ecosystem, sans binaire GitHub)"
+    - "cargo-verus présent dans /opt/verus/cargo-verus pour l'intégration cargo (option d'invocation)"
+    - "vstd préchargé : /opt/verus/libvstd.rlib + /opt/verus/vstd.vir (pas de dépendance Cargo réseau requise pour vstd avec verus standalone)"
+  steps:
+    - description: >
+        ÉTAPE 0 — Sonder l'environnement (FAIT, lecture seule). Constat : verus disponible
+        (/usr/bin/verus via verus-bin AUR), z3 4.12.5 bundlé dans /opt/verus, paru disponible,
+        cargo 1.94.0 actif, nightly et plusieurs toolchains présentes MAIS la toolchain
+        1.95.0-x86_64-unknown-linux-gnu exigée par verus est absente. Conclusion : pas besoin
+        de paru -S supplémentaire ni de cargo install pour verus lui-même ; seul le toolchain
+        Rust 1.95.0 doit être ajouté.
+    - description: >
+        ÉTAPE 1 — Installer la toolchain Rust manquante. Exécuter
+        `rustup toolchain install 1.95.0-x86_64-unknown-linux-gnu`. Reste dans l'écosystème
+        Rust maîtrisé (pas de binaire GitHub opaque). Vérifier ensuite que `verus --version`
+        répond sans erreur de toolchain. Si l'install échoue (réseau, indisponibilité de la
+        version), S'ARRÊTER et signaler au PM/utilisateur sans contourner (règle d'arrêt propre
+        du design-doc, décision install gradée).
+    - description: >
+        ÉTAPE 2 — Créer le scaffolding Cargo HORS company-os. `mkdir -p /home/bibux/Compagny/sum-n-verus/src`.
+        Crate unique (pas de workspace). Aucun fichier de code ne doit jamais être écrit sous
+        company-os (frontière physique invariante du design-doc).
+      files:
+        - /home/bibux/Compagny/sum-n-verus/Cargo.toml
+        - /home/bibux/Compagny/sum-n-verus/src/main.rs
+    - description: >
+        ÉTAPE 3 — Écrire Cargo.toml minimal. Crate binaire (src/main.rs) nommé sum-n-verus,
+        edition 2021, profil par défaut. Pas de dépendance applicative. vstd est fourni par
+        l'installation Verus (rlib préchargé /opt/verus/libvstd.rlib), donc aucune dépendance
+        réseau vstd n'est nécessaire pour l'invocation verus standalone. Le crate doit aussi
+        compiler en build exec normal (cargo build) sans warning : le code Verus erasé via
+        la macro verus! {} reste du Rust valide.
+      files:
+        - /home/bibux/Compagny/sum-n-verus/Cargo.toml
+    - description: >
+        ÉTAPE 4 — Écrire src/main.rs avec le contenu Verus dans `verus! {}`. Structure :
+        (a) `use vstd::prelude::*;` puis `verus! { ... }`.
+        (b) spec fn récursive `spec fn sum_spec(n: nat) -> nat decreases n { if n == 0 { 0 } else { n + sum_spec((n-1) as nat) } }` — vérité de terrain mathématique indépendante du code (anti-pattern "spec qui répète le code", lesson b2c68c30).
+        (c) lemme de parité / formule fermée : `proof fn lemma_gauss(n: nat) ensures sum_spec(n) == n*(n+1)/2 decreases n` prouvé par induction (cas de base + pas inductif avec assertion intermédiaire pour guider Z3 sur la non-linéarité n*(n+1)).
+        (d) constante de borne : N_MAX tel que N_MAX*(N_MAX+1)/2 <= 2^64-1 (accumulateur u64, 2^64-1 = 18446744073709551615). MÉTHODE de calcul de la borne maximale théorique : n_max = floor((-1 + sqrt(1 + 8*(2^64-1))) / 2), c'est-à-dire le plus grand n tel que n*(n+1)/2 <= 2^64-1 (résolution de l'inéquation quadratique n^2+n-2*(2^64-1) <= 0). La valeur exacte sera calculée et VÉRIFIÉE empiriquement au moment de l'implémentation (aucun chiffre n'est posé comme vérifié ici tant qu'il ne l'est pas). Alternative acceptable pour un terrain de jeu : une borne ronde et sûre bien en-dessous du maximum théorique (seuil documenté), tant que sum_n(0)=0 reste dans le domaine et que la pré-condition n'est ni vide ni triviale (requires false interdit, lesson b2c68c30). Choisir une borne explicite, documentée, et non triviale.
+        (e) fonction exec `fn sum_n(n: u64) -> (r: u64) requires n <= N_MAX ensures r == n*(n+1)/2` : boucle itérative avec accumulateur, compteur i, invariant `acc == i*(i+1)/2` (ou sum_spec(i)), variant `decreases n - i`, assertions checkpoints pour la non-linéarité et la parité (n*(n+1) toujours pair -> division entière == division exacte).
+        (f) un `fn main()` exec minimal qui appelle sum_n sur une valeur du domaine (pour que cargo build produise un binaire et un usage concret).
+        Appliquer les pièges de la lesson 016e47c4 : reveal_with_fuel sur sum_spec récursive si timeout, pas reveal seul ; assertions intermédiaires pour découper.
+      files:
+        - /home/bibux/Compagny/sum-n-verus/src/main.rs
+    - description: >
+        ÉTAPE 5 — Écrire le Makefile à la racine. Cibles :
+        `verify` : invoque la vérification statique Verus sur src/main.rs (commande concrète :
+        `verus src/main.rs` en standalone, vstd étant préchargé ; alternative `/opt/verus/cargo-verus verify`
+        si l'intégration cargo est préférée). Doit échouer (exit non nul) si une preuve ne passe pas.
+        `build` : `cargo build` exec, doit compiler sans warning.
+        `run` : exécute le binaire.
+        `help` : liste les cibles.
+        Interface stable : un seul `make verify` suffit au critère d'acceptation. Encapsule la
+        commande Verus concrète derrière la cible (décision design : moyen libre, contrat fixe).
+      files:
+        - /home/bibux/Compagny/sum-n-verus/Makefile
+    - description: >
+        ÉTAPE 6 — Écrire le README. Documenter : (1) prérequis et installation de la toolchain
+        (paru -S verus-bin pour Verus+Z3 ; rustup toolchain install 1.95.0 pour la toolchain Rust
+        exigée ; fallback cargo install si paru indisponible ; règle d'arrêt si rien n'aboutit) ;
+        (2) usage : make verify, make build, make run ; (3) note sur la propriété prouvée
+        (sum_n(n) == n*(n+1)/2, absence d'overflow sur le domaine, terminaison). Reproductibilité
+        de zéro = contrat humain (composant README du design-doc).
+      files:
+        - /home/bibux/Compagny/sum-n-verus/README.md
+    - description: >
+        ÉTAPE 7 — Boucle de vérification (CI interne du projet, source de vérité du critère done).
+        Lancer `make verify` et itérer sur les preuves jusqu'au vert (0 erreur). Stratégie de
+        débogage attendue (lessons) : si Z3 timeout ou échoue sur la non-linéarité, ajouter des
+        assertions checkpoints, isoler la parité dans un lemme, utiliser reveal_with_fuel sur la
+        spec fn récursive, recourir aux lemmes vstd d'arithmétique non-linéaire (nonlinear_arith /
+        lemma_mul_*) si besoin. Puis `make build` pour confirmer compilation exec sans warning.
+        Le projet n'est done que lorsque make verify ET make build passent intégralement.
+    - description: >
+        ÉTAPE 8 — Capitalisation. Après make verify vert, créer une lesson-learned sur les
+        surprises rencontrées (bonnes et mauvaises) lors de cette mise en place Verus standalone
+        (toolchain 1.95.0 manquante, vstd préchargé, invocation verus vs cargo-verus, gestion de
+        la division entière/parité). Chaîner avec les lessons 016e47c4 et b2c68c30 via related.
+  risks:
+    - "Toolchain Rust 1.95.0 indisponible au téléchargement rustup au moment de l'install -> appliquer la règle d'arrêt propre et signaler, ne pas contourner par binaire GitHub."
+    - "Non-linéarité n*(n+1) : Z3 peut échouer/timeout sur le produit de deux variables et la division entière par 2. Mitigation : lemme de parité explicite + assertions checkpoints + lemmes vstd nonlinear_arith (lesson b2c68c30 piège non-linéarité, lesson 016e47c4)."
+    - "spec fn récursive sum_spec opaque par défaut : reveal manquant -> assertions échouent. Mitigation : reveal_with_fuel(sum_spec, ...) plutôt que reveal seul (lesson 016e47c4 piège #4)."
+    - "Divergence build exec vs verify (cfg(verus_only), warnings) : le Makefile couvre les deux usages et le critère 'compile sans warning' est validé séparément (lesson 016e47c4 piège #5)."
+    - "Borne N_MAX mal calculée -> overflow non couvert ou domaine inutilement restreint. Mitigation : calculer et documenter la borne exacte (plus grand n tel que n*(n+1)/2 < 2^64), garder sum_n(0)=0 dans le domaine, éviter requires false (lesson b2c68c30)."
+    - "Invocation Verus standalone vs cargo-verus selon vstd : si verus standalone ne trouve pas vstd, basculer sur /opt/verus/cargo-verus verify. Contrat make verify inchangé."

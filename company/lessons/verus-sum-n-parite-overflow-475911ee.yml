@@ -1,0 +1,106 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 475911ee-4ed8-44ba-a572-6e2eea4fd278
+  title: "Verus : prouver une somme = n(n+1)/2 — parité d'un produit et borne d'overflow d'accumulateur"
+  author: implementer
+  created_at: "2026-06-06"
+  description: >
+    Pièges concrets et solutions rencontrés en prouvant sum_n(n) == n*(n+1)/2 avec Verus
+    (projet sum-n-verus). Trois leçons réutilisables : (1) `assert(... % 2 == 0) by (nonlinear_arith)`
+    TIMEOUT sur la parité d'un produit, à remplacer par une construction explicite du témoin de
+    divisibilité ; (2) l'absence d'overflow d'un accumulateur u64 se prouve en majorant la valeur
+    triangulaire par monotonicité plus une borne concrète `by (compute)` ; (3) invariant de boucle
+    multiplicatif vs divisé, et `println!` interdit dans verus!. Setup toolchain : verus-bin AUR +
+    rustup toolchain exacte.
+  tags:
+    - verus
+    - rust
+    - formal-verification
+    - nonlinear-arith
+    - overflow
+    - parité
+    - loop-invariant
+    - sum-n
+    - pièges
+    - z3
+  related:
+    - id: 016e47c4-ec14-4194-bd60-15f115248cd8
+      kind: lesson-learned
+      relationship: related
+    - id: b2c68c30-29ab-4150-90b3-df02b6c616aa
+      kind: lesson-learned
+      relationship: derived-from
+    - id: 1f8423e6-6ba8-4aec-906a-74dac710576b
+      kind: implementation-plan
+      relationship: related
+
+spec:
+  context: >
+    Implémentation du terrain de jeu Verus sum-n-verus : une fonction exec itérative sum_n(n)
+    calculant 1+2+...+n, prouvée égale à la formule fermée de Gauss n*(n+1)/2, avec absence
+    d'overflow u64 et terminaison. Verus 0.2026.05.31 (verus-bin AUR), Z3 4.12.5 bundlé,
+    toolchain Rust 1.95.0. La preuve finale : 17 verified, 0 errors, sans aucun assume/admit
+    (vérifié via le flag --no-cheating). Le contenu mathématique est trivial mais a révélé trois
+    pièges Verus non couverts par la lesson 016e47c4 (qui traite mutation, enums, clone, cfg).
+
+  insight: >
+    **Piège #1 (le plus coûteux) : `assert((n * (n + 1)) % 2 == 0) by (nonlinear_arith)` TIMEOUT.**
+    Z3 ne raisonne pas sur la distribution du modulo à travers une multiplication de variables.
+    Même en case-splittant sur n%2 et en fournissant `requires n % 2 == 0`, l'assertion timeout
+    (rlimit exceeded) OU échoue. La cause profonde : prouver « le produit est pair » à partir de
+    « un facteur est pair » est déjà du raisonnement non-linéaire sur le modulo, que `nonlinear_arith`
+    ne franchit pas seul.
+    SOLUTION robuste : CONSTRUIRE explicitement le témoin de divisibilité. Si n%2==0, poser h = n/2,
+    prouver n == 2*h (linéaire, `by (nonlinear_arith)` avec requires n%2==0 et h==n/2), puis
+    n*(n+1) == 2*(h*(n+1)) (égalité polynomiale pure), d'où (2*X)%2==0 (trivial). Symétriquement si
+    n+1 est pair. Chaque pas est soit une égalité polynomiale, soit un modulo d'un multiple littéral
+    de 2 — jamais « modulo d'un produit de variables ». C'est exactement la stratégie « isoler la
+    non-linéarité » du design : ne pas demander à Z3 de deviner, lui fournir la factorisation.
+
+    **Piège #2 : overflow `acc = acc + i` malgré un invariant correct.**
+    Avec l'invariant acc == i*(i+1)/2 et i <= n <= N_MAX, Verus n'infère PAS seul que acc+i ne
+    déborde pas u64, car la majoration (i+1)*(i+2) <= N_MAX*(N_MAX+1) est non-linéaire.
+    SOLUTION en deux temps : (a) un lemme de monotonicité `lemma_tri_mono(a,b) requires 0<=a<=b
+    ensures a*(a+1) <= b*(b+1)` prouvé par `by (nonlinear_arith) requires 0<=a<=b` (Z3 gère cette
+    monotonie simple) ; (b) un lemme de borne concrète `lemma_bound_fits ensures N_MAX*(N_MAX+1)/2
+    <= u64::MAX` prouvé par `by (compute)`. Invoqués dans le bloc proof de la boucle AVANT
+    l'incrément, ils donnent à Z3 la chaîne (i+1)*(i+2)/2 <= N_MAX*(N_MAX+1)/2 <= u64::MAX.
+    `by (compute)` est l'outil idéal pour vérifier une borne numérique littérale : il évalue
+    réellement l'arithmétique, ce qui VÉRIFIE la valeur de N_MAX au lieu de la poser sur parole.
+
+    **Piège #3 : `println!` interdit dans verus! { }.**
+    `println!("...", x)` à l'intérieur du bloc verus! provoque `error: Unsupported constant type`.
+    SOLUTION : sortir `fn main()` (et toute I/O) HORS du bloc verus!. La fonction prouvée reste
+    appelable depuis du Rust standard ; son contrat ensures garantit le résultat sans re-vérification.
+
+    **Piège #4 (bon réflexe) : invariant multiplicatif comme alternative.**
+    Quand la division entière complique la preuve, formuler l'invariant sans division (ex.
+    2*acc == i*(i+1)) transforme les pas de boucle en égalités polynomiales pures, faciles pour
+    `nonlinear_arith`. La parité n'intervient alors qu'une fois, à la sortie, pour passer de
+    2*acc == n*(n+1) à acc == n*(n+1)/2. Ici l'invariant divisé a suffi une fois les lemmes #1
+    en place, mais l'invariant multiplicatif est une porte de sortie connue si la division résiste.
+
+    **Setup toolchain (reproductibilité).** verus-bin (AUR, paru) fournit verus + Z3 bundlé dans
+    /opt/verus/z3 (pas de z3 système requis). MAIS verus exige une toolchain Rust EXACTE
+    (lisible dans /opt/verus/version.json et via `verus --version`) ; ici 1.95.0, absente, à
+    installer par `rustup toolchain install 1.95.0-x86_64-unknown-linux-gnu` (in-ecosystem, pas de
+    binaire GitHub). Pour le build exec, le squelette `cargo verus new` donne le bon Cargo.toml
+    (dépendance vstd versionnée + lint unexpected_cfgs autorisant cfg(verus_only)). `verus src/main.rs`
+    en standalone émet un binaire `main` dans le CWD (passe rustc) : le nettoyer dans la cible
+    Makefile pour ne pas polluer la racine.
+
+  recommendation: >
+    Pour toute preuve Verus impliquant arithmétique non-linéaire et bornes d'overflow :
+    1. Ne JAMAIS prouver la parité/divisibilité d'un produit par `by (nonlinear_arith)` direct —
+       construire le témoin : facteur pair == 2*k, puis produit == 2*(reste), puis modulo trivial.
+    2. Pour l'absence d'overflow d'un accumulateur, combiner un lemme de monotonicité
+       (`by (nonlinear_arith)`) et une borne numérique littérale (`by (compute)`). `by (compute)`
+       vérifie la borne au lieu de la supposer.
+    3. Garder toute I/O (println!, etc.) HORS du bloc verus!.
+    4. Si la division entière dans l'invariant résiste, basculer sur un invariant multiplicatif
+       (2*acc == i*(i+1)) et ne traiter la parité qu'au passage final à la division.
+    5. Vérifier la version Rust exacte exigée par verus (version.json) AVANT de coder ;
+       l'installer via rustup, jamais par binaire opaque.
+    6. Lancer la vérification avec `--no-cheating` pour garantir qu'aucune preuve n'est maquillée
+       par assume/admit/external_body — c'est une preuve d'intégrité gratuite.

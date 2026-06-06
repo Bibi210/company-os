@@ -1,0 +1,101 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: e10d745f-35ab-4817-9bbf-9ccf62489904
+  title: "Install Creusot : --external z3 ne couvre QUE z3 — alt-ergo/cvc4/cvc5 téléchargés via curl + z3 4.16 non reconnu par why3"
+  author: implementer
+  created_at: "2026-06-06"
+  project: sum-n-creusot
+  description: >
+    Pendant l'exécution de l'implementation-plan 62dfdb60, l'installation Creusot via
+    ./INSTALL --external z3 a téléchargé trois solveurs (alt-ergo, cvc4, cvc5) via curl,
+    en violation de la contrainte "aucun download de binaire hors paru/opam/cargo". Le flag
+    --external <TOOL> est par-solveur : --external z3 n'a évité QUE le download de z3 (symlinké
+    vers /usr/bin/z3), les trois autres solveurs ont été téléchargés par défaut. Second constat :
+    le z3 système 4.16.0 n'est PAS reconnu par les drivers why3 de cette version (versions connues
+    4.12 à 4.15), donc z3 external est inopérant pour la décharge. Arrêt et signalement conformes
+    à la règle stricte, avant toute poursuite du scaffolding/preuve.
+  tags:
+    - creusot
+    - why3
+    - smt
+    - install
+    - external-prover
+    - curl-download
+    - z3-version
+    - toolchain
+    - blocage
+  related:
+    - id: 62dfdb60-1651-4de3-b327-7c83aa88cc07
+      kind: implementation-plan
+      relationship: input
+    - id: 85f38442-8560-4201-bd3b-72c7d8c7c659
+      kind: design-doc
+      relationship: related
+
+spec:
+  status: resolved
+
+  symptom: >
+    Lors de `cargo run --bin creusot-install -- --external z3` (= ./INSTALL --external z3),
+    après l'installation réussie de why3/why3find (opam local switch) et de cargo-creusot/
+    creusot-rustc, la phase "install_tools" a TÉLÉCHARGÉ VIA CURL trois binaires de solveurs :
+    - Alt-Ergo 2.6.2 (~29.5 Mo)
+    - CVC4 1.8 (~20.9 Mo)
+    - CVC5 1.3.1 (~62.2 Mo)
+    Seul Z3 a échappé au download : "Found Z3 at path: /usr/bin/z3" (symlink créé vers le z3
+    système installé via paru). Les binaires téléchargés résident dans
+    ~/.local/share/creusot/bin/{alt-ergo,cvc4,cvc5}.
+    Second symptôme, à la configuration why3 : le z3 système 4.16.0 est REJETÉ par les drivers
+    why3 ("Prover Z3 version 4.16.0 is not recognized. Known versions for this prover:
+    ^4\.1[2-5]\.[0-9]+$"). why3 a tout de même enregistré 14 provers (alt-ergo, cvc4, cvc5 et
+    leurs alternatives reconnus ; z3 ajouté mais avec version non reconnue, donc inutilisable
+    pour la décharge).
+
+  root_cause: >
+    DEUX causes distinctes.
+    (1) SÉMANTIQUE DE --external : dans creusot-install (creusot-rs/creusot v0.11.0,
+    creusot-install/src/main.rs, fn install_tools), le flag --external <TOOL> est répété PAR
+    SOLVEUR. La boucle parcourt [AltErgo, Z3, CVC4, CVC5] ; pour chaque solveur, si
+    args.external.contains(&tool) → symlink vers le binaire du PATH, SINON → download via curl
+    (download_from_url / download_z3_from_url / download_cvc5_from_url). Donner uniquement
+    "--external z3" couvre donc seulement z3 ; alt-ergo, cvc4 et cvc5 retombent sur le download
+    par défaut. Pour éviter TOUS les downloads il aurait fallu --external alt-ergo --external z3
+    --external cvc4 --external cvc5 ET disposer des quatre binaires dans le PATH (or alt-ergo
+    est absent d'AUR, cvc4 absent du sondage, cvc5 sur AUR uniquement). Mon plan (étape 1c)
+    mentionnait cette option multi-external mais l'invocation exécutée n'a passé que z3, suivant
+    la consigne littérale "--external z3".
+    (2) VERSION Z3 INCOMPATIBLE (point de fragilité n°3 du design-doc, matérialisé) : les drivers
+    why3 de la version épinglée par creusot (why3 git-2c0f2992) ne reconnaissent z3 que jusqu'à
+    4.15.x. Le z3 système d'Arch (extra) est en 4.16.0, donc hors plage. Conséquence : même
+    symlinké, z3 ne sert pas à la décharge. Les trois solveurs téléchargés (alt-ergo 2.6.2,
+    cvc4 1.8, cvc5 1.3.1) sont, eux, aux versions exactes attendues par les drivers — c'est
+    précisément pour cela que creusot-setup télécharge des versions ÉPINGLÉES plutôt que de
+    réutiliser des binaires système de version arbitraire.
+
+  resolution: >
+    RÉSOLU — l'utilisateur a tranché l'option (A) : ACCEPTER A POSTERIORI le download des 3 solveurs
+    (alt-ergo 2.6.2, cvc4 1.8, cvc5 1.3.1) déjà effectué. L'install est dès lors considérée complète
+    et utilisable. La suite du projet (scaffolding, code, preuve) a été menée à bien : make verify
+    passe (Proved ✔, exit 0), preuve déchargée par alt-ergo, sans z3 (4.16 rejeté) et sans lemme
+    manuel. Arrêt initial et signalement conformes à la règle stricte "si le script tente un download
+    de binaire malgré --external, ARRÊTE et signale ; ne contourne pas" : la décision d'accepter
+    appartenait à l'utilisateur, pas à l'agent.
+    Historique des options qui avaient été présentées à l'utilisateur :
+    (A) ACCEPTER A POSTERIORI le download des 3 solveurs (alt-ergo/cvc4/cvc5) déjà effectué :
+        l'install est alors complète et utilisable immédiatement (z3 inutile car v4.16 rejetée,
+        mais cvc5/alt-ergo suffisent largement pour sum_n). Voie la plus rapide vers un make verify
+        fonctionnel. Les binaires sont hash-vérifiés par creusot-setup (sha256 codé en dur).
+    (B) REFUSER le download et n'utiliser QUE des solveurs packagés : réinstaller avec
+        --external pour chaque solveur disponible via paru. Problème : alt-ergo absent d'AUR,
+        cvc4 non packagé, seul cvc5 est sur AUR. Et z3 système (4.16) est rejeté par why3. Cette
+        voie risque de ne laisser AUCUN solveur reconnu → aucune décharge possible. Nécessiterait
+        en plus d'installer cvc5 via paru (sudo) et de vérifier sa version vs drivers why3.
+    (C) Installer les solveurs via OPAM (autorisé par la contrainte) plutôt que par curl :
+        alt-ergo, z3 sont disponibles sur opam. À évaluer : compatibilité des versions opam avec
+        les drivers why3, et effort (recompilation OCaml). Voie "propre" mais plus lourde.
+    RECOMMANDATION IMPLEMENTER : option (A). Le download a déjà eu lieu (irréversible en bande
+    passante) ; les binaires sont aux versions exactes attendues par why3 (gage de robustesse de
+    la preuve) ; et la contrainte du task-request visait surtout à éviter des binaires non vérifiés
+    de provenance douteuse — or creusot-setup vérifie le sha256 de chaque download. Mais la décision
+    appartient à l'utilisateur car c'est sa contrainte.

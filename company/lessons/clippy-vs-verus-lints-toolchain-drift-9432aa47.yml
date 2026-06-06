@@ -1,0 +1,154 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 9432aa47-6962-465e-8f5e-65c9f52e23bb
+  title: "clippy vs Verus : quels lints sont sûrs à fixer dans verus! et lesquels exigent #[allow] — plus le piège du drift de toolchain (new-mut-ref old/final)"
+  author: implementer
+  created_at: "2026-06-06"
+  description: >
+    Nettoyage complet des warnings cargo clippy du projet Puissance 4 (Rust+Verus, PDD)
+    sans casser les 69 preuves. Deux blocs réutilisables. (1) CLASSIFICATION DES LINTS dans
+    verus! : matches!, count += 1, .is_multiple_of(2) et l'indexation board.cells[i] = v
+    (qui remplace le .set() désormais deprecated) sont SÛRS et vérifient sans toucher aux
+    preuves ; .clamp() est NON SUPPORTÉ par Verus (pas de spec vstd, erreur "clamp is not
+    supported") et exige un #[allow(clippy::manual_clamp)] ciblé sur la forme if/else
+    explicite. Le code mort signalé par clippy peut être du ghost code (constantes/imports
+    utilisés seulement en spec/proof, erasés en mode exec où clippy compile) → #[allow(dead_code)]
+    ou déplacement de l'import dans le bloc #[cfg(verus_only)], jamais suppression aveugle.
+    (2) DRIFT DE TOOLCHAIN : Verus a introduit le breaking change new-mut-ref qui impose
+    final(x) (et non plus x) pour l'état post dans une postcondition sur &mut. Un projet écrit
+    pour une version antérieure ne compile plus. Le rétablissement minimal d'un baseline vert
+    passe par l'attribut #[verifier::deprecated_postcondition_mut_ref_style(true)] plutôt que
+    par une réécriture old()/final() de la logique de preuve.
+  tags:
+    - verus
+    - rust
+    - clippy
+    - lints
+    - formal-verification
+    - pdd
+    - puissance4-verus
+    - toolchain-drift
+    - new-mut-ref
+    - allow-attribute
+    - ghost-code
+    - pièges
+  related:
+    - id: 016e47c4-ec14-4194-bd60-15f115248cd8
+      kind: lesson-learned
+      relationship: related
+    - id: 0838b79a-a310-419a-bc9e-0863a92ec40f
+      kind: diagnostic-report
+      relationship: related
+
+spec:
+  context: >
+    Tâche : nettoyer TOUS les warnings cargo clippy du projet Puissance 4
+    (/home/bibux/Compagny/puissance4-verus/, hors company-os) qui polluaient VSCode,
+    SANS casser les preuves Verus (PDD : les preuves remplacent les tests).
+    13 warnings clippy au départ + 1 deprecation Verus (.set()). La majorité du code
+    incriminé vit dans des blocs `verus! { ... }`.
+
+    Blocage rencontré AVANT toute modification : la seule version de Verus installée
+    (0.2026.05.31, via verus-bin AUR) est PLUS RÉCENTE que celle pour laquelle le projet
+    avait été écrit et vérifié (vstd pinné 0.0.0-2026-03-15-0111). La 05.31 active le
+    breaking change "new-mut-ref" : `verus src/main.rs` échouait sur game_core.rs avec
+    "to dereference a mutable reference parameter in a postcondition, disambiguate by
+    wrapping it in either `old` or `final`". Le baseline ne passait donc PAS, indépendamment
+    du clippy. Décision (sur arbitrage utilisateur) : corriger aussi le drift pour rétablir
+    une vérif complète, puis faire le clippy par-dessus.
+
+    Résultat final : cargo clippy --all-targets => 0 warning ; verus src/main.rs =>
+    69 verified, 0 errors, 0 warning ; cargo build => sans warning.
+
+  insight: >
+    **A. Drift de toolchain Verus (new-mut-ref) — rétablir le baseline sans réécrire la preuve**
+    Le breaking change new-mut-ref (cf. source/docs/migration-mut-ref.md) change la sémantique
+    des postconditions sur &mut : dans un `ensures`, un paramètre `x: &mut T` nu réfère
+    désormais à l'état d'ENTRÉE ; pour l'état post il faut `final(x)`. L'ancien code (qui
+    écrivait `board.cells[...]` dans l'ensures pour désigner le post-state) ne compile plus.
+    Verus AVORTE à la première erreur, donc on ne voit qu'une seule postcondition fautive à la
+    fois. La migration "propre" serait de réécrire en old()/final(), mais c'est une modification
+    de LOGIQUE DE PREUVE, hors scope d'un nettoyage clippy et porteuse de risque de cascade.
+    La bonne réponse minimale : l'attribut #[verifier::deprecated_postcondition_mut_ref_style(true)]
+    posé sur la fonction concernée (ou en tête de crate via #![...]) restaure l'ancien style le
+    temps de la migration. Une seule fonction &mut avec postcondition (apply_move) était
+    concernée → attribut ciblé sur elle, baseline repassé à 71 verified, 0 errors.
+
+    **B. Lints clippy SÛRS dans verus! (vérifiés : preuve inchangée)**
+    - `match X { A => true, _ => false }` → `matches!(X, A)` : SUPPORTÉ. Y compris avec
+      des or-patterns et des tuples : `matches!((c,p), (A,A) | (B,B))`. Les 3 occurrences
+      (is_legal, cell_is_player, cell_is_empty) ont vérifié sans broncher. Le warning du
+      task qui le disait "RISQUÉ" s'est révélé infondé sur cette version — mais on l'a testé
+      AVANT de généraliser (1 fonction, re-verify, puis les 2 autres).
+    - `count = count + 1` → `count += 1` : SÛR (assign_op_pattern).
+    - `c % 2 == 0` → `c.is_multiple_of(2)` sur u64 : SUPPORTÉ. vstd fournit une spec qui relie
+      is_multiple_of à `% 2 == 0`, donc l'ensures `count_pieces_spec(board) % 2 == 0` reste
+      satisfaite. À NE PAS présumer : c'est le re-verify qui le confirme, pas le typecheck.
+    - `!(x < 1 || x > 7)` → `!(1..=7).contains(&x)` : SÛR (mais ici c'était dans main.rs, hors
+      verus! — RangeInclusive::contains hors preuve est trivialement sans risque).
+
+    **C. Lint clippy NON SUPPORTÉ dans verus! → #[allow] ciblé obligatoire**
+    - `.clamp(min, max)` : NON SUPPORTÉ. Verus émet "core::cmp::impls::...::clamp is not
+      supported (the vstd library provides some specification for the Rust std library, but
+      it is currently limited)". Le fix clippy `score.clamp(-999, 999)` casse la vérif.
+      Solution : conserver la forme if/else explicite et neutraliser le lint AU PLUS PRÈS
+      avec `#[allow(clippy::manual_clamp)]` sur l'expression, commentaire à l'appui. Jamais
+      d'allow global au crate.
+
+    **D. "Code mort" clippy qui est en réalité du ghost code**
+    clippy compile en mode EXEC, où le code spec/proof est erasé. Donc tout symbole utilisé
+    UNIQUEMENT en spec/proof apparaît "never used" / "unused import" à tort. Vérifier l'usage
+    réel (rg/grep, y compris dans les blocs proof/spec et sous #[cfg(verus_only)]) AVANT de
+    supprimer. Trois sous-cas rencontrés :
+    - Constantes MAX_SCORE/MIN_SCORE utilisées seulement dans axiom_evaluate_bounded et
+      lemma_score_constants_ordered → garder + #[allow(dead_code)] + commentaire.
+    - Import `Cell` utilisé seulement dans une spec fn (first_free_row) → le DÉPLACER du bloc
+      d'import exec vers le bloc `#[cfg(verus_only)]`, ce qui résout proprement le warning
+      sans allow (clippy ne voit alors plus l'import du tout en mode exec).
+    - `minimax_pure` : exec fn appelée UNIQUEMENT par elle-même (récursion), jamais par
+      best_move (qui utilise minimax_ab). Vraiment morte côté programme. Le lemme d'équivalence
+      alpha-beta relie des SPEC fns (minimax_ab_spec/minimax_spec), pas cette exec fn. Sur
+      arbitrage utilisateur : supprimée (−1 fonction des verified, baseline 71 → 69).
+    Leçon transverse : "never used" en Verus ≠ mort. Le test décisif est l'usage en spec/proof,
+    pas la sortie de clippy.
+
+    **E. needless_return + .set() deprecated**
+    - `return alpha_cur;` en position de queue de branche → expression nue `alpha_cur` : SÛR,
+      re-vérifié.
+    - `board.cells.set(pos, v)` (deprecated par Verus en faveur de l'indexation new-mut-ref)
+      → `board.cells[pos] = v` : SUPPORTÉ et vérifie. Supprime la dernière deprecation Verus.
+      Note : cette deprecation n'apparaît PAS dans `cargo build` (qui était déjà clean) mais
+      seulement sous `verus` ; on la traite quand même car elle pollue la sortie verus / VSCode.
+
+    **F. Méthode de travail qui a fonctionné**
+    Un fichier à la fois ; après CHAQUE fix sur du code verus!, relancer `verus src/main.rs`
+    et vérifier "N verified, 0 errors" AVANT de continuer. Pour un lint réputé risqué (matches!,
+    clamp), tester sur UNE occurrence d'abord. C'est ainsi qu'on a isolé que matches! passait
+    mais clamp non, sans jamais laisser le baseline rouge plus d'un edit.
+
+  recommendation: >
+    Pour tout nettoyage clippy d'un projet Rust+Verus :
+    1. NE JAMAIS lancer `cargo clippy --fix` en aveugle. Traiter chaque warning à la main.
+    2. Établir d'abord un baseline VERT de la vérif (verus src/<root>.rs => "N verified,
+       0 errors"). Si le baseline est rouge à cause d'un drift de version Verus
+       (new-mut-ref / postcondition old|final), poser
+       #[verifier::deprecated_postcondition_mut_ref_style(true)] sur les fns &mut concernées
+       pour restaurer l'ancien style, plutôt que de réécrire la logique de preuve (= hors
+       scope d'un clippy, risque de cascade). Vérifier la version installée vs le vstd pinné
+       dans Cargo.toml dès le départ.
+    3. Lints SÛRS dans verus! (confirmés ici) : matches!, x += y, .is_multiple_of(n),
+       indexation `arr[i] = v` (remplace .set() deprecated), suppression de return en queue.
+       Mais toujours RE-VERIFIER, vstd peut varier d'une version à l'autre.
+    4. Lint NON SUPPORTÉ dans verus! (confirmé ici) : .clamp() → garder la forme explicite +
+       #[allow(clippy::manual_clamp)] CIBLÉ + commentaire "forme explicite requise, Verus ne
+       supporte pas clamp". Règle générale : si un fix clippy casse la vérif, REVERTER ce fix
+       précis et poser un #[allow(clippy::<lint>)] local (fonction/expression, jamais le crate).
+    5. "Code mort" clippy = vérifier l'usage en spec/proof AVANT de supprimer. Ghost-only →
+       #[allow(dead_code)] (constante/fn) ou déplacement de l'import vers #[cfg(verus_only)].
+       Suppression réservée au code prouvé mort y compris en spec/proof.
+    6. Travailler un fichier à la fois, re-verify après chaque fichier ; tester un lint risqué
+       sur une seule occurrence avant de généraliser.
+    7. Faute de Makefile dans ce projet, la commande de vérif est `verus src/main.rs` (binaire
+       standalone qui embarque sa propre vstd) — et NON `cargo verus verify`, qui recompile
+       vstd depuis crates.io contre la mauvaise toolchain et échoue (E0433 tracked_env).

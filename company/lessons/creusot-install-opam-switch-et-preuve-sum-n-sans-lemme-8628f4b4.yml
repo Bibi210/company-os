@@ -1,0 +1,195 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 8628f4b4-005f-4c13-bb16-0ad36d88da9c
+  title: "Creusot : installer la toolchain (opam switch + --external par-solveur) et prouver sum_n = n(n+1)/2 sans lemme"
+  author: implementer
+  created_at: "2026-06-06"
+  description: >
+    Premier retour Creusot de CompanyOS (projet sum-n-creusot). Deux blocs réutilisables :
+    (1) INSTALLATION — la réalité Creusot 0.11.0 diffère de l'hypothèse "cargo install + why3 AUR" :
+    le script ./INSTALL crée un opam local switch qui ÉPINGLE why3/why3find compatibles (dissout le
+    risque de version creusot<->why3 par construction), et télécharge des solveurs aux versions
+    exactes attendues. Pièges : le flag --external est PAR SOLVEUR (--external z3 n'évite QUE z3) ;
+    le z3 système 4.16 est REJETÉ par les drivers why3 (plage 4.12-4.15) ; why3-ide tire une dép GTK
+    système (gtksourceview-3.0) qui peut casser le switch et qu'on retire pour un usage CLI.
+    (2) PREUVE — la MÊME propriété qui exige 4 lemmes/pièges en Verus (cf. lesson 475911ee : témoin
+    de divisibilité, monotonicité, by(compute), invariant multiplicatif) passe en Creusot DU PREMIER
+    COUP, sans aucun lemme : requires/ensures dans Int via @, invariant acc@==i@*(i@+1)/2 + i@<=n@,
+    variant n@-i@. Contraste outillage majeur à capitaliser.
+  tags:
+    - creusot
+    - why3
+    - smt
+    - formal-verification
+    - deductive-verification
+    - rust
+    - toolchain
+    - opam
+    - install
+    - sum-n
+    - pearlite
+    - pièges
+    - executable
+  changelog:
+    - date: "2026-06-06"
+      author: implementer
+      description: >
+        Ajout du PIÈGE D (BLOC 2) : rendre un crate Creusot vérifié EXÉCUTABLE en
+        ajoutant un binaire (src/main.rs) sans casser la preuve. `cargo creusot prove`
+        échoue sur le `println!` du main (Unsupported constant value) ; solution propre
+        `cargo creusot prove -- --lib` qui exclut le binaire de la vérif. Pendant exact
+        du piège #3 Verus (println! interdit dans verus!). Aucun #[trusted]/assume, code
+        prouvé inchangé. Tag `executable` ajouté.
+  related:
+    - id: 475911ee-4ed8-44ba-a572-6e2eea4fd278
+      kind: lesson-learned
+      relationship: related
+    - id: b2c68c30-29ab-4150-90b3-df02b6c616aa
+      kind: lesson-learned
+      relationship: related
+    - id: e10d745f-35ab-4817-9bbf-9ccf62489904
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: 62dfdb60-1651-4de3-b327-7c83aa88cc07
+      kind: implementation-plan
+      relationship: related
+
+spec:
+  context: >
+    Projet sum-n-creusot : terrain de jeu Creusot dont le coeur est la mise en place de la chaîne
+    de vérification (toolchain creusot + why3 + solveurs SMT), le contenu prouvé étant la fonction
+    itérative sum_n(n) == n*(n+1)/2 (formule fermée), avec absence d'overflow et terminaison.
+    Machine Arch Linux. Versions obtenues et validées : cargo-creusot 0.11.0, creusot-rustc
+    nightly-2026-02-27, Why3 1.8.2+git, why3find 1.3.0+dev, alt-ergo 2.6.2, cvc4 1.8, cvc5 1.3.1,
+    z3 4.16.0 système (rejeté par why3). Résultat final : `make verify` => Proved ✔ (exit 0),
+    `cargo build` sans warning, AUCUN assume/admit, AUCUN lemme manuel. Premier projet Creusot de
+    la mémoire CompanyOS — à comparer au jumeau Verus sum-n-verus (lesson 475911ee, même propriété).
+
+  insight: >
+    ===== BLOC 1 : INSTALLATION DE LA TOOLCHAIN CREUSOT =====
+
+    **La méthode officielle 0.11.0 n'est PAS `cargo install creusot`.** creusot/cargo-creusot
+    n'existent ni sur AUR ni sur crates.io comme binaire. La voie réelle : cloner le dépôt au tag
+    de la release stable (`git clone --branch v0.11.0 https://github.com/creusot-rs/creusot`) puis
+    lancer `./INSTALL` (qui délègue à `cargo run --bin creusot-install`).
+
+    **L'opam local switch dissout le risque de version creusot<->why3.** ./INSTALL crée un switch
+    opam DÉDIÉ sous ~/.local/share/creusot/_opam dont le fichier creusot-deps.opam ÉPINGLE des
+    versions git précises de why3 et why3find compatibles avec ce creusot. C'est l'inverse de
+    l'hypothèse fragile "installer why3-bin d'AUR (1.8.0) à côté d'un creusot indépendant" : ici
+    l'alignement est garanti PAR CONSTRUCTION. Ne PAS mélanger avec un why3 système. Prérequis :
+    rustup, cargo, opam, curl. Le switch compile beaucoup de dépendances OCaml (plusieurs minutes) ;
+    prévoir un timeout généreux.
+
+    **PIÈGE A — why3-ide casse le switch sur dépendance GTK système manquante.** creusot-deps.opam
+    tire par défaut `why3-ide` (IDE graphique), qui dépend de lablgtk3 + conf-gtksourceview3, lequel
+    exige le paquet SYSTÈME gtksourceview-3.0. S'il manque, `opam switch create` échoue ENTIÈREMENT
+    (rollback complet du switch) sur cette seule dép GUI — alors que why3 et why3find CLI
+    s'installaient, eux, sans problème. SOLUTION pour un usage `make verify` en ligne de commande :
+    retirer la ligne `why3-ide` (et son pin-depends) du creusot-deps.opam du CLONE avant ./INSTALL.
+    why3-ide est inutile sans IDE. (Alternative : installer le paquet système gtksourceview3.)
+
+    **PIÈGE B — `--external <TOOL>` est PAR SOLVEUR, pas global.** Dans creusot-install
+    (fn install_tools), la boucle parcourt [alt-ergo, z3, cvc4, cvc5] ; pour chacun, --external
+    crée un symlink vers le binaire du PATH, SINON download curl (hash sha256 vérifié). `--external z3`
+    seul n'évite QUE le download de z3. Pour tout réutiliser depuis le système :
+    `--external alt-ergo --external z3 --external cvc4 --external cvc5` ET avoir les 4 dans le PATH
+    (or alt-ergo et cvc4 ne sont pas packagés sur Arch ; seul cvc5 est sur AUR, z3 dans extra). En
+    pratique, sur Arch, seul z3 est aisément --external-able ; les trois autres seront téléchargés.
+    Les downloads sont des binaires de versions ÉPINGLÉES correspondant exactement aux drivers why3,
+    et sont sha256-vérifiés par creusot-setup — ce n'est pas un download opaque.
+
+    **PIÈGE C — le z3 système trop récent est rejeté par why3.** z3 4.16.0 (Arch extra) est hors de
+    la plage reconnue par les drivers why3 de cette version (^4\.1[2-5]\.[0-9]+$ = 4.12 à 4.15).
+    Symptôme : "Prover Z3 version 4.16.0 is not recognized". z3 est enregistré mais inopérant pour la
+    décharge. Sans conséquence ici car alt-ergo/cvc5/cvc4 (versions exactes) suffisent. Pour utiliser
+    z3, il faudrait une 4.15.x. Leçon générale : pour Creusot, préférer les solveurs gérés par
+    creusot-setup (versions alignées sur les drivers) plutôt qu'un solveur système de version
+    arbitraire. La config why3 (~/.config/creusot/why3.conf) est générée AUTOMATIQUEMENT par
+    creusot-setup pendant ./INSTALL — pas besoin d'un `why3 config detect` manuel.
+
+    ===== BLOC 2 : LE SCAFFOLDING ET LE CONTRAT (syntaxe Pearlite v0.11.0) =====
+
+    **`cargo creusot new <nom>` génère le bon squelette** : Cargo.toml avec `creusot-std = "0.11.0"`
+    en dépendance NORMALE (pas creusot-contracts — c'est le nom de la release stable ; les macros
+    s'effacent en no-op hors vérification donc `cargo build` passe sans warning), un lint
+    `unexpected_cfgs check-cfg=['cfg(creusot)']`, ET le why3find.json (config provers/timeouts)
+    indispensable à `cargo creusot prove`. Toujours partir de `cargo creusot new` plutôt que d'un
+    Cargo.toml fait main : il câble why3find.json sans lequel la vérif ne trouve pas sa config.
+
+    **Forme du contrat qui passe (import `use creusot_std::prelude::*;`) :**
+      #[requires(n@ <= BORNE@)]
+      #[ensures(result@ == n@ * (n@ + 1) / 2)]
+    avec dans la boucle :
+      #[invariant(i@ <= n@)]
+      #[invariant(acc@ == i@ * (i@ + 1) / 2)]
+      #[variant(n@ - i@)]
+    L'opérateur de modèle `@` projette une valeur exec (u64) dans le modèle d'entiers mathématiques
+    Int. Le ensures vit donc dans Int (arithmétique exacte), PAS en u64 machine : c'est ce qui rend
+    la formule fermée n*(n+1)/2 correcte (la division entière par 2 d'un produit de deux consécutifs
+    est exacte). Les constantes aussi se projettent (`BORNE@`, `i64::MAX@`). Commande de vérif :
+    `cargo creusot prove` (exit 0 = tout prouvé) ; câblée telle quelle dans la cible Makefile verify.
+
+    **Borne d'overflow calculée (pas inventée).** BORNE = 4_000_000_000. Justification : n*(n+1) doit
+    tenir dans u64 (max ~1.8447e19) ; sqrt(2^64) ~ 2^32 ~ 4.29e9 ; 4e9*(4e9+1) ~ 1.6e19 < u64::MAX.
+    L'accumulateur final ~8e18 tient aussi. Borne statique, non vide (domaine immense, pas d'ex falso),
+    non débordante.
+
+    **PIÈGE D — rendre le projet EXÉCUTABLE sans casser la vérif : exclure le binaire via `--lib`.**
+    Pendant inspection (préparation des examples), confirmé. Pour ajouter un point d'entrée
+    exécutable (`make run`) à un crate Creusot vérifié, on garde la lib comme objet de preuve
+    (src/lib.rs) et on ajoute un binaire (src/main.rs) qui appelle la fonction prouvée
+    (`use <crate_snake>::sum_n;` — le package `sum-n-creusot` devient le crate `sum_n_creusot`).
+    PROBLÈME : `cargo creusot prove` traduit AUSSI le binaire et ÉCHOUE sur `println!` avec
+    « error: Unsupported constant value: Scalar(...) of type &[u8; N] » — Creusot ne sait pas
+    traduire le littéral de format en Coma. C'est le pendant EXACT du piège #3 Verus (println!
+    interdit dans verus!), mais côté Creusot il casse la commande de preuve, pas la compilation.
+    SOLUTION la plus propre : cibler la bibliothèque uniquement avec `cargo creusot prove -- --lib`
+    (les CARGO_FLAGS après `--` sont transmis au cargo sous-jacent ; `--lib` restreint la cible).
+    Le binaire est alors ignoré par la vérif ; sa compilation/exécution restent normales via
+    `cargo build` / `cargo run`. AVANTAGES vs alternatives : pas besoin de `#[trusted]` sur main
+    (qui n'aiderait pas, le souci est le corps avec println, pas la signature), pas besoin de
+    commenter le println (ce que font les examples Creusot, ex. knights_tour.rs), aucun assume.
+    Le code prouvé (sum_n) n'est en RIEN affaibli. Régression vérifiée nulle : make verify reste
+    `Proved ✔` exit 0, cargo build sans warning, make run affiche `sum_n(100) = 5050`.
+
+    ===== BLOC 3 : LE CONTRASTE CREUSOT vs VERUS (la donnée la plus précieuse) =====
+
+    La MÊME propriété sum_n == n*(n+1)/2 a été prouvée dans les deux outils :
+    - En VERUS (lesson 475911ee) : 4 difficultés majeures. (1) `assert((n*(n+1))%2==0) by
+      (nonlinear_arith)` TIMEOUT → témoin de divisibilité à construire à la main (n==2*h, etc.) ;
+      (2) overflow acc+i non inféré → lemme de monotonicité + borne `by (compute)` ; (3) invariant
+      multiplicatif de secours ; (4) println! interdit dans verus!.
+    - En CREUSOT : passe DU PREMIER COUP, ZÉRO lemme, ZÉRO assertion intermédiaire. L'invariant divisé
+      acc@==i@*(i@+1)/2 et la formule fermée dans Int sont déchargés directement par alt-ergo.
+    POURQUOI ce contraste : (a) Creusot raisonne nativement en Int (arithmétique exacte non bornée)
+    côté spec, donc la parité du produit de deux consécutifs et la division entière exacte sont dans
+    le modèle, pas un obstacle SMT à franchir explicitement ; (b) le multi-solveur why3find (alt-ergo
+    + cvc5 + cvc4 simultanés via why3) augmente fortement le taux de décharge automatique vs un Z3
+    unique ; (c) alt-ergo, conçu pour ce type d'arithmétique, décharge l'identité polynomiale du pas
+    inductif sans guidage. NB : ce contraste vaut pour CETTE preuve (arithmétique scalaire simple) ;
+    Creusot a son propre coût (chaîne d'outils plus lourde : opam, why3, versions de solveurs) qui se
+    paie à l'INSTALLATION plutôt qu'à la preuve. Le coût se déplace, il ne disparaît pas.
+
+  recommendation: >
+    Pour tout projet Creusot dans CompanyOS :
+    1. INSTALL : cloner le dépôt au tag d'une release STABLE (X.Y.Z, pas master/-dev qui impose le
+       patch creusot-std local), lancer ./INSTALL. NE PAS tenter `cargo install creusot` ni mélanger
+       un why3 système : l'opam switch épingle les versions compatibles.
+    2. Pour un usage CLI (`make verify`), retirer `why3-ide` de creusot-deps.opam du clone AVANT
+       ./INSTALL (évite l'échec sur la dép GTK gtksourceview-3.0), ou installer ce paquet système.
+    3. Sur Arch, n'espérer --external que pour z3 (extra) ; accepter que alt-ergo/cvc4/cvc5 soient
+       téléchargés (sha256-vérifiés, versions alignées why3). Si la contrainte interdit tout download,
+       le SIGNALER à l'utilisateur AVANT l'install — c'est une décision qui lui appartient.
+    4. Ne PAS compter sur un z3 système de version arbitraire : vérifier la plage reconnue par why3
+       (cargo creusot version montre "recommended X.Y.Z"). Préférer les solveurs creusot-setup.
+    5. Scaffolding via `cargo creusot new` (jamais Cargo.toml fait main) pour obtenir why3find.json.
+       Contrat dans Int via `@`, formule fermée en ensures, invariant + variant dans la boucle.
+       Commande de vérif `cargo creusot prove` (exit 0 = prouvé), câblée dans make verify.
+    6. STRATÉGIE DE PREUVE : SMT-d'abord, sans lemme. Pour l'arithmétique scalaire simple, Creusot+
+       why3find multi-solveur décharge souvent directement (contraste fort avec Verus/Z3 seul). N'ajouter
+       assertions/lemmes qu'en RÉACTION à un échec constaté, jamais a priori. Jamais d'assume/admit.
+    7. Quand on a le choix de l'outil pour une preuve d'arithmétique scalaire : Creusot paie son coût
+       à l'install (lourde) mais peut éviter le travail de lemmes que Verus exige. Arbitrer selon que
+       le coût pèse plutôt sur la mise en place (Creusot) ou sur l'écriture de la preuve (Verus).
