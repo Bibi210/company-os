@@ -25,6 +25,9 @@ metadata:
     - id: 00f2f2cc-472b-483a-a8e8-77d1a28e07c3
       kind: lesson-learned
       relationship: related
+    - id: 710ed84c-193e-4fbe-a275-9919cb24b30a
+      kind: lesson-learned
+      relationship: related
     - id: 04dc72df-d895-4639-aee9-d2c5ab4fb49f
       kind: design-doc
       relationship: derived-from

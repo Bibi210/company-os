@@ -11,8 +11,14 @@ metadata:
     son geste (confirmation factuelle, validation explicite d'arbitrage,
     matérialisation d'une décision demandée). Tous ces gestes contreviennent
     à la lettre de review_findings_honesty mais répondent à un besoin réel
-    de traçabilité. Cette lesson capture le pattern et propose un fix
+    de traçabilité.     Cette lesson capture le pattern et propose un fix
     procédural au lieu de rappels répétés à la règle.
+    NOTE D'AUDIT (V1 2026-06-10) : le champ notes proposé (Option 2) n'a pas
+    été implémenté dans review-report.schema.json. La règle
+    review_findings_honesty de shared-rules a en revanche été précisée depuis :
+    critère objectif correctif (a) vs hors-scope (b), et observation possible
+    en "note informelle hors-verdict". Le besoin d'audit trail structuré reste
+    un candidat RFC ouvert.
   tags:
     - review
     - workflow
@@ -20,6 +26,10 @@ metadata:
     - verdict
     - rule-friction
     - process-improvement
+  related:
+    - id: 6353ec2c-cbc3-423a-a931-6cd033fd4c59
+      kind: lesson-learned
+      relationship: derived-from
 
 spec:
   context: >

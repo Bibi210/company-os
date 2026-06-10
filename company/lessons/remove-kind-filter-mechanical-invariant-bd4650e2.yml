@@ -39,6 +39,9 @@ metadata:
     - id: 600307a4-74f6-43dd-95e1-4dee3d2326c1
       kind: lesson-learned
       relationship: related
+    - id: 02b8e1ce-184d-4b3f-8c46-357dfa828791
+      kind: lesson-learned
+      relationship: derived-from
     - id: 1d3a3581-db81-4c95-9973-2cbae7be35df
       kind: rfc
       relationship: derived-from

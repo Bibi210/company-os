@@ -21,6 +21,9 @@ metadata:
     - id: 2cb9201f-cdf3-4e1e-8b59-759ef23f2c04
       kind: rfc
       relationship: related
+    - id: 27b75614-9d8d-4748-b54c-ef1c8f6c7c98
+      kind: lesson-learned
+      relationship: related
 
 spec:
   context: >

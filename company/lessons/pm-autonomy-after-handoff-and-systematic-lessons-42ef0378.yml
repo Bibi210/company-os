@@ -24,6 +24,9 @@ metadata:
     - id: f099252d-d079-48f0-b1fd-d53c27cdbf93
       kind: lesson-learned
       relationship: supersedes
+    - id: b8cb709d-2332-436b-b741-a8566102c41f
+      kind: lesson-learned
+      relationship: supersedes
     - id: e460f9c2-f3c4-471e-bde0-e82ea59e0d85
       kind: lesson-learned
       relationship: related
