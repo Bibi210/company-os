@@ -5,7 +5,8 @@ metadata:
   title: "Fix export _test dans defense-in-depth.mjs"
   author: ceo
   created_at: "2026-03-15"
-  status: approved
+  status: implemented
+  implemented_at: "2026-06-10T09:42:50.519407964+00:00"
   description: >
     Fix de sécurité critique : le plugin defense-in-depth crashe au chargement
     d'OpenCode car export const _test exporte un plain object, ce qui fait

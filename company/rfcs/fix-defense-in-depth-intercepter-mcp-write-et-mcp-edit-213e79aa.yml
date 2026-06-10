@@ -5,7 +5,8 @@ metadata:
   title: "Fix defense-in-depth : intercepter mcp_write et mcp_edit"
   author: pm
   created_at: "2026-03-15"
-  status: approved
+  status: implemented
+  implemented_at: "2026-06-10T09:42:50.518024941+00:00"
   approved_at: "2026-03-15T16:25:27.522213877+00:00"
   description: >
     Le plugin defense-in-depth n'intercepte pas les writes effectués par les sous-agents
