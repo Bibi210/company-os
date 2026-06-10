@@ -24,6 +24,23 @@ metadata:
     Rust mort de human-review-triggers — avec verrou schema
     (additionalProperties: false) pour que la réintroduction échoue
     mécaniquement (pattern bd4650e2 : retirer plutôt qu'interdire).
+  changelog:
+    - date: "2026-06-10"
+      author: architect
+      description: >
+        Itération 2 (round 281a5401, request_changes Implementer). Finding
+        bloquant corrigé : purge (d) déclare désormais self_review_forbidden
+        et review_analysis_framework dans review-protocol.schema.json (sinon
+        additionalProperties: false cassait make validate sur la prose
+        conservée). Sous-spécifications tranchées : signature de
+        engine.submit_vote change (param notes, inventaire ~9 call-sites +
+        main.rs L558) ; fixtures grant via db.upsert_artifact avec embedding
+        zéros (new_without_embedder ne peut pas indexer) ; sémantique "all"
+        = ensemble fermé {pm, architect, implementer, ceo} moins l'auteur
+        (pseudo-personas Myself/All exclues) ; design hot-reload watcher
+        explicité (clone Arc avant closure, .write() sur Config) ;
+        divergence globs git tranchée (préfixe :(glob) sur métacaractères,
+        comportement conservateur fail-safe).
   tags:
     - companyos-v1
     - process
@@ -112,9 +129,11 @@ spec:
        Message : "Self-review forbidden: author '<persona>' cannot be a
        required reviewer of their own artifact. Remove the author from
        required_reviewers (review-protocol: self_review_forbidden)."
-    b) engine.submit_vote (signature inchangée) rejette
-       reviewer == round.author avec la même variante. Message analogue
-       ("the author cannot vote on their own artifact").
+    b) engine.submit_vote rejette reviewer == round.author avec la même
+       variante. Message analogue ("the author cannot vote on their own
+       artifact"). NB : contrairement à initiate_review_round, la signature
+       de submit_vote CHANGE — non à cause de cette garde mais du paramètre
+       notes de la GARDE 2b (inventaire des call-sites là-bas).
 
     GARDE 2 — review_findings_honesty + canal notes (couches : engine +
     surface MCP + schema).
@@ -127,8 +146,13 @@ spec:
     b) Canal légitime (réponse au pattern e63992f0) : ReviewVote
        (crates/orchestrator/src/types.rs) gagne un champ
        notes: Option<String> avec #[serde(default)] (rétro-compatible avec
-       les votes JSON déjà stockés en DB) ; SubmitVoteParams (main.rs)
-       gagne un paramètre optionnel notes (description : "Non-corrective
+       les votes JSON déjà stockés en DB) ; engine.submit_vote gagne un
+       paramètre notes: Option<String> — CHANGEMENT DE SIGNATURE d'API
+       publique de crate. Caller-inventory (lesson ea6e9dd1) : main.rs L558
+       (tool submit_review_vote) + ~9 call-sites de tests inline dans
+       engine.rs (L1472-1640) ; tous les fichiers porteurs sont déjà dans
+       affected_files.modified. SubmitVoteParams (main.rs) gagne le
+       paramètre optionnel correspondant (description : "Non-corrective
        observations for the record ; n'affecte pas le verdict"). Les notes
        sont acceptées avec les DEUX verdicts.
     c) company/schemas/review-report.schema.json : ajout d'un conditional
@@ -147,10 +171,20 @@ spec:
     sales. Message : "Permit consumption refused: uncommitted changes on
     target paths: <liste>. Commit your code FIRST (git add && git commit),
     then consume the permit (write_permit_full_sequence step 4)." Les
-    target_paths sont passés comme pathspecs git (les patterns à glob
-    restent supportés). Cas limites : permit introuvable → erreur existante
-    inchangée ; git indisponible → refus fail-safe avec message distinct
-    (git est déjà un prérequis dur du grant, RFC 359f9162).
+    target_paths sont passés comme pathspecs git. ATTENTION divergence de
+    sémantique glob : ailleurs dans le système les target_paths sont
+    interprétés façon crate glob / prefix-match (hook hasActivePermit),
+    tandis que les pathspecs git ont leur propre dialecte. Règle adoptée :
+    tout target_path contenant un métacaractère (*, ?, [) est passé avec le
+    préfixe ":(glob)" pour forcer le matching glob complet de git
+    (wildcards traversant les /) ; les chemins littéraux sont passés tels
+    quels (match préfixe natif des pathspecs). Comportement conservateur
+    assumé : en cas de doute d'interprétation, git matche PLUS de fichiers
+    et le refus est plus strict — un faux positif bloque à tort mais ne
+    laisse jamais passer un worktree sale (fail-safe). Cas limites : permit
+    introuvable → erreur existante inchangée ; git indisponible → refus
+    fail-safe avec message distinct (git est déjà un prérequis dur du
+    grant, RFC 359f9162).
 
     GARDE 4 — grant exige un RFC approved (couche : serveur MCP).
     grant_write_permit (main.rs), après vérification du token CEO et AVANT
@@ -171,10 +205,21 @@ spec:
     OrchestratorServer détient le ReviewProtocol chargé (nouveau champ
     Arc<RwLock<ReviewProtocol>>, rempli par run_server, rafraîchi par les
     deux chemins de hot-reload existants : watcher ConfigChangeKind::Config
-    et tool reload_config). Le tool initiate_review_round vérifie que
+    et tool reload_config). Design du hot-reload côté watcher : l'Arc est
+    cloné AVANT la closure du watcher (même pattern que engine/validator/
+    watcher_alive, zone main.rs L1577-1581) puis capturé par le bloc async
+    move ; la branche ConfigChangeKind::Config (L1607), qui recharge déjà
+    CompanyConfig et pousse max_review_iterations dans l'engine, prend en
+    plus un .write() sur le RwLock pour y déposer config.review_protocol.
+    Attention disjoint capture edition 2024 (lesson ea6e9dd1) : le clone
+    doit être textuellement lu dans la closure. Le tool
+    initiate_review_round vérifie que
     params.required_reviewers ⊇ le minimum du protocole pour
-    artifact_kind : la sémantique "all" se résout en "tous les personas
-    sauf l'auteur" ; les kinds absents du mapping ne sont pas contraints ;
+    artifact_kind : la sémantique "all" se résout en l'ensemble FERMÉ des
+    4 personas concrètes {pm, architect, implementer, ceo} moins l'auteur —
+    PAS via PersonaId::all(), qui contient aussi les pseudo-personas
+    Myself et All à exclure explicitement (un reviewer "myself" ou "all"
+    n'a pas de sens) ; les kinds absents du mapping ne sont pas contraints ;
     ajouter des reviewers AU-DELÀ du minimum reste permis par construction
     (la prose "les reviewers listés sont le minimum requis" est préservée).
     Refus : "Review round refused: required_reviewers must include the
@@ -200,6 +245,18 @@ spec:
        human-review-triggers.yml dont les 4 triggers sont identiques 1:1).
     d) company/schemas/review-protocol.schema.json : suppression de la
        propriété escalation_rules, additionalProperties: false sur spec.
+       CORRECTIF (finding Implementer, round 281a5401 iteration 2) : le
+       spec de review-protocol.yml conserve les clés prose
+       self_review_forbidden et review_analysis_framework (décision
+       "prose amendée, jamais supprimée quand elle porte un critère de
+       jugement", section impact). Le schema doit donc les DÉCLARER —
+       objets {description: string, required: [description]} — sinon
+       additionalProperties: false ferait échouer make validate sur le
+       fichier conservé (vérifié empiriquement par l'Implementer). Le
+       verrou reste entier : seules les 3 clés légitimes
+       (reviewers_by_artifact_type, self_review_forbidden,
+       review_analysis_framework) sont admises, escalation_rules et toute
+       réintroduction échouent à la validation.
     e) company/config/human-review-triggers.yml : metadata.description
        enrichie pour acter qu'il est désormais la SOURCE UNIQUE des
        conditions d'escalade utilisateur (absorbe ceo_cannot_approve_alone,
@@ -228,7 +285,16 @@ spec:
       implemented, accepté sur RFC approved (les fixtures de test
       existantes test_grant_* L1903+ utilisent des rfc_id aléatoires non
       indexés : elles sont mises à jour pour indexer un RFC approved
-      fixture — impact recensé) ; consume refusé worktree sale sur
+      fixture — impact recensé). COMMENT des fixtures (observation
+      Implementer) : setup_server construit l'engine via
+      new_without_embedder, or engine.index_artifact exige un embedder —
+      les fixtures ne passent donc PAS par index_artifact mais par
+      db.upsert_artifact directement, avec un embedding de zéros de
+      dimension EMBEDDING_DIM et le YAML du RFC fixture écrit dans le
+      tempdir du test (la lecture du statut se fait sur ce YAML via le
+      file_path indexé) ; l'insertion a lieu AVANT le wrap de l'engine
+      dans Arc<Mutex> pour éviter tout lock asynchrone dans le setup ;
+      consume refusé worktree sale sur
       target_paths, accepté worktree propre ; initiate refusé sous le
       minimum protocolaire, accepté au minimum et au-delà ; hot-reload du
       protocole pris en compte.
