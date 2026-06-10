@@ -1,0 +1,116 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 9b2c1951-1d26-4284-add6-a295ff82cc1e
+  title: "Une supersession unilatérale laisse la lesson ancienne silencieusement périmée : annoter la description de l'ancienne au moment où on la supersede"
+  author: architect
+  created_at: "2026-06-10"
+  description: >
+    Capitalisation du domaine 2 (v1-memory-audit) du programme companyos-v1
+    (diagnostic 162f2c8c). L'audit des 52 lessons a montré que les
+    supersessions étaient posées UNIQUEMENT côté lesson nouvelle
+    (relationship: supersedes), jamais côté lesson ancienne : 11 lessons
+    périmées (wipe nucléaire, seal manuel, filtre kind, agent-message,
+    affected_files plat, doctrine PM, contradiction review) restaient
+    lisibles comme valides pour tout agent qui les atteignait par search()
+    sans naviguer related(). Règle dérivée : superseder = DEUX écritures
+    (le lien supersedes côté nouvelle + la mention d'obsolescence dans la
+    description de l'ancienne). Instance mémoire du pattern général
+    a1601839 (aucune étape ne force la clôture des artifacts amont).
+  tags:
+    - memory
+    - lessons
+    - supersedes
+    - curation
+    - knowledge-graph
+    - retrieval
+    - hygiene
+    - companyos-v1
+    - companyos-internals
+    - meta
+  related:
+    - id: a1601839-9c40-4425-9d13-a2291b1c58b3
+      kind: lesson-learned
+      relationship: derived-from
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: related
+    - id: 162f2c8c-e325-407e-b91b-0616a8dc4be4
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: related
+
+spec:
+  context: >
+    Audit complet de company/lessons/ (52 fichiers) le 2026-06-10, deuxième
+    domaine du programme V1. Constat central : les chantiers récents avaient
+    correctement appliqué la PRATIQUE 3 de be16dc46 (créer une lesson qui
+    supersede celle qui décrivait le contournement : 85ad44d3 supersede
+    ed7776fb, 23de8594 supersede 611fde3e, d5c9c933 supersede 8fd49300,
+    42ef0378 supersede f099252d), MAIS dans 100% des cas la lesson ANCIENNE
+    ne portait aucune trace de sa propre obsolescence. Sa description, son
+    insight et ses recommandations se lisaient comme parfaitement actuels.
+    11 lessons sur 52 étaient dans cet état, dont une (13fdf5bc, og-memory)
+    en contradiction frontale avec la règle canonique
+    review_findings_honesty : elle prescrivait "au moins un finding même
+    sur approve", exactement l'anti-pattern que e63992f0 documente comme
+    violation récurrente.
+
+  insight: >
+    Le retrieval hybride ne lit pas le graphe : search() retourne des
+    résumés (titre, description, tags) et l'agent décide quoi get() sur
+    cette seule base. Une supersession posée uniquement côté lesson
+    nouvelle est donc INVISIBLE au moment où ça compte : si le search
+    remonte l'ancienne lesson (ce qu'il fait, puisque son vocabulaire
+    correspond toujours au sujet), rien dans son résumé ne signale qu'elle
+    est périmée. L'agent doit avoir la chance de remonter AUSSI la nouvelle
+    lesson, ou de naviguer related() depuis l'ancienne, pour découvrir la
+    supersession. C'est une course entre deux documents que le périmé peut
+    gagner.
+
+    La cause est structurelle, pas disciplinaire : c'est l'instance mémoire
+    du pattern a1601839. La transition de fin de cycle de vie d'une lesson
+    (active -> superseded) est laissée à la main de l'agent, et l'étape
+    naturelle du workflow (créer la nouvelle lesson) n'exige PAS de toucher
+    l'ancienne. Le lien supersedes donne l'illusion que le travail est fait
+    parce que le graphe est correct, alors que la surface de retrieval
+    (la description) reste mensongère. Un graphe correct avec des nœuds
+    menteurs est pire qu'une pile de fiches honnêtes.
+
+    Corollaire observé sur 13fdf5bc : les lessons og-memory (synthèses de
+    référence importées en bloc) sont les plus exposées, parce qu'aucun
+    chantier ne les supersede jamais formellement ; elles dérivent par
+    rapport aux règles canoniques qui évoluent à côté d'elles.
+
+  recommendation: >
+    RÈGLE OPÉRATIONNELLE : superseder une lesson = DEUX écritures dans la
+    même unité de travail.
+    (1) Côté lesson NOUVELLE : metadata.related avec relationship:
+        supersedes vers l'ancienne (pratique déjà acquise).
+    (2) Côté lesson ANCIENNE : ajouter dans metadata.description une
+        mention courte et datée, en tête de ce qui est périmé : quel
+        RFC/lesson la périme, et CE QUI RESTE VALIDE si la supersession
+        est partielle (ne pas jeter l'invariant avec le contexte, cf.
+        8fd49300 dont le consume-en-dernier survit au seal manuel).
+    company/lessons/ n'est pas une zone protégée : cette seconde écriture
+    ne coûte aucun permit, il n'y a aucune excuse de friction.
+
+    POUR LES SUPERSESSIONS PARTIELLES : la mention doit distinguer
+    explicitement la partie périmée de la partie vivante. Une lesson
+    partiellement périmée sans cette distinction pousse l'agent à tout
+    rejeter ou tout garder.
+
+    POUR LES LESSONS DE SYNTHÈSE (og-memory) : lors de tout RFC qui change
+    une règle canonique (review, workflow), inclure dans le périmètre un
+    grep des lessons qui énoncent l'ancienne doctrine, et les annoter.
+    Même logique que le caller-inventory de prose (a9bc9f6d).
+
+    STRUCTUREL (candidat v1-automation, roadmap a410bb43) : un check
+    déterministe peut détecter l'incohérence "X est ciblée par un
+    supersedes mais sa description ne contient aucune mention
+    d'obsolescence" et la signaler, sur le modèle des drift_warnings de
+    l'auto-sync roadmap (a5f25718). Le LLM juge QUOI superseder ;
+    l'algorithme vérifie que les deux écritures ont bien eu lieu
+    (préférence 4e5c109b).
