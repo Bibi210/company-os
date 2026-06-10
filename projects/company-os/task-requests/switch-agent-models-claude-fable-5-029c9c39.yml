@@ -24,7 +24,7 @@ metadata:
 
 spec:
   priority: medium
-  status: in_progress
+  status: done
 
   context: >
     L'utilisateur a initialement changé manuellement le modèle des 4 agents de
