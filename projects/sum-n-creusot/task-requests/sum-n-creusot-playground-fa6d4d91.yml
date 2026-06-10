@@ -28,7 +28,7 @@ metadata:
 
 spec:
   priority: medium
-  status: backlog
+  status: done
 
   context: >
     L'utilisateur veut un terrain de jeu pour s'exercer à la vérification formelle déductive
