@@ -41,6 +41,18 @@ metadata:
     - date: "2026-06-10"
       author: pm
       description: >
+        Clarifications utilisateur intégrées : (1) le test spirituel du
+        programme est "make clean-company ne casse rien et tout ce qu'on a
+        appris se retrouve dans le harness" ; (2) nouvel item
+        v1-harness-refactor (refactor global du harness en fin de programme
+        pour éviter la chimère). v1-release en dépend désormais.
+        v1-memory-audit terminé (diagnostic 162f2c8c, lesson 9b2c1951) :
+        52 lessons auditées, 11 obsolescences datées, 1 doublon résolu,
+        graphe rechaîné sur 6 fichiers. v1-process-hardening passe en
+        in_progress.
+    - date: "2026-06-10"
+      author: pm
+      description: >
         v1-hygiene terminé (diagnostic af11b99e, lesson a1601839) : 6 RFCs
         approved passés implemented, 9 task-requests backlog passés done,
         2 conservés backlog (api-callers tracé companyos-system,
@@ -93,6 +105,19 @@ spec:
     l'automatisation. Le LLM doit être réservé aux décisions, jamais au
     bookkeeping.
 
+    Le test spirituel du programme, fixé par l'utilisateur (2026-06-10) :
+    si demain un make clean-company efface la mémoire YAML, tout doit
+    continuer de marcher et tout ce qu'on a appris doit se retrouver dans
+    le harness. Une connaissance qui ne vit que dans une lesson-learned
+    n'est pas institutionnalisée : les lessons sont l'historique et le
+    contexte, le harness est le mécanisme. Chaque domaine du revamp doit
+    se mesurer à ce test. Corollaire, également fixé par l'utilisateur :
+    le durcissement va accréter des mécanismes (hooks, tools, checks)
+    au fil des domaines, et le programme se termine par un refactor
+    global du harness (item v1-harness-refactor) pour que le résultat
+    soit une architecture cohérente et maintenable, pas une chimère
+    impossible à faire évoluer.
+
     La méthode est la même pour chaque domaine : recensement exhaustif
     (diagnostic-report), tri garder/tuer/unifier (délégué aux agents par
     décision utilisateur du 2026-06-10), changements structurels via RFC ou
@@ -130,8 +155,8 @@ spec:
         type: loose
         category: exploration
         label: "Passe complète sur company/lessons/ : dédupliquer, superseder, chaîner, élaguer"
-      timeframe: present
-      status: in_progress
+      timeframe: past
+      status: done
       target_date: "2026-Q2"
       depends_on: [v1-hygiene]
       rationale: >
@@ -147,8 +172,8 @@ spec:
         type: loose
         category: exploration
         label: "shared-rules, review-protocol, flow-control, human-review-triggers : prose -> mécanisme partout où c'est possible"
-      timeframe: future
-      status: planned
+      timeframe: present
+      status: in_progress
       target_date: "2026-Q3"
       depends_on: [v1-memory-audit]
       rationale: >
@@ -250,6 +275,26 @@ spec:
         notamment que le harness JS et le serveur Rust ne dupliquent pas de
         logique (zones protégées définies aux deux endroits ?).
 
+    - key: v1-harness-refactor
+      title: "Refactor global du harness (cohérence et maintenabilité)"
+      ref:
+        type: loose
+        category: idea
+        label: "Refondre hooks + plugins + tools MCP + schemas accrétés en une architecture délibérée"
+      timeframe: future
+      status: planned
+      target_date: "2026-Q4"
+      depends_on: [v1-process-hardening, v1-automation, v1-rust-audit, v1-plugins-tooling-audit]
+      rationale: >
+        Demandé explicitement par l'utilisateur (2026-06-10) : les domaines
+        3 à 8 vont descendre beaucoup de règles dans le harness, mécanisme
+        par mécanisme. Sans passe finale, le harness deviendrait une chimère
+        de hooks, checks et tools empilés organiquement (exactement le mal
+        que la V1 corrige côté artifacts). Ce refactor redessine l'ensemble :
+        responsabilités claires entre plugin JS, serveur Rust et schemas,
+        zéro duplication de logique entre les couches, et documentation de
+        l'architecture du harness comme état de référence pour la V1.
+
     - key: v1-release
       title: "Définition de la V1 et tag git v1"
       ref:
@@ -259,7 +304,7 @@ spec:
       timeframe: future
       status: planned
       target_date: "2026-Q4"
-      depends_on: [v1-hygiene, v1-memory-audit, v1-process-hardening, v1-automation, v1-personas-audit, v1-schemas-audit, v1-rust-audit, v1-plugins-tooling-audit]
+      depends_on: [v1-hygiene, v1-memory-audit, v1-process-hardening, v1-automation, v1-personas-audit, v1-schemas-audit, v1-rust-audit, v1-plugins-tooling-audit, v1-harness-refactor]
       rationale: >
         Clôture du programme : ce qui reste après les sept domaines est la
         V1. Documenter l'état de référence (ce que CompanyOS est, ses
