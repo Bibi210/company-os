@@ -1,0 +1,479 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: c981bf62-9d53-4ea2-8da3-c34af9d3e922
+  title: "Recensement V1 des règles de process : 62 règles classées (mécanisées, mécanisables, prose, mortes) au test clean-company"
+  author: architect
+  created_at: "2026-06-10"
+  project: company-os
+  description: >
+    Phase 1 du domaine v1-process-hardening (task-request 11f13a9d, roadmap
+    a410bb43). Recensement exhaustif des règles de process en prose :
+    shared-rules.yml (14 règles + artifact_catalog), review-protocol.yml (4),
+    flow-control.yml (3), human-review-triggers.yml (4 triggers), et les
+    rules des 4 personas (36 entrées). Total 62 règles, chacune classée au
+    test clean-company (survivrait-elle à l'effacement de la mémoire YAML ?) :
+    10 déjà mécanisées, 16 mécanisables (mécanisme concret + couche + coût
+    proposés), 33 intrinsèquement prose, 3 mortes (budget_limits,
+    circuit_breaker, escalation_rules dupliquées/jamais lues). Priorisation
+    en 3 lots ; le lot 1 (6 mécanismes coût S, serveur Rust + schema) ferme
+    les violations observées : consume-avant-commit du 2026-06-10,
+    approve+findings, self-review non gardée, grant sans RFC approved.
+  tags:
+    - companyos-v1
+    - process
+    - hardening
+    - harness
+    - mechanical-invariant
+    - recensement
+    - audit
+  related:
+    - id: 11f13a9d-467b-4e5b-b4c3-a5e45ce1e080
+      kind: task-request
+      relationship: input
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: related
+    - id: 9b2c1951-1d26-4284-add6-a295ff82cc1e
+      kind: lesson-learned
+      relationship: related
+    - id: bd4650e2-ab42-4b4e-9c10-cca638ded48c
+      kind: lesson-learned
+      relationship: related
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  status: resolved
+
+  symptom: >
+    Les règles de process de CompanyOS vivent majoritairement en prose
+    (shared-rules.yml, review-protocol.yml, rules des personas), lue par des
+    LLMs et appliquée sur la base de leur bonne volonté. Test directeur fixé
+    par l'utilisateur : si make clean-company effaçait la mémoire YAML demain,
+    une règle ne survit que si elle est encodée dans le harness (plugin
+    defense-in-depth, pre-commit, tool MCP serveur Rust, schema JSON,
+    Makefile). Or la prose system-prompt (shared-rules, personas) survit au
+    clean-company en tant que FICHIER (préservé par le Makefile) mais pas en
+    tant que GARANTIE : rien ne force son application. Violations observées :
+    ordre commit-puis-consume violé en session le 2026-06-10 (aucun check au
+    consume), vote approve+findings logiquement contradictoire (aucun rejet
+    serveur ni schema), self-review possible (submit_vote ne compare jamais
+    reviewer et author), grant_write_permit accepte un rfc_id inexistant ou
+    non-approved. En parallèle, des paramètres de config sont parsés par le
+    code Rust mais jamais appliqués (budget_limits, circuit_breaker,
+    escalation_rules) : prose morte déguisée en config.
+
+  root_cause: >
+    Croissance organique : chaque règle a été ajoutée en prose par défaut
+    (shared-rules ou persona), parce que c'est le chemin de moindre coût au
+    moment de l'incident qui la motive. Le harness (hooks, serveur, schemas,
+    pre-commit) n'a été sollicité que pour les invariants de sécurité les plus
+    durs (zones protégées, permits, validation YAML, auth). Résultat : trois
+    symptômes systémiques. (1) Des règles mécanisables à coût S restent prose
+    pendant des mois et finissent violées (consume-avant-commit). (2) Des
+    configs ont été créées AVANT leur consommateur (budget_limits,
+    circuit_breaker, human-review-triggers côté code) et le consommateur n'a
+    jamais été écrit : config parsée jamais lue. (3) De la duplication
+    s'accumule entre fichiers (max_iterations_before_ceo vs
+    max_review_iterations ; ceo_cannot_approve_alone vs human-review-triggers)
+    sans qu'aucune couche ne détecte la divergence.
+
+  resolution: >
+    RECENSEMENT COMPLET — 62 règles. Légende par règle : [classement]
+    mécanisme existant ou proposé | couche | coût (S/M/L) | test
+    clean-company (SURVIT / NE SURVIT PAS / PARTIEL).
+
+    Vérifications code effectuées : crates/orchestrator/src/engine.rs
+    (initiate_review_round L205, submit_vote L231, compute_consensus L1307),
+    crates/mcp-servers/orchestrator/src/main.rs (TokenStore L25,
+    grant_write_permit L669, consume_write_permit L817, run_server L1406),
+    crates/config/src/{types.rs,loader.rs}, company/plugins/
+    defense-in-depth-core.mjs (intégral), .githooks/pre-commit (intégral),
+    Makefile, company/schemas/*.json, company/scripts/check-artifact-naming.sh.
+
+    ════════════════════════════════════════════════════════════════
+    A. shared-rules.yml (spec.rules + artifact_catalog) — 15 entrées
+    ════════════════════════════════════════════════════════════════
+
+    A1. artifact_id (UUID via generate_id) — [DÉJÀ MÉCANISÉE] Le format UUID
+    v4 est imposé par _base.schema.json (pattern sur metadata.id et
+    related[].id), appliqué par le hook write (validateYaml + revert), le
+    pre-commit et make validate. La provenance generate_id() elle-même n'est
+    pas vérifiable (un agent peut forger un UUID valide) mais le risque
+    résiduel est nul (collision). Prose encore utile comme pointeur vers le
+    tool. SURVIT.
+
+    A2. lessons (chercher avant de créer, dédupliquer) — [INTRINSÈQUEMENT
+    PROSE] La décision créer-vs-améliorer est de la curation pure. La
+    sous-partie supersession est traitée en A12. NE SURVIT PAS (assumé).
+
+    A3. related_artifacts — [MÉCANISABLE, complément] La STRUCTURE est déjà
+    mécanisée (_base.schema : UUID + enum relationship). Manque : la
+    validation référentielle (l'id référencé existe dans l'index). Mécanisme :
+    warning non bloquant à l'indexation (index_artifact, serveur Rust) quand
+    un related[].id est introuvable | serveur Rust | M | PARTIEL (structure
+    survit, intégrité référentielle non). L'obligation de POSER des liens
+    reste prose (jugement).
+
+    A4. artifact_index (auto-indexation + consultation) — [DÉJÀ MÉCANISÉE]
+    pour l'indexation : hook autoIndex à chaque write YAML, file watcher
+    serveur (500ms debounce), reindex_all au boot, autorepair PILIER D. La
+    consigne "consulte avant de produire" relève de A10 (prose). SURVIT.
+
+    A5. file_placement — [MÉCANISABLE, complément] Déjà mécanisé : la naming
+    convention <slug>-<8uuid>.yml (check-artifact-naming.sh appelé par le
+    hook write avec revert, + make check-naming dans make ci, donc
+    pre-commit). NON mécanisé : la cohérence kind↔chemin (un design-doc dans
+    company/lessons/ passerait). Mécanisme : table kind→pattern de chemin
+    dans companyos-yaml-validator (qui connaît déjà kind et path) | binaire
+    Rust validator (donc hook + pre-commit + make validate gratuits) | S |
+    PARTIEL. Valeur : un artifact égaré échappe à clean-company et aux
+    conventions de navigation.
+
+    A6. review_protocol (renvoi) — [PROSE-RENVOI] Duplique B16/B17 en
+    résumé. Classement porté par B16/B17. À dégraisser éventuellement
+    (pointer sans paraphraser).
+
+    A7. authentication — [DÉJÀ MÉCANISÉE] TokenStore en mémoire serveur,
+    verify() sur submit_review_vote / grant_write_permit (CEO only) /
+    consume_write_permit ; le hook bloque l'authenticate cross-persona
+    (defense-in-depth-core L374). "Ne jamais écrire le token dans un
+    fichier" reste prose (un scan de contenu coûterait plus que la menace).
+    SURVIT.
+
+    A8. mcp_reconnect — [DÉJÀ MÉCANISÉE] en substance par mcp-proxy.mjs
+    (buffering des messages pendant restart, replay après health check,
+    circuit breaker du proxy). La procédure de retry 3x côté agent est un
+    fallback prose raisonnable pour le cas où le proxy lui-même est cassé.
+    SURVIT.
+
+    A9. continuous_improvement — [INTRINSÈQUEMENT PROSE] Proactivité et
+    jugement. Aucun mécanisme ne peut forcer un agent à AVOIR des idées.
+
+    A10. memory_lookup_before_acting — [INTRINSÈQUEMENT PROSE] La curation
+    est un jugement ("est-ce que ce que j'ai lu change ma décision ?"). Un
+    quota mécanique de search()/get() serait du cargo-cult (lesson 02b8e1ce)
+    et un check de conformité noierait le contexte, contre l'esprit de la
+    règle. Le harness pourrait LOGGER les appels search() par session pour
+    audit a posteriori, mais l'application reste prose. NE SURVIT PAS
+    (assumé, c'est le coût de la curation).
+
+    A11. lesson_after_every_artifact — [INTRINSÈQUEMENT PROSE] Le QUAND et
+    le QUOI capitaliser sont du jugement ; une lesson forcée mécaniquement
+    serait une lesson de complaisance. Option lot 3 (non bloquante) :
+    rfc_set_implemented et la résolution d'un diagnostic émettent un RAPPEL
+    si aucune lesson liée n'existe | serveur Rust | S | hors lot 1-2 car
+    valeur incertaine.
+
+    A12. lesson_chaining — [MÉCANISABLE, sous-partie] Le choix du type de
+    lien est prose. MAIS la supersession à deux écritures (lesson 9b2c1951 :
+    11 lessons silencieusement périmées découvertes à l'audit V1) est un
+    check déterministe. Mécanisme : tool MCP supersede_artifact(old_id,
+    new_id) qui pose atomiquement le lien supersedes côté nouveau ET
+    l'annotation superseded-by côté ancien ; en complément, warning à
+    l'indexation quand un supersedes n'a pas de réciproque | serveur Rust |
+    M | NE SURVIT PAS actuellement.
+
+    A13. review_findings_honesty (approve+findings interdit) — [MÉCANISABLE,
+    LOT 1] La règle est née d'une contradiction observée ; aujourd'hui RIEN
+    ne l'empêche : submit_vote stocke verdict et findings sans aucun
+    croisement, le schema review-report accepte verdict=approve avec
+    findings non vides. Mécanisme double couche : (a) serveur :
+    submit_review_vote rejette verdict=approve avec findings non vides ;
+    (b) schema review-report : conditional if verdict==approve then
+    findings maxItems 0 | serveur Rust + schema JSON | S | NE SURVIT PAS
+    actuellement.
+
+    A14. affected_files_categorization — [DÉJÀ MÉCANISÉE] pour la structure :
+    rfc.schema.json anyOf FORME A/B (RFC a4eb3ee7, implemented). Le choix de
+    forme reste une recommandation prose. Le débouché outillage (pré-check
+    permit : union modified+created comparée aux target_paths, fermerait la
+    lesson 611fde3e) est MÉCANISABLE lot 3 | serveur Rust (warning au
+    grant_write_permit) | M. PARTIEL.
+
+    A15. artifact_catalog — [INTRINSÈQUEMENT PROSE] Documentation de
+    navigation. Partiellement redondante avec company/schemas/ (la liste
+    des kinds vit déjà dans les schemas et dans types.rs) ; les pointeurs
+    schema: sont la partie la plus utile. Candidate à dégraissage dans le
+    domaine v1 (renvoyer aux schemas plutôt que paraphraser), pas morte.
+
+    ════════════════════════════════════════════════════════════════
+    B. review-protocol.yml — 4 entrées
+    ════════════════════════════════════════════════════════════════
+
+    B16. self_review_forbidden — [MÉCANISABLE, LOT 1] AUCUNE garde code :
+    initiate_review_round (engine.rs L205) accepte author ∈
+    required_reviewers ; submit_vote (L231) ne compare jamais reviewer et
+    round.author. La règle absolue n°1 du système est violable
+    silencieusement. Mécanisme : (a) initiate_review_round rejette
+    author ∈ required_reviewers ; (b) submit_vote rejette
+    reviewer == round.author | serveur Rust | S | NE SURVIT PAS actuellement.
+
+    B17. review_analysis_framework (triaxial) — [MÉCANISABLE pour la
+    structure, prose pour le fond] Le schema review-report n'exige que
+    verdict + findings ; rien n'impose une section par axe. Mécanisme :
+    schema review-report avec spec.axes {nominal, negative, edge}, chacun
+    {verdict, notes}, en anyOf rétro-compatible (pattern RFC a4eb3ee7) |
+    schema JSON | S | PARTIEL après mécanisation (la forme survit, la
+    qualité de l'analyse reste prose/LLM).
+
+    B18. reviewers_by_artifact_type — [MÉCANISABLE, LOT 1] La config est
+    parsée (types.rs L299, ReviewProtocol) mais JAMAIS appliquée :
+    initiate_review_round accepte n'importe quelle liste de reviewers, le
+    mapping kind→reviewers n'est consulté par aucun code. Mécanisme :
+    initiate_review_round valide required_reviewers ⊇ minimum du protocole
+    pour artifact_kind (sémantique "all" résolue côté serveur ; la prose
+    "ajouter des reviewers en plus" reste permise par construction) |
+    serveur Rust | S | NE SURVIT PAS actuellement.
+
+    B19. escalation_rules — [MORTE en partie] (a)
+    max_iterations_before_ceo=3 DUPLIQUE flow-control.max_review_iterations=3 ;
+    seul flow-control est lu par le code (main.rs L1415, compute_consensus) ;
+    max_iterations_before_ceo est parsé (types.rs L307) et jamais lu →
+    RETIRER (déduplication, source unique flow-control). (b)
+    ceo_cannot_approve_alone : parsé, jamais appliqué par du code, et ses 4
+    catégories dupliquent les 4 triggers de human-review-triggers.yml →
+    FUSIONNER avec human-review-triggers (une seule source pour "ce qui
+    exige l'humain"), mécanisation partielle en lot 3 (cf. D).
+
+    ════════════════════════════════════════════════════════════════
+    C. flow-control.yml — 3 entrées
+    ════════════════════════════════════════════════════════════════
+
+    C20. max_review_iterations — [DÉJÀ MÉCANISÉE] Lue au boot (main.rs
+    L1415), hot-reload par le file watcher (L1609) et reload_config (L912),
+    appliquée par compute_consensus (engine.rs L1327 : EscalationNeeded
+    quand iteration >= max). SURVIT. Seul paramètre vivant du fichier.
+
+    C21. budget_limits (max_tokens_per_task, max_subagent_spawns) — [MORTE]
+    Struct parsée (types.rs L273-281), ZÉRO usage dans tout le workspace.
+    De plus inapplicable en l'état : le serveur MCP n'a aucun accès aux
+    compteurs de tokens ni aux spawns de sub-agents d'opencode. RETIRER
+    (pattern lesson bd4650e2 : retirer le paramètre plutôt que laisser une
+    promesse non tenue), ré-introduire seulement si un consommateur concret
+    existe un jour.
+
+    C22. circuit_breaker (consecutive_failures_threshold, cooldown_seconds)
+    — [MORTE] Parsée (types.rs L285-288), zéro usage, et aucune définition
+    de ce qui compte comme "failure" ni de qui ouvrirait le circuit.
+    RETIRER ou re-spécifier avec un consommateur réel.
+
+    ════════════════════════════════════════════════════════════════
+    D. human-review-triggers.yml — 4 triggers
+    ════════════════════════════════════════════════════════════════
+
+    Constat transversal : le fichier est chargé par le code Rust (loader.rs
+    L23) mais AUCUN code ne l'évalue jamais. Aujourd'hui c'est de la prose à
+    destination du CEO, avec un chargement Rust mort.
+
+    D23. rfc modifies access matrix — [MÉCANISABLE, lot 3] Path-matching :
+    affected_files/target_paths ∩ company/config/protected-zones.json →
+    grant_write_permit exige un flag d'approbation utilisateur | serveur
+    Rust | M | NE SURVIT PAS actuellement.
+
+    D24. rfc modifies ceo persona — [MÉCANISABLE, lot 3] Path-matching sur
+    company/personas/ceo.yml, même mécanisme que D23 | serveur Rust | M.
+
+    D25. rfc introduces breaking schema change — [INTRINSÈQUEMENT PROSE]
+    Qualifier "breaking" est un jugement sémantique sur le diff d'un schema ;
+    un détecteur heuristique serait L avec faux positifs/négatifs. Reste
+    prose CEO.
+
+    D26. rfc deletes persona — [MÉCANISABLE, lot 3] Détection de suppression
+    sous company/personas/ (le hook voit déjà les diffs git post-bash) |
+    plugin JS ou serveur | M.
+
+    ════════════════════════════════════════════════════════════════
+    E. Personas — 36 entrées
+    ════════════════════════════════════════════════════════════════
+
+    — PM (8) —
+    E27. Être la seule interface utilisateur — [PROSE] organisationnel,
+    non observable par le harness.
+    E28. Confirmation user avant task-request — [PROSE] interaction humaine.
+    E29. Déléguer les décisions techniques — [PROSE] jugement.
+    E30. Orchestrer les review rounds via MCP — [PROSE] (les tools et leur
+    auth sont mécanisés ; la consigne d'usage reste prose).
+    E31. Lookup mémoire (must) — [PROSE] cf. A10. Duplication intentionnelle
+    4 personas + shared-rules (RFC 8cd28d64, saillance).
+    E32. never produire code/design-docs/artifacts techniques — [MÉCANISABLE,
+    lot 3] Matrice author↔produces validée à l'indexation (un design-doc
+    avec metadata.author=pm est rejeté ; la matrice existe déjà dans
+    personas.yml artifacts.produces) | serveur Rust (index_artifact) ou
+    validator | M | valeur moyenne (violation rare mais structurante).
+    E33. never exposer les noms internes — [PROSE].
+    E34. never décisions d'architecture — [PROSE].
+
+    — Architect (10) —
+    E35. design_doc_boundary — [PROSE] frontière de contenu (jugement).
+    L'invalidation du plan quand le design-doc change après approbation
+    serait mécanisable par timestamps, mais aucun schema ne porte
+    approved_at : L, hors V1.
+    E36. Documenter le rationale — [PROSE] partiellement appuyé par le
+    schema design-doc (decisions[].rationale required quand decisions
+    présent).
+    E37. Vérifier la conformité design↔code en review — [PROSE].
+    E38. Design docs complets (overview, components, decisions) —
+    [MÉCANISABLE, lot 2] Le schema n'exige QUE overview ; components et
+    decisions sont optionnels. Mécanisme : les exiger dans
+    design-doc.schema.json | schema JSON | S | PARTIEL actuellement.
+    E39. Lookup mémoire — [PROSE] cf. E31.
+    E40. Recensement callers API pub avant signature — [PROSE] procédure
+    LSP/rg, le filet aval mécanique est le pré-check permit (A14, lot 3).
+    E41. never implémenter du code — [PROSE].
+    E42. never implementation plans détaillés — [PROSE].
+    E43. never décisions business — [PROSE].
+    E44. never modifier zones protégées directement — [DÉJÀ MÉCANISÉE]
+    hook L1 : revert + erreur sans permit actif. NUANCE durcissable (lot 2) :
+    hasActivePermit (defense-in-depth-core L116) vérifie l'existence d'UN
+    permit actif couvrant le path, pas QUE l'écrivain est le granted_to —
+    un autre agent peut écrire sous le permit de l'Implementer. Mécanisme :
+    croiser input.agent avec granted_to | plugin JS | S. SURVIT.
+
+    — Implementer (13) —
+    E45. write_permit_full_sequence — [MÉCANISABLE, complément, LOT 1]
+    Déjà mécanisé : étape 1 (grant atomique + seal git, serveur, RFC
+    359f9162, rollback anti-permit-fantôme) ; et "commit exige permit
+    actif" (hook L2b : reset des commits non autorisés). NON mécanisé :
+    l'ordre "consume APRÈS le commit du code" — violé en session le
+    2026-06-10, aucun check au consume. Mécanisme : consume_write_permit
+    refuse si git status --porcelain montre des modifications non
+    committées sur les target_paths du permit | serveur Rust | S/M |
+    PARTIEL. INCOHÉRENCE INTER-COUCHES détectée au passage : le pre-commit
+    accepte status IN ('active','consumed') (L~98) alors que le hook
+    plugin exige 'active' — à unifier dans v1-harness-refactor.
+    E46. hotreload_last — [MÉCANISABLE partiel, lot 2] Conditions build/test
+    non vérifiables côté serveur (il ne lance pas la CI). Mais "tous les
+    permits consommés avant reload" est checkable : reload_config refuse
+    s'il existe des permits actifs | serveur Rust | S | PARTIEL après.
+    E47. write_permit_gate (plan approuvé avant permit) — [MÉCANISABLE,
+    LOT 1 partie a] grant_write_permit ne vérifie MÊME PAS que rfc_id
+    désigne un RFC existant dans l'index avec status=approved (main.rs
+    L669-744 : aucun lookup). Mécanisme (a) : lookup index, exiger
+    kind=rfc + status=approved | serveur Rust | S. Partie (b)
+    "implementation-plan approuvé par l'Architect" : M, nécessite de lier
+    plan→rfc et un statut machine du review round → lot 3.
+    E48. Tests pour chaque acceptance criterion — [PROSE] jugement de
+    couverture.
+    E49. Suivre le design doc — [PROSE].
+    E50. Diagnostic-report en cas d'échec — [PROSE].
+    E51. Appliquer les RFC avec un permit valide — [DÉJÀ MÉCANISÉE] hook
+    L1/L2. SURVIT.
+    E52. Lookup mémoire — [PROSE] cf. E31.
+    E53. CI-validation (la CI source de vérité du done) — [DÉJÀ MÉCANISÉE]
+    pour CompanyOS : le pre-commit exécute make ci (fmt+clippy+test+
+    validate+naming) en bloquant. La prose reste utile pour les projets
+    externes (cas 1 et 2 de la règle). SURVIT.
+    E54. Re-recensement callers avant modif API — [PROSE] cf. E40.
+    E55. never redesigner l'architecture — [PROSE].
+    E56. never merger — [PROSE].
+    E57. never zones protégées sans permit — [DÉJÀ MÉCANISÉE] doublon de
+    E51 côté garde. SURVIT.
+
+    — CEO (5) —
+    E58. Intervenir uniquement quand sollicité — [PROSE].
+    E59. Escalader les changements profonds à l'utilisateur — [PROSE,
+    partiel lot 3] cf. D23/D24/D26 pour la part path-matchable.
+    E60. Agir uniquement via MCP tools / never écrire des fichiers —
+    [MÉCANISABLE, lot 2] Le hook connaît input.agent (il s'en sert déjà
+    pour l'authenticate cross-persona) : bloquer write/edit/mcp_write/
+    mcp_edit quand agent==ceo | plugin JS | S | NE SURVIT PAS actuellement.
+    E61. never intervenir proactivement — [PROSE].
+    E62. never approuver seul les RFCs critiques — [PROSE, partiel lot 3]
+    cf. B19b/D.
+
+    ════════════════════════════════════════════════════════════════
+    STATISTIQUES (catégorie dominante par règle, 62 au total)
+    ════════════════════════════════════════════════════════════════
+    - DÉJÀ MÉCANISÉES : 10 (A1, A4, A7, A8, A14, C20, E44, E51, E53, E57)
+    - MÉCANISABLES : 16 (A3, A5, A12, A13, B16, B17, B18, D23, D24, D26,
+      E32, E38, E45, E46, E47, E60)
+    - INTRINSÈQUEMENT PROSE : 33 (A2, A6, A9, A10, A11, A15, D25, et 26
+      entrées personas)
+    - MORTES : 3 (B19 escalation_rules dupliquées/jamais lues, C21
+      budget_limits, C22 circuit_breaker)
+
+    Test clean-company global : sur les 62 règles, seules les 10 mécanisées
+    survivent comme GARANTIES. Les fichiers de prose système (shared-rules,
+    personas, config) survivent physiquement (préservés par le Makefile)
+    mais leur application repose sur les LLMs. Après lot 1 : 16 garanties.
+    Après lots 1+2 : 23.
+
+    ════════════════════════════════════════════════════════════════
+    PRIORISATION EN LOTS (pour les RFCs de phase 2)
+    ════════════════════════════════════════════════════════════════
+
+    LOT 1 — serveur Rust + schemas, coût S, valeur maximale (ferme des
+    violations OBSERVÉES ou des règles absolues non gardées). Candidat à un
+    RFC unique "durcissement du protocole de review et des permits" :
+      1. self_review_forbidden côté serveur : initiate_review_round rejette
+         author ∈ required_reviewers ; submit_vote rejette
+         reviewer == author (B16).
+      2. review_findings_honesty : submit_review_vote rejette
+         approve + findings non vides ; schema review-report conditional
+         équivalent (A13).
+      3. Ordre commit-puis-consume : consume_write_permit refuse si le
+         worktree a des modifications non committées sur les target_paths
+         du permit — ferme la violation du 2026-06-10 (E45).
+      4. grant_write_permit vérifie que rfc_id désigne un RFC indexé avec
+         status=approved (E47a).
+      5. reviewers_by_artifact_type appliqué par initiate_review_round :
+         required_reviewers doit couvrir le minimum du protocole pour le
+         kind (B18) — donne enfin un consommateur à la config parsée.
+      6. Purge des morts : retrait de budget_limits et circuit_breaker
+         (flow-control.yml + schema + types.rs), retrait de
+         escalation_rules.max_iterations_before_ceo (source unique
+         flow-control), fusion de ceo_cannot_approve_alone dans
+         human-review-triggers (B19, C21, C22) — pattern bd4650e2 :
+         retirer plutôt que laisser une promesse non tenue.
+
+    LOT 2 — coût S/M, valeur haute mais sans violation observée :
+      7. Schema review-report triaxial structurel : spec.axes
+         {nominal, negative, edge}, anyOf rétro-compatible (B17).
+      8. Schema design-doc : exiger components et decisions en plus
+         d'overview (E38).
+      9. file_placement kind↔chemin dans companyos-yaml-validator (A5).
+      10. Supersession à deux écritures : tool MCP supersede_artifact +
+          warning d'asymétrie à l'indexation (A12, lesson 9b2c1951).
+      11. reload_config refuse si des permits actifs subsistent (E46).
+      12. Hook : bloquer write/edit pour agent==ceo (E60).
+      13. Hook : hasActivePermit croise input.agent avec granted_to (E44).
+
+    LOT 3 — coût M/L, valeur moyenne ou conditionnelle, opportuniste :
+      14. Pré-check permit : union affected_files.modified+created vs
+          target_paths au grant, warning sur les oublis (A14, lesson
+          611fde3e).
+      15. human-review-triggers par path-matching pour les 3 triggers
+          fichiers (D23, D24, D26) ; D25 reste prose.
+      16. Matrice author↔produces validée à l'indexation (E32).
+      17. Validation référentielle des related[].id à l'indexation (A3).
+      18. write_permit_gate partie plan-approuvé (E47b).
+      19. Rappel non bloquant de lesson manquante sur rfc_set_implemented
+          et diagnostic resolved (A11).
+
+    RÈGLES MORTES À TRAITER (dans le RFC lot 1, point 6) :
+      - flow-control.budget_limits : parsée, jamais lue, inapplicable.
+      - flow-control.circuit_breaker : parsée, jamais lue, "failure"
+        indéfini.
+      - review-protocol.escalation_rules.max_iterations_before_ceo :
+        duplication morte de flow-control.max_review_iterations.
+      - review-protocol.escalation_rules.ceo_cannot_approve_alone :
+        parsée jamais appliquée, duplique human-review-triggers → fusion.
+      - Chargement Rust de human-review-triggers (loader.rs) : code mort
+        tant qu'aucun évaluateur n'existe — soit lui donner un consommateur
+        (lot 3), soit retirer le chargement.
+
+    INCOHÉRENCES INTER-COUCHES (à transmettre au domaine
+    v1-harness-refactor) :
+      - pre-commit accepte les permits status IN ('active','consumed') là
+        où le hook plugin exige 'active' seul.
+      - La logique "permit couvre ce path" existe en 3 implémentations
+        (hasActivePermit JS, pre-commit bash LIKE, engine.check_permit
+        Rust) avec des sémantiques de matching légèrement différentes
+        (LIKE '%file%' vs prefix vs glob).
+
+    Conclusion : resolved au sens de la phase 1 (recensement livré). La
+    phase 2 (RFCs lot 1 puis implémentation via le cycle complet) démarre
+    sur cette base.

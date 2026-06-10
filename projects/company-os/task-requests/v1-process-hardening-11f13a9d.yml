@@ -1,0 +1,61 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 11f13a9d-467b-4e5b-b4c3-a5e45ce1e080
+  title: "V1 process : recensement des règles en prose et durcissement dans le harness"
+  author: pm
+  created_at: "2026-06-10"
+  project: company-os
+  description: >
+    Troisième domaine du programme companyos-v1 (roadmap a410bb43, item
+    v1-process-hardening). Recenser TOUTES les règles de process en prose
+    (shared-rules, review-protocol, flow-control, human-review-triggers,
+    rules des 4 personas) et classer chacune : déjà mécanisée / mécanisable
+    (avec mécanisme proposé) / intrinsèquement prose. Puis durcir dans le
+    harness tout ce qui est mécanisable, via RFCs. Test de réussite fixé
+    par l'utilisateur : si make clean-company efface la mémoire YAML, tout
+    ce qu'on a appris doit survivre parce qu'il vit dans le harness.
+  tags:
+    - companyos-v1
+    - process
+    - hardening
+    - harness
+    - mechanical-invariant
+  related:
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: input
+    - id: 55b8ecc0-5fea-4529-be71-df5aa1d0939d
+      kind: task-request
+      relationship: related
+
+spec:
+  priority: high
+  status: in_progress
+
+  context: >
+    Principe directeur n°1 du programme V1 : le harness avant la prose. Une
+    règle d'interaction entre agents qui ne vit que dans shared-rules repose
+    sur la bonne volonté d'un LLM ; une règle dans le harness (hook
+    defense-in-depth, pre-commit, tool MCP, schema JSON) est impossible à
+    contourner. Le pattern est déjà validé par la mémoire (invariant
+    mécanique : retirer le paramètre plutôt qu'interdire son usage, lesson
+    bd4650e2 ; supersession à deux écritures détectable par check
+    déterministe, lesson 9b2c1951 ; l'ordre commit-puis-consume des permits
+    violé en session le 2026-06-10 faute d'être outillé). Le recensement
+    doit couvrir l'intégralité des règles, y compris celles des personas,
+    et proposer pour chaque règle mécanisable le mécanisme concret et sa
+    couche (plugin JS, serveur Rust, schema, pre-commit).
+
+  acceptance_criteria:
+    - "Un diagnostic-report recense TOUTES les règles de process en prose des fichiers : shared-rules.yml, review-protocol.yml, flow-control.yml, human-review-triggers.yml, et les rules.must/never des 4 personas"
+    - "Chaque règle est classée : déjà mécanisée (avec le mécanisme existant), mécanisable (avec le mécanisme proposé et sa couche), ou intrinsèquement prose (avec justification)"
+    - "Chaque règle est aussi évaluée au test clean-company : survivrait-elle à l'effacement de la mémoire YAML ?"
+    - "Les règles mécanisables sont priorisées par rapport coût/valeur et regroupées en lots cohérents donnant lieu à un ou plusieurs RFCs"
+    - "Au moins le premier lot (le plus haute valeur) est implémenté via le cycle complet RFC -> review -> approbation CEO -> permit -> implémentation"
+    - "Le recensement identifie aussi les règles mortes (jamais appliquées, contredites par la pratique) à retirer ou amender"
+
+  constraints:
+    - "Les mécanismes ajoutés ne doivent pas dupliquer de logique entre couches (préparer le terrain de v1-harness-refactor, pas l'aggraver)"
+    - "Pas de push : commits locaux uniquement"
+    - "Les changements aux zones protégées passent par RFC + approbation CEO + write permit, comme toujours"
