@@ -1,0 +1,172 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: 162f2c8c-e325-407e-b91b-0616a8dc4be4
+  title: "Audit V1 de la mémoire : recensement complet des 52 lessons-learned (doublons, obsolètes, chaînage, métadonnées)"
+  author: architect
+  created_at: "2026-06-10"
+  project: company-os
+  description: >
+    Domaine 2 du programme companyos-v1 (roadmap a410bb43, item
+    v1-memory-audit, task-request 55b8ecc0). Passe complète sur les 52
+    lessons de company/lessons/ : chaque lesson lue intégralement et classée
+    (saine / doublon / obsolète / chaînage manquant / métadonnées faibles),
+    puis corrections appliquées. Résultat : 36 saines, 11 marquées
+    obsolètes (totales ou partielles, mention dans description avec
+    référence au RFC implemented qui les périme), 1 doublon supersedé
+    in-place, 6 chaînes related posées. Aucune lesson supprimée, aucun
+    contenu factuel historique réécrit. Aucune lesson consolidée nouvelle
+    n'a été nécessaire : le seul cluster doublon (autonomie PM) possédait
+    déjà sa consolidation de fait (lesson 42ef0378).
+  tags:
+    - companyos-v1
+    - memory
+    - lessons
+    - audit
+    - knowledge-graph
+    - hygiene
+  related:
+    - id: 55b8ecc0-5fea-4529-be71-df5aa1d0939d
+      kind: task-request
+      relationship: input
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: related
+    - id: af11b99e-4009-4868-ba66-27cf66d0727b
+      kind: diagnostic-report
+      relationship: related
+
+spec:
+  status: resolved
+
+  symptom: >
+    La mémoire collective (company/lessons/, 52 fichiers) a grossi
+    organiquement pendant trois mois sans aucune passe de curation. Risques
+    matérialisés : lessons décrivant des contournements ou mécanismes
+    remplacés depuis par des RFCs implemented (wipe nucléaire du hook,
+    seal manuel du permit, filtre kind de search, kind agent-message,
+    array plat affected_files), recouvrements sémantiques (doctrine
+    d'autonomie PM éclatée sur trois lessons dont deux périmées), une
+    contradiction frontale entre une lesson og-memory (13fdf5bc : "chaque
+    review doit avoir au moins un finding même sur approve") et la règle
+    canonique review_findings_honesty, et des chaînes metadata.related
+    jamais posées entre lessons d'un même fil (le graphe de connaissances
+    était partiellement une pile de fiches). Le retrieval hybride remontait
+    donc des procédures périmées au même rang que les procédures valides.
+
+  root_cause: >
+    Aucune étape du workflow ne force la curation de la mémoire quand un
+    RFC rend une lesson obsolète. La règle be16dc46 (PRATIQUE 3 : superseder
+    les lessons qui décrivaient le contournement quand la solution arrive)
+    a été appliquée de façon inégale : les chantiers friction-permits de
+    juin l'ont bien appliquée (85ad44d3 supersede ed7776fb, 23de8594
+    supersede 611fde3e, d5c9c933 supersede 8fd49300) MAIS uniquement côté
+    lesson NOUVELLE ; la description de la lesson ANCIENNE ne signalait
+    jamais sa propre obsolescence, donc un agent qui tombait dessus par
+    search() sans naviguer related() lisait une procédure périmée comme
+    valide. Pour les fils plus anciens (PM workflow, clean-review og-memory,
+    exemples kind dans 02b8e1ce), aucune supersession n'avait été posée du
+    tout. Même pattern structurel que la dérive de bookkeeping du domaine 1
+    (lesson a1601839) : une transition de fin de cycle de vie déléguée à la
+    discipline d'agent, sans déclencheur.
+
+  resolution: >
+    Recensement complet : 52 lessons lues intégralement, classées, corrigées,
+    16 fichiers modifiés, tous validés au schema. Aucun fichier supprimé,
+    contenu factuel (context/insight/recommendation) intact partout.
+
+    TABLEAU DE CLASSEMENT (52 lessons).
+
+    SAINES sans action (36) :
+    a1601839 (bookkeeping-drift), 595b2d8d (atomic-sealing-absorbs-staged),
+    e0256a35 (lean-mathlib), 9432aa47 (clippy-vs-verus), 8628f4b4
+    (creusot-install), 475911ee (verus-sum-n), a9bc9f6d (retire-kind),
+    83289cf4 (makefile-drift), c12ca551 (roadmap-autosync), 4e5c109b
+    (pref-deterministe), cf3c40a8 (schema-migration), b04f8838
+    (triaxial-tests), 23de8594 (affected-files), 85ad44d3 (selective-revert),
+    80f7b27a (rfc-set-implemented), d5c9c933 (atomic-grant), be16dc46
+    (cleanup-workaround), ea6e9dd1 (disjoint-capture), f3fc4a5d
+    (implementation-pitfalls), 3f507271 (new-kind-rust), c5413270
+    (proxy-test-scripted), e460f9c2 (pm-task-tool), 0b0f3327
+    (verus-escalier), 710ed84c (verus-conventions), 6353ec2c
+    (croire-findings), f3b8bbb1 (projet-owned), c1e235dc (ci-source-of-truth),
+    54f76b21 (rfc-une-ligne), 27b75614 (fix-profond), 5c96452d
+    (design-doc-granulaire), e3f53486 (prouver-empiriquement), 00f2f2cc
+    (architecture-pdd), 243c106c (spec-auto-validation), b2c68c30
+    (verus-og), 78b74101 (clean-design), e8be5814 (clean-code).
+
+    OBSOLÈTES, totales ou partielles -> mention d'obsolescence ajoutée dans
+    metadata.description avec référence au RFC/lesson qui périme (11) :
+    - ed7776fb (wipe total) : périmée par RFC bde023e2 / lesson 85ad44d3 ;
+      restent valides "jamais de SQL direct" et "diagnostic plutôt que
+      workaround". Supersession existait côté 85ad44d3, mention désormais
+      visible côté ed7776fb.
+    - f099252d (PM s'arrête après task-request) : OBSOLÈTE totale, doctrine
+      inversée par 42ef0378 (supersession existante, mention ajoutée).
+    - b8cb709d (pas de confirmation back-and-forth) : DOUBLON recouvert par
+      42ef0378 ; supersedes posé côté 42ef0378 + mention côté b8cb709d.
+    - 8fd49300 (consume après commit) : invariant TOUJOURS valide ; contexte
+      périmé (seal manuel disparu, RFC 359f9162) signalé, renvois d5c9c933
+      et 595b2d8d.
+    - 600307a4 (hybrid search) : sections permits périmées (RFCs 359f9162 +
+      bde023e2, sa RECOMMANDATION 3 "atomiciser le grant" est RÉALISÉE) ;
+      filtres kind/author/project/dates retirés (RFC 1d3a3581) ;
+      architecture et chiffres toujours valides.
+    - 611fde3e (SQLite WAL 4 piliers) : ENSEIGNEMENT 3 / RECO 3 superseded
+      par 23de8594 (RFC a4eb3ee7) ; mention agent-message périmée
+      (RFC 3d9f0b0c) ; les 4 piliers restent valides.
+    - 13fdf5bc (clean-review og-memory) : point 2 ("au moins un finding
+      même sur approve") CONTREDIT review_findings_honesty -> mention de
+      correction + chaînage vers 6353ec2c et e63992f0. C'était la
+      contradiction la plus dangereuse du corpus (une lesson og-memory qui
+      prescrit exactement l'anti-pattern approve+findings).
+    - 02b8e1ce (defaults dans tool calls) : principe valide, exemples kind
+      sur search() périmés (RFC 1d3a3581).
+    - 016e47c4 (Verus puissance4) : valide pour sa version épinglée ;
+      .set() deprecated et new-mut-ref signalés (renvoi 9432aa47).
+    - 3e7f8d48 (project-config au démarrage) : chemin cité périmé, renvoi
+      à la règle file_placement canonique.
+    - b6ec1709 (caller-inventory persona) : mentions "agent-message"
+      périmées (RFC 3d9f0b0c), lecture corrigée vers "canal de coordination".
+
+    CHAÎNAGE MANQUANT -> entrées metadata.related posées (6 fichiers) :
+    - e63992f0 : related absent au complet -> derived-from 6353ec2c (même
+      fil doctrine du verdict) + note sur le statut du champ notes (non
+      implémenté, règle précisée depuis).
+    - 5d2357af -> related 27b75614 (même incident superseded-by, deux
+      angles : lacune de schéma vs anti-pattern contournement).
+    - 42ef0378 -> supersedes b8cb709d (consolidation du fil autonomie PM).
+    - bd4650e2 -> derived-from 02b8e1ce (la lesson cite déjà 02b8e1ce dans
+      son insight sans lien machine-readable).
+    - 89b0ce07 -> related 710ed84c (même pattern document méta transversal,
+      niveau design-doc vs implementation-plan).
+    - 13fdf5bc -> related 6353ec2c + e63992f0 (cf. supra).
+
+    MÉTADONNÉES FAIBLES : traitées via les mentions de description
+    ci-dessus (les descriptions périmées étaient le vrai déficit de
+    retrieval) ; aucun cas de tags structurellement insuffisants ne
+    justifiait une réécriture au-delà.
+
+    DOUBLONS : un seul cluster réel (autonomie PM : b8cb709d / f099252d /
+    42ef0378). DÉCISION (cas difficile documenté) : ne PAS créer de lesson
+    consolidée nouvelle ; 42ef0378 EST déjà la consolidation (récente,
+    complète, déjà supersedes f099252d). Créer une 4e lesson aurait ajouté
+    du churn au problème qu'on corrige. Le doublon b8cb709d est supersedé
+    in-place via 42ef0378. Zéro lesson consolidée créée.
+
+  notes: >
+    Cas difficiles et décisions d'arbitrage :
+    (1) 13fdf5bc (og-memory, author ceo) contredisait la règle canonique :
+    corrigée par mention + chaînage plutôt que réécriture, le contenu
+    historique reste lisible mais l'obsolescence du point 2 est explicite
+    dès la description. (2) Les supersessions partielles (8fd49300,
+    611fde3e, 600307a4, ed7776fb) distinguent systématiquement CE QUI RESTE
+    VALIDE de ce qui est périmé, pour ne pas jeter l'invariant avec le
+    contexte. (3) c12ca551 contient une note de suivi listant 8 RFCs
+    approved depuis clôturés par le triage v1-hygiene : laissée telle
+    quelle, le diagnostic af11b99e et la lesson a1601839 documentent déjà
+    la résolution et sont chaînés. (4) Structurel : la même dérive
+    reviendra tant qu'aucune étape ne force la mention d'obsolescence sur
+    la lesson ANCIENNE au moment de la supersession ; candidat à intégrer
+    au domaine v1-automation (roadmap a410bb43), dans la continuité de la
+    lesson a1601839.

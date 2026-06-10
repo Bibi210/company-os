@@ -1,0 +1,59 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 55b8ecc0-5fea-4529-be71-df5aa1d0939d
+  title: "V1 mémoire : audit complet des lessons-learned (doublons, obsolètes, chaînage)"
+  author: pm
+  created_at: "2026-06-10"
+  project: company-os
+  description: >
+    Deuxième domaine du programme companyos-v1 (roadmap a410bb43, item
+    v1-memory-audit). Passe complète sur company/lessons/ (~52 lessons) :
+    identifier les doublons sémantiques, les lessons décrivant des mécanismes
+    depuis remplacés (à superseder), les chaînes related manquantes, et les
+    descriptions/tags faibles pour le retrieval. Appliquer les corrections.
+    La mémoire est l'outil de travail de tous les domaines suivants du
+    programme V1 : elle doit être fiable avant qu'on s'en serve massivement.
+  tags:
+    - companyos-v1
+    - memory
+    - lessons
+    - audit
+    - knowledge-graph
+  related:
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: input
+    - id: c448a646-dd58-4aa2-93ed-858df3845e21
+      kind: task-request
+      relationship: related
+
+spec:
+  priority: high
+  status: done
+
+  context: >
+    51+ lessons accumulées en trois mois de croissance organique. Risques
+    identifiés : doublons sémantiques (deux lessons qui disent la même chose
+    avec des mots différents, ce qui fragmente le rappel), lessons obsolètes
+    (décrivant des contournements ou mécanismes depuis remplacés par des RFCs,
+    ex. : contournements permits d'avant les RFCs 359f9162/1c0f2570/bde023e2),
+    chaînes metadata.related jamais posées (la mémoire doit être un graphe,
+    pas une pile de fiches), et métadonnées faibles (descriptions vagues ou
+    tags manquants qui dégradent le retrieval hybride). Le droit de tri est
+    délégué aux agents (décision utilisateur 2026-06-10, roadmap a410bb43).
+
+  acceptance_criteria:
+    - "Chaque lesson a été lue et classée : saine / doublon / obsolète / métadonnées faibles / chaînage manquant"
+    - "Les doublons sont fusionnés : une lesson consolidée supersede les doublons (relationship: supersedes), les fichiers d'origine sont conservés"
+    - "Les lessons obsolètes sont supersedées par une lesson à jour ou explicitement marquées comme historiques dans leur description"
+    - "Les chaînes related manquantes entre lessons d'un même fil sont posées"
+    - "Les descriptions et tags faibles sont renforcés pour le retrieval"
+    - "Un diagnostic-report documente le recensement complet et chaque action appliquée"
+    - "Toutes les lessons modifiées ou créées restent valides au schema"
+
+  constraints:
+    - "Ne supprimer aucun fichier : superseder, jamais effacer"
+    - "Ne pas réécrire l'histoire : le contenu factuel d'une lesson historique reste intact, seules les métadonnées (related, tags, description) et les mentions d'obsolescence peuvent être ajoutées"
+    - "Pas de push : commits locaux uniquement"
+    - "Zones protégées interdites : ce lot ne touche que company/lessons/ et projects/company-os/diagnostic-reports/"
