@@ -27,6 +27,22 @@ metadata:
     286abb1a-d7d8-456e-bdfd-25188338065b couvre les 16 paths
     d'affected_files.modified. Consume APRÈS les commits, jamais avant
     (lesson 8fd49300, et la GARDE 3 implémentée l'exigera).
+  changelog:
+    - date: "2026-06-10"
+      author: implementer
+      description: >
+        Itération 2 (round 40afe0c5, request_changes Architect). 2 findings
+        correctifs traités : (1) GARDE 4 — ajout du test obligatoire
+        test_grant_refused_wrong_kind (fixture kind=lesson-learned via
+        db.upsert_artifact, refus nommant le kind réel) à l'étape 14 ;
+        (2) GARDE 3 — test_consume_refused_dirty_glob_pattern rendu
+        OBLIGATOIRE dans la liste ferme de l'étape 14 (au lieu du "si possible"
+        du risque 2). 3 observations intégrées : inversion étapes 3/4 (types.rs
+        notes AVANT engine.submit_vote) ; ApproveWithFindings déclarée
+        directement dans l'étape 1 (plus de NB rétroactif) ; nuance de l'étape
+        16.3 (le binaire en cours reste l'ancien jusqu'au hot-reload, l'ordre
+        commits-puis-consume reste obligatoire via lesson 8fd49300 + hook
+        Layer 2). Risque 2 mis à jour (deux tests obligatoires).
   tags:
     - companyos-v1
     - process
@@ -127,14 +143,26 @@ spec:
         aucun code.
       files: []
     - description: >
-        ÉTAPE 1 — GARDE 1 (self_review_forbidden) : nouvelle variante d'erreur.
-        Ajouter dans crates/orchestrator/src/error.rs une variante
-        OrchestratorError::SelfReviewForbidden { author: PersonaId,
-        round_context: String } avec un #[error("...")] dérivant le message
-        du RFC GARDE 1a/1b. round_context porte le contexte (id du round ou
-        artifact_path) pour distinguer l'échec à l'initiate de l'échec au vote.
-        error.rs est dans le permit. C'est la première étape car engine.rs
-        (étapes 2-3) en dépend.
+        ÉTAPE 1 — GARDE 1 + GARDE 2a : DEUX nouvelles variantes d'erreur
+        (regroupées ici pour ne toucher error.rs qu'une seule fois).
+        1.1 SelfReviewForbidden (GARDE 1) : ajouter dans
+          crates/orchestrator/src/error.rs une variante
+          OrchestratorError::SelfReviewForbidden { author: PersonaId,
+          round_context: String } avec un #[error("...")] dérivant le message
+          du RFC GARDE 1a/1b. round_context porte le contexte (id du round ou
+          artifact_path) pour distinguer l'échec à l'initiate de l'échec au
+          vote.
+        1.2 ApproveWithFindings (GARDE 2a) : ajouter dans le MÊME fichier la
+          variante OrchestratorError::ApproveWithFindings { count: usize } avec
+          un #[error("...")] dérivant le message du RFC GARDE 2a ("Contradictory
+          vote: approve with N finding(s)..."). Cette variante est consommée
+          par engine.submit_vote (étape 4). Elle est déclarée DÈS MAINTENANT,
+          en même temps que SelfReviewForbidden, pour ne pas rouvrir error.rs
+          plus tard.
+        error.rs est dans le permit. C'est la première étape car les gardes
+        engine.rs en dépendent : SelfReviewForbidden est utilisée à l'étape 2
+        (initiate) et à l'étape 4 (submit_vote) ; ApproveWithFindings à
+        l'étape 4 (submit_vote).
       files:
         - crates/orchestrator/src/error.rs
     - description: >
@@ -150,15 +178,30 @@ spec:
       files:
         - crates/orchestrator/src/engine.rs
     - description: >
-        ÉTAPE 3 — GARDE 1b + GARDE 2a + GARDE 2b : refonte de
-        engine.submit_vote (engine.rs:231). CHANGEMENT DE SIGNATURE D'API
-        PUBLIQUE DE CRATE (décision itération 2) :
+        ÉTAPE 3 — GARDE 2b : champ notes sur ReviewVote
+        (crates/orchestrator/src/types.rs, struct ReviewVote L172). Cette étape
+        est placée AVANT la refonte de engine.submit_vote (étape 4) car cette
+        dernière construit un ReviewVote avec le nouveau champ : le type doit
+        exister d'abord. Ajouter
+          #[serde(default)]
+          pub notes: Option<String>,
+        après le champ findings (avant submitted_at, ou en dernier — choix
+        sans impact). #[serde(default)] garantit la rétro-compatibilité : les
+        votes JSON déjà stockés en DB (sans clé notes) se désérialisent en
+        None sans migration (impact RFC, rollback_plan). types.rs est dans le
+        permit.
+      files:
+        - crates/orchestrator/src/types.rs
+    - description: >
+        ÉTAPE 4 — GARDE 1b + GARDE 2a + GARDE 2b : refonte de
+        engine.submit_vote (engine.rs:231). Dépend de l'étape 1 (les deux
+        variantes d'erreur SelfReviewForbidden et ApproveWithFindings y sont
+        déjà déclarées) et de l'étape 3 (le champ notes existe sur ReviewVote).
+        CHANGEMENT DE SIGNATURE D'API PUBLIQUE DE CRATE (décision itération 2) :
           pub fn submit_vote(&self, round_id: Uuid, reviewer: PersonaId,
             verdict: ReviewVerdict, findings: Vec<Finding>,
             notes: Option<String>) -> Result<ReviewRound, OrchestratorError>
-        Ordre des gardes en tête de fonction, APRÈS la résolution du round
-        (get_round) et les checks existants (RoundNotOpen,
-        NotRequiredReviewer) ou AVANT selon cohérence — fixer l'ordre ainsi :
+        Ordre des gardes en tête de fonction — fixer l'ordre ainsi :
           (a) round résolu (existant, L238-241) ;
           (b) GARDE 1b self-review : si reviewer == round.author -> return
               SelfReviewForbidden { author: round.author, round_context:
@@ -169,34 +212,15 @@ spec:
           (d) GARDE 2a approve+findings : si verdict == ReviewVerdict::Approve
               && !findings.is_empty() -> return
               OrchestratorError::ApproveWithFindings { count: findings.len() }
-              (NOUVELLE variante à ajouter en étape 1bis, voir NB) avec le
-              message RFC GARDE 2a ;
+              (variante déclarée à l'étape 1.2) avec le message RFC GARDE 2a ;
           (e) construction du ReviewVote (L256) AVEC le nouveau champ
               notes (GARDE 2b) : ReviewVote { reviewer, verdict, findings,
               notes, submitted_at } ; les notes sont acceptées avec les DEUX
               verdicts.
-        NB sur l'ordre des étapes : la variante ApproveWithFindings { count }
-        doit être ajoutée à error.rs en MÊME TEMPS que SelfReviewForbidden
-        (étape 1) — regrouper les deux variantes dans l'étape 1 pour ne
-        toucher error.rs qu'une fois. (Le présent plan considère donc que
-        l'étape 1 ajoute LES DEUX variantes SelfReviewForbidden et
-        ApproveWithFindings.)
         Mettre à jour le SEUL caller non-test de submit_vote (main.rs L558,
-        traité étape 7) et les 9 call-sites de tests (étape 9).
+        traité étape 7) et les 9 call-sites de tests (étape 13).
       files:
         - crates/orchestrator/src/engine.rs
-    - description: >
-        ÉTAPE 4 — GARDE 2b : champ notes sur ReviewVote
-        (crates/orchestrator/src/types.rs, struct ReviewVote L172). Ajouter
-          #[serde(default)]
-          pub notes: Option<String>,
-        après le champ findings (avant submitted_at, ou en dernier — choix
-        sans impact). #[serde(default)] garantit la rétro-compatibilité : les
-        votes JSON déjà stockés en DB (sans clé notes) se désérialisent en
-        None sans migration (impact RFC, rollback_plan). types.rs est dans le
-        permit.
-      files:
-        - crates/orchestrator/src/types.rs
     - description: >
         ÉTAPE 5 — GARDE 2b (suite) : fixtures ReviewVote en DB
         (crates/orchestrator/src/db.rs). Les deux fixtures struct-literal
@@ -487,25 +511,34 @@ spec:
         d'index_artifact). Méthode : adapter setup_server (ou un helper
         setup_server_with_rfc) pour, AVANT de wrapper l'engine dans
         Arc<Mutex> :
-          (1) écrire le YAML du RFC fixture dans le tempdir sous
-              company/rfcs/<nom>.yml avec metadata.status au choix du test
+          (1) écrire le YAML du fixture dans le tempdir sous le bon dossier
+              (company/rfcs/<nom>.yml pour un RFC ; pour le test wrong_kind,
+              un kind != rfc, ex. company/lessons/<nom>.yml avec
+              kind: lesson-learned), avec metadata.status au choix du test
               (approved / draft / implemented). Fixtures construites avec
               String + \n littéraux + indentation explicite (lesson f3fc4a5d,
               JAMAIS la continuation backslash Rust).
           (2) indexer directement via db.upsert_artifact (OrchestratorDb et
               IndexedArtifact sont pub-exportés, lib.rs L12/L24 ; le harness
               construit déjà OrchestratorDb directement L1783) avec un
-              IndexedArtifact { id: <rfc_id>, kind: "rfc", file_path:
-              "company/rfcs/<nom>.yml", ... }, le content du YAML, un embedding
-              de zéros vec![0.0f32; companyos_orchestrator::EMBEDDING_DIM]
+              IndexedArtifact { id: <id>, kind: "rfc" (ou "lesson-learned"
+              pour wrong_kind), file_path: <chemin du fixture>, ... }, le
+              content du YAML, un embedding de zéros
+              vec![0.0f32; companyos_orchestrator::EMBEDDING_DIM]
               (EMBEDDING_DIM = 384), et &[] pour les relations. db.upsert_artifact
               prend &mut self -> appeler sur le db AVANT new_without_embedder
               (qui consomme db par valeur).
           (3) init_git_repo (L1767) pour avoir un HEAD (déjà fait par les
               tests grant existants).
-        Tests :
+        Tests (liste FERME, tous obligatoires) :
           - test_grant_refused_rfc_not_indexed : rfc_id aléatoire non indexé
             -> refus "not indexed".
+          - test_grant_refused_wrong_kind : fixture indexée avec
+            kind=lesson-learned (via db.upsert_artifact, file_path sous
+            company/lessons/) référencée comme rfc_id -> refus dont le message
+            NOMME le kind réel trouvé ("found: lesson-learned/..."), conforme
+            au message RFC GARDE 4. Couvre la branche kind != "rfc" de la
+            garde, distincte de not_indexed et des refus de status.
           - test_grant_refused_rfc_draft : fixture status draft -> refus
             nommant draft.
           - test_grant_refused_rfc_implemented : fixture status implemented
@@ -516,10 +549,20 @@ spec:
           L1956, L1990, L2032, L2058) qui utilisent Uuid::new_v4() non indexé :
           elles doivent indexer un RFC approved fixture pour continuer à
           passer (impact recensé RFC).
-        GARDE 3 :
-          - test_consume_refused_dirty_worktree : grant + permit actif ;
-            modifier (sans commit) un fichier couvert par un target_path ;
+        GARDE 3 (liste FERME, tous obligatoires) :
+          - test_consume_refused_dirty_worktree : grant + permit actif sur un
+            target_path LITTÉRAL ; modifier (sans commit) ce fichier ;
             consume -> refus listant le fichier sale.
+          - test_consume_refused_dirty_glob_pattern : grant + permit actif sur
+            un target_path à WILDCARD (ex. "crates/x/src/*.rs" ou
+            "crates/**/*.rs") ; créer/modifier (sans commit) un fichier qui
+            MATCHE le pattern (ex. crates/x/src/a.rs) ; consume -> refus listant
+            le fichier sale. Vérifie spécifiquement le passage du target_path
+            comme pathspec git avec préfixe :(glob) sur les métacaractères
+            (décision itération 2) et le comportement conservateur fail-safe.
+            OBLIGATOIRE (et non plus "si possible") : c'est l'unique test qui
+            exerce la branche glob du calcul de pathspec, distincte du chemin
+            littéral.
           - test_consume_accepted_clean_worktree : grant + commit du fichier
             (ou worktree propre) ; consume -> Ok.
           - test_consume_git_unavailable (optionnel/edge) : documenter ;
@@ -574,9 +617,21 @@ spec:
               (peut être fusionné avec (1) si préféré ; l'essentiel est que
               TOUT soit commité AVANT le consume).
           (3) consume_write_permit(286abb1a-d7d8-456e-bdfd-25188338065b) —
-              APRÈS les commits (lesson 8fd49300 ; et la GARDE 3 fraîchement
-              implémentée refusera un consume si le worktree des target_paths
-              est sale, donc les commits DOIVENT précéder).
+              APRÈS les commits. NUANCE (observation Architect) : à ce stade
+              le binaire serveur EN COURS d'exécution est encore l'ANCIEN (la
+              GARDE 3 vient d'être COMPILÉE mais le hot-reload via cargo build
+              (étape 16.4) n'a pas encore eu lieu, et reload_config (16.7) non
+              plus) ; le consume de cette toute première exécution ne sera donc
+              PAS encore gardé par la nouvelle logique GARDE 3. L'ordre
+              commits-puis-consume reste néanmoins OBLIGATOIRE pour deux raisons
+              indépendantes de la GARDE 3 : (a) l'invariant historique de la
+              lesson 8fd49300 (consume APRÈS le commit, jamais avant) ; (b) le
+              hook defense-in-depth Layer 2 qui rejette tout commit en zone
+              protégée si le permit est déjà consommé. Une fois le serveur
+              hot-reloadé, les consumes ULTÉRIEURS (autres workflows) seront en
+              plus gardés mécaniquement par la GARDE 3. Conclusion : ne jamais
+              consommer avant que TOUT soit commité, indépendamment de l'état
+              de chargement de la GARDE 3.
           (4) cargo build (SANS --target-dir, déclencheur du hot-reload des
               MCP servers) -> 0 erreur.
           (5) cargo test (workspace complet) -> 0 failed (tests existants +
@@ -608,11 +663,13 @@ spec:
       RISQUE 2 — Divergence glob crate vs pathspec git (GARDE 3). Décision
       itération 2 : préfixe :(glob) sur les métacaractères, comportement
       conservateur fail-safe (git matche plus -> refus plus strict, jamais un
-      worktree sale qui passe). Mitigation : test
-      test_consume_refused_dirty_worktree sur un target_path littéral ET, si
-      possible, sur un pattern glob, pour confirmer le matching. Le risque
-      résiduel est un faux positif (refus à tort) qui se résout en commitant,
-      jamais une faille de sécurité.
+      worktree sale qui passe). Mitigation : DEUX tests OBLIGATOIRES à l'étape
+      14 (finding Architect round 40afe0c5) — test_consume_refused_dirty_
+      worktree sur un target_path LITTÉRAL ET test_consume_refused_dirty_glob_
+      pattern sur un target_path à WILDCARD, ce dernier exerçant spécifiquement
+      la branche de calcul du pathspec :(glob). Le risque résiduel est un faux
+      positif (refus à tort) qui se résout en commitant, jamais une faille de
+      sécurité.
     - >
       RISQUE 3 — Disjoint capture edition 2024 sur le clone de
       Arc<RwLock<ReviewProtocol>> dans la closure du watcher (GARDE 5,
@@ -645,10 +702,11 @@ spec:
       qu'aucun round ouvert n'a author ∈ required_reviewers ; sinon le fermer
       / recréer. Hors scope code de ce plan.
     - >
-      RISQUE 7 — error.rs touché deux fois (SelfReviewForbidden +
-      ApproveWithFindings). Mitigation : regrouper l'ajout des DEUX variantes
-      dans l'étape 1 (une seule passe sur error.rs), même si la garde 2a est
-      décrite en étape 3. error.rs est dans le permit.
+      RISQUE 7 — error.rs touché plusieurs fois. Mitigation : regrouper l'ajout
+      des DEUX variantes (SelfReviewForbidden ET ApproveWithFindings) dans
+      l'étape 1 (une seule passe sur error.rs), bien que la garde 2a qui
+      consomme ApproveWithFindings soit implémentée à l'étape 4
+      (engine.submit_vote). error.rs est dans le permit.
     - >
       RISQUE 8 — Périmètre des écritures borné aux 16 affected_files.modified.
       AUCUN fichier à créer (le RFC ne crée rien : tests inline, pas de
