@@ -1,0 +1,133 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: f82847f1-7ee2-4fc7-a4f5-a1685a62c152
+  title: "Pre-commit hook bloque tout commit malgré make ci vert : fuite GIT_* du commit parent vers cargo test"
+  author: implementer
+  created_at: "2026-06-10"
+  description: >
+    Pendant la finalisation de l'implementation-plan du RFC 8bf78218
+    (plan 4b56b1b9), le pre-commit hook a refusé systématiquement tous les
+    commits avec "CI pipeline failed", alors que make ci exécuté à la main
+    était intégralement vert. Investigation : le hook exporte involontairement
+    l'environnement git du commit en cours (GIT_INDEX_FILE, GIT_DIR, etc.)
+    vers le cargo test lancé par make ci ; les tests git-based de l'orchestrator
+    MCP, qui créent des dépôts git jetables en tempdir, opéraient alors sur
+    l'index du dépôt EXTERNE. Corrigé à la source par sanitization de
+    l'environnement au point de fuite (le hook), commit 916bf1d.
+  tags:
+    - pre-commit
+    - git
+    - hermeticite
+    - environment-leak
+    - ci
+    - harness
+    - companyos-internals
+    - critical-infra
+  related:
+    - id: 4b56b1b9-bd6f-4913-ae66-189b24824c8a
+      kind: implementation-plan
+      relationship: related
+    - id: d5c9c933-2955-41e1-b2ae-73c9f307f09f
+      kind: lesson-learned
+      relationship: related
+    - id: 8bf78218-e1f3-4bc5-864c-2abf618a990d
+      kind: rfc
+      relationship: related
+
+spec:
+  symptom: >
+    Le pre-commit hook (.githooks/pre-commit) refusait TOUT commit, y compris
+    un simple document YAML dans projects/ (hors zone protégée, validé au
+    schema, auto-indexé) :
+
+      [companyos:pre-commit] ERROR: CI pipeline failed
+      | context: make ci (fmt + clippy + test + validate)
+      | reason:  One or more CI checks failed
+
+    Paradoxe diagnostique : la MÊME commande `make ci` lancée manuellement
+    dans le shell sortait avec exit 0 (lint OK, test OK, validate OK,
+    check-naming OK), de façon reproductible et dans tous les environnements
+    testés (shell interactif, env minimal `env -i`, hook-style avec
+    COMPANYOS_ROOT). Exécuter directement le script du hook
+    (`bash .githooks/pre-commit`) sortait aussi "All checks passed". Le
+    blocage n'apparaissait QUE lorsque le hook était invoqué par
+    `git commit` lui-même. Trois tentatives de retry (espacées, conformes à
+    shared-rules.mcp_reconnect par analogie) n'ont rien changé : échec
+    déterministe, pas transitoire.
+
+  root_cause: >
+    Quand `git commit` exécute un hook, git EXPORTE dans l'environnement du
+    processus hook un jeu de variables propres au commit en cours. Capturé
+    empiriquement en instrumentant temporairement le hook
+    (`env | grep -i '^GIT_' > fichier ; exit 1`) :
+
+      GIT_INDEX_FILE=/.../.git/next-index-NNN.lock   <-- le coupable principal
+      GIT_DIR (implicite), GIT_PREFIX=
+      GIT_AUTHOR_NAME / GIT_AUTHOR_EMAIL / GIT_AUTHOR_DATE
+      GIT_EXEC_PATH, GIT_EDITOR=:
+
+    Ces variables sont héritées par TOUS les enfants du hook, dont le
+    `cargo test` lancé par `make ci`. Or les tests git-based de
+    crates/mcp-servers/orchestrator/src/main.rs (test_seal_db_commit_*,
+    test_grant_write_permit_*) appellent un helper init_git_repo qui crée un
+    dépôt git JETABLE dans un tempdir puis exécute `git init`, `git add
+    README.md`, `git commit`. Le helper `git()` (main.rs L1752) fixe bien
+    current_dir(tempdir) MAIS ne neutralise pas les variables GIT_* ambiantes.
+    Conséquence : GIT_INDEX_FILE pointant sur le lock d'index du dépôt EXTERNE,
+    les `git add`/`git commit` du tempdir opéraient sur ce lock au lieu de
+    l'index du tempdir, échouant avec :
+
+      git ["add", "README.md"] failed: fatal : Impossible de créer
+        '/.../.git/next-index-NNN.lock.lock' : Le fichier existe.
+      git ["commit", ...] failed: erreur : invalid object 100755 ...
+        for '.githooks/pre-commit'
+
+    (le ".lock.lock" est le lock que git pose SUR le GIT_INDEX_FILE déjà
+    suffixé .lock ; "invalid object for .githooks/pre-commit" trahit que le
+    commit du tempdir lisait l'index/arbre du dépôt externe). 5 tests sur 10
+    du binaire orchestrator-server échouaient ainsi, faisant échouer
+    `make test` (Error 101) donc `make ci`, donc le hook. La panne était
+    invisible en isolation parce qu'aucune variable GIT_* n'est positionnée
+    hors d'un hook git.
+
+  resolution: >
+    Fix DÉFINITIF À LA SOURCE, au point de fuite (le hook lui-même, là où
+    l'environnement git est injecté). Modification de .githooks/pre-commit
+    (hors zone protégée, aucun write permit requis) : l'appel
+    `make -C "$ROOT" ci` est désormais préfixé par `env -u` qui retire les
+    variables git héritées avant de lancer le pipeline :
+
+      env -u GIT_INDEX_FILE -u GIT_DIR -u GIT_WORK_TREE -u GIT_PREFIX \
+          -u GIT_AUTHOR_NAME -u GIT_AUTHOR_EMAIL -u GIT_AUTHOR_DATE \
+          -u GIT_COMMITTER_NAME -u GIT_COMMITTER_EMAIL -u GIT_COMMITTER_DATE \
+          make -C "$ROOT" ci > /dev/null 2>&1
+
+    Tout enfant du pipeline (cargo test inclus) part ainsi d'un environnement
+    git vierge ; les invocations git nichées résolvent leur dépôt depuis leur
+    propre cwd. Commit 916bf1d ("fix(hook): sanitize leaked git env before
+    make ci in pre-commit"). Vérifié : les deux commits suivants (916bf1d
+    lui-même via auto-application, puis le plan d5eb6a9) sortent
+    "[companyos:pre-commit] OK: All checks passed" ; et `make ci` reste
+    hermétique même avec GIT_INDEX_FILE/GIT_DIR injectés manuellement
+    (`env -u ... make ci` -> exit 0).
+
+    DÉFENSE EN PROFONDEUR (différée, pas dans ce fix) : les helpers de test
+    git (helper `git()` et init_git_repo dans main.rs) devraient AUSSI être
+    rendus hermétiques (env_remove des GIT_* sur chaque Command::new("git")),
+    et la closure git() de production de seal_db_commit (main.rs L396) gagnerait
+    à faire de même par hygiène — ces fichiers sont en zone protégée et sont
+    déjà touchés par l'implémentation du RFC 8bf78218 (permit 286abb1a), donc
+    le durcissement des helpers de test sera intégré à la phase d'implémentation
+    du lot 1 (et noté dans la lesson 1afcbe17). Le fix du hook seul suffit à
+    débloquer tous les commits immédiatement.
+
+    EFFET DE BORD OBSERVÉ (non causé par ce diagnostic) : pendant le
+    `cargo build`/relink déclenché par make ci au moment d'un commit, le binaire
+    companyos-orchestrator-server en cours d'exécution a été remplacé et le
+    serveur MCP orchestrator + son proxy se sont arrêtés sans être respawnés
+    dans la session. La connexion MCP a été perdue jusqu'au reboot de session
+    par l'utilisateur. C'est cohérent avec le risque connu du hot-reload
+    (implementer.yml hotreload_last) ; non traité ici.
+
+  status: resolved

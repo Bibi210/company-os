@@ -1,0 +1,134 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 1afcbe17-74d5-42db-b0de-b381e73910ea
+  title: "Un processus lancé depuis un git hook hérite des variables GIT_* du commit : tout code/test qui spawn git doit être hermétique"
+  author: implementer
+  created_at: "2026-06-10"
+  description: >
+    Capitalisation après le diagnostic f82847f1 : le pre-commit hook bloquait
+    tout commit alors que make ci était vert en isolation. Cause = git exporte
+    GIT_INDEX_FILE / GIT_DIR / GIT_AUTHOR_* dans l'environnement du hook, hérité
+    par le cargo test qu'il lance ; les tests créant des dépôts git jetables en
+    tempdir opéraient sur l'index du dépôt externe. Cette lesson généralise :
+    tout processus enfant d'un git hook part d'un environnement git POLLUÉ, et
+    tout code (test ou production) qui invoque git doit neutraliser ces
+    variables pour être hermétique. Fix appliqué au point de fuite (le hook,
+    via env -u), commit 916bf1d.
+  tags:
+    - git
+    - hermeticite
+    - environment-leak
+    - pre-commit
+    - hook
+    - ci
+    - testing
+    - harness
+    - companyos-internals
+    - lessons-from-implementation
+  related:
+    - id: f82847f1-7ee2-4fc7-a4f5-a1685a62c152
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: d5c9c933-2955-41e1-b2ae-73c9f307f09f
+      kind: lesson-learned
+      relationship: related
+    - id: f3fc4a5d-e9e6-43ef-86e9-49441fa84eaa
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    En finalisant l'implementation-plan du RFC 8bf78218 (un simple document
+    YAML dans projects/, hors zone protégée), le pre-commit hook refusait TOUT
+    commit avec "CI pipeline failed". Or `make ci` lancé manuellement sortait
+    exit 0 de façon reproductible, dans tous les environnements (shell
+    interactif, env minimal, hook-style), et exécuter directement
+    `bash .githooks/pre-commit` affichait "All checks passed". Le blocage
+    n'apparaissait QUE quand le hook était invoqué par `git commit`.
+
+    L'instrumentation du hook (`env | grep '^GIT_'`) a révélé que `git commit`
+    exporte vers le processus hook : GIT_INDEX_FILE (pointant sur
+    .git/next-index-NNN.lock, l'index temporaire du commit en cours), GIT_DIR,
+    GIT_PREFIX, GIT_AUTHOR_NAME/EMAIL/DATE, GIT_EXEC_PATH, GIT_EDITOR. Ces
+    variables étaient héritées par le `cargo test` de make ci. Les tests
+    git-based de l'orchestrator MCP (test_seal_db_commit_*,
+    test_grant_write_permit_*) créent un dépôt git jetable en tempdir et y
+    lancent git add/commit ; leur helper git() fixait current_dir(tempdir)
+    mais ne nettoyait pas l'environnement, si bien que GIT_INDEX_FILE les
+    faisait écrire sur le lock d'index du dépôt EXTERNE :
+    "Impossible de créer '.git/next-index-NNN.lock.lock'" +
+    "invalid object ... for '.githooks/pre-commit'". 5 tests échouaient,
+    cassant make test puis le hook.
+
+  insight: >
+    DEUX enseignements liés.
+
+    (1) UN GIT HOOK POLLUE L'ENVIRONNEMENT DE SES ENFANTS. Quand git exécute un
+    hook (pre-commit, commit-msg, post-commit, etc.), il exporte des variables
+    propres à l'opération en cours : GIT_INDEX_FILE (souvent un index
+    TEMPORAIRE distinct de .git/index), GIT_DIR, GIT_WORK_TREE, GIT_PREFIX, et
+    l'identité GIT_AUTHOR_*/GIT_COMMITTER_*. Tout processus lancé par le hook
+    (build, lint, test, script) en hérite. Un pipeline qui passe parfaitement
+    en isolation peut donc échouer UNIQUEMENT sous le hook — symptôme
+    déroutant, car la commande "identique" diverge selon son environnement.
+    Le tell-tale signature : des erreurs git mentionnant un index .lock que
+    le code ne devrait pas connaître, ou un chemin du dépôt PARENT apparaissant
+    dans un test censé être isolé.
+
+    (2) TOUT CODE QUI SPAWN GIT DOIT ÊTRE HERMÉTIQUE. Fixer current_dir() ne
+    suffit PAS : git consulte GIT_DIR / GIT_INDEX_FILE AVANT le cwd. Un
+    Command::new("git") qui veut viser un dépôt précis doit explicitement
+    RETIRER les variables GIT_* ambiantes (Rust: .env_remove("GIT_DIR"),
+    .env_remove("GIT_INDEX_FILE"), .env_remove("GIT_WORK_TREE"), etc. ; shell:
+    `env -u GIT_DIR -u GIT_INDEX_FILE ...`). C'est l'analogue du forçage
+    LC_ALL=C de la lesson d5c9c933 (seal_db_commit), même classe de problème :
+    l'environnement ambiant change silencieusement la sémantique d'une
+    invocation git. Là où d5c9c933 neutralisait la LOCALE pour stabiliser le
+    PARSING des messages, ici on neutralise les variables d'ÉTAT git pour
+    stabiliser la CIBLE de l'invocation.
+
+    Le fix le moins coûteux et le plus complet se fait AU POINT DE FUITE : le
+    hook, qui est l'unique frontière où git injecte ces variables. Préfixer le
+    pipeline par `env -u <toutes les GIT_*> make ci` assainit d'un coup TOUS
+    les enfants, sans avoir à auditer chaque test. La défense en profondeur
+    (rendre chaque helper git de test hermétique) reste souhaitable mais
+    secondaire.
+
+  recommendation: >
+    1. SANITISER L'ENVIRONNEMENT GIT AU POINT DE FUITE. Dans tout git hook qui
+       lance un pipeline (make ci, cargo, npm, scripts), préfixer l'invocation
+       par `env -u GIT_INDEX_FILE -u GIT_DIR -u GIT_WORK_TREE -u GIT_PREFIX
+       -u GIT_AUTHOR_NAME -u GIT_AUTHOR_EMAIL -u GIT_AUTHOR_DATE
+       -u GIT_COMMITTER_NAME -u GIT_COMMITTER_EMAIL -u GIT_COMMITTER_DATE`.
+       C'est le correctif global : il protège tous les enfants, présents et
+       futurs, sans dépendre de la discipline de chaque test.
+
+    2. RENDRE HERMÉTIQUE TOUT HELPER/CODE QUI SPAWN GIT (défense en profondeur).
+       Sur chaque Command::new("git") qui doit cibler un dépôt par son cwd,
+       ajouter .env_remove des variables GIT_* d'état (au minimum GIT_DIR,
+       GIT_INDEX_FILE, GIT_WORK_TREE). Pour les tests créant des dépôts
+       jetables, c'est indispensable à leur hermeticité. Pour le code de
+       production (ex. la closure git() de seal_db_commit / la future garde
+       GARDE 3 git status du RFC 8bf78218), c'est de l'hygiène bon marché qui
+       blinde contre une invocation depuis un contexte pollué.
+
+    3. SYMPTÔME -> RÉFLEXE. "Une commande verte en isolation mais rouge sous un
+       git hook" => suspecter immédiatement une fuite d'environnement (GIT_*,
+       mais aussi tout var positionné par le contexte appelant). Instrumenter
+       en capturant `env` dans le hook AVANT de chercher ailleurs ; c'est
+       rapide et décisif. Ne pas partir sur une piste de flakiness/contention
+       de build (fausse piste initiale ici) sans avoir d'abord comparé les
+       environnements.
+
+    4. GÉNÉRALISATION. La même précaution vaut pour d'autres outils sensibles à
+       l'environnement hérité (GNUPGHOME, SSH_AUTH_SOCK, variables CARGO_*,
+       NODE_OPTIONS) quand un hook ou un orchestrateur spawn des sous-processus
+       censés être isolés. Le principe : un sous-processus qui doit être
+       hermétique ne doit jamais faire confiance à l'environnement hérité pour
+       les variables qui déterminent sa cible ou sa sémantique.
+
+    Empirique : fix validé runtime — make ci redevient hermétique même avec
+    GIT_INDEX_FILE/GIT_DIR injectés, et les commits passent
+    "[companyos:pre-commit] OK: All checks passed" (commit 916bf1d du hook,
+    puis d5eb6a9 du plan).
