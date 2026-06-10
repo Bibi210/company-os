@@ -41,6 +41,14 @@ metadata:
     - date: "2026-06-10"
       author: pm
       description: >
+        v1-hygiene terminé (diagnostic af11b99e, lesson a1601839) : 6 RFCs
+        approved passés implemented, 9 task-requests backlog passés done,
+        2 conservés backlog (api-callers tracé companyos-system,
+        onnx-cpu-saturation ajouté à companyos-system suite au triage).
+        v1-memory-audit passe en in_progress.
+    - date: "2026-06-10"
+      author: pm
+      description: >
         Création de la roadmap. Décisions utilisateur fondatrices : roadmap
         dédiée (domaine companyos-v1), objectif final tag git v1, ordre
         hygiène d'abord validé, droit de tri délégué intégralement aux agents
@@ -105,8 +113,8 @@ spec:
         type: loose
         category: exploration
         label: "Triage des 6 RFCs approved non clos, 12 task-requests backlog, archivage playgrounds"
-      timeframe: present
-      status: planned
+      timeframe: past
+      status: done
       target_date: "2026-Q2"
       rationale: >
         Nettoyer la table avant l'analyse de fond. Trois lots : les 6 RFCs
@@ -122,8 +130,8 @@ spec:
         type: loose
         category: exploration
         label: "Passe complète sur company/lessons/ : dédupliquer, superseder, chaîner, élaguer"
-      timeframe: future
-      status: planned
+      timeframe: present
+      status: in_progress
       target_date: "2026-Q2"
       depends_on: [v1-hygiene]
       rationale: >

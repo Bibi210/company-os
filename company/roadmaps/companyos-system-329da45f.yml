@@ -344,6 +344,24 @@ spec:
         des callers, validation par l'Architect au review du
         plan.
 
+    - key: onnx-cpu-saturation
+      title: "Saturation CPU ONNX / contention engine d'embedding"
+      ref:
+        type: loose
+        category: idea
+        label: "Task-request 0e089d1b en backlog, diagnostic fa9bd072 : RFC PISTE B à rédiger"
+      timeframe: future
+      status: planned
+      rationale: >
+        Remonté par le triage v1-hygiene (diagnostic af11b99e,
+        2026-06-10) : le task-request 0e089d1b (critical-infra,
+        priorité haute) était en backlog sans être tracé dans aucune
+        roadmap. Le diagnostic fa9bd072 conclut qu'un RFC dédié
+        (PISTE B) reste à rédiger pour résoudre la contention CPU de
+        l'engine d'embedding lors de reload_config. Tracé ici pour
+        rendre la conservation du backlog conforme à la règle de
+        triage du programme companyos-v1.
+
     - key: backup-strategy
       title: "Stratégie de sauvegarde mémoire collective"
       ref:
