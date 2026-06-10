@@ -1,0 +1,127 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 272eda39-dee6-4e8c-8696-62edd0f25b35
+  title: "Basculer le modèle des agents pm et architect vers anthropic/claude-fable-5 dans opencode.json"
+  author: architect
+  created_at: "2026-06-10"
+  status: implemented
+  implemented_at: "2026-06-10T09:24:38.685398935+00:00"
+  approved_at: "2026-06-10T09:20:15.519534628+00:00"
+  description: >
+    Remplace anthropic/claude-opus-4-8 par anthropic/claude-fable-5 dans le champ
+    model des agents pm et architect de company/config/opencode.json. Les agents
+    implementer et ceo restent sur anthropic/claude-opus-4-8 (périmètre réduit de
+    4 à 2 agents sur précision utilisateur du 2026-06-10). Changement demandé par
+    l'utilisateur, bloqué une première fois par le hook defense-in-depth (zone
+    protégée company/config/). Périmètre strictement borné aux 2 champs model.
+    Issu du task-request 029c9c39.
+  tags:
+    - opencode
+    - config
+    - model
+    - agents
+    - companyos-internals
+  related:
+    - id: 029c9c39-186f-41f5-bf08-225ba9776f83
+      relationship: input
+
+spec:
+  motivation: >
+    L'utilisateur a demandé de basculer le modèle des agents pm et architect de
+    anthropic/claude-opus-4-8 vers anthropic/claude-fable-5 dans
+    company/config/opencode.json (task-request 029c9c39-186f-41f5-bf08-225ba9776f83).
+    La demande initiale couvrait les 4 agents ; l'utilisateur a ensuite précisé le
+    périmètre le 2026-06-10 : seuls pm et architect basculent, implementer et ceo
+    restent sur anthropic/claude-opus-4-8. Le task-request source a été mis à jour
+    par le PM en conséquence, et ce RFC (encore en draft) est révisé pour s'y aligner.
+
+    Une première tentative de modification directe a été annulée par le hook
+    defense-in-depth le 2026-06-10 : company/config/ est une zone protégée, et toute
+    modification doit passer par le circuit officiel (RFC, approbation CEO, write
+    permit, implémentation, commit local sans push). Le fichier dans le working tree
+    est donc actuellement revenu à claude-opus-4-8 pour les 4 agents (état vérifié
+    le 2026-06-10).
+
+    Ce RFC formalise le changement pour le faire passer par le circuit officiel,
+    conformément à la règle companyos_is_a_project des shared-rules.
+
+  proposal: >
+    Une seule modification dans company/config/opencode.json : remplacer la valeur
+    du champ model pour les agents pm et architect uniquement. Les champs model
+    des agents implementer et ceo NE SONT PAS modifiés et restent à
+    "anthropic/claude-opus-4-8". Aucun autre champ n'est touché (default_agent,
+    prompt, tools, mcp, instructions, plugin, permission restent strictement
+    identiques). Le fichier reste un JSON valide avec la même structure.
+
+    Diff exact attendu (2 lignes modifiées, rien d'autre) :
+
+      agent.pm.model :
+        BEFORE : "anthropic/claude-opus-4-8"
+        AFTER  : "anthropic/claude-fable-5"
+
+      agent.architect.model :
+        BEFORE : "anthropic/claude-opus-4-8"
+        AFTER  : "anthropic/claude-fable-5"
+
+      agent.implementer.model : INCHANGÉ ("anthropic/claude-opus-4-8")
+      agent.ceo.model         : INCHANGÉ ("anthropic/claude-opus-4-8")
+
+    En notation diff unifiée, les 2 hunks sont identiques :
+
+      -      "model": "anthropic/claude-opus-4-8",
+      +      "model": "anthropic/claude-fable-5",
+
+    (une occurrence par agent basculé : pm ligne 6, architect ligne 10 dans l'état
+    actuel du fichier ; les lignes 14 et 18, implementer et ceo, restent intactes).
+
+  impact: >
+    Impact opérationnel : à partir de la prochaine session opencode (ou du prochain
+    rechargement de la config), les personas pm et architect seront servies par
+    anthropic/claude-fable-5, tandis que implementer et ceo continueront d'être
+    servies par anthropic/claude-opus-4-8. Les sessions déjà ouvertes ne sont pas
+    affectées rétroactivement.
+
+    Configuration hétérogène des modèles : ce changement introduit un parc de
+    modèles mixte (2 agents sur claude-fable-5, 2 agents sur claude-opus-4-8),
+    là où la config était jusqu'ici homogène. Conséquences à évaluer :
+    (a) les artifacts produits par pm et architect (task-requests, design-docs,
+    RFCs) seront rédigés par un modèle différent de celui qui les consomme et les
+    review (implementer, ceo), ce qui peut faire varier le style et la granularité
+    entre maillons de la chaîne, sans toutefois affecter les contrats structurels
+    (schemas YAML, review-protocol, règles partagées, qui restent le référentiel
+    commun et machine-checked) ; (b) le diagnostic d'un comportement inattendu
+    d'agent devra désormais tenir compte du modèle sous-jacent de la persona
+    concernée ; (c) cette hétérogénéité est un choix explicite de l'utilisateur,
+    réversible agent par agent via le même circuit RFC. Aucun mécanisme de
+    CompanyOS ne suppose que les agents partagent le même modèle : le risque
+    structurel est nul, le risque est limité à la variabilité comportementale
+    inter-modèles.
+
+    Impact sur le système : aucun changement de code, aucun changement de schema,
+    aucun changement de persona ni de workflow. Les prompts, les tools restrictions
+    du CEO (write/edit/bash désactivés), les serveurs MCP et les plugins restent
+    inchangés. Le risque fonctionnel se limite au comportement du nouveau modèle
+    sur les 2 agents basculés, qui relève du choix assumé de l'utilisateur.
+
+    Cas négatif : si l'identifiant anthropic/claude-fable-5 n'était pas reconnu par
+    opencode ou par le provider, les agents pm et architect ne démarreraient pas
+    (implementer et ceo resteraient fonctionnels) ; le rollback_plan couvre ce cas
+    par un retour immédiat des 2 champs à claude-opus-4-8.
+
+    Zone protégée : company/config/opencode.json. Approbation CEO et write permit
+    requis avant implémentation. Commit local uniquement, pas de push (contrainte
+    du task-request).
+
+  affected_files:
+    modified:
+      - company/config/opencode.json
+
+  rollback_plan: >
+    Restaurer la valeur "anthropic/claude-opus-4-8" dans le champ model des 2 agents
+    basculés (pm et architect) de company/config/opencode.json, ce qui ramène la
+    config à un parc homogène claude-opus-4-8. Le rollback est le miroir exact du
+    changement (2 lignes), et nécessitera lui aussi un write permit sur
+    company/config/opencode.json (zone protégée). Déclencheur de rollback :
+    identifiant de modèle non reconnu, agents pm/architect incapables de démarrer,
+    ou décision utilisateur de revenir en arrière.
