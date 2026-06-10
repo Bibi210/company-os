@@ -1,0 +1,86 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 595b2d8d-fd74-4b23-a6fb-cf04ae33902b
+  title: "Le scellement atomique de grant_write_permit peut absorber une modif protégée déjà stagée : le commit de code devient un no-op"
+  author: implementer
+  created_at: "2026-06-10"
+  description: >
+    Quand un fichier en zone protégée est déjà stagé dans l'index git (état M)
+    au moment où le CEO réémet un write permit, le commit de scellement atomique
+    de grant_write_permit (RFC 359f9162, git add -f orchestrator.db + git commit)
+    embarque AUSSI ce fichier stagé dans son commit. Conséquence : à l'étape
+    "commit du code" de write_permit_full_sequence, git diff HEAD est vide, il n'y
+    a plus rien à committer, et le changement de code est déjà scellé sous le commit
+    de seal. Ne pas créer de commit vide ; vérifier l'état réel de HEAD avant de
+    committer. L'invariant consume-en-dernier (lesson 8fd49300) reste entièrement
+    valide et n'est pas contredit.
+  tags:
+    - write-permit
+    - defense-in-depth
+    - atomicity
+    - sealing
+    - sequencing
+    - implementer
+    - workflow
+    - git
+    - companyos-internals
+    - lessons-from-implementation
+  related:
+    - id: 8fd49300-14e5-4e7c-b75f-e0e4bd461aac
+      kind: lesson-learned
+      relationship: related
+    - id: d5c9c933-2955-41e1-b2ae-73c9f307f09f
+      kind: lesson-learned
+      relationship: related
+    - id: 272eda39-dee6-4e8c-8696-62edd0f25b35
+      kind: rfc
+      relationship: derived-from
+
+spec:
+  context: >
+    Implémentation du RFC 272eda39 (bascule du model de pm/architect vers
+    claude-fable-5 dans company/config/opencode.json, zone protégée). Premier
+    essai : j'ai suivi un ordre d'étapes qui consommait le permit AVANT le commit
+    du code. Le hook defense-in-depth a rejeté et reverté le commit (permit déjà
+    consumed, Layer 2 exige un permit active au commit), exactement l'anti-pattern
+    documenté par la lesson 8fd49300. Le working tree restait correct (modif
+    stagée, fable-5 préservé) mais non committable, et le permit était brûlé.
+
+    Le CEO a réémis un second permit (a540d440). À ce moment, opencode.json était
+    TOUJOURS stagé en index (M) suite au revert précédent qui préserve le working
+    tree. Le grant_write_permit du second permit a déclenché son scellement
+    atomique (RFC 359f9162) : git add -f orchestrator.db + git commit. Ce commit de
+    seal a embarqué la modif d'opencode.json déjà stagée. Résultat constaté : après
+    le grant, `git status` ne listait PLUS opencode.json (déjà committé sous le
+    commit de seal a9aeabc), et `git diff HEAD -- company/config/opencode.json`
+    était vide. L'étape "commit du code" de la mission était donc déjà satisfaite,
+    sans action de ma part.
+
+  insight: >
+    Le scellement atomique de grant_write_permit fait un `git commit` global, pas un
+    commit ciblé uniquement sur orchestrator.db : tout ce qui est déjà dans l'index
+    au moment du grant part dans le même commit. Quand le fichier protégé visé par
+    le permit est déjà stagé (cas classique après un revert de hook qui préserve le
+    working tree mais laisse l'index peuplé), le scellement le commit "gratuitement".
+    Ce n'est ni un bug ni une violation de permit : l'écriture du fichier avait eu
+    lieu sous un permit actif (Layer 1 OK), et le commit se fait pendant que le
+    nouveau permit est actif (Layer 2 OK). C'est un raccourci heureux, mais qui peut
+    surprendre : on s'attend à committer soi-même à l'étape suivante et on trouve un
+    HEAD déjà à jour. Tenter un commit explicite donnerait alors "nothing to commit".
+
+  recommendation: >
+    Après une réémission de permit, TOUJOURS inspecter l'état réel avant de committer :
+    `git status --short`, `git log --oneline -3` (chercher un commit de seal récent),
+    et `git diff HEAD -- <fichier protégé>`. Trois cas :
+    (1) le fichier protégé est encore listé comme modifié/stagé et absent de HEAD ->
+        committer normalement pendant que le permit est actif, puis consume.
+    (2) le fichier protégé a disparu de git status et HEAD contient déjà le bon
+        contenu (diff HEAD vide) -> le scellement l'a déjà committé ; NE PAS créer de
+        commit vide, passer directement à consume puis aux étapes de clôture.
+    (3) doute -> vérifier le contenu de HEAD avec `git show HEAD:<fichier> | grep`.
+    Ne jamais forcer un commit vide ni boucler sur orchestrator.db (le serveur MCP
+    touche la DB en continu, un M résiduel sur orchestrator.db après commit est du
+    churn runtime normal, pas un travail à committer). L'ordre write -> commit ->
+    consume reste la règle ; ce qui change ici, c'est que "commit" peut être déjà
+    fait par le seal.
