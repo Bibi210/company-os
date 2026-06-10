@@ -1,0 +1,656 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 4b56b1b9-bd6f-4913-ae66-189b24824c8a
+  title: "Implementation-plan : V1 process lot 1 — 5 gardes serveur/schema + purge des règles mortes"
+  author: implementer
+  created_at: "2026-06-10"
+  description: >
+    Plan d'implémentation du RFC 8bf78218 (approuvé, itération 2). Mécanise
+    dans le harness les 5 gardes de process (self_review_forbidden,
+    review_findings_honesty + canal notes, commit-puis-consume,
+    grant exige un RFC approved, reviewers_by_artifact_type appliqué) et
+    purge les règles mortes (budget_limits, circuit_breaker,
+    escalation_rules, chargement Rust de human-review-triggers) avec verrou
+    schema additionalProperties: false. Intègre les décisions tranchées en
+    itération 2 du review : engine.submit_vote CHANGE de signature (param
+    notes, caller-inventory main.rs L558 + 9 call-sites engine.rs) ;
+    fixtures GARDE 4 via db.upsert_artifact + embedding zéros EMBEDDING_DIM
+    (le harness setup_server utilise new_without_embedder, index_artifact
+    impossible) ; sémantique "all" = ensemble FERMÉ {pm, architect,
+    implementer, ceo} moins l'auteur (Myself/All exclues) ; hot-reload
+    watcher = clone Arc<RwLock<ReviewProtocol>> avant la closure + .write()
+    sur ConfigChangeKind::Config (attention disjoint capture edition 2024,
+    lesson ea6e9dd1) ; pathspecs git avec préfixe :(glob) sur les
+    métacaractères, comportement conservateur fail-safe. La purge YAML +
+    schemas + Rust est ATOMIQUE (un seul commit). Le permit
+    286abb1a-d7d8-456e-bdfd-25188338065b couvre les 16 paths
+    d'affected_files.modified. Consume APRÈS les commits, jamais avant
+    (lesson 8fd49300, et la GARDE 3 implémentée l'exigera).
+  tags:
+    - companyos-v1
+    - process
+    - hardening
+    - harness
+    - mechanical-invariant
+    - review-protocol
+    - write-permit
+    - companyos-internals
+    - critical-infra
+  related:
+    - id: 8bf78218-e1f3-4bc5-864c-2abf618a990d
+      kind: rfc
+      relationship: input
+    - id: 11f13a9d-467b-4e5b-b4c3-a5e45ce1e080
+      kind: task-request
+      relationship: input
+    - id: ea6e9dd1-93dc-4b19-9854-103328203489
+      kind: lesson-learned
+      relationship: input
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: input
+    - id: 8fd49300-14e5-4e7c-b75f-e0e4bd461aac
+      kind: lesson-learned
+      relationship: input
+    - id: d5c9c933-2955-41e1-b2ae-73c9f307f09f
+      kind: lesson-learned
+      relationship: input
+    - id: f3fc4a5d-e9e6-43ef-86e9-49441fa84eaa
+      kind: lesson-learned
+      relationship: input
+
+spec:
+  dependencies:
+    - >
+      RFC 8bf78218 APPROUVÉ (status: approved, itération 2, round 281a5401
+      fermé). Ce plan en dérive directement ; aucune décision architecturale
+      n'est remise en question. Si une décision du RFC s'avère insuffisante
+      en exécution, escalade à l'Architect (jamais de redesign en
+      implémentation).
+    - >
+      Write permit ACTIF 286abb1a-d7d8-456e-bdfd-25188338065b (rfc_id
+      8bf78218, granted_to implementer) couvrant les 16 paths
+      d'affected_files.modified — TOUS EXISTANTS, AUCUN fichier à créer.
+      Vérifié au moment T : check_write_permit(implementer, error.rs) renvoie
+      le permit avec les 16 target_paths. Avant toute écriture, ne pas
+      contourner un permit incomplet : si un caller hors target_paths
+      apparaît en exécution, s'arrêter et signaler à l'Architect/PM pour
+      extension (lesson 611fde3e), ne jamais écrire un fichier non couvert.
+    - >
+      ORDRE DE COMMIT CONTRAINT (impact RFC + lesson 8fd49300) : la purge
+      YAML + schemas + Rust DOIT être atomique (un seul commit) car les
+      champs Rust supprimés rendraient les YAML contenant encore
+      budget_limits/circuit_breaker/escalation_rules invalides au schema
+      durci ; et inversement le schema durci (additionalProperties: false)
+      casserait make validate si les YAML n'étaient pas purgés dans le même
+      commit. Les gardes 1-5 peuvent être dans le même commit ou un commit
+      séparé, mais TOUS les commits passent AVANT consume_write_permit
+      (la GARDE 3 que ce plan implémente refusera bientôt un consume sur
+      worktree sale ; et le hook defense-in-depth Layer 2 rejette un commit
+      si le permit est déjà consommé).
+    - >
+      CI INTERNE = cas 3 de write_permit_full_sequence (CompanyOS lui-même).
+      cargo build (SANS --target-dir, déclencheur du hot-reload) + cargo test
+      verts constituent la CI interne ; aucune CI supplémentaire requise.
+      make ci est exécuté en complément pour la validation YAML/schema
+      (make validate) qui couvre le verrou additionalProperties: false.
+
+  steps:
+    - description: >
+        ÉTAPE 0 — CALLER-INVENTORY FINAL AU MOMENT T (lesson ea6e9dd1,
+        re-vérifié à l'instant de rédaction de ce plan). Avant toute écriture,
+        re-exécuter l'inventaire pour détecter un caller ajouté depuis le
+        review du RFC.
+        0.1 SYMBOLES PURGÉS — rg sur crates/ + company/plugins/ + scripts/ +
+          Makefile des symboles BudgetLimits, CircuitBreaker, EscalationRules,
+          EscalationCategory, HumanReviewTriggersSpec, HumanReviewTrigger,
+          TriggerCondition, TriggerAction, budget_limits, circuit_breaker,
+          escalation_rules, human_review_triggers, load_human_review_triggers,
+          CONFIG_HUMAN_REVIEW_TRIGGERS, ceo_cannot_approve_alone,
+          max_iterations_before_ceo. RÉSULTAT ATTENDU (vérifié au moment T) :
+          aucune occurrence hors crates/config/src/{types,loader,constants}.rs
+          + les 2 schemas (flow-control, review-protocol). Zéro plugin .mjs,
+          zéro script, zéro Makefile. ArtifactKind::HumanReviewTriggers est
+          CONSERVÉ (variant enum, mapping schema + access matrix L233).
+        0.2 SIGNATURE engine.submit_vote — call-sites confirmés au moment T :
+          main.rs L558 (tool submit_review_vote) + 9 call-sites de tests
+          inline dans engine.rs (L1472, L1497, L1505, L1527, L1560, L1587,
+          L1597, L1622, L1640). Tous les fichiers porteurs (engine.rs,
+          main.rs) sont dans le permit. AUCUN caller hors workspace.
+        0.3 engine.initiate_review_round — call-sites : main.rs L524 + 8 tests
+          engine.rs (signature INCHANGÉE, garde 1a en early-return, pas
+          d'impact call-site).
+        Si l'inventaire diverge du périmètre du permit (un caller hors
+        target_paths) : STOP, signaler à l'Architect/PM pour extension du
+        permit AVANT toute écriture (lesson 611fde3e). Cette étape ne produit
+        aucun code.
+      files: []
+    - description: >
+        ÉTAPE 1 — GARDE 1 (self_review_forbidden) : nouvelle variante d'erreur.
+        Ajouter dans crates/orchestrator/src/error.rs une variante
+        OrchestratorError::SelfReviewForbidden { author: PersonaId,
+        round_context: String } avec un #[error("...")] dérivant le message
+        du RFC GARDE 1a/1b. round_context porte le contexte (id du round ou
+        artifact_path) pour distinguer l'échec à l'initiate de l'échec au vote.
+        error.rs est dans le permit. C'est la première étape car engine.rs
+        (étapes 2-3) en dépend.
+      files:
+        - crates/orchestrator/src/error.rs
+    - description: >
+        ÉTAPE 2 — GARDE 1a : self-review rejeté à l'initiate
+        (engine.rs:205 initiate_review_round, SIGNATURE INCHANGÉE). En tête de
+        fonction, AVANT self.db.create_round : si
+        required_reviewers.contains(&author) -> return
+        Err(OrchestratorError::SelfReviewForbidden { author,
+        round_context: artifact_path.to_string() }). Message RFC GARDE 1a
+        ("Self-review forbidden: author '<persona>' cannot be a required
+        reviewer of their own artifact..."). Early-return, aucun autre
+        changement de comportement.
+      files:
+        - crates/orchestrator/src/engine.rs
+    - description: >
+        ÉTAPE 3 — GARDE 1b + GARDE 2a + GARDE 2b : refonte de
+        engine.submit_vote (engine.rs:231). CHANGEMENT DE SIGNATURE D'API
+        PUBLIQUE DE CRATE (décision itération 2) :
+          pub fn submit_vote(&self, round_id: Uuid, reviewer: PersonaId,
+            verdict: ReviewVerdict, findings: Vec<Finding>,
+            notes: Option<String>) -> Result<ReviewRound, OrchestratorError>
+        Ordre des gardes en tête de fonction, APRÈS la résolution du round
+        (get_round) et les checks existants (RoundNotOpen,
+        NotRequiredReviewer) ou AVANT selon cohérence — fixer l'ordre ainsi :
+          (a) round résolu (existant, L238-241) ;
+          (b) GARDE 1b self-review : si reviewer == round.author -> return
+              SelfReviewForbidden { author: round.author, round_context:
+              round_id.to_string() } (message "the author cannot vote on
+              their own artifact") ;
+          (c) checks existants RoundNotOpen (L243) et NotRequiredReviewer
+              (L250) INCHANGÉS ;
+          (d) GARDE 2a approve+findings : si verdict == ReviewVerdict::Approve
+              && !findings.is_empty() -> return
+              OrchestratorError::ApproveWithFindings { count: findings.len() }
+              (NOUVELLE variante à ajouter en étape 1bis, voir NB) avec le
+              message RFC GARDE 2a ;
+          (e) construction du ReviewVote (L256) AVEC le nouveau champ
+              notes (GARDE 2b) : ReviewVote { reviewer, verdict, findings,
+              notes, submitted_at } ; les notes sont acceptées avec les DEUX
+              verdicts.
+        NB sur l'ordre des étapes : la variante ApproveWithFindings { count }
+        doit être ajoutée à error.rs en MÊME TEMPS que SelfReviewForbidden
+        (étape 1) — regrouper les deux variantes dans l'étape 1 pour ne
+        toucher error.rs qu'une fois. (Le présent plan considère donc que
+        l'étape 1 ajoute LES DEUX variantes SelfReviewForbidden et
+        ApproveWithFindings.)
+        Mettre à jour le SEUL caller non-test de submit_vote (main.rs L558,
+        traité étape 7) et les 9 call-sites de tests (étape 9).
+      files:
+        - crates/orchestrator/src/engine.rs
+    - description: >
+        ÉTAPE 4 — GARDE 2b : champ notes sur ReviewVote
+        (crates/orchestrator/src/types.rs, struct ReviewVote L172). Ajouter
+          #[serde(default)]
+          pub notes: Option<String>,
+        après le champ findings (avant submitted_at, ou en dernier — choix
+        sans impact). #[serde(default)] garantit la rétro-compatibilité : les
+        votes JSON déjà stockés en DB (sans clé notes) se désérialisent en
+        None sans migration (impact RFC, rollback_plan). types.rs est dans le
+        permit.
+      files:
+        - crates/orchestrator/src/types.rs
+    - description: >
+        ÉTAPE 5 — GARDE 2b (suite) : fixtures ReviewVote en DB
+        (crates/orchestrator/src/db.rs). Les deux fixtures struct-literal
+        ReviewVote (L2084 test_update_round, L2104 test_round_json_fields_
+        roundtrip) gagnent notes: None (sinon la construction du struct ne
+        compile plus, le champ étant obligatoire en construction Rust malgré
+        #[serde(default)]). AJOUTER un test round-trip : créer un round avec
+        un vote portant notes: Some("observation"), update_round +
+        get_round, et asserter que fetched.votes[0].notes ==
+        Some("observation") (couvre la sérialisation/désérialisation JSON du
+        champ via votes_json db.rs:539/590, et into_round db.rs:1475).
+        db.rs est dans le permit. AUCUNE migration SQL : les votes sont
+        sérialisés en JSON, le champ optionnel ne change pas le schéma SQLite.
+      files:
+        - crates/orchestrator/src/db.rs
+    - description: >
+        ÉTAPE 6 — GARDE 2c : conditional schema review-report
+        (company/schemas/review-report.schema.json). Dans la branche allOf
+        portant spec, ajouter :
+          (a) une propriété optionnelle "notes": { "type": "string" } dans
+              spec.properties (à côté de verdict/findings/summary) ;
+          (b) un conditional "if/then" sur le spec : if { properties:
+              { verdict: { const: "approve" } } } then { properties:
+              { findings: { maxItems: 0 } } }. Cela matérialise au schema la
+              règle review_findings_honesty (approve => findings vides).
+        NE PAS ajouter additionalProperties: false ici (non demandé par le
+        RFC pour ce schema ; spec.notes est additif). Aucun review-report
+        YAML n'existe dans le repo (vérifié) -> zéro migration. Valider que le
+        schema reste un JSON Schema Draft 2020-12 bien formé (test étape 12).
+        review-report.schema.json est dans le permit.
+      files:
+        - company/schemas/review-report.schema.json
+    - description: >
+        ÉTAPE 7 — GARDE 2 + GARDE 1 surface MCP : SubmitVoteParams + tool
+        submit_review_vote (crates/mcp-servers/orchestrator/src/main.rs).
+        7.a SubmitVoteParams (L82) gagne :
+          #[schemars(description = "Non-corrective observations for the
+            record; n'affecte pas le verdict")]
+          notes: Option<String>,
+        7.b Le tool submit_review_vote (L544) passe params.notes à
+          engine.submit_vote (nouveau 5e argument) : engine.submit_vote(
+          params.round_id, params.reviewer, params.verdict, params.findings,
+          params.notes). Les erreurs SelfReviewForbidden et
+          ApproveWithFindings remontent via le bras Err(e) existant (format!
+          ("{e}")), pas de nouveau bras nécessaire ; affiner le with_fix si
+          pertinent (pour ApproveWithFindings, pointer vers le paramètre
+          notes). main.rs est dans le permit.
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+    - description: >
+        ÉTAPE 8 — GARDE 3 (commit-puis-consume) : check worktree dans
+        consume_write_permit (main.rs:817). APRÈS la vérification du token et
+        AVANT engine.consume_permit :
+          (1) récupérer le permit via engine (exposer un passe-plat si besoin
+              vers db.get_permit db.rs:696 ; OrchestratorEngine n'expose pas
+              encore get_permit publiquement — ajouter
+              pub fn get_permit(&self, id: Uuid) -> Result<Option<WritePermit>,
+              OrchestratorError> { self.db.get_permit(id) } sur l'engine,
+              engine.rs, dans le permit). Si None -> conserver le comportement
+              d'erreur existant (PermitNotFound, message inchangé).
+          (2) Construire l'invocation git en RÉUTILISANT le précédent
+              seal_db_commit (main.rs:396-402) : closure git() avec
+              current_dir(self.root_path), env LC_ALL=C, env LANG=C.
+              --porcelain est déjà locale-stable (lesson d5c9c933, pas de
+              piège "nothing to commit" ici), mais conserver LC_ALL=C par
+              cohérence et pour les messages d'erreur.
+          (3) Pour chaque target_path du permit, construire le pathspec git :
+              si le path contient un métacaractère glob (*, ?, ou [), le
+              préfixer par ":(glob)" (décision itération 2) ; sinon le passer
+              littéral. Exécuter
+              git status --porcelain -- <pathspec1> <pathspec2> ... (un seul
+              appel avec tous les pathspecs, ou un par path — choisir l'appel
+              unique pour la performance). Comportement conservateur fail-safe
+              assumé : en cas de doute d'interprétation, git matche PLUS et le
+              refus est plus strict.
+          (4) Si stdout non vide -> refus avec le message RFC GARDE 3
+              ("Permit consumption refused: uncommitted changes on target
+              paths: <liste des lignes porcelain>. Commit your code FIRST...").
+          (5) git indisponible (ErrorKind::NotFound au spawn) -> refus
+              fail-safe avec message DISTINCT ("git unavailable, cannot verify
+              worktree cleanliness; consumption refused"). git est un
+              prérequis dur du grant (RFC 359f9162).
+          (6) Si worktree propre -> poursuivre vers engine.consume_permit
+              (comportement existant inchangé).
+        main.rs et engine.rs sont dans le permit.
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+        - crates/orchestrator/src/engine.rs
+    - description: >
+        ÉTAPE 9 — GARDE 4 (grant exige un RFC approved) : grant_write_permit
+        (main.rs:669). APRÈS la vérification du token CEO (L675) et AVANT le
+        lookup d'idempotence (L691, sous le même engine.lock) :
+          (1) résoudre rfc_id dans l'index : engine.get(&rfc_id.to_string(),
+              &self.root_path) ou un passe-plat vers db.get_artifact — choisir
+              le chemin déjà utilisé par rfc_set_implemented
+              (engine.set_rfc_implemented résout via db.get_artifact,
+              engine.rs:447). Pour rester sous le même verrou et sans relire,
+              ajouter sur l'engine
+              pub fn get_artifact(&self, id: &str) ->
+                Result<Option<IndexedArtifact>, OrchestratorError>
+              (passe-plat db.get_artifact db.rs:1250) si non déjà exposé.
+              Si None -> refus "...| not indexed. Approve the RFC via the
+              review cycle first." (message RFC GARDE 4).
+          (2) vérifier artifact.kind == "rfc" ; sinon refus nommant le kind
+              réel.
+          (3) lire le YAML source (full_path = root + file_path) et extraire
+              metadata.status (même machinerie que set_rfc_implemented
+              engine.rs:478-489) ; si status != "approved" -> refus nommant
+              le status trouvé (un RFC draft/review/rejected ET un RFC
+              implemented sont refusés : un permit ne se justifie que dans la
+              fenêtre approved -> implemented).
+          (4) status == "approved" -> poursuivre vers le lookup d'idempotence
+              et le grant (comportement existant inchangé).
+        Pour ne pas dupliquer la lecture YAML+status, envisager d'extraire la
+        logique de lecture de status dans une petite fonction réutilisable
+        côté engine (réutilisée par set_rfc_implemented et par cette garde),
+        SANS toucher d'autres fichiers que engine.rs. main.rs et engine.rs
+        sont dans le permit.
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+        - crates/orchestrator/src/engine.rs
+    - description: >
+        ÉTAPE 10 — GARDE 5 (reviewers_by_artifact_type appliqué). Trois sous-
+        modifications côté serveur MCP (main.rs) + chargement protocole.
+        10.a OrchestratorServer (struct, main.rs ~L50) gagne un champ
+          review_protocol: Arc<RwLock<companyos_config::ReviewProtocol>>.
+          OrchestratorServer::new (L479) prend ce paramètre supplémentaire et
+          le stocke. tool_router inchangé.
+        10.b run_server (L1406) : après CompanyConfig::load (L1414), extraire
+          config.review_protocol et construire
+          Arc::new(RwLock::new(review_protocol)) ; le passer à
+          OrchestratorServer::new (L1540). Cloner cet Arc AVANT la closure du
+          watcher (zone L1577-1581, MÊME pattern que engine/validator/
+          watcher_alive) : let review_protocol = review_protocol.clone();
+          ATTENTION DISJOINT CAPTURE edition 2024 (lesson ea6e9dd1) : le clone
+          doit être TEXTUELLEMENT lu dans le corps de l'async move (il l'est
+          naturellement via le .write() de 10.c, donc capturé — vérifier qu'il
+          n'est pas optimisé en _underscore).
+        10.c Hot-reload : dans la branche ConfigChangeKind::Config du watcher
+          (L1607) — qui recharge déjà CompanyConfig et pousse
+          max_review_iterations dans l'engine — ajouter
+          *review_protocol.write().await = config.review_protocol; pour
+          rafraîchir le protocole. SYMÉTRIQUEMENT, dans le tool reload_config
+          (L909) qui recharge CompanyConfig, ajouter le même .write() sur
+          self.review_protocol. Les DEUX chemins de hot-reload existants sont
+          ainsi couverts.
+        10.d Tool initiate_review_round (L518) : AVANT
+          engine.initiate_review_round, calculer le minimum protocolaire pour
+          params.artifact_kind :
+            - lire self.review_protocol.read().await ;
+            - chercher reviewers_by_artifact_type.get(&artifact_kind) ; si
+              ABSENT du mapping -> pas de contrainte (poursuivre) ;
+            - sinon résoudre la liste : remplacer toute entrée PersonaId::All
+              par l'ENSEMBLE FERMÉ {Pm, Architect, Implementer, Ceo} (décision
+              itération 2, PAS PersonaId::all() qui inclut Myself/All) ;
+              exclure explicitement Myself et All d'une liste résolue ; puis
+              RETIRER l'auteur (params.author) du minimum (interaction GARDE 1
+              : la résolution se fait APRÈS retrait de l'auteur, de sorte que
+              les deux gardes sont satisfiables simultanément) ;
+            - vérifier que params.required_reviewers ⊇ ce minimum résolu ;
+              calculer missing = minimum \ required_reviewers ; si non vide ->
+              refus avec le message RFC GARDE 5 ("Review round refused:
+              required_reviewers must include the protocol minimum for kind
+              '<kind>': missing <liste>...") SANS appeler l'engine ;
+            - ajouter des reviewers AU-DELÀ du minimum reste permis (prose
+              "les reviewers listés sont le minimum requis" préservée).
+          main.rs est dans le permit ; ReviewProtocol/PersonaId/ArtifactKind
+          sont déjà importés ou importables depuis companyos_config.
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+    - description: >
+        ÉTAPE 11 — PURGE ATOMIQUE (un SEUL commit pour tout ce bloc, contrainte
+        d'ordre RFC impact). Diff exact :
+        11.a company/config/flow-control.yml : supprimer les blocs
+          budget_limits et circuit_breaker ; ne reste que
+          max_review_iterations: 3.
+        11.b company/schemas/flow-control.schema.json : supprimer les
+          propriétés budget_limits et circuit_breaker ; ajouter
+          "additionalProperties": false sur l'objet spec (verrou pattern
+          bd4650e2). spec ne déclare plus que max_review_iterations.
+        11.c company/config/review-protocol.yml : supprimer le bloc
+          escalation_rules. CONSERVER self_review_forbidden et
+          review_analysis_framework (décision prose, RFC impact). Reste donc :
+          self_review_forbidden, review_analysis_framework,
+          reviewers_by_artifact_type.
+        11.d company/schemas/review-protocol.schema.json : supprimer la
+          propriété escalation_rules ; ajouter "additionalProperties": false
+          sur spec ; et DÉCLARER les 3 clés légitimes (CORRECTIF finding
+          Implementer itération 2) :
+            - reviewers_by_artifact_type (inchangé) ;
+            - self_review_forbidden : { "type": "object", "properties":
+              { "description": { "type": "string" } }, "required":
+              ["description"] } ;
+            - review_analysis_framework : idem.
+          Verrou entier : seules ces 3 clés admises, escalation_rules et toute
+          réintroduction (budget_limits, etc.) échouent à la validation.
+          (Vérifié empiriquement en review itération 2 : la prose conservée
+          PASSE, la réintroduction d'escalation_rules est REJETÉE.)
+        11.e company/config/human-review-triggers.yml : enrichir
+          metadata.description pour acter qu'il est désormais la SOURCE UNIQUE
+          des conditions d'escalade utilisateur (absorbe
+          ceo_cannot_approve_alone, dont les 4 catégories = les 4 triggers
+          1:1). Contenu des triggers INCHANGÉ. (Pas de additionalProperties:
+          false sur ce schema, non demandé.)
+        11.f crates/config/src/types.rs : supprimer les structs BudgetLimits,
+          CircuitBreaker (+ champs Option budget_limits/circuit_breaker de
+          FlowControl), EscalationRules, EscalationCategory (+ champ
+          escalation_rules de ReviewProtocol), HumanReviewTriggersSpec,
+          HumanReviewTriggers, HumanReviewTrigger, TriggerCondition,
+          TriggerAction. CONSERVER ArtifactKind::HumanReviewTriggers (variant
+          enum + as_str + FromStr + access matrix L233 + test
+          test_artifact_kind_* L456). Après suppression, FlowControl ne porte
+          que max_review_iterations ; ReviewProtocol ne porte que
+          reviewers_by_artifact_type.
+        11.g crates/config/src/loader.rs : supprimer le champ
+          human_review_triggers de CompanyConfig (L11), l'appel
+          load_human_review_triggers dans load (L23), le champ dans le struct
+          retourné (L29), et la fonction load_human_review_triggers
+          (L67-71). load_flow_control et load_review_protocol INCHANGÉS.
+        11.h crates/config/src/constants.rs : supprimer
+          CONFIG_HUMAN_REVIEW_TRIGGERS (L27, seul caller = la fonction
+          supprimée en 11.g).
+        TOUS ces fichiers sont dans le permit. La purge est validée par
+        cargo build (les structs supprimés ne doivent plus avoir de référence
+        — garanti par l'étape 0) + make validate (les YAML purgés doivent
+        passer les schemas durcis dans le MÊME commit).
+      files:
+        - company/config/flow-control.yml
+        - company/schemas/flow-control.schema.json
+        - company/config/review-protocol.yml
+        - company/schemas/review-protocol.schema.json
+        - company/config/human-review-triggers.yml
+        - crates/config/src/types.rs
+        - crates/config/src/loader.rs
+        - crates/config/src/constants.rs
+    - description: >
+        ÉTAPE 12 — PROSE AMENDÉE (édition de texte, dans le permit).
+        12.a company/config/shared-rules.yml : règle review_findings_honesty
+          CONSERVÉE (le critère correctif (a) vs hors-scope (b) est un jugement
+          que la machine ne porte pas) + ajouter une mention du rejet
+          serveur/schema (approve+findings désormais rejeté mécaniquement) et
+          du canal notes (paramètre optionnel pour observations
+          non-correctives). Édition de prose uniquement, pas de changement de
+          structure (spec.rules du project-config, schema permissif vérifié).
+        12.b company/personas/implementer.yml : règle
+          write_permit_full_sequence CONSERVÉE (séquence 1-6 inchangée) +
+          annoter l'étape 4 (consume_write_permit) "vérifié mécaniquement par
+          consume_write_permit (GARDE 3 RFC 8bf78218 : refus si worktree sale
+          sur les target_paths)". Édition de prose uniquement.
+        Les deux fichiers sont dans le permit. Ces éditions peuvent être dans
+        le commit de la purge ou le commit des gardes — sans contrainte
+        d'atomicité avec le code (prose pure, pas de couplage schema).
+      files:
+        - company/config/shared-rules.yml
+        - company/personas/implementer.yml
+    - description: >
+        ÉTAPE 13 — TESTS INLINE engine.rs (#[cfg(test)], réutiliser
+        setup_engine / new_without_embedder ; pour GARDE 4 côté engine pas de
+        test ici car la garde vit dans main.rs).
+        GARDE 1 :
+          - test_initiate_rejects_author_in_reviewers : author ∈
+            required_reviewers -> SelfReviewForbidden.
+          - test_submit_vote_rejects_author : round dont author == reviewer
+            qui vote -> SelfReviewForbidden (round pré-existant avec author
+            dans required_reviewers, vote de l'author rejeté).
+        GARDE 2 :
+          - test_submit_vote_approve_with_findings_rejected : verdict Approve
+            + findings non vides -> ApproveWithFindings { count }.
+          - test_submit_vote_approve_with_notes_accepted : Approve + findings
+            vides + notes Some(...) -> Ok, vote stocké avec notes.
+          - test_submit_vote_request_changes_with_findings_accepted :
+            RequestChanges + findings -> Ok (comportement nominal préservé).
+          - test_submit_vote_request_changes_with_notes_accepted : notes
+            acceptées avec request_changes aussi.
+        Mettre à jour les 9 call-sites de tests existants de submit_vote
+        (L1472, L1497, L1505, L1527, L1560, L1587, L1597, L1622, L1640) pour
+        passer le 5e argument None (notes). Vérifier que les tests existants
+        de consensus utilisant Pm comme author + [Architect, Ceo] comme
+        reviewers ne déclenchent PAS la garde self-review (Pm n'est pas dans
+        les reviewers, donc OK — vérifié).
+      files:
+        - crates/orchestrator/src/engine.rs
+    - description: >
+        ÉTAPE 14 — TESTS INLINE main.rs (#[cfg(test)], harness setup_server
+        L1779).
+        GARDE 4 — FIXTURES (décision itération 2 : le harness utilise
+        new_without_embedder, index_artifact EXIGE un embedder, donc PAS
+        d'index_artifact). Méthode : adapter setup_server (ou un helper
+        setup_server_with_rfc) pour, AVANT de wrapper l'engine dans
+        Arc<Mutex> :
+          (1) écrire le YAML du RFC fixture dans le tempdir sous
+              company/rfcs/<nom>.yml avec metadata.status au choix du test
+              (approved / draft / implemented). Fixtures construites avec
+              String + \n littéraux + indentation explicite (lesson f3fc4a5d,
+              JAMAIS la continuation backslash Rust).
+          (2) indexer directement via db.upsert_artifact (OrchestratorDb et
+              IndexedArtifact sont pub-exportés, lib.rs L12/L24 ; le harness
+              construit déjà OrchestratorDb directement L1783) avec un
+              IndexedArtifact { id: <rfc_id>, kind: "rfc", file_path:
+              "company/rfcs/<nom>.yml", ... }, le content du YAML, un embedding
+              de zéros vec![0.0f32; companyos_orchestrator::EMBEDDING_DIM]
+              (EMBEDDING_DIM = 384), et &[] pour les relations. db.upsert_artifact
+              prend &mut self -> appeler sur le db AVANT new_without_embedder
+              (qui consomme db par valeur).
+          (3) init_git_repo (L1767) pour avoir un HEAD (déjà fait par les
+              tests grant existants).
+        Tests :
+          - test_grant_refused_rfc_not_indexed : rfc_id aléatoire non indexé
+            -> refus "not indexed".
+          - test_grant_refused_rfc_draft : fixture status draft -> refus
+            nommant draft.
+          - test_grant_refused_rfc_implemented : fixture status implemented
+            -> refus (fenêtre approved->implemented).
+          - test_grant_accepted_rfc_approved : fixture status approved ->
+            grant réussit (puis seal git comme les tests existants).
+          METTRE À JOUR les fixtures grant existantes test_grant_* (L1900,
+          L1956, L1990, L2032, L2058) qui utilisent Uuid::new_v4() non indexé :
+          elles doivent indexer un RFC approved fixture pour continuer à
+          passer (impact recensé RFC).
+        GARDE 3 :
+          - test_consume_refused_dirty_worktree : grant + permit actif ;
+            modifier (sans commit) un fichier couvert par un target_path ;
+            consume -> refus listant le fichier sale.
+          - test_consume_accepted_clean_worktree : grant + commit du fichier
+            (ou worktree propre) ; consume -> Ok.
+          - test_consume_git_unavailable (optionnel/edge) : documenter ;
+            difficile à simuler sans PATH manipulé — au minimum commentaire.
+        GARDE 5 :
+          - test_initiate_refused_below_protocol_minimum : kind design-doc,
+            required_reviewers manquant un reviewer du minimum -> refus
+            listant missing.
+          - test_initiate_accepted_at_minimum : required_reviewers == minimum
+            résolu (auteur exclu) -> Ok.
+          - test_initiate_accepted_above_minimum : minimum + reviewer extra
+            -> Ok.
+          - test_initiate_all_resolves_to_four_minus_author : kind rfc
+            (mapping "all"), author architect ; minimum résolu = {pm,
+            implementer, ceo} (architect retiré, Myself/All exclus) ; vérifier
+            qu'une liste contenant ces 3 passe et qu'en omettre un échoue.
+          - test_initiate_unmapped_kind_unconstrained : kind sans entrée au
+            mapping -> aucune contrainte.
+          - test_hotreload_protocol_via_reload_config (edge) : après
+            reload_config, un protocole modifié est pris en compte par
+            initiate_review_round (au minimum vérifier que le champ
+            review_protocol du serveur est rafraîchi ; le test du watcher
+            inotify est couvert ailleurs / best-effort).
+        setup_server gagnera un paramètre review_protocol (ou une valeur par
+        défaut construite à la main) pour 10.a/10.b — fournir un
+        ReviewProtocol de test cohérent avec review-protocol.yml.
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+    - description: >
+        ÉTAPE 15 — VALIDATION DES SCHEMAS DURCIS (test ou vérification
+        manuelle via le tool MCP yaml-validator, HORS zone protégée, aucun
+        fichier écrit). Après l'étape 11 :
+          - validate_file(company/config/flow-control.yml) -> valide
+            (max_review_iterations seul) ;
+          - validate_file(company/config/review-protocol.yml) -> valide (les 3
+            clés prose+data déclarées) ;
+          - validate_yaml d'un flow-control AVEC budget_limits réintroduit ->
+            INVALIDE (verrou) ;
+          - validate_yaml d'un review-protocol AVEC escalation_rules
+            réintroduit -> INVALIDE (verrou).
+        Ces vérifications confirment que additionalProperties: false ne casse
+        PAS la prose conservée ET rejette bien toute réintroduction. Cette
+        étape ne produit pas de code ; elle est exécutée en phase exécution.
+      files: []
+    - description: >
+        ÉTAPE 16 — CI INTERNE + SÉQUENCE DE CLÔTURE (phase EXÉCUTION,
+        post-écriture, NON exécutée à la rédaction du plan). Ordre
+        write_permit_full_sequence, consume APRÈS les commits :
+          (1) git add <fichiers du lot purge atomique> && git commit (un seul
+              commit pour la purge YAML+schemas+Rust, contrainte d'atomicité).
+          (2) git add <fichiers des gardes 1-5 + prose + tests> && git commit
+              (peut être fusionné avec (1) si préféré ; l'essentiel est que
+              TOUT soit commité AVANT le consume).
+          (3) consume_write_permit(286abb1a-d7d8-456e-bdfd-25188338065b) —
+              APRÈS les commits (lesson 8fd49300 ; et la GARDE 3 fraîchement
+              implémentée refusera un consume si le worktree des target_paths
+              est sale, donc les commits DOIVENT précéder).
+          (4) cargo build (SANS --target-dir, déclencheur du hot-reload des
+              MCP servers) -> 0 erreur.
+          (5) cargo test (workspace complet) -> 0 failed (tests existants +
+              nouveaux). Cibler aussi -p companyos-orchestrator et
+              -p companyos-config et -p companyos-orchestrator-* selon les
+              noms de crate.
+          (6) make ci (inclut make validate pour les schemas/YAML : confirme
+              le verrou additionalProperties: false sur les fichiers réels).
+          (7) reload_config() EN DERNIER, uniquement si build + test + ci
+              verts (lesson hotreload_last).
+          (8) rfc_set_implemented(8bf78218-e1f3-4bc5-864c-2abf618a990d) pour
+              passer le RFC de approved à implemented.
+        Toute découverte d'un trou de permit (caller hors target_paths) en
+        cours d'exécution -> STOP + escalade Architect/PM (lesson 611fde3e),
+        jamais de contournement.
+      files: []
+
+  risks:
+    - >
+      RISQUE 1 — Signature publique engine.submit_vote modifiée. Caller-
+      inventory fait en étape 0 (au moment T) : main.rs L558 + 9 tests
+      engine.rs, tous dans le permit. Aucun caller hors workspace (crate
+      interne, pas d'API exportée consommée ailleurs). Mitigation : si
+      cargo build révèle un call-site oublié (improbable, l'inventaire est
+      exhaustif), il sera dans engine.rs ou main.rs (déjà dans le permit) ;
+      si par extraordinaire ailleurs -> STOP + escalade (lesson 611fde3e /
+      ea6e9dd1 APPRENTISSAGE 4).
+    - >
+      RISQUE 2 — Divergence glob crate vs pathspec git (GARDE 3). Décision
+      itération 2 : préfixe :(glob) sur les métacaractères, comportement
+      conservateur fail-safe (git matche plus -> refus plus strict, jamais un
+      worktree sale qui passe). Mitigation : test
+      test_consume_refused_dirty_worktree sur un target_path littéral ET, si
+      possible, sur un pattern glob, pour confirmer le matching. Le risque
+      résiduel est un faux positif (refus à tort) qui se résout en commitant,
+      jamais une faille de sécurité.
+    - >
+      RISQUE 3 — Disjoint capture edition 2024 sur le clone de
+      Arc<RwLock<ReviewProtocol>> dans la closure du watcher (GARDE 5,
+      lesson ea6e9dd1). Le clone DOIT être textuellement lu dans l'async move
+      (il l'est via le .write() de l'étape 10.c). Mitigation : ne PAS préfixer
+      le binding par _ ; vérifier au get_diagnostics / cargo build qu'aucun
+      warning unused n'apparaît (signe que la capture n'a pas eu lieu) ; le
+      test de hot-reload (étape 14) exerce le rafraîchissement.
+    - >
+      RISQUE 4 — Fixtures GARDE 4 : le harness setup_server consomme db par
+      valeur (new_without_embedder). L'upsert direct DOIT précéder la
+      construction de l'engine. Mitigation : helper setup_server_with_rfc qui
+      ouvre le db, migrate, upsert l'artifact RFC (embedding zéros
+      EMBEDDING_DIM), PUIS new_without_embedder(db, 3). Fixtures YAML
+      construites sans continuation backslash (lesson f3fc4a5d).
+    - >
+      RISQUE 5 — Atomicité de la purge. Si la purge YAML+schemas+Rust est
+      scindée en plusieurs commits, un commit intermédiaire laisse soit des
+      YAML invalides au schema durci, soit des structs Rust orphelines. RFC
+      impact : un seul commit. Mitigation : l'étape 11 regroupe les 8
+      fichiers de purge ; le commit de purge inclut les 8 d'un coup. cargo
+      build (structs orphelines) + make validate (YAML vs schema) valident
+      l'atomicité.
+    - >
+      RISQUE 6 — Rounds en vol non conformes (impact RFC). La garde
+      submit_vote s'applique aussi aux rounds pré-existants : un author dans
+      required_reviewers d'un round ouvert ne peut plus voter. Décision
+      assumée (RFC) : données éphémères, l'invariant prime ; aucun round
+      ouvert non conforme connu à ce jour. Mitigation : au merge, vérifier
+      qu'aucun round ouvert n'a author ∈ required_reviewers ; sinon le fermer
+      / recréer. Hors scope code de ce plan.
+    - >
+      RISQUE 7 — error.rs touché deux fois (SelfReviewForbidden +
+      ApproveWithFindings). Mitigation : regrouper l'ajout des DEUX variantes
+      dans l'étape 1 (une seule passe sur error.rs), même si la garde 2a est
+      décrite en étape 3. error.rs est dans le permit.
+    - >
+      RISQUE 8 — Périmètre des écritures borné aux 16 affected_files.modified.
+      AUCUN fichier à créer (le RFC ne crée rien : tests inline, pas de
+      nouveau fichier — convention workspace). Le permit couvre exactement
+      ces 16 paths (vérifié). Aucun amendement d'affected_files nécessaire.
