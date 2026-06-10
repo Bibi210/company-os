@@ -1,0 +1,191 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: af11b99e-4009-4868-ba66-27cf66d0727b
+  title: "V1 hygiène : recensement et triage des RFCs non clos, du backlog et des projets dormants"
+  author: implementer
+  created_at: "2026-06-10"
+  project: company-os
+  description: >
+    Recensement exhaustif et triage item par item du domaine 1 (v1-hygiene)
+    du programme companyos-v1. Statue sur les 6 RFCs en status approved
+    jamais passés implemented, sur les 11 task-requests en backlog du projet
+    company-os, et vérifie l'archivage des projets de test. Droit de tri
+    délégué aux agents (décision utilisateur 2026-06-10). Tous les items
+    vérifiés contre l'état réel du code/config/git, pas contre les statuts
+    déclarés.
+  tags:
+    - companyos-v1
+    - hygiene
+    - triage
+    - cleanup
+    - bookkeeping
+    - recensement
+  related:
+    - id: c448a646-dd58-4aa2-93ed-858df3845e21
+      kind: task-request
+      relationship: input
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: related
+
+spec:
+  status: resolved
+
+  symptom: >
+    Dérive de bookkeeping accumulée par la croissance organique de CompanyOS.
+    Au moment du recensement, 6 RFCs restaient en status approved alors que
+    leur travail était entièrement mergé en code/config (vérifié dans le
+    code réel), et 11 task-requests du projet company-os restaient en backlog
+    alors que pour 8 d'entre eux le RFC correspondant était déjà implemented.
+    Conséquence : les statuts ne sont pas fiables, toute analyse de fond est
+    polluée, et les vraies idées encore ouvertes (onnx-cpu-saturation) sont
+    noyées dans un backlog faussement chargé.
+
+  root_cause: >
+    Aucune étape du workflow CompanyOS ne FORCE la clôture des artifacts
+    amont quand le travail aval est livré. Le cycle de vie est piloté à la
+    main pour deux transitions clés :
+
+    1. RFC approved -> implemented. Le tool rfc_set_implemented(id) existe
+       (RFC 1c0f2570) et ne demande aucun permit, mais son appel reste à la
+       discrétion de l'agent qui termine l'implémentation. Quand plusieurs
+       RFCs sont implémentés dans une rafale (les 8 RFCs de friction-permits
+       du 2026-06-05), la clôture est oubliée car rien ne la déclenche
+       automatiquement à partir du merge du code.
+
+    2. task-request backlog -> done. Il n'existe AUCUN mécanisme reliant la
+       clôture d'un RFC (ou le merge du code correspondant) au passage du
+       task-request source en done. Le lien task-request -> RFC existe dans
+       metadata.related (relationship input), donc l'information est présente
+       et machine-readable, mais aucun algorithme ne l'exploite pour
+       propager le statut.
+
+    La cause est structurelle, pas humaine : le LLM décide correctement quoi
+    livrer, mais on lui délègue aussi la tenue des registres (bookkeeping),
+    tâche purement mécanique qu'il oublie sous charge. C'est exactement le
+    principe directeur n°2 de la roadmap a410bb43 (item v1-automation) :
+    l'intelligence algorithmique partout où elle suffit ; le LLM réservé aux
+    décisions, jamais au bookkeeping.
+
+  resolution: >
+    Triage appliqué item par item. Tableau complet (état constaté -> décision
+    -> action).
+
+    === LOT 1 — 6 RFCs en status approved ===
+
+    [1] 2492822c "Convention de nommage des fichiers YAML d'artifacts".
+        CONSTAT : implémenté. company/scripts/check-artifact-naming.sh existe
+        (mode FILE + scan global), Makefile cible check-naming dépendance de
+        ci, migration des fichiers UUID purs faite (check-naming passe : 0
+        violation), shared-rules documente le format. DÉCISION : implemented.
+        ACTION : rfc_set_implemented(2492822c) -> OK.
+
+    [2] 49354fcb "Enforcement naming YAML dans defense-in-depth".
+        CONSTAT : implémenté. defense-in-depth-core.mjs contient
+        ARTIFACT_NAMING_PREFIXES (L46), isArtifactPath (L76), checkNaming
+        (L80), bloc de check au write (L445). DÉCISION : implemented.
+        ACTION : rfc_set_implemented(49354fcb) -> OK.
+
+    [3] 213e79aa "Fix defense-in-depth : intercepter mcp_write et mcp_edit".
+        CONSTAT : implémenté. La condition du handler couvre mcp_edit et
+        mcp_write (defense-in-depth-core.mjs L435-438). DÉCISION :
+        implemented. ACTION : rfc_set_implemented(213e79aa) -> OK.
+
+    [4] cc4d9f8a "Fix export _test dans defense-in-depth.mjs".
+        CONSTAT : implémenté. defense-in-depth.mjs L139 = `const _test`
+        (sans export), bridge via globalThis.__defenseInDepthTest (L152).
+        DÉCISION : implemented. ACTION : rfc_set_implemented(cc4d9f8a) -> OK.
+
+    [5] 7bfc784c "Fix revert des fichiers untracked dans defense-in-depth".
+        CONSTAT : implémenté. revertFile + cleanupEmptyParentDirs (L163, L198)
+        présents dans defense-in-depth-core.mjs. DÉCISION : implemented.
+        ACTION : rfc_set_implemented(7bfc784c) -> OK.
+
+    [6] e1ebf14b "Reclassifier project-config comme artifact projet".
+        CONSTAT : implémenté. shared-rules file_placement liste project-config
+        sous les kinds projet (L211), description du catalog mise à jour.
+        DÉCISION : implemented. ACTION : rfc_set_implemented(e1ebf14b) -> OK.
+
+    Bilan LOT 1 : 6/6 RFCs étaient implémentés mais non clos (pure dérive de
+    bookkeeping). 0 RFC abandonné. 0 cas ambigu. Tous passés implemented via
+    le tool serveur (aucun permit requis).
+
+    === LOT 2 — 11 task-requests en backlog ===
+
+    [a] atomic-grant-write-permit 0b0e6c77 -> DONE.
+        Livré par RFC 359f9162 (implemented). Tool grant_write_permit
+        auto-commit + rollback en place.
+
+    [b] defense-in-depth-selective-revert dcb17b79 -> DONE.
+        Livré par RFC bde023e2 (implemented). Revert sélectif par défaut,
+        nucléaire borné. 46 tests JS verts.
+
+    [c] makefile-alignment-current-conventions 5ecc2877 -> DONE.
+        Livré hors RFC (Makefile non protégé) : design-doc 98bb95af +
+        implementation-plan 7d54f0b3. Vérifié dans le Makefile : clean-company
+        couvre company/roadmaps/ et company/agent-messages/ (ligne
+        transitoire), dossiers inexistants retirés.
+
+    [d] remove-kind-filter-from-search e362e438 -> DONE.
+        Livré par RFC 1d3a3581 (implemented). Filtres kind/author/project/
+        dates retirés de la surface MCP search, tags + id_prefix conservés.
+
+    [e] retire-agent-message-kind 95e93649 -> DONE.
+        Livré par RFC 3d9f0b0c (implemented). Kind retiré du schema, de
+        l'enum Rust, de shared-rules, du plugin, des personas ; 11 YAML +
+        dossier supprimés.
+
+    [f] rfc-affected-files-categorize 08d5b9a2 -> DONE.
+        Livré par RFC a4eb3ee7 (implemented). anyOf rétro-compatible FORME A
+        legacy + FORME B {modified, created} dans rfc.schema.json.
+
+    [g] rfc-set-implemented-tool c666b783 -> DONE.
+        Livré par RFC 1c0f2570 (implemented). Tool MCP rfc_set_implemented(id)
+        en place ; utilisé dans ce triage même pour clore les 6 RFCs du LOT 1.
+
+    [h] roadmap-auto-sync-and-loose-ref-typing e8c4d628 -> DONE.
+        Livré par RFC a5f25718 (implemented). Auto-sync à la lecture + ref
+        loose typé + drift_warnings. Roadmap 329da45f migrée.
+
+    [i] schema-migration-discipline 1554764d -> DONE.
+        Livré par RFC 973a5569 (implemented). PRAGMA user_version + registre
+        de migrations numérotées dans migrations.rs.
+
+    [j] api-callers-discoverability dabc159c -> BACKLOG CONSERVÉ.
+        Le RFC eb42a8de (caller inventory discipline) a livré une PARTIE du
+        sujet (règles personas Architect + Implementer). Le sujet plus large
+        (tooling LSP/MCP automatique d'inventaire des callers) reste ouvert.
+        Tracé dans la roadmap companyos-system (item api-callers-discoverability,
+        future / loose / idea). Conservation conforme à la règle « backlog
+        seulement si tracé dans une roadmap ».
+
+    [k] onnx-cpu-saturation-engine-contention 0e089d1b -> BACKLOG CONSERVÉ
+        (cas ambigu, tranché par l'agent). Sujet réel, priorité haute
+        (critical-infra), NON livré : le diagnostic fa9bd072 conclut qu'un
+        RFC dédié pour la PISTE B (bridage pool ONNX côté binaire Rust) reste
+        à rédiger. search() + git log confirment aucun RFC/fix produit.
+        EXCEPTION explicite à la règle « backlog seulement si tracé dans une
+        roadmap » : ce sujet n'est PAS encore tracé. Décision : NE PAS annuler
+        (le défaut de saturation CPU est bien réel), conserver backlog, et
+        remonter au PM l'action de suivi « ajouter cet item à une roadmap ».
+        Note de triage ajoutée dans le YAML du task-request (spec.triage_note).
+
+    Bilan LOT 2 : 9 done, 2 backlog conservés (1 tracé roadmap, 1 ambigu
+    documenté). 0 cancelled.
+
+    === LOT 3 — Projets de test ===
+
+    sum-n-verus (f9ea6094), sum-n-creusot (fa6d4d91), sum-n-lean (8b3922c3) :
+    task-requests tous en status done. puissance4-verus (ffe3306d) :
+    task-request en status cancelled. Aucun artifact ouvert restant. Rien à
+    faire, conforme à l'attendu.
+
+    === SOLUTION STRUCTURELLE ===
+
+    Le triage corrige les symptômes ; la cause racine (aucune étape ne force
+    la clôture) relève de l'item v1-automation de la roadmap a410bb43 :
+    automatiser la propagation de statut (RFC implemented -> task-request
+    source done) à partir du lien metadata.related déjà présent, et la
+    détection des RFCs approved jamais implémentés. Le LLM décide, l'algorithme
+    tient les registres. Capitalisé en lesson-learned.

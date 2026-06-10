@@ -1,0 +1,51 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: c448a646-dd58-4aa2-93ed-858df3845e21
+  title: "V1 hygiène : triage des RFCs non clos, du backlog et des projets dormants"
+  author: pm
+  created_at: "2026-06-10"
+  project: company-os
+  description: >
+    Premier domaine du programme companyos-v1 (roadmap a410bb43, item v1-hygiene).
+    Nettoyer la table avant l'analyse de fond : statuer sur les 6 RFCs en status
+    approved jamais passés implemented, sur les 11 task-requests encore en backlog,
+    et finaliser l'archivage des projets de test. Produit un diagnostic-report de
+    recensement avec décision et action par item. Le droit de tri est délégué aux
+    agents (décision utilisateur 2026-06-10, documentée dans la roadmap a410bb43).
+  tags:
+    - companyos-v1
+    - hygiene
+    - triage
+    - cleanup
+    - bookkeeping
+  related:
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: input
+
+spec:
+  priority: high
+  status: done
+
+  context: >
+    CompanyOS a grandi organiquement et le bookkeeping a dérivé : des RFCs dont le
+    travail est mergé restent en approved, des task-requests dont le travail est
+    livré restent en backlog. Cet état pollue toute analyse (les statuts ne sont
+    pas fiables) et masque les vraies idées mortes. Le programme V1 commence par
+    cette passe d'hygiène. Lots : (1) RFCs approved : 2492822c, 49354fcb, 213e79aa,
+    cc4d9f8a, 7bfc784c, e1ebf14b ; (2) les 11 task-requests en backlog du projet
+    company-os ; (3) projets de test sum-n-* et puissance4-verus (déjà clos ou
+    cancelled, vérifier qu'il ne reste rien d'ouvert).
+
+  acceptance_criteria:
+    - "Chaque RFC en approved a été vérifié contre l'état réel du code/config : passé à implemented via rfc_set_implemented si le travail est livré, ou explicitement marqué rejected avec note de triage si l'idée est abandonnée"
+    - "Chaque task-request en backlog a un statut final cohérent avec la réalité : done si le travail est livré, cancelled si l'idée est abandonnée, backlog conservé uniquement si l'idée est encore désirée et tracée dans une roadmap"
+    - "Un diagnostic-report documente le recensement complet : pour chaque item, l'état constaté, la décision, l'action appliquée"
+    - "Aucun RFC ne reste en approved et aucun task-request ne reste en backlog sans justification explicite"
+    - "Une lesson-learned capitalise la root cause de la dérive de bookkeeping (alimente l'item v1-automation de la roadmap a410bb43)"
+
+  constraints:
+    - "Ne pas supprimer de fichiers : le triage change des statuts et documente, il n'efface pas l'historique"
+    - "Pas de push : commits locaux uniquement"
+    - "Ne pas toucher aux zones protégées (company/config/, company/personas/, company/schemas/, company/plugins/, crates/) : ce lot est purement artifacts"

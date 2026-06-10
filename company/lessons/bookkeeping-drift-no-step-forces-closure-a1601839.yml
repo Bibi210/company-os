@@ -1,0 +1,112 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: a1601839-9c40-4425-9d13-a2291b1c58b3
+  title: "La dérive de bookkeeping vient de ce qu'aucune étape du workflow ne force la clôture des artifacts amont"
+  author: implementer
+  created_at: "2026-06-10"
+  description: >
+    Capitalisation du domaine 1 (v1-hygiene) du programme companyos-v1
+    (diagnostic af11b99e). Le triage a trouvé 6 RFCs implémentés restés en
+    approved et 8 task-requests livrés restés en backlog. Root cause : le
+    bookkeeping (transitions de statut de fin de cycle de vie) est délégué au
+    LLM, qui l'oublie sous charge, alors qu'il est purement mécanique.
+    Solution structurelle : automatiser la propagation de statut à partir des
+    liens metadata.related déjà présents (item v1-automation, roadmap
+    a410bb43). Cas d'application directe de la préférence déterministe
+    4e5c109b.
+  tags:
+    - bookkeeping
+    - lifecycle
+    - automation
+    - determinism
+    - companyos-v1
+    - hygiene
+    - rfc-lifecycle
+    - task-request-lifecycle
+    - companyos-internals
+    - meta
+  related:
+    - id: 4e5c109b-ec35-46ff-98af-3714b1d7a36f
+      kind: lesson-learned
+      relationship: derived-from
+    - id: c12ca551-f378-4fdb-a629-11563e8e4b72
+      kind: lesson-learned
+      relationship: related
+    - id: 80f7b27a-9bc5-47b6-bdf4-65a18f7f5df9
+      kind: lesson-learned
+      relationship: related
+    - id: af11b99e-4009-4868-ba66-27cf66d0727b
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: related
+
+spec:
+  context: >
+    Premier domaine du programme V1 (hygiène) : recensement et triage des
+    RFCs non clos et du backlog. État constaté au triage du 2026-06-10 :
+    6 RFCs (2492822c, 49354fcb, 213e79aa, cc4d9f8a, 7bfc784c, e1ebf14b)
+    étaient en status approved alors que leur travail était entièrement
+    mergé en code et config, vérifié ligne par ligne dans le repo réel.
+    Parallèlement, 8 task-requests du projet company-os étaient encore en
+    backlog alors que le RFC qui les livrait était déjà implemented
+    (atomic-grant, selective-revert, kind-filter, agent-message,
+    affected-files, set-implemented, schema-migration, roadmap-auto-sync).
+    Aucune de ces incohérences n'était un désaccord de fond : pur retard de
+    bookkeeping. La majorité des RFCs concernés avaient été implémentés dans
+    une même rafale (les 8 RFCs friction-permits du 2026-06-05), ce qui a
+    saturé l'attention et fait sauter la clôture.
+
+  insight: >
+    La dérive de bookkeeping n'est pas un défaut de discipline individuelle,
+    c'est un défaut STRUCTUREL du workflow : aucune étape ne FORCE la clôture
+    des artifacts amont quand le travail aval est livré. Deux transitions de
+    fin de cycle de vie sont laissées à la main de l'agent :
+
+    1. RFC approved -> implemented. Le tool rfc_set_implemented(id) existe
+       (RFC 1c0f2570) et ne coûte aucun permit, mais son appel reste à la
+       discrétion de l'agent. Rien dans le merge du code ne déclenche la
+       clôture du RFC.
+
+    2. task-request backlog -> done. Il n'existe AUCUN mécanisme reliant la
+       clôture d'un RFC au passage du task-request source en done, alors que
+       le lien est déjà présent et machine-readable (task-request ->
+       metadata.related -> RFC avec relationship input). L'information existe,
+       personne ne l'exploite algorithmiquement.
+
+    Le LLM décide correctement QUOI livrer (jugement), mais on lui délègue
+    aussi la tenue des REGISTRES (mécanique), qu'il oublie dès que la charge
+    monte. C'est exactement l'angle mort que la préférence 4e5c109b cible :
+    une propriété garantissable par algorithme ne doit pas dépendre d'une
+    discipline d'agent. Le même pattern a déjà été observé une fois sur les
+    roadmaps (lesson c12ca551 : la convention sociale de mise à jour manuelle
+    du status a dérivé en moins d'une session, ce qui a justifié l'auto-sync
+    calculé à la lecture). La dérive RFC/backlog est la version non encore
+    automatisée du même problème.
+
+  recommendation: >
+    Court terme (fait) : trier à la main une fois pour rétablir des statuts
+    fiables, et documenter chaque décision (diagnostic af11b99e). Mais le tri
+    manuel ne traite que le symptôme : sans mécanisme, la dérive reviendra à
+    la prochaine rafale d'implémentations.
+
+    Structurel (item v1-automation de la roadmap a410bb43, à implémenter) :
+    porter le bookkeeping de fin de cycle de vie dans le harness algorithmique,
+    sur le modèle déjà éprouvé de l'auto-sync roadmap (calcul à la lecture
+    depuis l'artifact source) et de rfc_set_implemented (transition serveur
+    sans permit). Deux mécanismes concrets :
+
+    (a) Propagation de statut task-request : quand un RFC passe implemented,
+        marquer automatiquement done le(s) task-request(s) qui le référencent
+        en input via metadata.related. Le lien existe déjà ; il suffit de
+        l'exploiter (algorithme, pas LLM).
+
+    (b) Détection des RFCs approved jamais implémentés : un check (CI ou tool
+        MCP de diagnostic) qui liste les RFCs approved dont le code semble
+        mergé, pour signaler la dérive AVANT qu'elle ne s'accumule.
+
+    Principe directeur : le LLM réservé aux décisions (faut-il livrer ? est-ce
+    réellement done ?), l'algorithme pour tenir les registres. Tant que la
+    clôture dépend d'un appel manuel que rien ne déclenche, elle sera oubliée.
