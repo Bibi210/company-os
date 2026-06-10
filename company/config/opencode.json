@@ -3,11 +3,11 @@
   "default_agent": "pm",
   "agent": {
     "pm": {
-      "model": "anthropic/claude-opus-4-8",
+      "model": "anthropic/claude-fable-5",
       "prompt": "{file:company/personas/pm.yml}"
     },
     "architect": {
-      "model": "anthropic/claude-opus-4-8",
+      "model": "anthropic/claude-fable-5",
       "prompt": "{file:company/personas/architect.yml}"
     },
     "implementer": {
