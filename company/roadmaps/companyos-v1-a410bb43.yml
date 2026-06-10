@@ -41,6 +41,16 @@ metadata:
     - date: "2026-06-10"
       author: pm
       description: >
+        Deux directives utilisateur ajoutées : v1-mcp-availability
+        (remplacer le polling/retry MCP par une gestion propre, task-request
+        415c73c0, suite à l'incident proxy mort pendant relink) et
+        v1-protect-githooks (ajouter .githooks/ aux zones protégées,
+        task-request 30ab07d5). Lot 1 process-hardening en cours : RFC
+        8bf78218 approved (2 itérations), permit 286abb1a émis, plan
+        4b56b1b9 rédigé, en attente review Architect.
+    - date: "2026-06-10"
+      author: pm
+      description: >
         Clarifications utilisateur intégrées : (1) le test spirituel du
         programme est "make clean-company ne casse rien et tout ce qu'on a
         appris se retrouve dans le harness" ; (2) nouvel item
@@ -274,6 +284,40 @@ spec:
         et leurs tests), le Makefile, company/scripts/ et docs/. Vérifier
         notamment que le harness JS et le serveur Rust ne dupliquent pas de
         logique (zones protégées définies aux deux endroits ?).
+
+    - key: v1-mcp-availability
+      title: "Disponibilité MCP : remplacer le polling/retry par une gestion propre"
+      ref:
+        type: loose
+        category: exploration
+        label: "Task-request 415c73c0 : supervision/respawn événementiel, fin de la règle de prose mcp_reconnect"
+      timeframe: future
+      status: planned
+      target_date: "2026-Q3"
+      rationale: >
+        Directive utilisateur (2026-06-10) après l'incident du jour : binaire
+        tué pendant un relink cargo, proxy jamais respawné, session MCP morte
+        jusqu'à reboot manuel. La chaîne actuelle (health check par polling,
+        règle de prose mcp_reconnect demandant des retries avec sleeps aux
+        agents) est condamnée : il faut une architecture événementielle et
+        auto-réparante. Application directe du principe harness-avant-prose
+        à la couche infra.
+
+    - key: v1-protect-githooks
+      title: "Protéger .githooks/ (le point d'enforcement du harness)"
+      ref:
+        type: loose
+        category: hotfix
+        label: "Task-request 30ab07d5 : ajouter .githooks/ à protected-zones.json via RFC"
+      timeframe: future
+      status: planned
+      target_date: "2026-Q2"
+      rationale: >
+        Directive utilisateur (2026-06-10) : un harness dont le point
+        d'enforcement (pre-commit) est librement modifiable par les agents
+        qu'il contraint n'est pas un harness. Démonstration le jour même
+        (fix 916bf1d appliqué sans aucun contrôle). Petit RFC chirurgical,
+        à exécuter dès que le lot 1 process-hardening est mergé.
 
     - key: v1-harness-refactor
       title: "Refactor global du harness (cohérence et maintenabilité)"

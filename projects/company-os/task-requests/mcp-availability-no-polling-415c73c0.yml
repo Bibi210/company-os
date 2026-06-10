@@ -1,0 +1,69 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 415c73c0-eae9-46e0-8f05-e3ff38156b3c
+  title: "Disponibilité MCP : remplacer la stratégie de polling/retry par une gestion propre"
+  author: pm
+  created_at: "2026-06-10"
+  project: company-os
+  description: >
+    Directive utilisateur (2026-06-10) : arrêter la stratégie de polling pourrie
+    et concevoir un vrai mécanisme propre de disponibilité du serveur MCP.
+    Aujourd'hui, quand le binaire orchestrator est tué (cargo build/relink
+    pendant make ci, reload_config, crash), la récupération repose sur un
+    empilement de contournements : health check par polling dans le proxy,
+    règle de prose mcp_reconnect demandant aux agents de retry 3 fois avec des
+    sleeps, et en dernier recours un reboot manuel de la session par
+    l'utilisateur. Incident du jour : le proxy terminé pendant le relink n'a
+    jamais été respawné, bloquant generate_id et l'indexation pour toute la
+    fin de session malgré les retries. Objectif : une architecture de
+    disponibilité événementielle et auto-réparante, sans polling ni sleeps,
+    où la panne du binaire est un événement géré, pas une instruction de
+    patience donnée aux LLMs.
+  tags:
+    - companyos-v1
+    - mcp
+    - proxy
+    - availability
+    - resilience
+    - harness
+    - critical-infra
+  related:
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: input
+    - id: d9399863-254e-42f5-a485-ea019ce56a93
+      kind: rfc
+      relationship: related
+
+spec:
+  priority: high
+  status: backlog
+
+  context: >
+    Le RFC d9399863 a rendu le proxy résilient aux restarts courts (buffer
+    FIFO, health check, circuit breaker), mais l'incident du 2026-06-10
+    montre les limites : binaire tué pendant un relink cargo, proxy terminé
+    sans respawn, session MCP morte jusqu'au reboot utilisateur. Côté agents,
+    la règle mcp_reconnect (prose) prescrit des retries espacés de sleeps,
+    exactement le pattern de polling que la directive utilisateur condamne.
+    Le sujet exige d'abord une investigation : cartographier tous les points
+    de polling/sleep/retry de la chaîne (proxy, plugin, règles de prose,
+    comportements d'agents), identifier les modes de panne réels observés
+    (diagnostics e84b641d, fa9bd072, incident du jour), puis concevoir le
+    mécanisme propre (supervision/respawn du processus, readiness
+    événementielle, file d'attente persistante des requêtes, escalade
+    structurée vers l'utilisateur en dernier recours). S'inscrit dans le
+    principe V1 "le harness avant la prose" : la règle mcp_reconnect devrait
+    disparaître au profit d'un mécanisme.
+
+  acceptance_criteria:
+    - "Un diagnostic-report cartographie tous les points de polling/sleep/retry de la chaîne MCP (proxy, plugins, règles de prose, Makefile) et les modes de panne observés"
+    - "Un RFC propose une architecture de disponibilité sans polling : supervision et respawn automatique du binaire, readiness événementielle, gestion des requêtes pendant l'indisponibilité"
+    - "La règle de prose mcp_reconnect est retirée ou réduite à un pointeur vers le mécanisme (test clean-company)"
+    - "Un kill du binaire pendant un cargo build/relink ne nécessite plus jamais un reboot de session utilisateur"
+
+  constraints:
+    - "Compatible avec le transport MCP stdio imposé par opencode"
+    - "Ne pas casser la résilience existante du RFC d9399863 : l'améliorer ou la remplacer explicitement"
+    - "Pas de push : commits locaux uniquement"

@@ -1,0 +1,58 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 30ab07d5-8c98-4a23-b829-0f1ba72cbfad
+  title: "Ajouter .githooks/ aux zones protégées"
+  author: pm
+  created_at: "2026-06-10"
+  project: company-os
+  description: >
+    Directive utilisateur (2026-06-10) : le hook pre-commit doit faire partie
+    des fichiers protégés. Aujourd'hui .githooks/ n'est pas dans
+    protected-zones.json : n'importe quel agent peut modifier le pre-commit
+    (qui est précisément le mécanisme d'enforcement du harness) sans RFC ni
+    write permit. Démonstration le jour même : l'Implementer a légitimement
+    corrigé .githooks/pre-commit (fix fuite GIT_*, commit 916bf1d) sans
+    aucun contrôle. Un harness dont le point d'enforcement est librement
+    modifiable par les agents qu'il contraint n'est pas un harness.
+  tags:
+    - companyos-v1
+    - protected-zones
+    - githooks
+    - pre-commit
+    - hardening
+    - security
+  related:
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: input
+    - id: f82847f1-7ee2-4fc7-a4f5-a1685a62c152
+      kind: diagnostic-report
+      relationship: related
+
+spec:
+  priority: high
+  status: backlog
+
+  context: >
+    protected-zones.json couvre company/config/, company/personas/,
+    company/schemas/, company/plugins/, crates/ et opencode.json, mais pas
+    .githooks/. Or le pre-commit hook est une pièce centrale du harness
+    (validation YAML, naming, zones protégées au commit, make ci). Le
+    changement est petit (ajouter le prefix .githooks/ dans
+    protected-zones.json) mais protected-zones.json est lui-même en zone
+    protégée (company/config/) : RFC + approbation CEO + write permit requis.
+    Vérifier aussi que le plugin defense-in-depth et le pre-commit consomment
+    bien la liste de prefixes dynamiquement (pas de liste dupliquée en dur à
+    mettre à jour, cf. découverte du recensement c981bf62 sur la triple
+    implémentation de la logique permit/path).
+
+  acceptance_criteria:
+    - ".githooks/ est dans les prefixes de protected-zones.json : toute modification par un agent sans permit est détectée et revertée par le hook defense-in-depth, et bloquée au commit par le pre-commit"
+    - "La protection est vérifiée empiriquement (tentative d'écriture sans permit refusée)"
+    - "Aucune duplication de la liste des zones : si une liste en dur existe ailleurs, elle est unifiée ou l'écart est documenté pour v1-harness-refactor"
+    - "Le changement passe par le circuit RFC -> review -> approbation CEO -> permit"
+
+  constraints:
+    - "Périmètre minimal : ajout du prefix et vérifications, pas de refonte du mécanisme (réservée à v1-harness-refactor)"
+    - "Pas de push : commits locaux uniquement"
