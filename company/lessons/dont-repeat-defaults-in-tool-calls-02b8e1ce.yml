@@ -8,9 +8,13 @@ metadata:
   description: >
     Plusieurs agents (dont le PM dans cette session) passent systématiquement
     des paramètres optionnels avec leur valeur par défaut (ex. limit=10 sur
-    search() alors que le défaut est déjà 10). C'est du cargo cult : ça donne
+    search() alors que le défaut est déjà 10).     C'est du cargo cult : ça donne
     l'illusion d'un arbitrage conscient sans en être un. Règle : ne passer un
     paramètre optionnel QUE quand on dévie consciemment du défaut.
+    NOTE D'AUDIT (V1 2026-06-10) : le principe reste valide, mais les exemples
+    utilisant kind sur search() sont périmés — le filtre kind a été retiré de
+    la surface MCP par le RFC 1d3a3581 (lesson bd4650e2, qui élève ce principe
+    du niveau appel au niveau définition d'API).
   tags:
     - tools
     - cargo-cult

@@ -8,6 +8,10 @@ metadata:
   description: >
     Quand un nouveau projet est initié pour la première fois, il faut créer un artifact
     project-config avant de créer la task-request, pour enregistrer le projet dans le système.
+    NOTE D'AUDIT (V1 2026-06-10) : le chemin cité dans la recommandation est
+    périmé ; l'emplacement canonique actuel est
+    projects/<project-slug>/config/<artifact-id>.yml (règle file_placement de
+    shared-rules). Le principe (project-config d'abord) reste valide.
   tags:
     - project-config
     - workflow

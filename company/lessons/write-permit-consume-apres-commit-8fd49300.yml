@@ -9,6 +9,10 @@ metadata:
     Le Layer 2 defense-in-depth vérifie que le permit est 'active' au moment du commit git.
     Un permit 'consumed' avant le commit bloque le commit et force un nouveau cycle CEO →
     grant → commit → consume. L'ordre write → commit → consume est non-négociable.
+    NOTE D'AUDIT (V1 2026-06-10) : l'invariant consume-en-dernier reste
+    ENTIÈREMENT valide. Seul le contexte a évolué : le scellement manuel de la
+    DB après grant a disparu (RFC 359f9162 atomic grant, lesson d5c9c933), et
+    le commit du code peut déjà avoir été absorbé par le seal (lesson 595b2d8d).
   tags:
     - write-permit
     - defense-in-depth

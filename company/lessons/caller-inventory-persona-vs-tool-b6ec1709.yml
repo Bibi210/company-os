@@ -18,6 +18,10 @@ metadata:
     produire APRÈS sa rédaction ; (c) une friction de process observée
     pendant l'exécution (le pre-commit make ci global sérialise des
     chantiers parallèles disjoints).
+    NOTE D'AUDIT (V1 2026-06-10) : les mentions "agent-message au PM" dans
+    insight et recommandations renvoient à un kind retiré (RFC 3d9f0b0c,
+    lesson a9bc9f6d) ; lire "canal de coordination (retour du Task tool)".
+    Le fond de la lesson reste entièrement valide.
   tags:
     - workflow
     - api

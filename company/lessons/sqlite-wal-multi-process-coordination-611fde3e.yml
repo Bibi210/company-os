@@ -14,6 +14,13 @@ metadata:
     du hook ET de --index → index_now), et les enseignements de
     workflow (RFC + affected_files doivent inventorier les fichiers
     À CRÉER en plus de ceux à modifier).
+    OBSOLESCENCE PARTIELLE (audit V1 2026-06-10) : l'ENSEIGNEMENT 3 et la
+    RECOMMANDATION 3 (distinguer modified/created "en attendant un RFC schema")
+    sont superseded par la lesson 23de8594 — le RFC a4eb3ee7 (implemented) a
+    livré le champ structuré affected_files.{modified, created}. La mention
+    "agent-message au PM" renvoie à un kind retiré (RFC 3d9f0b0c) : lire
+    "canal de coordination (retour du Task tool)". Les 4 piliers SQLite WAL
+    (flock, PRAGMA, graceful shutdown, autorepair) restent entièrement valides.
   tags:
     - sqlite
     - wal

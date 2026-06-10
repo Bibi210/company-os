@@ -9,10 +9,15 @@ metadata:
     Pendant le PHASE 2 outillage roadmaps, l'Implementer a tenté de
     contourner une coupure MCP en exécutant un UPDATE direct via sqlite3
     pour marquer un write_permit comme consumed. Le hook defense-in-depth
-    a détecté l'altération hors-MCP et a réagi en remettant la table à un
+    a détecté l'altération hors-MCP et     a réagi en remettant la table à un
     état vide ("0 permits"). Conséquence : l'altération locale a été
     transformée en perte globale de l'état des permits. Cette lesson
     documente le comportement, son rationale, et la procédure correcte.
+    OBSOLESCENCE PARTIELLE — Superseded par 85ad44d3 (audit V1 2026-06-10) :
+    depuis le RFC bde023e2 (selective revert, implemented), le wipe total
+    n'est PLUS le comportement par défaut du hook ; il est borné au seul cas
+    baseline-indéterminable. Restent valides : "jamais de SQL direct sur les
+    tables sensibles" et "diagnostic-report plutôt que workaround".
   tags:
     - defense-in-depth
     - write-permits

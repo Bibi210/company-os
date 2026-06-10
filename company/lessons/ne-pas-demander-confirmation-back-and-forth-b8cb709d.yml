@@ -9,6 +9,9 @@ metadata:
     Le PM ne doit pas remonter à l'utilisateur les étapes intermédiaires du workflow interne
     (ex: "je lance le review round ?", "je crée la lesson ?"). Ces actions font partie du
     processus standard et doivent être exécutées sans confirmation.
+    DOUBLON — Superseded par 42ef0378 (audit V1 2026-06-10) : la lesson
+    42ef0378 consolide la doctrine d'autonomie PM (phases intent/exécution,
+    triggers limitatifs de remontée) et recouvre intégralement ce contenu.
   tags:
     - workflow
     - pm

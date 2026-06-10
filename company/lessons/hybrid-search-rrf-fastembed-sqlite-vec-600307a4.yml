@@ -16,6 +16,14 @@ metadata:
     cross-architecture, comportement de fastembed avec HF_HUB_OFFLINE),
     (c) les frictions opérationnelles avec le hook defense-in-depth
     qui ont coûté 2 cycles de re-émission de permits pendant la session.
+    OBSOLESCENCE PARTIELLE (audit V1 2026-06-10) : les sections permits sont
+    périmées — le wipe nucléaire du hook a été remplacé par le revert sélectif
+    (RFC bde023e2, lesson 85ad44d3) et le scellement du grant est désormais
+    atomique côté serveur (RFC 359f9162, lesson d5c9c933 : la RECOMMANDATION 3
+    "candidat RFC futur" est RÉALISÉE). Les filtres structurés listés (kind,
+    author, project, dates) ont été retirés de la surface search par le RFC
+    1d3a3581 (lesson bd4650e2) ; seuls tags et id_prefix survivent.
+    L'architecture hybrid FTS5+vec+RRF et ses chiffres restent valides.
   tags:
     - search
     - retrieval

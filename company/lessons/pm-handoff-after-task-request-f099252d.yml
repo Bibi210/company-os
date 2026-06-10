@@ -10,6 +10,10 @@ metadata:
     immédiat du PM s'arrête. Le PM ne doit pas continuer à pousser le workflow
     (convoquer l'Architect, lancer un review round, etc.) sauf demande explicite.
     L'utilisateur reprend la main et décide quand relancer la machine.
+    OBSOLÈTE — Superseded par 42ef0378 (audit V1 2026-06-10) : cette lesson a
+    été sur-interprétée comme "le PM s'arrête après le task-request". La
+    doctrine actuelle est l'inverse : après le task-request validé, le PM
+    avance en autonomie (lesson 42ef0378). Conservée comme trace historique.
   tags:
     - pm
     - workflow

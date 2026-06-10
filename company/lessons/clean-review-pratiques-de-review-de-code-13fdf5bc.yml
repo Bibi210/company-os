@@ -10,6 +10,13 @@ metadata:
     Microsoft (MacLeod et al.), les anti-patterns courants, et la psychologie de la review.
     Focus sur l'analyse triaxiale, les pièges du rubber-stamping, et la review comme outil
     d'apprentissage collectif.
+    OBSOLESCENCE PARTIELLE (audit V1 2026-06-10) : le point 2 ("chaque review
+    DOIT avoir au moins un finding même si le verdict est approve") contredit
+    la règle canonique review_findings_honesty de shared-rules : un approve
+    valide est SANS findings ; un finding implique request_changes. La parade
+    au rubber-stamping est l'analyse triaxiale documentée, pas un finding
+    obligatoire (cf. lessons 6353ec2c et e63992f0). Le reste (triaxial, taille
+    des changements, auto-review interdite, escalade) reste valide.
   tags:
     - clean-review
     - code-review
@@ -21,6 +28,12 @@ metadata:
       kind: lesson-learned
       relationship: related
     - id: 78b74101-a23a-4841-a2da-c76651399883
+      kind: lesson-learned
+      relationship: related
+    - id: 6353ec2c-cbc3-423a-a931-6cd033fd4c59
+      kind: lesson-learned
+      relationship: related
+    - id: e63992f0-7317-4d59-b744-1163f14c4f57
       kind: lesson-learned
       relationship: related
 

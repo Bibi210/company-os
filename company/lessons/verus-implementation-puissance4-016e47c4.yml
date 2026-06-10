@@ -7,9 +7,13 @@ metadata:
   created_at: "2026-03-15"
   description: >
     Retour d'expérience concret sur l'implémentation complète du jeu Puissance 4 avec
-    preuves Verus (PDD). Couvre les pièges techniques non documentés dans les design-docs :
+    preuves Verus (PDD).     Couvre les pièges techniques non documentés dans les design-docs :
     tableau 1D vs 2D pour la mutation, `PartialEq` dans verus!, clone avec ensures,
     cfg(verus_only) pour les imports spec, et la complexité de lemma_ab_equals_pure.
+    NOTE D'AUDIT (V1 2026-06-10) : valide pour Verus 0.2026.03.10 ; sur les
+    versions récentes, `board.cells.set(pos, val)` est deprecated au profit de
+    l'indexation `board.cells[pos] = v`, et le breaking change new-mut-ref
+    impose final(x) dans les ensures sur &mut (cf. lesson 9432aa47).
   tags:
     - verus
     - rust
