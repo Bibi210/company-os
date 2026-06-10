@@ -1,0 +1,111 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 8b3922c3-5a1d-4cf4-a06b-43a51d50c19a
+  title: "sum-n-lean — Terrain de jeu Lean 4 : theorem sumN n = n(n+1)/2 par induction"
+  author: pm
+  created_at: "2026-06-06"
+  project: sum-n-lean
+  description: >
+    Projet d'exercice minimal pour s'entraîner à la preuve formelle avec Lean 4.
+    Troisième terrain de jeu de la série (après sum-n-verus et sum-n-creusot), mais avec
+    une nature DIFFÉRENTE : Lean n'est pas un vérifieur de code Rust, c'est un assistant de
+    preuve / langage à part entière. Ici sum_n et sa preuve SONT les mathématiques. L'objectif
+    principal reste l'INFRASTRUCTURE : scaffolding lake, toolchain elan, intégration de Mathlib,
+    et Makefile avec cible verify. Le contenu se réduit à une fonction récursive sumN : Nat -> Nat
+    et au théorème sumN n = n*(n+1)/2 prouvé PAR INDUCTION (à la main).
+  tags:
+    - lean
+    - lean4
+    - mathlib
+    - formal-verification
+    - theorem-proving
+    - playground
+    - scaffolding
+    - sum-n
+  related:
+    - id: 475911ee-4ed8-44ba-a572-6e2eea4fd278
+      kind: lesson-learned
+      relationship: related
+    - id: 8628f4b4-005f-4c13-bb16-0ad36d88da9c
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  priority: medium
+  status: done
+
+  context: >
+    L'utilisateur veut un troisième terrain de jeu de vérification formelle, cette fois avec
+    Lean 4. Différence conceptuelle majeure avec les deux précédents (Verus, Creusot) : ceux-ci
+    vérifient du code Rust annoté de contrats ; Lean est un assistant de preuve où l'on écrit
+    directement des définitions mathématiques et leurs preuves. Il n'y a pas de "code exec" à
+    prouver correct vis-à-vis d'une spec : la définition de sumN EST l'objet, et le théorème EST
+    la propriété. Pas de notion d'overflow non plus (on travaille sur Nat, entiers mathématiques
+    non bornés).
+
+    Le coeur de la demande reste l'INFRASTRUCTURE : que toute la tuyauterie de build/vérification
+    soit en place et fonctionne d'un seul make verify (en Lean, builder = vérifier les preuves :
+    si une preuve échoue, lake build échoue).
+
+    Contrainte d'emplacement : les artifacts CompanyOS vivent dans company-os sous
+    projects/sum-n-lean/. Le CODE SOURCE du projet vit en dehors de company-os, dans
+    /home/bibux/Compagny/sum-n-lean/.
+
+    Contrainte d'installation : elan (le gestionnaire de toolchain Lean, équivalent de rustup)
+    doit être installé en priorité via paru (AUR). lake (le gestionnaire de projet/build, livré
+    avec la toolchain Lean) gère le projet. Mathlib est tiré comme dépendance via lake, avec son
+    CACHE BINAIRE officiel (lake exe cache get) pour éviter de compiler tout Mathlib from scratch.
+    Éviter le téléchargement direct de binaires hors elan/lake/paru. Si l'install échoue,
+    s'arrêter et signaler.
+
+    Décisions utilisateur déjà tranchées (à respecter par le design) :
+    - Build system : elan + lake.
+    - Mathlib : OUI, on l'intègre (l'utilisateur l'a explicitement demandé).
+    - Forme : fonction récursive def sumN : Nat -> Nat, théorème prouvé PAR INDUCTION à la main
+      (et non en réutilisant directement Gauss_sum de Mathlib, même si Mathlib est disponible
+      pour les tactiques omega/ring/simp/induction).
+
+  what_to_build:
+    - Scaffolding lake complet dans /home/bibux/Compagny/sum-n-lean/ (lakefile, lean-toolchain, src)
+    - Une définition récursive def sumN : Nat -> Nat (somme des entiers de 0/1 à n)
+    - Un théorème sumN n = n*(n+1)/2 prouvé PAR INDUCTION (preuve écrite à la main)
+    - Intégration de Mathlib comme dépendance lake (avec cache binaire)
+    - Un Makefile à la racine avec une cible verify qui lance lake build (= vérification des preuves)
+    - Un README documentant l'installation (elan via paru, lake, Mathlib + cache) et l'usage
+    - Installation effective de la toolchain Lean + Mathlib sur la machine
+
+  formal_verification_scope:
+    propriete_a_prouver:
+      - theorem sumN n = n*(n+1)/2 pour tout n : Nat
+      - Preuve par induction sur n (cas de base + cas inductif)
+    note_methode:
+      - Travail sur Nat : pas d'overflow (entiers mathématiques non bornés)
+      - La division par 2 sur Nat est exacte ici car n*(n+1) est toujours pair ; gérer le
+        raisonnement de division entière sur Nat (Nat.div) qui peut nécessiter un argument de
+        divisibilité, ou reformuler en 2 * sumN n = n*(n+1) pour éviter la division
+      - Mathlib disponible pour les tactiques (omega, ring, induction, simp) mais la STRUCTURE
+        de la preuve reste une induction explicite, pas un appel direct à un lemme Gauss_sum tout fait
+
+  acceptance_criteria:
+    - Le code source vit dans /home/bibux/Compagny/sum-n-lean/, pas dans company-os
+    - make verify lance lake build et passe sans erreur (toutes les preuves vérifiées)
+    - Le théorème sumN n = n*(n+1)/2 est prouvé PAR INDUCTION (preuve à la main, pas un simple appel à Gauss_sum)
+    - Mathlib est intégré et utilisable dans le projet
+    - Le projet build proprement (lake build) sans sorry ni axiome non justifié
+    - Le README documente l'installation (elan via paru, lake, Mathlib cache) et l'usage make verify
+    - La toolchain Lean + Mathlib est effectivement installée et fonctionnelle
+
+  out_of_scope:
+    - Toute logique au-delà de sumN et son théorème
+    - Réutilisation directe de Gauss_sum de Mathlib comme unique preuve (l'induction à la main est l'exercice)
+    - Comparaison de performance
+    - Téléchargement direct de binaires hors elan/lake/paru sans accord préalable de l'utilisateur
+
+  installation_constraints:
+    - Priorité à paru (AUR) pour elan (gestionnaire de toolchain Lean)
+    - lake (livré avec la toolchain via elan) gère le projet et tire Mathlib
+    - Mathlib via son cache binaire officiel (lake exe cache get) pour éviter une compilation complète
+    - Pas de téléchargement direct de binaires hors elan/lake/paru sans accord explicite
+    - En cas d'échec (install elan, résolution Mathlib, cache indisponible), s'arrêter et signaler
+    - Interdiction de sorry / d'axiome non justifié pour faire passer make verify (équivalent du no-cheating)

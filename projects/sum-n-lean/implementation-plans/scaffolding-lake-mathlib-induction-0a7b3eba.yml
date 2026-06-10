@@ -1,0 +1,232 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 0a7b3eba-e146-41c1-9708-6afb348acef1
+  title: "sum-n-lean — Plan d'implémentation : scaffolding lake + Mathlib (cache), theorem 2*sumN n = n*(n+1) par induction + corollaire divisé"
+  author: implementer
+  created_at: "2026-06-06"
+  project: sum-n-lean
+  changelog:
+    - date: "2026-06-06"
+      author: implementer
+      description: >
+        TERMINÉ. Toutes les étapes exécutées avec succès. Couple de versions retenu :
+        Lean leanprover/lean4:v4.30.0 dérivé de Mathlib v4.30.0 (tag stable, cache binaire
+        publié). Scaffolding lake hors company-os dans /home/bibux/Compagny/sum-n-lean/
+        (lakefile.toml avec require mathlib rev v4.30.0, lean-toolchain v4.30.0,
+        SumNLean/Basic.lean, Makefile, README.md). lake update a déclenché automatiquement
+        le cache get (8459 .olean depuis Azure) : aucune recompilation Mathlib. Théorème
+        principal forme multipliée 2*sumN n = n*(n+1) prouvé par induction explicite (cas
+        succ fermé par ring) ; corollaire divisé sumN n = n*(n+1)/2 dérivé hors induction
+        par omega. `make verify` => "Build completed successfully (8477 jobs)" exit 0,
+        0 sorry (confirmé `#print axioms` : propext + Quot.sound, aucun sorryAx ; sumN 100 =
+        5050). Capitalisation : lesson-learned e0256a35 (premier retour Lean de CompanyOS,
+        chaînée aux lessons Verus 475911ee et Creusot 8628f4b4). Légère divergence vs plan
+        documentée dans la lesson : lake update fait déjà le cache get (le step 5 explicite
+        devient un no-op idempotent), et le projet est une preuve pure (lean_exe/Main.lean
+        retirés du squelette lake init).
+  description: >
+    Plan d'exécution concret du terrain de jeu Lean 4 sum-n-lean, dérivé du design-doc approuvé
+    e24af522. Décline en étapes ordonnées et actionnables : (1) sonde lecture seule de
+    l'environnement (which elan/lake/lean, paru -Ss elan) ; (2) install elan via paru, choix
+    Mathlib-d'abord puis dérivation du lean-toolchain depuis Mathlib ; (3) scaffolding lake hors
+    company-os (/home/bibux/Compagny/sum-n-lean/) avec require Mathlib ; (4) lake exe cache get
+    AVANT lake build ; (5) écriture de la définition récursive sumN, du théorème principal en
+    FORME MULTIPLIÉE 2*sumN n = n*(n+1) prouvé par induction explicite, et du corollaire divisé
+    dérivé hors induction ; (6) Makefile (verify/build/help) ; (7) README ; (8) make verify vert,
+    0 sorry. Points de fragilité explicités : couple version Lean<->Mathlib, disponibilité du
+    cache binaire, division entière tronquée non additive sur Nat.
+  tags:
+    - lean
+    - lean4
+    - mathlib
+    - formal-verification
+    - theorem-proving
+    - playground
+    - scaffolding
+    - sum-n
+    - toolchain
+    - arch-linux
+    - elan
+    - lake
+    - implementation-plan
+  related:
+    - id: e24af522-384d-496a-b7e8-5971f7120562
+      kind: design-doc
+      relationship: derived-from
+    - id: 8b3922c3-5a1d-4cf4-a06b-43a51d50c19a
+      kind: task-request
+      relationship: input
+    - id: 475911ee-4ed8-44ba-a572-6e2eea4fd278
+      kind: lesson-learned
+      relationship: related
+    - id: 8628f4b4-005f-4c13-bb16-0ad36d88da9c
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  dependencies:
+    - "Accès réseau pour paru (AUR, elan), elan (toolchain Lean) et lake exe cache get (cache binaire Mathlib reservoir)"
+    - "paru fonctionnel (AUR helper) sur la machine Arch"
+    - "Toolchain Lean pinnée DÉRIVÉE de la révision Mathlib choisie (Mathlib-d'abord, jamais l'inverse)"
+    - "Cache binaire Mathlib publié pour la version Lean retenue (sinon recompilation multi-Go, exclue)"
+
+  steps:
+    - description: >
+        ÉTAPE 0 — Sonde de l'environnement en LECTURE SEULE (aucune écriture, aucune install).
+        Exécuter : `which elan lake lean` ; `elan --version` et `lean --version` si présents ;
+        `paru -Ss elan` pour confirmer la disponibilité du paquet elan sur AUR (chercher `elan`
+        et `elan-lean`). But : savoir si elan est déjà là (skip install) et confirmer la source
+        AUR avant toute action. Consigner les versions trouvées.
+      files: []
+
+    - description: >
+        ÉTAPE 1 — Installer elan via paru si absent. Si `which elan` échoue, installer en priorité
+        via `paru -S --noconfirm elan` (paquet `elan` ou `elan-lean` selon ce que la sonde a
+        confirmé). elan est le gestionnaire de toolchain Lean (analogue rustup) : il téléchargera
+        ensuite la toolchain Lean pinnée par lean-toolchain, ce qui est le comportement NORMAL
+        et N'EST PAS un téléchargement de binaire interdit. Si elan est ABSENT d'AUR : NE PAS
+        chercher de fallback (curl install script, binaire GitHub) — s'arrêter, produire un
+        diagnostic-report et signaler au PM.
+      files: []
+
+    - description: >
+        ÉTAPE 2 — Choisir la révision Mathlib (Mathlib-D'ABORD) et en DÉRIVER le lean-toolchain.
+        Discipline clé du design (decision install) : on part de Mathlib, pas de Lean. Choisir
+        une révision Mathlib STABLE récente (un tag/release ou un commit récent de master dont le
+        cache binaire est publié). Lire le fichier `lean-toolchain` de Mathlib à cette révision
+        (présent à la racine du dépôt Mathlib4) : il indique la version Lean EXACTE exigée
+        (ex. `leanprover/lean4:v4.x.0`). C'est cette chaîne qu'on recopiera dans le lean-toolchain
+        du projet. NE JAMAIS choisir une version Lean arbitraire puis espérer que Mathlib suive.
+      files: []
+
+    - description: >
+        ÉTAPE 3 — Créer l'arborescence du projet HORS company-os. `mkdir -p /home/bibux/Compagny/sum-n-lean`.
+        Initialiser un package lake standard via `lake new sum_n_lean` (ou `lake init` dans le
+        dossier) en utilisant le lake livré par la toolchain Lean dérivée à l'étape 2 (via
+        `elan run <toolchain> lake new ...` ou après `elan default`/`elan override set`). Ce
+        squelette génère lakefile (lakefile.toml ou lakefile.lean selon la version de lake — la
+        forme concrète est déléguée, on garde celle générée), lean-toolchain, et un répertoire
+        source. INVARIANT FORT : aucun fichier de code Lean ne doit être créé sous company-os.
+      files:
+        - /home/bibux/Compagny/sum-n-lean/ (création du répertoire racine du code, hors company-os)
+
+    - description: >
+        ÉTAPE 4 — Épingler le lean-toolchain dérivé et déclarer la dépendance Mathlib dans le
+        lakefile. Écraser le contenu de `/home/bibux/Compagny/sum-n-lean/lean-toolchain` avec la
+        version Lean EXACTE lue dans le lean-toolchain de Mathlib à l'étape 2. Ajouter dans le
+        lakefile le `require mathlib` pointant la révision Mathlib choisie (forme TOML :
+        `[[require]]` name = "mathlib", git/scope + rev ; forme Lean : `require mathlib from git
+        "https://github.com/leanprover-community/mathlib4" @ "<rev>"`). La cohérence version
+        Lean<->révision Mathlib est l'invariant central (point de fragilité documenté). Lancer
+        `lake update` (résolution des dépendances, écrit le manifest lake-manifest.json).
+      files:
+        - /home/bibux/Compagny/sum-n-lean/lean-toolchain
+        - /home/bibux/Compagny/sum-n-lean/lakefile.toml (ou lakefile.lean selon génération lake)
+        - /home/bibux/Compagny/sum-n-lean/lake-manifest.json (généré par lake update)
+
+    - description: >
+        ÉTAPE 5 — Récupérer le cache binaire Mathlib AVANT tout build. Exécuter
+        `lake exe cache get` à la racine du projet. NON NÉGOCIABLE : sans cette étape le premier
+        lake build recompile l'intégralité de Mathlib (plusieurs Go, dizaines de minutes), ce qui
+        rend le terrain de jeu inutilisable. Vérifier que le cache descend bien (sortie indiquant
+        des fichiers .olean récupérés depuis le reservoir). Si le cache est INDISPONIBLE pour la
+        version Lean retenue : revenir à l'étape 2 et choisir une autre révision Mathlib dont le
+        cache existe ; si aucune révision viable, appliquer la règle d'arrêt (diagnostic-report +
+        signalement), JAMAIS recompiler Mathlib à l'aveugle.
+      files: []
+
+    - description: >
+        ÉTAPE 6 — Écrire la définition récursive et les preuves dans le fichier source Lean du
+        projet (le module généré par lake, p.ex. SumNLean/Basic.lean ou SumNLean.lean selon le
+        squelette). Contenu :
+        (a) `import Mathlib` (ou imports Mathlib ciblés Tactic.Ring / Tactic.Omega) pour disposer
+            des tactiques ring/omega/simp.
+        (b) Définition récursive structurelle :
+            `def sumN : Nat → Nat | 0 => 0 | (n+1) => (n+1) + sumN n`
+            (cas 0 = 0, cas successeur (n+1) + sumN n ; totale et terminante par construction).
+        (c) THÉORÈME PRINCIPAL en FORME MULTIPLIÉE, prouvé par INDUCTION EXPLICITE :
+            `theorem two_mul_sumN (n : Nat) : 2 * sumN n = n * (n + 1)` par
+            `induction n with | zero => ... | succ k ih => ...`. Cas de base : `simp [sumN]` ou
+            `rfl`. Cas inductif : déplier sumN (succ), réécrire avec `ih`, fermer l'identité
+            polynomiale `2*(k+1) + k*(k+1) = (k+1)*(k+2)` par `ring` (ou `omega`). L'OSSATURE
+            inductive est écrite à la main ; ring/omega ne ferment que les feuilles algébriques.
+        (d) COROLLAIRE en FORME DIVISÉE, dérivé HORS induction :
+            `theorem sumN_eq (n : Nat) : sumN n = n * (n + 1) / 2`. Le dériver de two_mul_sumN
+            via la division exacte : `omega` à partir de l'hypothèse `2 * sumN n = n * (n + 1)`
+            (omega gère la division entière par un littéral et conclut sumN n = (n*(n+1))/2), ou
+            via un lemme Nat de Mathlib sur la division d'un multiple. Le pas de parité (produit
+            de deux consécutifs pair) est traité UNE SEULE FOIS ici, hors induction.
+        INTERDIT : sorry, axiome non justifié, ou réduire la preuve à un appel direct Gauss_sum.
+      files:
+        - /home/bibux/Compagny/sum-n-lean/SumNLean/Basic.lean (ou module source équivalent généré par lake)
+
+    - description: >
+        ÉTAPE 7 — Écrire le Makefile à la racine. Cibles :
+        - `verify` : `lake exe cache get` PUIS `lake build` (cache get avant build est le contrat
+          du design ; lake build = vérification de toutes les preuves, échoue si une preuve casse).
+        - `build` : `lake build` seul.
+        - `help` : liste des cibles.
+        Marquer les cibles .PHONY. Le contrat : un seul `make verify` suffit, il échoue si une
+        preuve casse, et il n'y a aucun sorry ni axiome non justifié.
+      files:
+        - /home/bibux/Compagny/sum-n-lean/Makefile
+
+    - description: >
+        ÉTAPE 8 — Écrire le README. Documenter : (1) installation elan via paru (priorité AUR) ;
+        (2) le couple version figé Lean<->Mathlib (révision Mathlib choisie + version Lean dérivée,
+        valeurs réelles obtenues à l'install) ; (3) lake exe cache get pour le cache binaire Mathlib
+        AVANT build ; (4) usage `make verify` ; (5) note explicite : elan télécharge la toolchain
+        Lean (comportement normal, comme rustup, pas une violation) ; (6) points de fragilité
+        (couple version, disponibilité du cache).
+      files:
+        - /home/bibux/Compagny/sum-n-lean/README.md
+
+    - description: >
+        ÉTAPE 9 — VERIFY. Lancer `make verify` depuis /home/bibux/Compagny/sum-n-lean/. Critère de
+        succès : lake build vert (exit 0), toutes les preuves élaborées. Vérifier l'ABSENCE de tout
+        warning de sorry résiduel dans la sortie (Lean signale tout sorry par un warning
+        d'élaboration `declaration uses 'sorry'`). Cette étape cargo-équivalente (lake build) EST
+        la CI du projet (projet owned, CI = make verify). Si échec de preuve : itérer sur l'étape 6
+        (tactiques par branche : ring vs ring_nf vs omega vs simp) sans jamais introduire de sorry.
+      files: []
+
+    - description: >
+        ÉTAPE 10 — CAPITALISATION. Une fois make verify vert : créer une lesson-learned (premier
+        retour Lean de CompanyOS) après search() préalable. Documenter : install réelle
+        (elan/paru, couple Lean/Mathlib obtenu, cache get), la FORME MULTIPLIÉE vs DIVISÉE comme
+        coeur pédagogique (division tronquée non additive sur Nat), et le contraste Lean vs
+        Verus/Creusot (Lean = assistant de preuve, Nat exact donc pas d'overflow, induction à la
+        main vs décharge SMT auto). Lier via related aux lessons jumelles 475911ee et 8628f4b4.
+        Marquer cet implementation-plan terminé (changelog).
+      files:
+        - /home/bibux/Compagny/company-os/company/lessons/ (nouvelle lesson-learned, slug-8chars.yml)
+
+  risks:
+    - >
+      COUPLE VERSION Lean<->Mathlib (fragilité centrale, analogue creusot/why3 lesson 8628f4b4).
+      Mathlib impose une version Lean PRÉCISE ; une version discordante casse l'élaboration.
+      Mitigation : dériver le lean-toolchain DEPUIS le lean-toolchain de Mathlib à la révision
+      choisie (Mathlib-d'abord). Jamais l'inverse.
+    - >
+      DISPONIBILITÉ DU CACHE BINAIRE Mathlib. Le cache n'existe que pour les versions Lean
+      officiellement publiées. Si absent pour la version visée, lake build recompile tout Mathlib
+      (multi-Go, exclu). Mitigation : choisir une révision Mathlib stable dont le cache est publié ;
+      sinon règle d'arrêt + diagnostic-report.
+    - >
+      DIVISION ENTIÈRE TRONQUÉE NON ADDITIVE sur Nat. Une induction directe sur la forme divisée
+      n*(n+1)/2 échoue car /2 n'est pas un morphisme additif (ring/simp ne ferment pas le pas).
+      Mitigation : prouver la forme MULTIPLIÉE 2*sumN n = n*(n+1) par induction (pure identité
+      polynomiale, ring/omega), puis dériver le corollaire divisé UNE SEULE FOIS hors induction
+      via omega (division par littéral) ou lemme Nat.
+    - >
+      elan ABSENT d'AUR. Si ni `elan` ni `elan-lean` ne sont sur AUR, pas de fallback binaire
+      autorisé. Mitigation : règle d'arrêt, diagnostic-report, signalement au PM.
+    - >
+      CONFUSION install_constraints : elan téléchargeant la toolchain Lean pourrait être pris pour
+      un téléchargement de binaire interdit. Ce n'est PAS le cas (comportement nominal du
+      gestionnaire, comme rustup). À documenter dans le README pour lever toute ambiguïté.
+    - >
+      FORME DU LAKEFILE (toml vs lean) dépend de la version de lake générée. Risque mineur : la
+      syntaxe du require Mathlib diffère entre les deux formes. Mitigation : garder la forme
+      générée par lake new et adapter la syntaxe require en conséquence.

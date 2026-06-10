@@ -1,0 +1,286 @@
+api_version: companyos/v1
+kind: design-doc
+metadata:
+  id: e24af522-384d-496a-b7e8-5971f7120562
+  title: "sum-n-lean — Architecture : infrastructure de preuve Lean 4 + Mathlib pour theorem sumN n = n(n+1)/2 par induction"
+  author: architect
+  created_at: "2026-06-06"
+  project: sum-n-lean
+  description: >
+    Architecture du troisième terrain de jeu de la série sum-n, cette fois avec Lean 4,
+    un ASSISTANT DE PREUVE (non un vérifieur de code annoté comme Verus ou Creusot).
+    Le coeur du design est l'INFRASTRUCTURE de preuve bout-en-bout : scaffolding lake,
+    toolchain pilotée par elan, intégration de Mathlib avec son cache binaire, et un
+    Makefile dont la cible verify lance lake build (= vérification des preuves). Le contenu
+    prouvé est volontairement minimal : une définition récursive def sumN : Nat -> Nat et un
+    theorem établissant sumN n = n*(n+1)/2 prouvé PAR INDUCTION à la main. Le design tranche
+    la convention de la définition récursive, la FORME DE L'ÉNONCÉ face à la division entière
+    sur Nat (énoncé principal en forme multipliée 2 * sumN n = n*(n+1) + corollaire divisé),
+    le rôle de Mathlib (tactiques dans les branches, pas de lemme Gauss tout fait court-circuitant
+    l'induction), la structure du scaffolding lake, le câblage de make verify avec cache get
+    préalable, et la stratégie d'installation sur Arch via elan/paru avec ses points de fragilité
+    (couple version Lean <-> version Mathlib, disponibilité du cache).
+  tags:
+    - lean
+    - lean4
+    - mathlib
+    - formal-verification
+    - theorem-proving
+    - playground
+    - scaffolding
+    - sum-n
+    - toolchain
+    - arch-linux
+    - elan
+    - lake
+  related:
+    - id: 8b3922c3-5a1d-4cf4-a06b-43a51d50c19a
+      kind: task-request
+      relationship: input
+    - id: 475911ee-4ed8-44ba-a572-6e2eea4fd278
+      kind: lesson-learned
+      relationship: related
+    - id: 8628f4b4-005f-4c13-bb16-0ad36d88da9c
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  overview: >
+    sum-n-lean est le troisième terrain de jeu de la série sum-n (après sum-n-verus et
+    sum-n-creusot). Sa nature est CONCEPTUELLEMENT DIFFÉRENTE des deux précédents. Verus et
+    Creusot vérifient du CODE Rust annoté de contrats (requires/ensures) : il existe un objet
+    exécutable dont on prouve la conformité à une spécification. Lean 4 est un ASSISTANT DE
+    PREUVE et un langage à part entière fondé sur la théorie des types : on n'écrit pas du code
+    à prouver correct, on écrit directement des objets mathématiques (def) et des propositions
+    (theorem) accompagnées de leurs preuves. Ici, la définition de sumN EST l'objet mathématique
+    étudié, et le théorème EST la propriété. Il n'y a ni "code exec vs spec", ni notion d'overflow :
+    on travaille sur Nat, les entiers naturels mathématiques non bornés. Builder le projet, c'est
+    vérifier les preuves : lake build échoue si une preuve échoue.
+
+    Le livrable architectural est une infrastructure de preuve reproductible : un projet lake
+    minimal vivant HORS de company-os (dans /home/bibux/Compagny/sum-n-lean/), pilotable par un
+    Makefile dont la cible verify invoque la vérification (lake build), une toolchain Lean gérée
+    par elan et épinglée par un fichier lean-toolchain, et Mathlib intégré comme dépendance lake
+    avec son cache binaire officiel.
+
+    Le contenu vérifié se réduit à : (1) une fonction récursive def sumN : Nat -> Nat calculant
+    la somme des entiers jusqu'à n ; (2) un théorème établissant l'égalité avec la formule fermée
+    de Gauss n*(n+1)/2, prouvé PAR INDUCTION explicite sur n (cas de base + cas inductif), à la
+    main, sans réduire la preuve à un appel direct au lemme Gauss_sum de Mathlib.
+
+    Ce document tranche le QUOI et le POURQUOI au niveau architectural. Il ne fixe ni le code Lean
+    complet, ni les noms de fichiers précis, ni l'ordre d'exécution : ces choix relèvent de
+    l'implementation-plan. Il cadre en revanche les invariants : la convention de sumN, la forme
+    de l'énoncé du théorème face à la division entière sur Nat, le rôle exact de Mathlib, et le
+    contrat de make verify.
+
+  components:
+    - name: "Scaffolding lake (projet hors company-os)"
+      description: >
+        Un package Lean unique et minimal, racine /home/bibux/Compagny/sum-n-lean/, structuré
+        par lake (le build/package manager livré avec la toolchain Lean). Il comporte un fichier
+        de configuration lake (lakefile.lean OU lakefile.toml — le choix concret de la forme est
+        laissé à l'Implementer, voir décisions), un fichier lean-toolchain épinglant la version
+        Lean, un répertoire source contenant la bibliothèque Lean du projet, et le require de
+        Mathlib. La frontière forte est l'emplacement : AUCUN fichier de code Lean ne doit être
+        créé sous company-os ; seuls les artifacts CompanyOS (cette design-doc, l'implementation-plan,
+        etc.) vivent dans projects/sum-n-lean/. La séparation physique entre dépôt de code et dépôt
+        d'artifacts est un invariant du projet.
+    - name: "Définition récursive sumN : Nat -> Nat"
+      description: >
+        La définition mathématique centrale : une fonction récursive sur Nat suivant la structure
+        naturelle des entiers naturels (cas 0, cas successeur n+1). Cette définition EST l'objet
+        d'étude, pas un "code à vérifier". Elle est totale et terminante par construction (récursion
+        structurelle décroissante sur l'argument Nat, acceptée directement par le compilateur Lean
+        sans obligation de terminaison explicite). La convention (somme de 0 à n vs 1 à n, valeur en
+        0) est tranchée dans les décisions.
+    - name: "Énoncé du théorème (forme multipliée principale + corollaire divisé)"
+      description: >
+        L'objet logique central : la proposition reliant sumN à la formule fermée de Gauss. Le design
+        tranche une structure à DEUX niveaux : (a) un théorème PRINCIPAL énoncé sous forme MULTIPLIÉE
+        2 * sumN n = n * (n + 1), qui évite toute division entière et se prouve proprement par
+        induction ; (b) un COROLLAIRE sumN n = n * (n + 1) / 2 dérivé du théorème principal, qui est
+        la forme demandée par le task-request et le contrat lisible pour un lecteur. Le corollaire est
+        l'énoncé que les acceptance criteria exigent ; le théorème multiplié est le véhicule de preuve
+        qui le rend atteignable sans douleur.
+    - name: "Appareil de preuve par induction (la preuve à la main)"
+      description: >
+        Le coeur intellectuel : la preuve par induction structurelle sur n du théorème principal
+        (cas de base n = 0 ; cas inductif n+1 utilisant l'hypothèse d'induction sur n). La STRUCTURE
+        est une induction explicite, écrite à la main. Les tactiques Mathlib (ring/ring_nf, omega,
+        simp) sont des outils invoqués DANS les branches pour décharger l'algèbre et l'arithmétique,
+        mais ne se substituent pas à l'ossature inductive. La dérivation du corollaire divisé à partir
+        du théorème multiplié est un second pas de preuve, court, reposant sur le fait que n*(n+1) est
+        pair (deux entiers consécutifs) et donc divisible exactement par 2.
+    - name: "Dépendance Mathlib (require lake + cache binaire)"
+      description: >
+        Mathlib est tiré comme dépendance lake via un require dans le lakefile, à une révision
+        compatible avec la version Lean épinglée. Son cache binaire officiel (récupéré par
+        lake exe cache get) est récupéré AVANT le build pour éviter de recompiler tout Mathlib
+        (plusieurs gigaoctets de sources, compilation très longue). Le rôle de Mathlib dans ce projet
+        est de FOURNIR LES TACTIQUES (ring, omega, simp, lemmes arithmétiques de base sur Nat), pas de
+        fournir un lemme Gauss_sum qui court-circuiterait l'exercice d'induction.
+    - name: "Makefile (orchestration de la vérification)"
+      description: >
+        Un Makefile à la racine du projet exposant au minimum une cible verify qui lance la
+        vérification (lake build, qui vérifie toutes les preuves), et conventionnellement une cible
+        d'aide. La cible verify doit assurer que le cache Mathlib est disponible (lake exe cache get)
+        AVANT lake build, faute de quoi le premier build compile Mathlib intégralement. Le contrat :
+        un seul make verify suffit, il échoue si une preuve casse, et il n'y a aucun sorry ni axiome
+        non justifié dans le projet.
+    - name: "README (documentation de la toolchain et de l'usage)"
+      description: >
+        Documentation décrivant précisément comment installer la chaîne sur Arch (elan via paru en
+        priorité, puis la toolchain Lean gérée par elan et épinglée par lean-toolchain, puis Mathlib
+        via lake + cache get), et comment utiliser le projet (make verify). Le README est le contrat
+        humain de reproductibilité : un lecteur doit pouvoir reproduire l'environnement de zéro, et il
+        documente explicitement les points de fragilité (couple version Lean/Mathlib, disponibilité
+        du cache, téléchargement de toolchain par elan comme comportement normal).
+    - name: "Toolchain Lean + Mathlib installée (livrable d'environnement)"
+      description: >
+        L'installation effective et fonctionnelle de la chaîne sur la machine est un composant du
+        livrable, pas un pré-requis tacite. Elle comprend elan (le toolchain manager, analogue de
+        rustup), la toolchain Lean qu'elan télécharge et gère (version pinnée par lean-toolchain), et
+        Mathlib résolu par lake avec son cache binaire disponible pour cette version exacte de Lean.
+
+  decisions:
+    - decision: >
+        Convention de la définition récursive : sumN : Nat -> Nat définie par récursion structurelle
+        avec sumN 0 = 0 et sumN (n+1) = (n+1) + sumN n. La somme va donc de 0 à n inclus, ce qui
+        équivaut à 1 + 2 + ... + n puisque le terme 0 est neutre. La valeur en 0 est 0.
+      rationale: >
+        La récursion structurelle sur Nat (motif cas 0 / cas n+1) est la forme canonique et idiomatique
+        en Lean 4 : elle est acceptée directement par le compilateur sans preuve de terminaison
+        supplémentaire (décroissance structurelle évidente), et elle calque exactement la structure de
+        l'induction qui servira à prouver le théorème (l'hypothèse d'induction porte sur sumN n quand on
+        traite sumN (n+1)). Le choix sumN 0 = 0 fixe le cas de base de l'induction de façon triviale et
+        rend la formule fermée correcte dès n = 0 (0*(0+1)/2 = 0). La convention "0 à n" plutôt que
+        "1 à n" est sans incidence sur le résultat (le terme 0 est neutre) mais simplifie l'écriture du
+        cas successeur. C'est l'analogue Lean de la spec récursive sum_spec(0)=0, sum_spec(n+1)=...
+        retenue dans le jumeau Verus, transposée du registre "spec auxiliaire" au registre "définition
+        de première classe" propre à un assistant de preuve.
+    - decision: >
+        Forme de l'énoncé et gestion de la division entière : énoncer le THÉORÈME PRINCIPAL sous forme
+        MULTIPLIÉE 2 * sumN n = n * (n + 1), le prouver par induction, puis DÉRIVER le corollaire
+        sumN n = n * (n + 1) / 2 à partir de lui. NE PAS faire l'induction directe sur la forme divisée.
+      rationale: >
+        C'est la décision architecturale centrale de ce design. Sur Nat, la division n*(n+1)/2 est
+        Nat.div, une division entière TRONQUÉE. Or la division entière ne se distribue pas sur
+        l'addition : dans le cas inductif, le pas (n+1)*(n+2)/2 = (n+1) + n*(n+1)/2 n'est PAS une
+        identité que ring ou simp ferment, car /2 n'est pas un morphisme additif sur Nat. Prouver cette
+        égalité directement exigerait de traîner à chaque pas un argument de divisibilité (le produit de
+        deux consécutifs est pair) à l'intérieur de l'induction, ce qui est pénible et fragile. La forme
+        multipliée 2 * sumN n = n * (n + 1) élimine entièrement la division : le cas inductif devient une
+        pure identité polynomiale sur Nat (2*(n+1) + n*(n+1) = (n+1)*(n+2)) que ring ou omega ferment
+        immédiatement. Le passage de la forme multipliée à la forme divisée se fait UNE SEULE FOIS, hors
+        induction, en utilisant la parité du produit de deux entiers consécutifs (n*(n+1) est pair, donc
+        sa division entière par 2 est exacte) — typiquement via omega ou un lemme Nat de Mathlib sur la
+        division d'un multiple. Cette stratégie est l'écho direct de l'enseignement croisé des jumeaux :
+        la lesson Verus 475911ee documente que l'invariant MULTIPLICATIF (2*acc == i*(i+1)) est la porte
+        de sortie connue quand la division entière résiste au solveur, et la lesson Creusot 8628f4b4
+        montre que raisonner nativement en entiers exacts (Int) lève l'obstacle. Lean travaillant
+        nativement en Nat exact (comme Creusot en Int), il n'a pas le mur du solveur SMT, mais conserve
+        le mur de la division tronquée non additive : la forme multipliée le contourne proprement et
+        garde le cas inductif dans le pur algébrique. Alternative écartée (induction directe sur la forme
+        divisée) : elle alourdit chaque pas d'un argument de divisibilité et n'apporte aucun gain
+        pédagogique sur l'induction elle-même.
+    - decision: >
+        Rôle de Mathlib : la STRUCTURE de la preuve reste une induction explicite écrite à la main
+        (tactique induction ou pattern matching récursif). Mathlib fournit les TACTIQUES utilisées DANS
+        les branches : ring / ring_nf pour fermer les identités polynomiales du cas inductif, omega pour
+        l'arithmétique linéaire et le pas de divisibilité/division exacte, simp pour le dépliage et les
+        simplifications. Il est INTERDIT de réduire la preuve à un appel direct d'un lemme Gauss_sum (ou
+        équivalent) de Mathlib qui démontrerait le résultat tout fait.
+      rationale: >
+        Le task-request fixe que l'exercice EST l'induction à la main : un appel à Gauss_sum
+        court-circuiterait l'objet même du terrain de jeu (out_of_scope explicite). Mais interdire
+        Mathlib entièrement serait contre-productif et contraire à la décision utilisateur de l'intégrer :
+        ring et omega sont des tactiques de décharge algébrique/arithmétique, pas des théorèmes sur les
+        sommes ; les utiliser pour fermer une identité polynomiale dans une branche d'induction ne dévoie
+        pas l'exercice, exactement comme nonlinear_arith/ring dans le jumeau Verus ou alt-ergo dans le
+        jumeau Creusot fermaient les pas algébriques sans constituer une "preuve toute faite". La ligne de
+        partage architecturale est nette : l'ossature inductive (cas de base, cas successeur, usage de
+        l'hypothèse d'induction) est écrite à la main ; les feuilles de calcul algébrique sont déléguées
+        aux tactiques. Cette ligne est ce que le design impose ; le choix précis des tactiques par branche
+        (ring vs ring_nf vs omega vs simp) est délégué à l'Implementer.
+    - decision: >
+        Structure du scaffolding : package lake unique (pas de multi-package), avec un fichier de
+        configuration lake, un fichier lean-toolchain épinglant la version Lean, un répertoire source
+        pour la bibliothèque du projet, et Mathlib en dépendance via require dans le lakefile. La forme
+        concrète du fichier de configuration (lakefile.lean en Lean, ou lakefile.toml déclaratif) est
+        laissée au choix de l'Implementer, à condition qu'elle déclare le require Mathlib et soit
+        cohérente avec le squelette généré par lake. La frontière code/artifacts est physique : code dans
+        /home/bibux/Compagny/sum-n-lean/, artifacts CompanyOS dans projects/sum-n-lean/.
+      rationale: >
+        Le problème étant mono-définition / mono-théorème, un package unique est l'architecture la plus
+        simple satisfaisant tous les critères ; un multi-package serait de la sur-ingénierie. Le fichier
+        lean-toolchain est la pièce de fragilité centrale (voir décision suivante) : il DOIT exister et
+        épingler une version Lean. Le choix lakefile.lean vs lakefile.toml est sans impact architectural
+        (les deux expriment le même require Mathlib) ; le déléguer évite de figer un détail qui dépend de
+        ce que la version de lake retenue génère par défaut, dans le même esprit que le jumeau Verus
+        laissait le choix entre invocation standalone et sous-commande cargo. La séparation physique des
+        dépôts répond à une contrainte forte du task-request et évite que du code ne pollue l'arbre
+        company-os ou ne déclenche des hooks de zone protégée.
+    - decision: >
+        Câblage de make verify : la cible verify exécute lake exe cache get (récupération du cache
+        binaire Mathlib) PUIS lake build (compilation = vérification de toutes les preuves). Le contrat :
+        une cible verify unique, qui échoue si une preuve casse, et l'absence totale de sorry et d'axiome
+        non justifié dans le projet.
+      rationale: >
+        En Lean, builder = vérifier : lake build élabore chaque def et chaque theorem, et échoue si une
+        preuve ne type-checke pas. C'est l'équivalent fonctionnel du make verify des jumeaux (cargo verus
+        verify / cargo creusot prove), mais sans étape de vérification séparée du build. L'étape cache get
+        AVANT le build est non négociable : sans elle, le premier build recompile Mathlib entièrement
+        (plusieurs gigaoctets, potentiellement des dizaines de minutes), ce qui rend le terrain de jeu
+        inutilisable en pratique. L'interdiction de sorry (qui est l'analogue exact de l'interdiction
+        assume/admit en Verus et du no-cheating Creusot, lessons 475911ee et 8628f4b4) garantit que le
+        vert de make verify signifie une preuve réelle et complète. Lean signale d'ailleurs tout sorry
+        résiduel par un warning d'élaboration, ce qui rend cette interdiction vérifiable.
+    - decision: >
+        Stratégie d'installation sur Arch et gestion du couple version Lean <-> version Mathlib :
+        (1) installer elan en priorité via paru (AUR) ; (2) laisser elan télécharger et gérer la toolchain
+        Lean, version épinglée par lean-toolchain — ce téléchargement de toolchain par elan est le
+        comportement NORMAL et attendu du gestionnaire, exactement comme rustup installe une toolchain
+        Rust, et N'EST PAS un "téléchargement de binaire interdit" ; (3) choisir la révision Mathlib
+        d'abord, et en DÉRIVER la version Lean exacte qu'elle exige (renseignée dans lean-toolchain) ;
+        (4) récupérer le cache Mathlib pour cette version via lake exe cache get ; (5) si rien n'aboutit
+        (elan indisponible, incompatibilité Lean/Mathlib insoluble, cache indisponible), S'ARRÊTER sur
+        l'installation et signaler, sans contourner ni recompiler Mathlib à l'aveugle.
+      rationale: >
+        Cette gradation reprend la politique d'hygiène système des jumeaux (paru en priorité) tout en
+        intégrant les décisions utilisateur déjà tranchées (elan + lake + Mathlib + cache). Le point de
+        fragilité CENTRAL, analogue au couple creusot/why3 documenté dans la lesson 8628f4b4, est le
+        couple version Lean <-> version Mathlib : Mathlib impose une version PRÉCISE de Lean, et utiliser
+        une version Lean discordante casse l'élaboration. La discipline qui dissout ce risque est de
+        partir de la révision Mathlib et d'en déduire le lean-toolchain (l'inverse de "choisir Lean puis
+        espérer que Mathlib suive"), exactement comme l'opam switch de Creusot épinglait why3 à partir de
+        creusot. Le second point de fragilité est la disponibilité du cache : le cache binaire Mathlib
+        n'existe que pour les versions Lean officiellement publiées ; si la version retenue n'a pas de
+        cache, le build recompile tout Mathlib — d'où la règle de choisir une révision Mathlib stable
+        dont le cache est publié. Le troisième point est conceptuel et doit être documenté pour ne pas
+        être confondu avec une violation des installation_constraints : elan téléchargeant la toolchain
+        Lean est le fonctionnement nominal du gestionnaire (comme rustup), pas un "download de binaire
+        opaque". La règle d'arrêt propre en cas d'échec total est la même que pour les jumeaux : un
+        environnement non reproductible ou une recompilation Mathlib à l'aveugle est pire qu'un arrêt
+        signalé.
+
+  open_questions:
+    - >
+      Révision exacte de Mathlib et version Lean correspondante : le design impose de choisir la révision
+      Mathlib d'abord et d'en dériver le lean-toolchain, mais le couple précis (tag/commit Mathlib <->
+      version Lean) est à fixer empiriquement par l'Implementer au moment de l'install, en privilégiant
+      une révision dont le cache binaire est publié. À documenter dans le README.
+    - >
+      Forme concrète du fichier de configuration lake (lakefile.lean vs lakefile.toml) : déléguée à
+      l'Implementer selon ce que la version de lake retenue génère par défaut, sous la contrainte qu'elle
+      déclare le require Mathlib.
+    - >
+      Disponibilité effective du cache binaire Mathlib pour la version Lean retenue au moment de l'install :
+      à constater empiriquement. Si le cache est indisponible pour la version visée, soit choisir une autre
+      révision Mathlib dont le cache existe, soit appliquer la règle d'arrêt et signaler (recompiler tout
+      Mathlib étant exclu en pratique).
+    - >
+      Tactique exacte fermant le pas de division exacte (passage de 2 * sumN n = n*(n+1) au corollaire
+      divisé) : omega seul, omega assisté d'un lemme Nat de Mathlib sur la division d'un multiple, ou simp
+      avec un lemme de divisibilité. La stratégie (passer par la parité du produit de deux consécutifs,
+      une seule fois hors induction) est fixée ; l'outil précis est délégué à l'Implementer.

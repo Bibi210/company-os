@@ -1,0 +1,281 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: e0256a35-ca3c-4cb5-b2c8-cfa30a0e2c34
+  title: "Lean 4 + Mathlib : scaffolder (elan/lake, Mathlib-d'abord + cache get) et prouver sumN n = n(n+1)/2 par induction (forme multipliée)"
+  author: implementer
+  created_at: "2026-06-06"
+  changelog:
+    - date: "2026-06-06"
+      author: implementer
+      description: >
+        Ajout du BLOC 4 (rendre le projet EXÉCUTABLE sans recompiler Mathlib). Piège constaté :
+        un lean_exe dont le Main importe (même transitivement) Mathlib force la COMPILATION
+        NATIVE (.c.o) de toute la fermeture Mathlib (≈ 17000 jobs), car le cache binaire ne
+        fournit que les .olean, pas les objets natifs. Solution : isoler la def exécutable dans
+        un module Mathlib-FREE (SumNLean/Def.lean), brancher Main dessus, garder les preuves dans
+        un module séparé (Basic.lean) qui importe Def + Mathlib. Build exe alors ≈ 6 jobs / ~3 s.
+        Pendant Lean des parades "println! hors verus!" et "creusot prove -- --lib" : les 3 outils
+        convergent sur "séparer le code exécutable du code de preuve". Tag `executable` ajouté.
+    - date: "2026-06-06"
+      author: implementer
+      description: >
+        Renommage du projet en livre d'exercices STRUCTURÉ PAR THÈME (sum-n-lean -> math-book ;
+        package sum_n_lean -> math_book ; namespace SumNLean -> MathBook ; le thème "somme des
+        naturels" rangé sous MathBook/SumN/). Deux points Lean notables confirmés. (1) NAMESPACE
+        IMBRIQUÉ par thème : `namespace MathBook.SumN ... end MathBook.SumN` qualifie sumN en
+        MathBook.SumN.sumN ; le Main fait `open MathBook.SumN` pour appeler `sumN` non qualifié.
+        L'archi Def-Mathlib-free/Basic-Mathlib se réplique PAR THÈME sans friction. (2) MAPPING
+        lean_lib -> DOSSIERS : avec `[[lean_lib]] name = "MathBook"`, lake compile le root
+        `MathBook.lean` (à la racine) PLUS tous les modules sous le dossier `MathBook/`. Le module
+        `MathBook/SumN/Def.lean` s'importe via `import MathBook.SumN.Def` (le chemin de dossiers
+        EST le chemin de module, séparateur point). Le root MathBook.lean agrège les imports de
+        chaque thème et reste l'endroit où brancher un futur thème. (3) RENOMMAGE PROPRE : `mv`
+        du dossier conserve .git ; `lake update` régénère le package name dans lake-manifest.json
+        SANS toucher la rev Mathlib épinglée (v4.30.0 reste, cache .olean valable, zéro
+        re-téléchargement). make verify reste vert (8478 jobs, 0 sorry, #print axioms propre :
+        MathBook.SumN.two_mul_sumN -> [propext], MathBook.SumN.sumN_eq -> [propext, Quot.sound]) ;
+        build exe toujours ~6 jobs sans recompiler Mathlib (l'exe branché sur MathBook.SumN.Def).
+  description: >
+    Premier retour Lean 4 de CompanyOS (projet sum-n-lean), troisième de la série sum-n après
+    Verus (475911ee) et Creusot (8628f4b4). Deux blocs réutilisables :
+    (1) INSTALLATION / SCAFFOLDING — discipline Mathlib-D'ABORD : on choisit une révision Mathlib
+    STABLE (tag vX.Y.0 dont le cache binaire est publié), on lit SON fichier lean-toolchain, et on
+    en DÉRIVE la version Lean exacte (jamais l'inverse). elan (AUR) télécharge la toolchain Lean
+    comme rustup (comportement normal, pas un binaire interdit). lake init génère un lakefile.toml ;
+    require mathlib via scope="leanprover-community" + rev="vX.Y.0". lake update fait DÉJÀ tourner le
+    post-update hook `cache get` (8459 .olean depuis Azure) : la recompilation multi-Go de Mathlib
+    est évitée. Couple figé obtenu : Lean v4.30.0 / Mathlib v4.30.0.
+    (2) PREUVE — la division entière Nat.div n'est PAS additive, donc une induction directe sur
+    n*(n+1)/2 échoue. Solution : théorème PRINCIPAL en forme MULTIPLIÉE 2*sumN n = n*(n+1), prouvé
+    par induction explicite (pas inductif fermé par `ring`), puis corollaire divisé dérivé HORS
+    induction par `omega` (division par le littéral 2). Contraste Lean (assistant de preuve, Nat
+    exact, induction à la main) vs Verus/Creusot (vérifieurs de code Rust annoté, décharge SMT).
+  tags:
+    - lean
+    - lean4
+    - mathlib
+    - formal-verification
+    - theorem-proving
+    - induction
+    - elan
+    - lake
+    - toolchain
+    - cache
+    - sum-n
+    - arch-linux
+    - nat-div
+    - pièges
+    - executable
+  related:
+    - id: 475911ee-4ed8-44ba-a572-6e2eea4fd278
+      kind: lesson-learned
+      relationship: related
+    - id: 8628f4b4-005f-4c13-bb16-0ad36d88da9c
+      kind: lesson-learned
+      relationship: related
+    - id: e24af522-384d-496a-b7e8-5971f7120562
+      kind: design-doc
+      relationship: derived-from
+    - id: 0a7b3eba-e146-41c1-9708-6afb348acef1
+      kind: implementation-plan
+      relationship: related
+
+spec:
+  context: >
+    Projet sum-n-lean : terrain de jeu Lean 4, troisième de la série sum-n. Nature
+    CONCEPTUELLEMENT DIFFÉRENTE des jumeaux Verus/Creusot : Lean 4 n'est pas un vérifieur de code
+    Rust annoté de contrats (requires/ensures sur un objet exécutable), c'est un ASSISTANT DE
+    PREUVE fondé sur la théorie des types. On écrit directement l'objet mathématique
+    (def sumN : Nat → Nat) et la proposition (theorem) avec sa preuve. On travaille sur Nat
+    (entiers naturels non bornés) : AUCUNE notion d'overflow, contrairement au u64 de Verus.
+    Builder = vérifier : `lake build` élabore chaque def/theorem et échoue si une preuve ne
+    type-checke pas. Versions obtenues et validées sur machine Arch : elan 4.2.1 (déjà installé),
+    Lean v4.30.0 (toolchain téléchargée par elan), Mathlib v4.30.0 (tag stable, cache binaire
+    publié). Résultat final : `make verify` => "Build completed successfully (8477 jobs)" exit 0,
+    0 sorry (confirmé par `#print axioms` : seulement propext + Quot.sound, AUCUN sorryAx),
+    sumN 100 = 5050 et sumN 10 = 55 à l'évaluation.
+
+  insight: >
+    ===== BLOC 1 : INSTALLATION ET SCAFFOLDING LEAN 4 + MATHLIB =====
+
+    **Discipline Mathlib-D'ABORD (le point de fragilité central, analogue creusot↔why3).**
+    Mathlib impose une version Lean PRÉCISE ; une version Lean discordante casse l'élaboration.
+    La règle qui dissout le risque : NE PAS choisir Lean puis espérer que Mathlib suive. On part
+    de la révision Mathlib, on lit SON fichier lean-toolchain, on recopie cette chaîne exacte dans
+    le lean-toolchain du projet. Concrètement :
+    `curl -fsSL https://raw.githubusercontent.com/leanprover-community/mathlib4/refs/tags/v4.30.0/lean-toolchain`
+    renvoie `leanprover/lean4:v4.30.0`. C'est cette ligne qu'on épingle. Les tags Mathlib stables
+    suivent le schéma vX.Y.0 et ont leur cache binaire publié (vérifiable via
+    `git ls-remote --tags https://github.com/leanprover-community/mathlib4`).
+
+    **elan télécharge la toolchain Lean : comportement NORMAL, pas un binaire interdit.** elan est
+    l'analogue exact de rustup. `elan toolchain install leanprover/lean4:v4.30.0` télécharge la
+    release officielle Lean ; ce n'est pas un "download de binaire opaque" mais le fonctionnement
+    nominal du gestionnaire. À documenter dans le README pour lever l'ambiguïté avec les
+    install_constraints. Sur cette machine elan/lake/lean étaient déjà dans /usr/bin (installés via
+    AUR/paru) mais SANS toolchain par défaut configurée (`elan default` non set) : il a fallu
+    installer explicitement la toolchain pinnée. Astuce : `elan override set leanprover/lean4:v4.30.0`
+    dans le dossier projet fixe la toolchain locale sans toucher au défaut global.
+
+    **Scaffolding : `lake init <nom>` génère un lakefile.toml (lake 5.0.0).** Le squelette livré
+    contient un [[lean_lib]] et un [[lean_exe]] avec un Main.lean qui dépend d'un `hello` factice.
+    Pour un projet de PREUVE PURE (pas d'exécutable utile), retirer le [[lean_exe]] et Main.lean,
+    et pointer defaultTargets sur la lib. Le require Mathlib en TOML s'écrit :
+      [[require]]
+      name = "mathlib"
+      scope = "leanprover-community"
+      rev = "v4.30.0"
+    (le `scope` remplace l'URL git explicite ; lake résout via le registre reservoir). Forme Lean
+    équivalente : `require mathlib from git "..." @ "v4.30.0"`. lakefile.toml est plus simple ici.
+
+    **`lake update` fait DÉJÀ le cache get (surprise agréable).** Contrairement au plan qui
+    séquençait lake update PUIS `lake exe cache get` séparément, le post-update hook de Mathlib
+    déclenche AUTOMATIQUEMENT le téléchargement du cache binaire à la fin de `lake update` (ici
+    8459 fichiers .olean récupérés depuis le cache Azure). Le `lake exe cache get` explicite de la
+    cible verify devient alors un no-op idempotent ("No files to download / Already decompressed
+    8459 file(s)") — ce qui est exactement le comportement voulu et confirme que le cache est
+    présent AVANT lake build. La règle "cache get avant build" reste correcte et non négociable ;
+    simplement, lake update l'a déjà honorée une première fois.
+
+    ===== BLOC 2 : LA PREUVE (forme multipliée vs divisée — le cœur pédagogique) =====
+
+    **Définition récursive structurelle, idiomatique Lean 4 :**
+      def sumN : Nat → Nat
+        | 0       => 0
+        | (n + 1) => (n + 1) + sumN n
+    Totale et terminante par construction (décroissance structurelle sur Nat, acceptée sans preuve
+    de terminaison). Ajouter `@[simp]` sur les équations sumN_zero/sumN_succ (prouvées par `rfl`)
+    aide le dépliage.
+
+    **Nat.div n'est PAS additive : induction directe sur la forme divisée = mur.** Sur Nat, /2 est
+    une division entière TRONQUÉE. Le pas inductif (n+1)*(n+2)/2 = (n+1) + n*(n+1)/2 n'est PAS une
+    identité que `ring`/`simp` ferment, car /2 n'est pas un morphisme additif. Prouver ça en direct
+    obligerait à traîner un argument de divisibilité (produit de deux consécutifs pair) DANS chaque
+    pas d'induction : pénible et fragile.
+
+    **Solution : forme MULTIPLIÉE en théorème principal, division dérivée hors induction.**
+      theorem two_mul_sumN (n : Nat) : 2 * sumN n = n * (n + 1) := by
+        induction n with
+        | zero => rfl
+        | succ k ih => rw [sumN_succ, Nat.mul_add, ih]; ring
+    Le cas inductif devient une pure identité polynomiale (2*(k+1) + k*(k+1) = (k+1)*(k+2)) que
+    `ring` ferme immédiatement, APRÈS réécriture par l'hypothèse d'induction `ih`. L'ossature
+    inductive (induction ... with | zero | succ) est écrite À LA MAIN ; ring ne ferme que la
+    feuille algébrique. Puis le corollaire divisé, UNE SEULE FOIS, hors induction :
+      theorem sumN_eq (n : Nat) : sumN n = n * (n + 1) / 2 := by
+        have h : 2 * sumN n = n * (n + 1) := two_mul_sumN n
+        omega
+    `omega` gère la division par le littéral 2 à partir de l'égalité h (il connaît la parité
+    implicite via 2 * sumN n = ...). Aucun lemme Gauss_sum de Mathlib n'est appelé : Mathlib ne
+    fournit que les tactiques (ring, omega). Pas de sorry, pas d'axiome ajouté.
+
+    **Vérifier l'absence de sorry / l'intégrité de la preuve.** Deux contrôles gratuits :
+    (a) une sortie `lake build` verte SANS warning `declaration uses 'sorry'` ; (b) `#print axioms
+    <theorem>` qui ne doit montrer que [propext, Quot.sound] (axiomes fondationnels standard) et
+    JAMAIS `sorryAx` (l'axiome qu'introduit sorry). C'est l'équivalent Lean du `--no-cheating`
+    Verus et du "no assume/admit" Creusot.
+
+    ===== BLOC 4 : RENDRE LE PROJET EXÉCUTABLE SANS RECOMPILER MATHLIB =====
+
+    **Le piège : un exécutable qui importe Mathlib force la compilation NATIVE de toute la
+    fermeture Mathlib.** Pour ajouter un point d'entrée (`def main : IO Unit`), on déclare un
+    `[[lean_exe]]` dans le lakefile (name + root = "Main") et on écrit Main.lean. Réflexe naïf :
+    `import SumNLean` (le root de la lib) pour accéder à sumN. ERREUR : le root tire Basic.lean
+    qui fait `import Mathlib`, donc l'exe dépend transitivement de Mathlib. Or construire un
+    EXÉCUTABLE exige la compilation NATIVE (génération de C puis objets `.c.o`, puis link) de TOUTE
+    la fermeture d'imports. Le cache binaire (`lake exe cache get`) ne fournit QUE les `.olean`
+    (suffisants pour `lake build` d'une bibliothèque = vérification des preuves), PAS les `.c.o`
+    natifs. Conséquence observée : `lake exe sum_n_lean` a démarré une recompilation native massive
+    de Mathlib (≈ 16940 jobs, des milliers de `Built Mathlib.*:c.o`), interminable. C'est le
+    symptôme distinctif : si tu vois défiler des `Built Mathlib.Algebra.*:c.o`, le main tire Mathlib.
+
+    **La solution : isoler la def exécutable dans un module Mathlib-FREE, séparer les preuves.**
+    Architecture en deux modules + le main :
+    - `SumNLean/Def.lean` : SANS aucun import. Contient UNIQUEMENT `def sumN : Nat → Nat`. Source
+      unique de vérité de la définition.
+    - `SumNLean/Basic.lean` : `import SumNLean.Def` PUIS `import Mathlib`. Contient les théorèmes
+      (sumN_zero/sumN_succ/two_mul_sumN/sumN_eq) prouvés SUR la def importée. Ne REDÉFINIT pas sumN
+      (sinon deux définitions distinctes, les preuves porteraient sur la mauvaise).
+    - `Main.lean` : `import SumNLean.Def` (PAS le root `SumNLean`). `def main := IO.println
+      s!"sum_n(100) = {sumN 100}"`. `ToString Nat` vient du prélude, pas de Mathlib.
+    Le lakefile garde `[[lean_lib]] name = "SumNLean"` (la lib complète, vérifiée par lake build)
+    ET `[[lean_exe]] name = "sum_n_lean" / root = "Main"`. Résultat mesuré : `lake build
+    sum_n_lean` => 6 jobs (`SumNLean.Def:c.o` 58ms, `Main`, `Main:c.o`, `sum_n_lean:exe` 1.6s),
+    ~3 secondes, ZÉRO recompilation Mathlib. `make verify` reste vert (8478 jobs, cache hit, 0
+    sorry, #print axioms propre). Le root SumNLean.lean importe Def ET Basic pour que la lib reste
+    cohérente ; seul Main contourne le root pour ne pas hériter de Mathlib.
+
+    ===== BLOC 3 : LE CONTRASTE LEAN vs VERUS vs CREUSOT =====
+
+    La MÊME propriété (somme des entiers = n(n+1)/2) a maintenant été traitée dans trois outils :
+    - VERUS (475911ee) : vérifieur de code Rust + Z3. u64 borné => preuve d'overflow nécessaire.
+      Division/parité résistent à Z3 => témoin de divisibilité construit à la main, lemmes de
+      monotonicité + by(compute). Coût sur l'ÉCRITURE DE LA PREUVE.
+    - CREUSOT (8628f4b4) : vérifieur de code Rust + why3 multi-solveur. Spec en Int (exact) via @
+      => passe du premier coup sans lemme. Coût sur l'INSTALLATION (opam switch, solveurs).
+    - LEAN : assistant de preuve, PAS un vérifieur de code. Nat exact non borné => AUCUNE preuve
+      d'overflow (la notion n'existe pas). Mais la division tronquée Nat.div reste non additive =>
+      le mur se déplace vers l'ÉCRITURE DE LA PREUVE, contourné par la forme multipliée + induction
+      à la main. L'induction est EXPLICITE et manuelle (pas de décharge SMT automatique du tout) :
+      c'est le prix conceptuel d'un assistant de preuve, où on construit l'objet de preuve soi-même
+      et où ring/omega ne ferment que les feuilles algébriques. Le coût se paie à l'install (modeste :
+      cache binaire Mathlib rapide) ET à l'écriture (l'ossature inductive, jamais automatique).
+    Enseignement transversal confirmé sur les trois : la forme MULTIPLIÉE (2*x = ...) est la porte
+    de sortie universelle quand la division entière /2 résiste, qu'il s'agisse d'un solveur SMT
+    (Verus) ou d'une tactique algébrique (Lean ring). Creusot l'évite en raisonnant nativement en
+    Int ; Lean et Verus la contournent par la multiplication.
+
+    **Second enseignement transversal (cf. BLOC 4) : SÉPARER LE CODE EXÉCUTABLE DU CODE DE PREUVE.**
+    Les trois outils butent sur le même mur quand on veut un binaire exécutable à côté du code
+    prouvé, et y répondent par la même stratégie de séparation :
+    - VERUS : `println!` interdit DANS le bloc `verus!` (Unsupported constant type) => sortir le
+      `main`/l'I/O HORS du bloc verus! (lesson 475911ee, piège #3).
+    - CREUSOT : `cargo creusot prove` échoue sur le `println!` du binaire (Unsupported constant
+      value) => `cargo creusot prove -- --lib` pour exclure le binaire de la vérif (lesson 8628f4b4,
+      piège D).
+    - LEAN : un lean_exe important Mathlib force la recompilation native de toute la fermeture
+      Mathlib => isoler la def exécutable dans un module Mathlib-free et y brancher le main.
+    Le motif commun : le code exécutable (I/O, main) et le code de preuve/vérification ont des
+    besoins de compilation incompatibles ; les garder dans des unités séparées est la parade
+    propre dans les trois écosystèmes, sans jamais affaiblir les preuves (aucun assume/admit/sorry,
+    aucun #[trusted]).
+
+  recommendation: >
+    Pour tout projet Lean 4 + Mathlib dans CompanyOS :
+    1. TOOLCHAIN Mathlib-D'ABORD : choisir une révision Mathlib STABLE (tag vX.Y.0 avec cache
+       publié), lire SON lean-toolchain (curl sur le raw GitHub du tag), recopier la version Lean
+       exacte dans le lean-toolchain du projet. JAMAIS choisir Lean en premier.
+    2. elan télécharge la toolchain Lean comme rustup : comportement normal, le documenter dans le
+       README. Utiliser `elan override set <toolchain>` pour épingler localement sans toucher au
+       défaut global. Si aucune toolchain par défaut n'est configurée, l'installer explicitement.
+    3. Scaffolding via `lake init <nom>` ; retirer le [[lean_exe]]/Main.lean pour un projet de preuve
+       pure ; require mathlib en TOML via scope="leanprover-community" + rev="vX.Y.0".
+    4. `lake update` déclenche DÉJÀ le cache get (post-update hook Mathlib) : ne pas s'inquiéter de
+       voir 8000+ fichiers descendre du cache Azure à ce moment. Garder quand même `lake exe cache
+       get` dans la cible verify (idempotent, garantit le cache avant build). NE JAMAIS laisser un
+       lake build recompiler Mathlib à l'aveugle : si le cache manque, changer de révision Mathlib.
+    5. STRATÉGIE DE PREUVE : pour toute égalité impliquant une division entière /k sur Nat, prouver
+       d'abord la forme MULTIPLIÉE (k * f n = ...) par induction explicite (pas inductif fermé par
+       `ring` après rw de l'hypothèse d'induction), PUIS dériver la forme divisée hors induction par
+       `omega`. Ne pas faire l'induction sur la forme divisée (Nat.div non additive).
+    6. Écrire l'OSSATURE inductive à la main (induction ... with | zero | succ) ; réserver
+       ring/omega/simp aux feuilles algébriques. Ne jamais réduire la preuve à un lemme Mathlib tout
+       fait (Gauss_sum) qui court-circuiterait l'exercice.
+    7. VÉRIFIER L'INTÉGRITÉ : sortie verte sans warning `declaration uses 'sorry'` ET
+       `#print axioms <theorem>` ne montrant que [propext, Quot.sound] (jamais sorryAx). C'est la
+       garantie gratuite équivalente au --no-cheating Verus / no-assume Creusot.
+    8. ARBITRAGE D'OUTIL pour une preuve d'arithmétique scalaire : Verus paie sur l'écriture
+       (lemmes Z3), Creusot paie sur l'install (opam/solveurs), Lean paie sur l'écriture (induction
+       manuelle, pas de SMT) avec une install modeste (cache Mathlib rapide). Choisir selon où l'on
+       préfère payer et selon que l'on veut un objet exécutable (Verus/Creusot) ou pur mathématique
+       (Lean).
+    9. EXÉCUTABLE Lean SANS recompiler Mathlib (cf. BLOC 4) : ne JAMAIS faire importer Mathlib (même
+       transitivement) au module racine d'un lean_exe — cela force la compilation native (.c.o) de
+       toute la fermeture Mathlib, que le cache (.olean only) ne couvre pas. Isoler la définition
+       exécutable dans un module SANS import (ex. SumNLean/Def.lean), brancher le Main dessus
+       (`import SumNLean.Def`, pas le root), et garder les preuves/tactiques dans un module séparé
+       qui importe Def + Mathlib. Une seule définition partagée (pas de doublon). Vérifier : le build
+       de l'exe doit faire une poignée de jobs en quelques secondes ; si des `Built Mathlib.*:c.o`
+       défilent, le main tire encore Mathlib, corriger l'import. C'est le pendant Lean de "println!
+       hors verus!" (Verus) et "creusot prove -- --lib" (Creusot) : séparer exécutable et preuve.
