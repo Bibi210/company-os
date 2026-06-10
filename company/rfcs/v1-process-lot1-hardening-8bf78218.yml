@@ -1,0 +1,323 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 8bf78218-e1f3-4bc5-864c-2abf618a990d
+  title: "V1 process lot 1 : 5 gardes serveur/schema (self-review, approve+findings, commit-puis-consume, RFC approved au grant, reviewers minimum) + purge des règles mortes"
+  author: architect
+  created_at: "2026-06-10"
+  status: draft
+  description: >
+    Lot 1 du durcissement process (diagnostic c981bf62, phase 2 du
+    task-request 11f13a9d, domaine v1-process-hardening de la roadmap
+    a410bb43). Mécanise dans le harness les 5 règles de process à meilleur
+    rapport valeur/coût, toutes violées ou violables silencieusement
+    aujourd'hui : self_review_forbidden (aucune garde code),
+    review_findings_honesty (violations récurrentes, lesson e63992f0, avec
+    ajout du canal notes pour les observations non-correctives),
+    commit-puis-consume (violé en session le 2026-06-10),
+    grant_write_permit sans vérification du statut du RFC, et
+    reviewers_by_artifact_type jamais consommé par le code. Purge en même
+    temps les règles mortes : flow-control.budget_limits,
+    flow-control.circuit_breaker, review-protocol.escalation_rules
+    (déduplication avec flow-control.max_review_iterations, fusion de
+    ceo_cannot_approve_alone dans human-review-triggers), et le chargement
+    Rust mort de human-review-triggers — avec verrou schema
+    (additionalProperties: false) pour que la réintroduction échoue
+    mécaniquement (pattern bd4650e2 : retirer plutôt qu'interdire).
+  tags:
+    - companyos-v1
+    - process
+    - hardening
+    - harness
+    - mechanical-invariant
+    - review-protocol
+    - write-permit
+    - companyos-internals
+    - critical-infra
+  related:
+    - id: c981bf62-9d53-4ea2-8da3-c34af9d3e922
+      kind: diagnostic-report
+      relationship: input
+    - id: 11f13a9d-467b-4e5b-b4c3-a5e45ce1e080
+      kind: task-request
+      relationship: input
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: related
+    - id: e63992f0-7317-4d59-b744-1163f14c4f57
+      kind: lesson-learned
+      relationship: input
+    - id: bd4650e2-ab42-4b4e-9c10-cca638ded48c
+      kind: lesson-learned
+      relationship: related
+    - id: ea6e9dd1-93dc-4b19-9854-103328203489
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  motivation: >
+    Le recensement c981bf62 (62 règles de process) a montré que seules 10
+    règles survivent au test clean-company comme GARANTIES ; les autres
+    reposent sur la bonne volonté des LLMs. Principe directeur du programme
+    V1 (roadmap a410bb43) : le harness avant la prose — une règle
+    d'interaction importante doit être impossible à contourner, pas
+    seulement écrite.
+
+    Ce lot 1 cible exclusivement les règles à violations OBSERVÉES ou à
+    gardes absentes sur des invariants absolus :
+
+    (1) self_review_forbidden — règle absolue n°1 du review-protocol,
+    AUCUNE garde code : engine.initiate_review_round accepte
+    author ∈ required_reviewers et engine.submit_vote ne compare jamais
+    reviewer et round.author (vérifié engine.rs L205/L231).
+
+    (2) review_findings_honesty — la lesson e63992f0 documente des
+    violations RÉCURRENTES en une seule session (Implementer, CEO,
+    Architect votant approve+findings), chacune motivée par un besoin réel
+    de traçabilité non-corrective. Le rappel répété de la règle ne marche
+    pas ; la lesson conclut qu'il faut un fix procédural. Ce RFC rejette
+    donc mécaniquement la contradiction ET fournit le canal légitime
+    (paramètre notes), sinon la friction se reproduira.
+
+    (3) Ordre commit-puis-consume — violé en session le 2026-06-10 :
+    consume_write_permit n'effectue aucune vérification de l'état du
+    worktree (main.rs L817-841), alors que la prose
+    write_permit_full_sequence de l'Implementer est explicite.
+
+    (4) grant_write_permit ne vérifie PAS que rfc_id désigne un RFC
+    existant et approved (main.rs L669-744 : aucun lookup) — le
+    point d'entrée le plus sensible du système accepte un UUID arbitraire.
+
+    (5) reviewers_by_artifact_type — config parsée (types.rs L299) mais
+    JAMAIS consommée : initiate_review_round accepte n'importe quelle
+    liste de reviewers. Le minimum du protocole n'est pas appliqué.
+
+    En parallèle, la purge des règles mortes applique le pattern bd4650e2
+    (retirer le paramètre plutôt que documenter son non-usage) :
+    budget_limits et circuit_breaker sont parsés et jamais lus (et
+    inapplicables : le serveur ne voit ni tokens ni spawns) ;
+    escalation_rules.max_iterations_before_ceo duplique
+    flow-control.max_review_iterations (seul ce dernier est lu, main.rs
+    L1415) ; ceo_cannot_approve_alone duplique 1:1 les 4 triggers de
+    human-review-triggers.yml ; le chargement Rust de human-review-triggers
+    (loader.rs L23/L67) n'a aucun consommateur. Laisser ces promesses non
+    tenues en config invite à la divergence silencieuse.
+
+  proposal: >
+    GARDE 1 — self_review_forbidden (couche : engine, invariant
+    config-indépendant).
+    a) engine.initiate_review_round (signature inchangée) rejette
+       author ∈ required_reviewers avec une nouvelle variante
+       OrchestratorError::SelfReviewForbidden { author, round_context }.
+       Message : "Self-review forbidden: author '<persona>' cannot be a
+       required reviewer of their own artifact. Remove the author from
+       required_reviewers (review-protocol: self_review_forbidden)."
+    b) engine.submit_vote (signature inchangée) rejette
+       reviewer == round.author avec la même variante. Message analogue
+       ("the author cannot vote on their own artifact").
+
+    GARDE 2 — review_findings_honesty + canal notes (couches : engine +
+    surface MCP + schema).
+    a) engine.submit_vote rejette verdict == Approve && !findings.is_empty()
+       avec OrchestratorError::ApproveWithFindings { count }. Message :
+       "Contradictory vote: approve with N finding(s). If a finding is
+       corrective, vote request_changes. If it is a non-corrective
+       observation, use the 'notes' parameter instead
+       (shared-rules: review_findings_honesty)."
+    b) Canal légitime (réponse au pattern e63992f0) : ReviewVote
+       (crates/orchestrator/src/types.rs) gagne un champ
+       notes: Option<String> avec #[serde(default)] (rétro-compatible avec
+       les votes JSON déjà stockés en DB) ; SubmitVoteParams (main.rs)
+       gagne un paramètre optionnel notes (description : "Non-corrective
+       observations for the record ; n'affecte pas le verdict"). Les notes
+       sont acceptées avec les DEUX verdicts.
+    c) company/schemas/review-report.schema.json : ajout d'un conditional
+       dans la branche spec — if verdict == "approve" then findings
+       maxItems 0 — et d'une propriété optionnelle spec.notes (string).
+       Aucun review-report YAML n'existe à ce jour dans le repo (vérifié),
+       donc zéro migration.
+
+    GARDE 3 — commit-puis-consume (couche : serveur MCP, qui détient
+    root_path et le précédent d'invocation git de seal_db_commit).
+    consume_write_permit (main.rs), après vérification du token et AVANT
+    engine.consume_permit : récupère le permit via db.get_permit
+    (existant, db.rs L696), puis exécute
+    git status --porcelain -- <chaque target_path> à la racine. Si la
+    sortie est non vide : refus avec erreur explicite listant les fichiers
+    sales. Message : "Permit consumption refused: uncommitted changes on
+    target paths: <liste>. Commit your code FIRST (git add && git commit),
+    then consume the permit (write_permit_full_sequence step 4)." Les
+    target_paths sont passés comme pathspecs git (les patterns à glob
+    restent supportés). Cas limites : permit introuvable → erreur existante
+    inchangée ; git indisponible → refus fail-safe avec message distinct
+    (git est déjà un prérequis dur du grant, RFC 359f9162).
+
+    GARDE 4 — grant exige un RFC approved (couche : serveur MCP).
+    grant_write_permit (main.rs), après vérification du token CEO et AVANT
+    le lookup d'idempotence : résout rfc_id dans l'index (file_path), lit
+    le YAML source et vérifie kind == rfc et metadata.status == "approved".
+    Choix délibéré : lecture du YAML source de vérité plutôt qu'ajout d'une
+    colonne status à l'index (IndexedArtifact n'a pas de champ status,
+    vérifié types.rs L22-30 ; pas de migration DB, pas de risque d'index
+    périmé ; la machinerie de lecture YAML par RFC existe déjà,
+    rfc_set_implemented). Refus : "Write permit refused: rfc_id <id> does
+    not reference an approved RFC (found: <kind>/<status> | not indexed).
+    Approve the RFC via the review cycle first." Un RFC implemented est
+    AUSSI refusé (un permit ne se justifie que pendant la fenêtre
+    approved → implemented).
+
+    GARDE 5 — reviewers_by_artifact_type appliqué (couche : serveur MCP,
+    seule couche détenant la config).
+    OrchestratorServer détient le ReviewProtocol chargé (nouveau champ
+    Arc<RwLock<ReviewProtocol>>, rempli par run_server, rafraîchi par les
+    deux chemins de hot-reload existants : watcher ConfigChangeKind::Config
+    et tool reload_config). Le tool initiate_review_round vérifie que
+    params.required_reviewers ⊇ le minimum du protocole pour
+    artifact_kind : la sémantique "all" se résout en "tous les personas
+    sauf l'auteur" ; les kinds absents du mapping ne sont pas contraints ;
+    ajouter des reviewers AU-DELÀ du minimum reste permis par construction
+    (la prose "les reviewers listés sont le minimum requis" est préservée).
+    Refus : "Review round refused: required_reviewers must include the
+    protocol minimum for kind '<kind>': missing <liste>
+    (review-protocol: reviewers_by_artifact_type)."
+    Interaction avec GARDE 1 : pour les kinds dont l'auteur fait partie du
+    minimum protocolaire (ex. RFC d'un architect avec reviewers "all"),
+    le minimum exigé exclut l'auteur — la résolution se fait APRÈS retrait
+    de l'auteur, de sorte que les deux gardes sont toujours satisfiables
+    simultanément.
+
+    PURGE DES RÈGLES MORTES (diff exact) :
+    a) company/config/flow-control.yml : suppression des blocs
+       budget_limits et circuit_breaker. Reste max_review_iterations: 3.
+    b) company/schemas/flow-control.schema.json : suppression des
+       propriétés budget_limits et circuit_breaker, ajout de
+       additionalProperties: false sur spec — toute réintroduction échoue
+       à la validation (verrou mécanique, pattern bd4650e2).
+    c) company/config/review-protocol.yml : suppression du bloc
+       escalation_rules (max_iterations_before_ceo dédupliqué au profit de
+       flow-control.max_review_iterations, source unique déjà la seule lue
+       par le code ; ceo_cannot_approve_alone fusionné dans
+       human-review-triggers.yml dont les 4 triggers sont identiques 1:1).
+    d) company/schemas/review-protocol.schema.json : suppression de la
+       propriété escalation_rules, additionalProperties: false sur spec.
+    e) company/config/human-review-triggers.yml : metadata.description
+       enrichie pour acter qu'il est désormais la SOURCE UNIQUE des
+       conditions d'escalade utilisateur (absorbe ceo_cannot_approve_alone,
+       contenu inchangé car identique).
+    f) crates/config/src/types.rs : suppression des structs BudgetLimits,
+       CircuitBreaker (et des champs Option correspondants de FlowControl),
+       EscalationRules, EscalationCategory (et du champ escalation_rules de
+       ReviewProtocol), HumanReviewTriggersSpec, HumanReviewTriggers,
+       HumanReviewTrigger, TriggerCondition, TriggerAction (caller-inventory
+       lesson ea6e9dd1 : aucun usage hors types.rs + loader.rs, vérifié par
+       rg sur le workspace). ArtifactKind::HumanReviewTriggers est CONSERVÉ
+       (mapping schema + access matrix L233 : le fichier YAML reste validé).
+    g) crates/config/src/loader.rs : suppression du champ
+       human_review_triggers de CompanyConfig et de la fonction
+       load_human_review_triggers.
+    h) crates/config/src/constants.rs : suppression de
+       CONFIG_HUMAN_REVIEW_TRIGGERS (seul caller : la fonction supprimée).
+
+    TESTS (tous inline dans les fichiers existants, AUCUN fichier créé —
+    convention actuelle du workspace) :
+    - engine.rs : self-review rejeté à l'initiate et au vote ;
+      approve+findings rejeté ; approve+notes accepté ; request_changes+
+      findings accepté ; round pré-existant avec author dans reviewers →
+      vote de l'author rejeté.
+    - main.rs : grant refusé sur rfc_id non indexé / RFC draft / RFC
+      implemented, accepté sur RFC approved (les fixtures de test
+      existantes test_grant_* L1903+ utilisent des rfc_id aléatoires non
+      indexés : elles sont mises à jour pour indexer un RFC approved
+      fixture — impact recensé) ; consume refusé worktree sale sur
+      target_paths, accepté worktree propre ; initiate refusé sous le
+      minimum protocolaire, accepté au minimum et au-delà ; hot-reload du
+      protocole pris en compte.
+    - db.rs : les deux fixtures ReviewVote (L2084, L2104) gagnent
+      notes: None ; round-trip de sérialisation d'un vote avec notes.
+
+  impact: >
+    BREAKING CHANGES CONTRÔLÉS (surface MCP) :
+    (1) Un vote approve avec findings non vides est désormais REJETÉ —
+    les agents doivent utiliser notes (nouveau paramètre optionnel,
+    additif). (2) initiate_review_round rejette les listes de reviewers
+    sous le minimum protocolaire ou contenant l'auteur. (3)
+    grant_write_permit exige un RFC indexé status=approved : les workflows
+    qui demandaient un permit AVANT l'approbation formelle échouent
+    désormais (c'est le but). (4) consume_write_permit refuse un worktree
+    sale sur les target_paths.
+
+    ROUNDS DÉJÀ OUVERTS : la garde submit_vote s'applique aussi aux rounds
+    pré-existants (un author dans required_reviewers d'un round ouvert ne
+    peut plus voter). Décision assumée : les review rounds sont des données
+    éphémères (cycle de quelques heures), la cohérence de l'invariant prime
+    sur la continuité d'un round en vol. Au moment du merge, fermer ou
+    re-créer les rounds ouverts non conformes (aucun connu à ce jour).
+
+    RÉTRO-COMPATIBILITÉ DONNÉES : ReviewVote.notes en #[serde(default)] —
+    les votes JSON déjà stockés se désérialisent sans migration. Aucun
+    review-report YAML n'existe dans le repo (vérifié) : le conditional du
+    schema n'invalide aucun fichier existant. Les YAML flow-control et
+    review-protocol sont modifiés DANS LE MÊME COMMIT que leurs schemas
+    durcis (additionalProperties: false), sinon make validate échouerait.
+
+    ORDRE D'IMPLÉMENTATION CONTRAINT : les champs Rust étant supprimés de
+    types.rs, tout YAML contenant encore budget_limits/circuit_breaker/
+    escalation_rules resterait PARSABLE (serde ignore les champs inconnus
+    par défaut) mais invalide au schema — la purge YAML + schema + Rust
+    doit donc être atomique (un seul commit), ce que la séquence
+    write_permit_full_sequence garantit déjà.
+
+    PROSE AMENDÉE, TRANCHÉ RÈGLE PAR RÈGLE (amendée = pointe le mécanisme ;
+    jamais supprimée quand elle porte un critère de jugement) :
+    - shared-rules review_findings_honesty : CONSERVÉE (le critère
+      correctif (a) vs hors-scope (b) est un jugement que la machine ne
+      porte pas) + mention du rejet serveur/schema et du canal notes.
+    - review-protocol.yml self_review_forbidden : CONSERVÉE (explique le
+      pourquoi + le cas d'escalade CEO) + mention de la garde serveur.
+    - review-protocol.yml review_analysis_framework : INCHANGÉE (lot 2).
+    - implementer.yml write_permit_full_sequence : CONSERVÉE (la séquence
+      complète 1-6 reste le guide opératoire) + étape 4 annotée "vérifié
+      mécaniquement par consume_write_permit".
+    - flow-control/review-protocol : sections mortes SUPPRIMÉES sans trace
+      prose (rien de pédagogique à garder, pattern bd4650e2).
+
+    HORS SCOPE (explicitement) : config.personas dans loader.rs a aussi
+    zéro caller mais n'est PAS purgé ici (candidat naturel du domaine
+    v1-harness-refactor, où la matrice author↔produces du lot 3 pourrait
+    lui donner un consommateur) ; l'incohérence pre-commit
+    (active|consumed) vs hook (active) est transmise à v1-harness-refactor ;
+    les lots 2 et 3 du diagnostic c981bf62 feront l'objet de RFCs séparés.
+
+    Après ce lot : 16 des 62 règles du recensement survivent au test
+    clean-company comme garanties mécaniques (10 aujourd'hui).
+
+  rollback_plan: >
+    Les 6 changements sont indépendants et réversibles individuellement.
+    Gardes 1-5 : revert du commit d'implémentation (les gardes sont des
+    early-return ajoutés en tête de fonctions existantes ; les retirer
+    restaure le comportement antérieur ; le champ notes peut rester, il est
+    optionnel et inerte). Purge : restaurer les blocs YAML + propriétés
+    schema + types Rust depuis l'historique git (le commit étant atomique,
+    un revert unique suffit) ; retirer additionalProperties: false
+    restaure la tolérance. Les votes stockés avec notes survivent à un
+    rollback du code grâce au champ JSON simplement ignoré à la relecture
+    (serde). Aucune migration de données dans les deux sens.
+
+  affected_files:
+    modified:
+      - crates/orchestrator/src/engine.rs
+      - crates/orchestrator/src/types.rs
+      - crates/orchestrator/src/db.rs
+      - crates/orchestrator/src/error.rs
+      - crates/mcp-servers/orchestrator/src/main.rs
+      - crates/config/src/types.rs
+      - crates/config/src/loader.rs
+      - crates/config/src/constants.rs
+      - company/schemas/flow-control.schema.json
+      - company/schemas/review-protocol.schema.json
+      - company/schemas/review-report.schema.json
+      - company/config/flow-control.yml
+      - company/config/review-protocol.yml
+      - company/config/human-review-triggers.yml
+      - company/config/shared-rules.yml
+      - company/personas/implementer.yml
