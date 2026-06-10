@@ -114,7 +114,25 @@ for file in $STAGED_FILES; do
 done
 
 # 3. Full CI pipeline (fmt + clippy + tests + YAML validation)
-if ! make -C "$ROOT" ci > /dev/null 2>&1; then
+#
+# Sanitize the git environment before spawning the CI pipeline. When git
+# runs this hook it exports GIT_INDEX_FILE (pointing at the in-progress
+# commit's temporary index lock, e.g. .git/next-index-NNN.lock), plus
+# GIT_DIR/GIT_WORK_TREE/GIT_PREFIX and the GIT_AUTHOR_* identity. Those
+# variables are inherited by every child process, including the
+# `cargo test` launched by `make ci`. Tests that spin up throwaway git
+# repositories in a tempdir (e.g. the seal_db_commit / grant_write_permit
+# tests in crates/mcp-servers/orchestrator) then run `git add`/`git commit`
+# against the OUTER repo's index lock instead of their own tempdir repo,
+# failing with "Unable to create '.git/next-index-NNN.lock.lock': File
+# exists" and "invalid object ... for '.githooks/pre-commit'". The exact
+# same `make ci` is green when run standalone — the breakage is purely the
+# leaked git env. Clearing these variables makes the pipeline hermetic so
+# nested git invocations resolve their own repo from their own cwd.
+if ! env -u GIT_INDEX_FILE -u GIT_DIR -u GIT_WORK_TREE -u GIT_PREFIX \
+        -u GIT_AUTHOR_NAME -u GIT_AUTHOR_EMAIL -u GIT_AUTHOR_DATE \
+        -u GIT_COMMITTER_NAME -u GIT_COMMITTER_EMAIL -u GIT_COMMITTER_DATE \
+        make -C "$ROOT" ci > /dev/null 2>&1; then
     diag_error "CI pipeline failed" \
         "make ci (fmt + clippy + test + validate)" \
         "One or more CI checks failed" \
