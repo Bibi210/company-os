@@ -1,0 +1,259 @@
+api_version: companyos/v1
+kind: roadmap
+metadata:
+  id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+  title: "Roadmap CompanyOS V1 — revamp from inside out"
+  author: pm
+  created_at: "2026-06-10"
+  description: >
+    Programme de refonte complète de CompanyOS vers une Version 1 taguée en git.
+    CompanyOS a grandi organiquement : idées mortes, code mort, duplication, et
+    bonnes idées appliquées à un seul endroit au lieu de partout. Cette roadmap
+    découpe le revamp en domaines analysés un par un (artifacts, mémoire, process,
+    personas, schemas, code Rust, plugins, outillage), chacun suivant le cycle
+    complet CompanyOS (recensement, tri, RFC/design-doc, implémentation, lesson).
+    Deux principes directeurs fixés par l'utilisateur : (1) les interactions entre
+    agents conçues comme importantes doivent vivre dans le HARNESS (hooks, tools
+    MCP, schemas) et non dans la prose, pour être impossibles à contourner ;
+    (2) tout ce qui est mécanisable sans LLM (transitions de statut, indexation,
+    scellement, validation) doit être algorithmique et automatique.
+    L'utilisateur a délégué le droit de tri (garder/tuer/fusionner) aux agents
+    pour ce programme (décision du 2026-06-10).
+  tags:
+    - roadmap
+    - companyos-v1
+    - revamp
+    - cleanup
+    - hardening
+    - automation
+    - meta
+  related:
+    - id: 329da45f-e24f-4200-9e18-e2e47b5a4f27
+      kind: roadmap
+      relationship: related
+    - id: bd4650e2-ab42-4b4e-9c10-cca638ded48c
+      kind: lesson-learned
+      relationship: input
+    - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
+      kind: lesson-learned
+      relationship: input
+  changelog:
+    - date: "2026-06-10"
+      author: pm
+      description: >
+        Création de la roadmap. Décisions utilisateur fondatrices : roadmap
+        dédiée (domaine companyos-v1), objectif final tag git v1, ordre
+        hygiène d'abord validé, droit de tri délégué intégralement aux agents
+        pour ce programme, playgrounds (sum-n-*, puissance4-verus) déclarés
+        archives de test sans valeur produit.
+
+spec:
+  domain: companyos-v1
+  status: active
+
+  narrative: >
+    CompanyOS s'est construit organiquement, idée après idée, RFC après RFC.
+    Le système fonctionne, mais il porte les cicatrices de sa croissance :
+    des RFCs approuvés jamais clos, des task-requests en backlog que personne
+    ne désire plus, des lessons qui se recouvrent, des règles en prose que
+    rien ne fait respecter, du code et des paramètres sans appelant, et des
+    bonnes idées appliquées à un seul endroit faute d'avoir été généralisées
+    (la FORME B d'affected_files, les transitions serveur sans permit, le
+    pattern de l'invariant mécanique). L'objectif de ce programme est de
+    transformer cet organisme en un logiciel : une Version 1 délibérée,
+    où chaque pièce restante a été examinée et justifiée, taguée v1 en git.
+
+    Deux principes directeurs gouvernent chaque domaine du revamp.
+
+    Premier principe : le harness avant la prose. Les interactions entre
+    agents que nous avons conçues (review, permits, lookup mémoire,
+    capitalisation) sont le coeur de CompanyOS. Quand elles ne vivent que
+    dans shared-rules, elles reposent sur la bonne volonté d'un LLM qui peut
+    les oublier. Quand elles vivent dans le harness (hooks defense-in-depth,
+    tools MCP, schemas, pre-commit), elles sont impossibles à éviter. La
+    mémoire collective a déjà validé ce pattern : la préférence "invariant
+    mécanique" (retirer le paramètre plutôt qu'interdire son usage, lesson
+    bd4650e2) en est l'expression. Le revamp doit systématiquement se
+    demander, pour chaque règle de process : peut-elle devenir un mécanisme ?
+
+    Second principe : l'intelligence algorithmique partout où elle suffit.
+    rfc_set_implemented, l'auto-indexation par file watcher, le scellement
+    atomique des permits, l'auto-sync des statuts de roadmap ont prouvé que
+    les transitions de cycle de vie et le bookkeeping n'ont pas besoin d'un
+    LLM. Chaque étape manuelle restante (clôture de task-requests, commits
+    de sync, génération de personas.yml, etc.) est un candidat à
+    l'automatisation. Le LLM doit être réservé aux décisions, jamais au
+    bookkeeping.
+
+    La méthode est la même pour chaque domaine : recensement exhaustif
+    (diagnostic-report), tri garder/tuer/unifier (délégué aux agents par
+    décision utilisateur du 2026-06-10), changements structurels via RFC ou
+    design-doc, implémentation, capitalisation en lessons. L'ordre des
+    domaines est causal : l'hygiène d'abord (nettoyer la table), puis la
+    mémoire (l'outil de travail de tous les domaines suivants), puis les
+    process et leur durcissement dans le harness, puis les personas qui ces
+    process exécutent, puis les schemas qui les contraignent, puis le code
+    Rust et les plugins qui les implémentent, et enfin la définition et le
+    tag de la V1. Les domaines amont améliorent les outils utilisés par les
+    domaines aval : c'est l'auto-amélioration voulue par l'utilisateur,
+    rendue mécanique par l'ordre de la roadmap.
+
+  items:
+    - key: v1-hygiene
+      title: "Hygiène : trier RFCs non clos, backlog, projets dormants, archives"
+      ref:
+        type: loose
+        category: exploration
+        label: "Triage des 6 RFCs approved non clos, 12 task-requests backlog, archivage playgrounds"
+      timeframe: present
+      status: planned
+      target_date: "2026-Q2"
+      rationale: >
+        Nettoyer la table avant l'analyse de fond. Trois lots : les 6 RFCs
+        en approved jamais passés implemented (implémentés non clos ou
+        abandonnés ?), les 12 task-requests en backlog (encore désirés ?),
+        les projets de test (sum-n-verus, sum-n-creusot, sum-n-lean,
+        puissance4-verus) déclarés archives par l'utilisateur. Produit un
+        diagnostic-report de recensement et applique le tri.
+
+    - key: v1-memory-audit
+      title: "Audit de la mémoire collective (51 lessons : doublons, obsolètes, chaînage)"
+      ref:
+        type: loose
+        category: exploration
+        label: "Passe complète sur company/lessons/ : dédupliquer, superseder, chaîner, élaguer"
+      timeframe: future
+      status: planned
+      target_date: "2026-Q2"
+      depends_on: [v1-hygiene]
+      rationale: >
+        La mémoire est l'outil de travail de tous les domaines suivants :
+        elle doit être fiable avant qu'on s'en serve massivement. 51 lessons
+        accumulées vite : vérifier doublons sémantiques, lessons décrivant
+        des mécanismes depuis remplacés (à superseder), chaînes related
+        manquantes, et qualité des descriptions/tags pour le retrieval.
+
+    - key: v1-process-hardening
+      title: "Process : audit des règles et durcissement dans le harness"
+      ref:
+        type: loose
+        category: exploration
+        label: "shared-rules, review-protocol, flow-control, human-review-triggers : prose -> mécanisme partout où c'est possible"
+      timeframe: future
+      status: planned
+      target_date: "2026-Q3"
+      depends_on: [v1-memory-audit]
+      rationale: >
+        Coeur du principe directeur n°1. Pour chaque règle de process en
+        prose : est-elle encore désirée ? est-elle appliquée en pratique ?
+        peut-elle devenir un mécanisme du harness (hook, tool MCP, schema,
+        pre-commit) qui la rend impossible à contourner ? Exemples connus :
+        l'ordre commit-puis-consume des permits (violé une fois le
+        2026-06-10), le lookup mémoire avant artifact, l'analyse triaxiale
+        des reviews, l'auto-review interdit.
+
+    - key: v1-automation
+      title: "Automatisation algorithmique du bookkeeping restant"
+      ref:
+        type: loose
+        category: exploration
+        label: "Recenser chaque étape manuelle de cycle de vie et l'automatiser sans LLM quand c'est possible"
+      timeframe: future
+      status: planned
+      target_date: "2026-Q3"
+      depends_on: [v1-hygiene]
+      rationale: >
+        Coeur du principe directeur n°2. Étendre le pattern
+        rfc_set_implemented / auto-indexation / auto-sync roadmap à tout le
+        bookkeeping : clôture des task-requests quand le travail est mergé,
+        commits de sync de la DB, génération de personas.yml, détection des
+        RFCs approved jamais implémentés, etc. Le LLM décide, l'algorithme
+        tient les registres. Peut avancer en parallèle de
+        v1-process-hardening, les deux convergent.
+
+    - key: v1-personas-audit
+      title: "Personas : audit une par une (règles vs réalité observée)"
+      ref:
+        type: loose
+        category: exploration
+        label: "pm, architect, implementer, ceo : règles mortes, manques, duplication avec shared-rules"
+      timeframe: future
+      status: planned
+      target_date: "2026-Q3"
+      depends_on: [v1-process-hardening]
+      rationale: >
+        Après le durcissement des process, les personas doivent être
+        réalignées : retirer les règles devenues mécaniques (plus besoin de
+        prose si le harness les impose), combler les manques observés en
+        sessions réelles, éliminer la duplication entre personas et
+        shared-rules. Dépend de v1-process-hardening pour ne pas réécrire
+        deux fois.
+
+    - key: v1-schemas-audit
+      title: "Schemas : audit des 14 schemas JSON (strictesse, idées à moitié appliquées)"
+      ref:
+        type: loose
+        category: exploration
+        label: "Cohérence inter-schemas, champs morts, validations manquantes, généralisation FORME B"
+      timeframe: future
+      status: planned
+      target_date: "2026-Q3"
+      depends_on: [v1-process-hardening]
+      rationale: >
+        Les schemas sont le harness statique des artifacts : chaque
+        durcissement de process qui peut s'exprimer en schema doit y
+        descendre. Auditer les 14 schemas : champs jamais utilisés,
+        laxismes (champs libres qui devraient être des enums), idées
+        appliquées à un seul schema (ex. FORME B affected_files) à
+        généraliser ou à trancher.
+
+    - key: v1-rust-audit
+      title: "Code Rust : audit crate par crate (dead code, duplication)"
+      ref:
+        type: loose
+        category: exploration
+        label: "~12 700 LOC sur 4 crates + 2 serveurs MCP : dead code, duplication, API sans callers"
+      timeframe: future
+      status: planned
+      target_date: "2026-Q4"
+      depends_on: [v1-schemas-audit, v1-automation]
+      rationale: >
+        Jamais de passe globale dead code / duplication depuis la création.
+        Crate par crate : code mort (cargo +nightly udeps, clippy,
+        get_references LSP), API publiques sans callers (cf. lesson
+        ea6e9dd1), duplication entre crates, dépendances inutilisées.
+        Dépend des schemas (le code valide ce que les schemas définissent)
+        et de v1-automation (les nouveaux mécanismes s'écrivent pendant
+        cet audit, autant ne creuser le code qu'une fois).
+
+    - key: v1-plugins-tooling-audit
+      title: "Plugins JS et outillage : defense-in-depth, mcp-proxy, Makefile, scripts, docs"
+      ref:
+        type: loose
+        category: exploration
+        label: "~1 300 LOC JS + Makefile + company/scripts + docs/ : même passe que le Rust"
+      timeframe: future
+      status: planned
+      target_date: "2026-Q4"
+      depends_on: [v1-rust-audit]
+      rationale: >
+        Même exercice que v1-rust-audit pour la couche JS (les deux plugins
+        et leurs tests), le Makefile, company/scripts/ et docs/. Vérifier
+        notamment que le harness JS et le serveur Rust ne dupliquent pas de
+        logique (zones protégées définies aux deux endroits ?).
+
+    - key: v1-release
+      title: "Définition de la V1 et tag git v1"
+      ref:
+        type: loose
+        category: idea
+        label: "État de référence documenté + tag git v1 quand tous les domaines sont clos"
+      timeframe: future
+      status: planned
+      target_date: "2026-Q4"
+      depends_on: [v1-hygiene, v1-memory-audit, v1-process-hardening, v1-automation, v1-personas-audit, v1-schemas-audit, v1-rust-audit, v1-plugins-tooling-audit]
+      rationale: >
+        Clôture du programme : ce qui reste après les sept domaines est la
+        V1. Documenter l'état de référence (ce que CompanyOS est, ses
+        mécanismes, ses invariants), poser le tag git v1, archiver cette
+        roadmap. Décision utilisateur : le marqueur de fin est le tag git.

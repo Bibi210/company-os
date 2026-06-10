@@ -21,7 +21,7 @@ metadata:
 
 spec:
   priority: high
-  status: backlog
+  status: cancelled
 
   context: >
     Le projet adopte une approche Proof-Driven Development (PDD) : au lieu de tests unitaires,
