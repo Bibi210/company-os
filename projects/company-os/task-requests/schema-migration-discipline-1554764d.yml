@@ -40,7 +40,7 @@ metadata:
 
 spec:
   priority: medium
-  status: backlog
+  status: done
   acceptance_criteria:
     - >
       L'état actuel de la gestion du schéma SQL de l'orchestrator est

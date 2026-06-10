@@ -46,7 +46,7 @@ metadata:
 
 spec:
   priority: medium
-  status: backlog
+  status: done
 
   acceptance_criteria:
     - >

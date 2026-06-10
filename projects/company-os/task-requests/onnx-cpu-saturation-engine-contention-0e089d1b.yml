@@ -47,6 +47,17 @@ metadata:
 spec:
   priority: high
   status: backlog
+  triage_note: >
+    Triage V1 hygiène (décision agents 2026-06-10, programme companyos-v1,
+    diagnostic v1-hygiene-recensement). Conservé en BACKLOG : le sujet est
+    réel, non livré, de priorité haute (critical-infra). Aucun RFC ni fix
+    n'a encore été produit (le diagnostic fa9bd072 conclut qu'un RFC dédié
+    reste à rédiger pour la PISTE B côté binaire Rust). EXCEPTION à la règle
+    « backlog conservé seulement si tracé dans une roadmap » : ce sujet
+    n'est PAS encore tracé dans une roadmap au moment du triage. Action de
+    suivi remontée au PM : ajouter cet item à la roadmap companyos-system
+    (ou companyos-v1) pour rendre la conservation conforme. Ne pas annuler :
+    le problème de saturation CPU ONNX est un vrai défaut de fond non résolu.
   acceptance_criteria:
     - >
       Le serveur orchestrator au repos (aucune requête en cours) consomme

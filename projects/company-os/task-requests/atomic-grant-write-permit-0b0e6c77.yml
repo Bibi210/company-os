@@ -37,7 +37,7 @@ metadata:
 
 spec:
   priority: medium
-  status: backlog
+  status: done
   acceptance_criteria:
     - >
       Il n'existe plus de fenêtre temporelle où un write permit est actif

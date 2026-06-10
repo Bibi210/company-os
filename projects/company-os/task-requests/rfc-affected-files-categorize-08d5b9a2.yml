@@ -39,7 +39,7 @@ metadata:
 
 spec:
   priority: medium
-  status: backlog
+  status: done
   acceptance_criteria:
     - >
       Le schema RFC (company/schemas/rfc.schema.json) permet de distinguer

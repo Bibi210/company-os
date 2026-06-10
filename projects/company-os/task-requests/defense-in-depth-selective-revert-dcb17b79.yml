@@ -44,7 +44,7 @@ metadata:
 
 spec:
   priority: medium
-  status: backlog
+  status: done
   acceptance_criteria:
     - >
       Le comportement du hook face à une altération de write_permits est
