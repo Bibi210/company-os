@@ -38,6 +38,19 @@ metadata:
       kind: lesson-learned
       relationship: input
   changelog:
+    - date: "2026-06-11"
+      author: pm
+      description: >
+        Lot 1 process-hardening LIVRÉ : RFC 8bf78218 implemented (5 gardes
+        serveur/schema actives et vérifiées en vif, purge des règles mortes
+        avec verrous, canal notes). 16 des 62 règles du recensement survivent
+        désormais au test clean-company (10 avant). Lesson 1bb07073 :
+        l'incident caller-inventory tests/ (3e occurrence malgré 2 lessons
+        et une règle persona) prouve que la prose ne suffit pas -> le lot 3
+        devra livrer un pré-check de périmètre déterministe.
+        v1-mcp-availability passé en in_progress priorité critical sur
+        directive utilisateur ("vraiment régler ce problème définitivement") :
+        3 coupures MCP en 24h nécessitant chacune un reboot manuel.
     - date: "2026-06-10"
       author: pm
       description: >
@@ -291,9 +304,9 @@ spec:
         type: loose
         category: exploration
         label: "Task-request 415c73c0 : supervision/respawn événementiel, fin de la règle de prose mcp_reconnect"
-      timeframe: future
-      status: planned
-      target_date: "2026-Q3"
+      timeframe: present
+      status: in_progress
+      target_date: "2026-Q2"
       rationale: >
         Directive utilisateur (2026-06-10) après l'incident du jour : binaire
         tué pendant un relink cargo, proxy jamais respawné, session MCP morte
