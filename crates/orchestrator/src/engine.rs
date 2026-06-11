@@ -209,6 +209,15 @@ impl OrchestratorEngine {
         author: PersonaId,
         required_reviewers: Vec<PersonaId>,
     ) -> Result<ReviewRound, OrchestratorError> {
+        // GARDE 1a (RFC 8bf78218, self_review_forbidden): the author can never
+        // be a required reviewer of their own artifact.
+        if required_reviewers.contains(&author) {
+            return Err(OrchestratorError::SelfReviewForbidden {
+                author,
+                round_context: format!("required_reviewers of {artifact_path}"),
+            });
+        }
+
         let now = Utc::now();
         let round = ReviewRound {
             id: Uuid::new_v4(),
@@ -234,11 +243,21 @@ impl OrchestratorEngine {
         reviewer: PersonaId,
         verdict: ReviewVerdict,
         findings: Vec<Finding>,
+        notes: Option<String>,
     ) -> Result<ReviewRound, OrchestratorError> {
         let mut round = self
             .db
             .get_round(round_id)?
             .ok_or_else(|| OrchestratorError::RoundNotFound { id: round_id })?;
+
+        // GARDE 1b (RFC 8bf78218, self_review_forbidden): the author can never
+        // vote on their own artifact, including on a pre-existing round.
+        if reviewer == round.author {
+            return Err(OrchestratorError::SelfReviewForbidden {
+                author: round.author,
+                round_context: format!("vote on round {round_id}"),
+            });
+        }
 
         if round.status != RoundStatus::Open && round.status != RoundStatus::RevisionRequired {
             return Err(OrchestratorError::RoundNotOpen {
@@ -251,12 +270,22 @@ impl OrchestratorEngine {
             return Err(OrchestratorError::NotRequiredReviewer { reviewer, round_id });
         }
 
+        // GARDE 2a (RFC 8bf78218, review_findings_honesty): an approve verdict
+        // with non-empty findings is contradictory. Corrective findings imply
+        // request_changes; non-corrective observations belong in `notes`.
+        if verdict == ReviewVerdict::Approve && !findings.is_empty() {
+            return Err(OrchestratorError::ApproveWithFindings {
+                count: findings.len(),
+            });
+        }
+
         round.votes.retain(|v| v.reviewer != reviewer);
 
         round.votes.push(ReviewVote {
             reviewer,
             verdict,
             findings,
+            notes,
             submitted_at: Utc::now(),
         });
 
@@ -621,6 +650,54 @@ impl OrchestratorEngine {
     /// seal failed, without touching other active permits.
     pub fn delete_permit(&self, id: Uuid) -> Result<(), OrchestratorError> {
         self.db.delete_permit(id)
+    }
+
+    /// Fetch a permit by id. Delegates to [`OrchestratorDb::get_permit`].
+    /// Used by GARDE 3 (RFC 8bf78218) in `consume_write_permit` to obtain the
+    /// permit's target_paths before checking the worktree.
+    pub fn get_permit(&self, id: Uuid) -> Result<Option<WritePermit>, OrchestratorError> {
+        self.db.get_permit(id)
+    }
+
+    /// Resolve an indexed artifact by id. Delegates to
+    /// [`OrchestratorDb::get_artifact`]. Used by GARDE 4 (RFC 8bf78218) in
+    /// `grant_write_permit` to verify the RFC kind/status before granting.
+    pub fn get_artifact(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::types::IndexedArtifact>, OrchestratorError> {
+        self.db.get_artifact(id)
+    }
+
+    /// Read `metadata.status` from the YAML artifact at `file_path` (relative
+    /// to `root`, or absolute). Returns "draft" when the field is absent,
+    /// mirroring the convention used by `set_rfc_implemented`. Used by GARDE 4
+    /// (RFC 8bf78218) so the grant path reads the source-of-truth status
+    /// rather than an indexed column. Shares the read+parse approach with
+    /// `set_rfc_implemented`.
+    pub fn read_artifact_status(
+        &self,
+        root: &str,
+        file_path: &str,
+    ) -> Result<String, OrchestratorError> {
+        let full_path = if file_path.starts_with('/') {
+            file_path.to_string()
+        } else {
+            format!("{root}/{file_path}")
+        };
+        let content =
+            std::fs::read_to_string(&full_path).map_err(|source| OrchestratorError::FileRead {
+                path: full_path.clone(),
+                source,
+            })?;
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        let status = parsed
+            .get("metadata")
+            .and_then(|m| m.get("status"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("draft")
+            .to_string();
+        Ok(status)
     }
 
     /// Idempotency lookup for the atomic grant (RFC 359f9162). Delegates
@@ -1426,9 +1503,12 @@ fn walk_yaml_files(dir: &Path, callback: &mut dyn FnMut(&Path)) {
 
 #[cfg(test)]
 mod tests {
+    use crate::error::OrchestratorError;
+    use crate::types::{ReviewRound, RoundStatus};
     use crate::{
         ArtifactPath, ConsensusResult, Finding, OrchestratorDb, OrchestratorEngine, ReviewVerdict,
     };
+    use chrono::Utc;
     use companyos_config::{ArtifactKind, PersonaId};
     use uuid::Uuid;
 
@@ -1474,6 +1554,7 @@ mod tests {
                 PersonaId::Architect,
                 ReviewVerdict::Approve,
                 vec![],
+                None,
             )
             .unwrap();
 
@@ -1499,10 +1580,17 @@ mod tests {
                 PersonaId::Architect,
                 ReviewVerdict::Approve,
                 vec![],
+                None,
             )
             .unwrap();
         engine
-            .submit_vote(round.id, PersonaId::Ceo, ReviewVerdict::Approve, vec![])
+            .submit_vote(
+                round.id,
+                PersonaId::Ceo,
+                ReviewVerdict::Approve,
+                vec![],
+                None,
+            )
             .unwrap();
 
         let result = engine.check_consensus(round.id).unwrap();
@@ -1529,6 +1617,7 @@ mod tests {
                 PersonaId::Architect,
                 ReviewVerdict::RequestChanges,
                 vec![Finding("needs work".into())],
+                None,
             )
             .unwrap();
 
@@ -1562,6 +1651,7 @@ mod tests {
                 PersonaId::Architect,
                 ReviewVerdict::RequestChanges,
                 vec![Finding("still broken".into())],
+                None,
             )
             .unwrap();
 
@@ -1589,6 +1679,7 @@ mod tests {
                 PersonaId::Architect,
                 ReviewVerdict::RequestChanges,
                 vec![Finding("issue".into())],
+                None,
             )
             .unwrap();
 
@@ -1599,6 +1690,7 @@ mod tests {
                 PersonaId::Architect,
                 ReviewVerdict::Approve,
                 vec![],
+                None,
             )
             .unwrap();
 
@@ -1619,7 +1711,13 @@ mod tests {
             .unwrap();
 
         // Ceo is not in required_reviewers
-        let result = engine.submit_vote(round.id, PersonaId::Ceo, ReviewVerdict::Approve, vec![]);
+        let result = engine.submit_vote(
+            round.id,
+            PersonaId::Ceo,
+            ReviewVerdict::Approve,
+            vec![],
+            None,
+        );
         assert!(result.is_err());
     }
 
@@ -1642,13 +1740,172 @@ mod tests {
             PersonaId::Architect,
             ReviewVerdict::Approve,
             vec![],
+            None,
         );
         assert!(result.is_err());
     }
 
+    // --- GARDE 1 (self_review_forbidden) + GARDE 2 (review_findings_honesty
+    //     + notes) tests — RFC 8bf78218 ---
+
+    #[test]
+    fn test_initiate_rejects_author_in_reviewers() {
+        // GARDE 1a: the author cannot be a required reviewer of their own artifact.
+        let engine = setup_engine();
+        let result = engine.initiate_review_round(
+            ArtifactPath("artifacts/rfc/test.yml".into()),
+            ArtifactKind::Rfc,
+            PersonaId::Architect,
+            vec![PersonaId::Architect, PersonaId::Ceo],
+        );
+        assert!(matches!(
+            result,
+            Err(OrchestratorError::SelfReviewForbidden { .. })
+        ));
+    }
+
+    #[test]
+    fn test_submit_vote_rejects_author() {
+        // GARDE 1b: even on a pre-existing round, the author cannot vote on
+        // their own artifact. We craft a round whose author is also listed in
+        // required_reviewers by writing it directly to the DB (bypassing the
+        // initiate guard) to prove the vote-time guard stands alone.
+        let engine = setup_engine();
+        let round = ReviewRound {
+            id: Uuid::new_v4(),
+            artifact_path: ArtifactPath("artifacts/rfc/test.yml".into()),
+            artifact_kind: ArtifactKind::Rfc,
+            author: PersonaId::Architect,
+            required_reviewers: vec![PersonaId::Architect, PersonaId::Ceo],
+            status: RoundStatus::Open,
+            iteration: 1,
+            max_iterations: 3,
+            votes: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        engine.db.create_round(&round).unwrap();
+
+        let result = engine.submit_vote(
+            round.id,
+            PersonaId::Architect,
+            ReviewVerdict::Approve,
+            vec![],
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(OrchestratorError::SelfReviewForbidden { .. })
+        ));
+    }
+
+    #[test]
+    fn test_submit_vote_approve_with_findings_rejected() {
+        // GARDE 2a: approve + non-empty findings is contradictory.
+        let engine = setup_engine();
+        let round = engine
+            .initiate_review_round(
+                ArtifactPath("artifacts/rfc/test.yml".into()),
+                ArtifactKind::Rfc,
+                PersonaId::Pm,
+                vec![PersonaId::Architect],
+            )
+            .unwrap();
+
+        let result = engine.submit_vote(
+            round.id,
+            PersonaId::Architect,
+            ReviewVerdict::Approve,
+            vec![Finding("a corrective remark".into())],
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(OrchestratorError::ApproveWithFindings { count: 1 })
+        ));
+    }
+
+    #[test]
+    fn test_submit_vote_approve_with_notes_accepted() {
+        // GARDE 2b: approve + empty findings + notes is accepted; notes stored.
+        let engine = setup_engine();
+        let round = engine
+            .initiate_review_round(
+                ArtifactPath("artifacts/rfc/test.yml".into()),
+                ArtifactKind::Rfc,
+                PersonaId::Pm,
+                vec![PersonaId::Architect],
+            )
+            .unwrap();
+
+        let updated = engine
+            .submit_vote(
+                round.id,
+                PersonaId::Architect,
+                ReviewVerdict::Approve,
+                vec![],
+                Some("non-corrective observation".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            updated.votes[0].notes.as_deref(),
+            Some("non-corrective observation")
+        );
+    }
+
+    #[test]
+    fn test_submit_vote_request_changes_with_findings_accepted() {
+        // Nominal path preserved: request_changes + findings is accepted.
+        let engine = setup_engine();
+        let round = engine
+            .initiate_review_round(
+                ArtifactPath("artifacts/rfc/test.yml".into()),
+                ArtifactKind::Rfc,
+                PersonaId::Pm,
+                vec![PersonaId::Architect],
+            )
+            .unwrap();
+
+        let updated = engine
+            .submit_vote(
+                round.id,
+                PersonaId::Architect,
+                ReviewVerdict::RequestChanges,
+                vec![Finding("must fix".into())],
+                None,
+            )
+            .unwrap();
+        assert_eq!(updated.votes[0].verdict, ReviewVerdict::RequestChanges);
+        assert_eq!(updated.votes[0].findings.len(), 1);
+    }
+
+    #[test]
+    fn test_submit_vote_request_changes_with_notes_accepted() {
+        // notes are accepted with request_changes too.
+        let engine = setup_engine();
+        let round = engine
+            .initiate_review_round(
+                ArtifactPath("artifacts/rfc/test.yml".into()),
+                ArtifactKind::Rfc,
+                PersonaId::Pm,
+                vec![PersonaId::Architect],
+            )
+            .unwrap();
+
+        let updated = engine
+            .submit_vote(
+                round.id,
+                PersonaId::Architect,
+                ReviewVerdict::RequestChanges,
+                vec![Finding("must fix".into())],
+                Some("for the record".into()),
+            )
+            .unwrap();
+        assert_eq!(updated.votes[0].notes.as_deref(), Some("for the record"));
+    }
+
     // --- Roadmap tools tests ---
 
-    use crate::OrchestratorError;
     use crate::roadmap_summary::RoadmapSelector;
 
     /// Self-cleaning temp root: a unique directory under std::env::temp_dir()

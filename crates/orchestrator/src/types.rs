@@ -173,6 +173,12 @@ pub struct ReviewVote {
     pub reviewer: PersonaId,
     pub verdict: ReviewVerdict,
     pub findings: Vec<Finding>,
+    /// Non-corrective observations for the record (GARDE 2b, RFC 8bf78218).
+    /// `#[serde(default)]` keeps backward compatibility with votes already
+    /// persisted in the DB before this field existed (they deserialize to
+    /// `None`, no migration).
+    #[serde(default)]
+    pub notes: Option<String>,
     pub submitted_at: DateTime<Utc>,
 }
 

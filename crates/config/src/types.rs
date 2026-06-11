@@ -17,16 +17,6 @@ impl fmt::Display for ArtifactId {
     }
 }
 
-/// DSL condition expression for human review triggers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct TriggerCondition(pub String);
-
-/// DSL action expression for human review triggers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct TriggerAction(pub String);
-
 /// Human-readable description text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -269,22 +259,6 @@ pub struct FlowControlSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowControl {
     pub max_review_iterations: u32,
-    #[serde(default)]
-    pub budget_limits: Option<BudgetLimits>,
-    #[serde(default)]
-    pub circuit_breaker: Option<CircuitBreaker>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BudgetLimits {
-    pub max_tokens_per_task: u64,
-    pub max_subagent_spawns: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CircuitBreaker {
-    pub consecutive_failures_threshold: u32,
-    pub cooldown_seconds: u64,
 }
 
 // --- Review Protocol ---
@@ -297,43 +271,6 @@ pub struct ReviewProtocolSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewProtocol {
     pub reviewers_by_artifact_type: std::collections::HashMap<ArtifactKind, Vec<PersonaId>>,
-    #[serde(default)]
-    pub escalation_rules: Option<EscalationRules>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EscalationRules {
-    pub max_iterations_before_ceo: u32,
-    pub ceo_cannot_approve_alone: Vec<EscalationCategory>,
-}
-
-/// Categories of sensitive changes that the CEO cannot approve alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum EscalationCategory {
-    ModifyAccessMatrix,
-    ModifyCeoPersona,
-    BreakingSchemaChange,
-    DeletePersona,
-}
-
-// --- Human Review Triggers ---
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HumanReviewTriggersSpec {
-    pub spec: HumanReviewTriggers,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HumanReviewTriggers {
-    pub triggers: Vec<HumanReviewTrigger>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HumanReviewTrigger {
-    pub condition: TriggerCondition,
-    pub action: TriggerAction,
-    pub description: Description,
 }
 
 // --- Persona ---

@@ -8,7 +8,6 @@ use crate::types::*;
 pub struct CompanyConfig {
     pub flow_control: FlowControl,
     pub review_protocol: ReviewProtocol,
-    pub human_review_triggers: HumanReviewTriggers,
     pub personas: HashMap<PersonaId, ArtifactEnvelope<PersonaSpec>>,
     pub root_dir: PathBuf,
 }
@@ -20,13 +19,11 @@ impl CompanyConfig {
 
         let flow_control = Self::load_flow_control(&root)?;
         let review_protocol = Self::load_review_protocol(&root)?;
-        let human_review_triggers = Self::load_human_review_triggers(&root)?;
         let personas = Self::load_personas(&root)?;
 
         Ok(Self {
             flow_control,
             review_protocol,
-            human_review_triggers,
             personas,
             root_dir: root,
         })
@@ -61,12 +58,6 @@ impl CompanyConfig {
     fn load_review_protocol(root: &Path) -> Result<ReviewProtocol, ConfigError> {
         let path = root.join(constants::CONFIG_REVIEW_PROTOCOL);
         let envelope: ArtifactEnvelope<ReviewProtocolSpec> = Self::load_yaml(&path)?;
-        Ok(envelope.spec.spec)
-    }
-
-    fn load_human_review_triggers(root: &Path) -> Result<HumanReviewTriggers, ConfigError> {
-        let path = root.join(constants::CONFIG_HUMAN_REVIEW_TRIGGERS);
-        let envelope: ArtifactEnvelope<HumanReviewTriggersSpec> = Self::load_yaml(&path)?;
         Ok(envelope.spec.spec)
     }
 

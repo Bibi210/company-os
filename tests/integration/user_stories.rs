@@ -104,7 +104,13 @@ spec:
 
     // 4. PM approves
     engine
-        .submit_vote(round.id, PersonaId::Pm, ReviewVerdict::Approve, vec![])
+        .submit_vote(
+            round.id,
+            PersonaId::Pm,
+            ReviewVerdict::Approve,
+            vec![],
+            None,
+        )
         .expect("pm vote");
 
     // Check: not yet consensus (waiting for implementer)
@@ -118,6 +124,7 @@ spec:
             PersonaId::Implementer,
             ReviewVerdict::Approve,
             vec![],
+            None,
         )
         .expect("implementer vote");
 
@@ -206,7 +213,13 @@ fn story2_review_with_revision() {
 
     // 2. PM approves but Implementer requests changes
     engine
-        .submit_vote(round.id, PersonaId::Pm, ReviewVerdict::Approve, vec![])
+        .submit_vote(
+            round.id,
+            PersonaId::Pm,
+            ReviewVerdict::Approve,
+            vec![],
+            None,
+        )
         .expect("pm vote");
     engine
         .submit_vote(
@@ -214,6 +227,7 @@ fn story2_review_with_revision() {
             PersonaId::Implementer,
             ReviewVerdict::RequestChanges,
             vec![Finding("Missing error handling section".into())],
+            None,
         )
         .expect("implementer vote");
 
@@ -228,7 +242,13 @@ fn story2_review_with_revision() {
 
     // 5. Both reviewers approve after revision
     engine
-        .submit_vote(round.id, PersonaId::Pm, ReviewVerdict::Approve, vec![])
+        .submit_vote(
+            round.id,
+            PersonaId::Pm,
+            ReviewVerdict::Approve,
+            vec![],
+            None,
+        )
         .expect("pm re-vote");
     engine
         .submit_vote(
@@ -236,6 +256,7 @@ fn story2_review_with_revision() {
             PersonaId::Implementer,
             ReviewVerdict::Approve,
             vec![],
+            None,
         )
         .expect("implementer re-vote");
 
@@ -283,10 +304,22 @@ spec:
         .expect("initiate rfc review");
 
     engine
-        .submit_vote(round.id, PersonaId::Pm, ReviewVerdict::Approve, vec![])
+        .submit_vote(
+            round.id,
+            PersonaId::Pm,
+            ReviewVerdict::Approve,
+            vec![],
+            None,
+        )
         .expect("pm vote");
     engine
-        .submit_vote(round.id, PersonaId::Ceo, ReviewVerdict::Approve, vec![])
+        .submit_vote(
+            round.id,
+            PersonaId::Ceo,
+            ReviewVerdict::Approve,
+            vec![],
+            None,
+        )
         .expect("ceo vote");
 
     let result = engine.check_consensus(round.id).expect("check");
@@ -345,6 +378,7 @@ fn story4_escalation() {
             PersonaId::Implementer,
             ReviewVerdict::RequestChanges,
             vec![Finding("Needs more detail".into())],
+            None,
         )
         .expect("vote iter 1");
     let result = engine.check_consensus(round.id).expect("check");
@@ -358,6 +392,7 @@ fn story4_escalation() {
             PersonaId::Implementer,
             ReviewVerdict::RequestChanges,
             vec![Finding("Still needs work".into())],
+            None,
         )
         .expect("vote iter 2");
     let result = engine.check_consensus(round.id).expect("check");
@@ -371,6 +406,7 @@ fn story4_escalation() {
             PersonaId::Implementer,
             ReviewVerdict::RequestChanges,
             vec![Finding("Fundamental design issue".into())],
+            None,
         )
         .expect("vote iter 3");
     let result = engine.check_consensus(round.id).expect("check");

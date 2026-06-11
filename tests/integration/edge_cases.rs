@@ -43,7 +43,13 @@ fn test_double_consume_permit() {
         .expect("initiate review");
 
     engine
-        .submit_vote(round.id, PersonaId::Pm, ReviewVerdict::Approve, vec![])
+        .submit_vote(
+            round.id,
+            PersonaId::Pm,
+            ReviewVerdict::Approve,
+            vec![],
+            None,
+        )
         .expect("pm vote");
     engine.close_round(round.id).expect("close round");
 
@@ -91,6 +97,7 @@ fn test_start_revision_increments_iteration() {
             PersonaId::Implementer,
             ReviewVerdict::RequestChanges,
             vec![],
+            None,
         )
         .expect("vote");
 
@@ -120,7 +127,13 @@ fn test_close_round_not_rfc() {
         .expect("initiate review");
 
     engine
-        .submit_vote(round.id, PersonaId::Pm, ReviewVerdict::Approve, vec![])
+        .submit_vote(
+            round.id,
+            PersonaId::Pm,
+            ReviewVerdict::Approve,
+            vec![],
+            None,
+        )
         .expect("pm vote");
 
     let root = workspace_root();
@@ -249,7 +262,13 @@ fn test_permit_prefix_matching() {
         .expect("initiate review");
 
     engine
-        .submit_vote(round.id, PersonaId::Pm, ReviewVerdict::Approve, vec![])
+        .submit_vote(
+            round.id,
+            PersonaId::Pm,
+            ReviewVerdict::Approve,
+            vec![],
+            None,
+        )
         .expect("pm vote");
     engine.close_round(round.id).expect("close round");
 

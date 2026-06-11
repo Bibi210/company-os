@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use companyos_config::watcher::{self, ConfigChangeKind};
-use companyos_config::{ArtifactKind, CompanyConfig, Diagnostic, PersonaId, constants};
+use companyos_config::{
+    ArtifactKind, CompanyConfig, Diagnostic, PersonaId, ReviewProtocol, constants,
+};
 use companyos_orchestrator::{
     ArtifactPath, Finding, OrchestratorDb, OrchestratorEngine, PathPattern, ReviewVerdict,
     RfcUpdateResult, RoadmapSelector,
@@ -59,6 +61,12 @@ struct OrchestratorServer {
     /// `Arc<AtomicBool>` keeps the lock-free invariant of the
     /// instrumentation (RFC bdee1af4 proposition 8).
     watcher_alive: Arc<AtomicBool>,
+    /// The review protocol loaded from config (GARDE 5, RFC 8bf78218).
+    /// Held behind `Arc<RwLock<_>>` so the two existing hot-reload paths
+    /// (the watcher's `ConfigChangeKind::Config` branch and the
+    /// `reload_config` tool) can refresh it. Read by `initiate_review_round`
+    /// to enforce the per-kind minimum reviewer set.
+    review_protocol: Arc<RwLock<ReviewProtocol>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -91,6 +99,10 @@ struct SubmitVoteParams {
     verdict: ReviewVerdict,
     #[schemars(description = "List of findings or comments", with = "Vec<String>")]
     findings: Vec<Finding>,
+    #[schemars(
+        description = "Non-corrective observations for the record; n'affecte pas le verdict"
+    )]
+    notes: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -308,6 +320,126 @@ fn is_nothing_to_commit(out: &str) -> bool {
         || out.contains("nothing added to commit")
 }
 
+/// Resolve the protocol minimum reviewer set for an artifact kind (GARDE 5,
+/// RFC 8bf78218). Returns `None` when the kind has no mapping (unconstrained).
+/// Otherwise returns the resolved set of CONCRETE reviewers required, with:
+///   - `PersonaId::All` expanded to the CLOSED set {Pm, Architect, Implementer,
+///     Ceo} (decision iteration 2 — NOT `PersonaId::all()`, which also contains
+///     the pseudo-personas Myself/All);
+///   - the pseudo-personas Myself and All never kept as concrete reviewers;
+///   - the `author` removed AFTER expansion, so GARDE 1 (self-review) and
+///     GARDE 5 stay simultaneously satisfiable.
+fn resolve_protocol_minimum(
+    protocol: &ReviewProtocol,
+    kind: ArtifactKind,
+    author: PersonaId,
+) -> Option<Vec<PersonaId>> {
+    const CONCRETE: [PersonaId; 4] = [
+        PersonaId::Pm,
+        PersonaId::Architect,
+        PersonaId::Implementer,
+        PersonaId::Ceo,
+    ];
+
+    let listed = protocol.reviewers_by_artifact_type.get(&kind)?;
+
+    let mut resolved: Vec<PersonaId> = Vec::new();
+    for &p in listed {
+        match p {
+            PersonaId::All => {
+                for &c in &CONCRETE {
+                    if !resolved.contains(&c) {
+                        resolved.push(c);
+                    }
+                }
+            }
+            // Pseudo-personas are never concrete reviewers.
+            PersonaId::Myself => {}
+            concrete => {
+                if !resolved.contains(&concrete) {
+                    resolved.push(concrete);
+                }
+            }
+        }
+    }
+
+    // Remove the author (resolution happens AFTER author removal so both
+    // guards are satisfiable — interaction with GARDE 1).
+    resolved.retain(|&p| p != author);
+    Some(resolved)
+}
+
+/// Outcome of the GARDE 3 worktree check (RFC 8bf78218).
+enum WorktreeCheck {
+    /// Worktree clean on every target path — consumption may proceed.
+    Clean,
+    /// Uncommitted changes detected; carries the `git status --porcelain`
+    /// lines (one per dirty path) for the diagnostic.
+    Dirty(String),
+    /// git could not be invoked (binary missing). Fail-safe refusal with a
+    /// distinct cause.
+    GitUnavailable(String),
+}
+
+/// Build a git pathspec for a permit target path (GARDE 3, RFC 8bf78218).
+/// A path containing a glob metacharacter (`*`, `?`, `[`) is wrapped with the
+/// `:(glob)` magic prefix so git's wildmatch (which traverses `/`) mirrors the
+/// crate-`glob` semantics used elsewhere for permit matching; literal paths are
+/// passed through unchanged (native pathspec prefix match). The behaviour is
+/// deliberately conservative: when in doubt git matches MORE files, making the
+/// refusal stricter — a false positive never lets a dirty worktree slip past.
+fn target_path_to_pathspec(target: &str) -> String {
+    if target.contains('*') || target.contains('?') || target.contains('[') {
+        format!(":(glob){target}")
+    } else {
+        target.to_string()
+    }
+}
+
+/// GARDE 3 (RFC 8bf78218): verify the worktree is clean on the permit's
+/// target paths before allowing `consume_write_permit`. Runs
+/// `git status --porcelain -- <pathspec...>` at `root`. The git environment is
+/// scrubbed (LC_ALL/LANG=C for stable output; GIT_DIR/GIT_INDEX_FILE/
+/// GIT_WORK_TREE removed) so the invocation always targets `root` regardless of
+/// any ambient git env leaked by a parent process (lesson 1afcbe17).
+fn check_worktree_clean(root: &str, target_paths: &[PathPattern]) -> WorktreeCheck {
+    use std::process::Command;
+
+    let mut cmd = Command::new("git");
+    cmd.current_dir(root)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_PREFIX")
+        .args(["status", "--porcelain", "--"]);
+    for p in target_paths {
+        cmd.arg(target_path_to_pathspec(&p.0));
+    }
+
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let trimmed = stdout.trim();
+            if trimmed.is_empty() {
+                WorktreeCheck::Clean
+            } else {
+                WorktreeCheck::Dirty(trimmed.to_string())
+            }
+        }
+        Ok(out) => WorktreeCheck::GitUnavailable(format!(
+            "git status exited with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            WorktreeCheck::GitUnavailable("git binary not found".to_string())
+        }
+        Err(e) => WorktreeCheck::GitUnavailable(format!("git status spawn failed: {e}")),
+    }
+}
+
 /// Serialize a permit into the MCP response JSON, optionally adding the
 /// additive `sealed_commit` field (RFC 359f9162). Backwards-compatible:
 /// every original permit field is preserved; `sealed_commit` is the only
@@ -481,6 +613,7 @@ impl OrchestratorServer {
         validator: Arc<RwLock<ArtifactValidator>>,
         root_path: String,
         watcher_alive: Arc<AtomicBool>,
+        review_protocol: Arc<RwLock<ReviewProtocol>>,
     ) -> Self {
         Self {
             engine,
@@ -488,6 +621,7 @@ impl OrchestratorServer {
             root_path,
             tokens: TokenStore::default(),
             watcher_alive,
+            review_protocol,
             tool_router: Self::tool_router(),
         }
     }
@@ -520,6 +654,36 @@ impl OrchestratorServer {
         params: Parameters<InitiateReviewParams>,
     ) -> Result<CallToolResult, McpError> {
         let params = params.0;
+
+        // GARDE 5 (RFC 8bf78218, reviewers_by_artifact_type): required_reviewers
+        // must include the protocol minimum for this artifact kind. Kinds absent
+        // from the mapping are unconstrained; reviewers beyond the minimum stay
+        // allowed (the minimum is a floor, not a ceiling). The minimum excludes
+        // the author so this guard and GARDE 1 are jointly satisfiable.
+        {
+            let protocol = self.review_protocol.read().await;
+            if let Some(minimum) =
+                resolve_protocol_minimum(&protocol, params.artifact_kind, params.author)
+            {
+                let missing: Vec<String> = minimum
+                    .iter()
+                    .filter(|m| !params.required_reviewers.contains(m))
+                    .map(|m| m.to_string())
+                    .collect();
+                if !missing.is_empty() {
+                    return err(Diagnostic::error(C, "Review round refused")
+                        .with_context("initiate_review_round")
+                        .with_reason(format!(
+                            "required_reviewers must include the protocol minimum for kind '{}': missing {}",
+                            params.artifact_kind,
+                            missing.join(", ")
+                        ))
+                        .with_fix("Add the missing reviewers (review-protocol: reviewers_by_artifact_type). You may add more reviewers beyond the minimum")
+                        .to_string());
+                }
+            }
+        }
+
         let engine = self.engine.lock().await;
         match engine.initiate_review_round(
             params.artifact_path,
@@ -560,12 +724,13 @@ impl OrchestratorServer {
             params.reviewer,
             params.verdict,
             params.findings,
+            params.notes,
         ) {
             Ok(round) => ok(serde_json::to_string_pretty(&round).unwrap_or_default()),
             Err(e) => err(Diagnostic::error(C, "Failed to submit review vote")
                 .with_context(format!("submit_review_vote(round_id={})", params.round_id))
                 .with_reason(format!("{e}"))
-                .with_fix("Verify the round_id exists and is open, and that the reviewer is in the required_reviewers list")
+                .with_fix("Verify the round_id exists and is open; the reviewer must be in required_reviewers and must NOT be the author; an approve vote must carry zero findings (use 'notes' for non-corrective observations)")
                 .to_string()),
         }
     }
@@ -684,6 +849,67 @@ impl OrchestratorServer {
         // concurrent grants AND their git commits are serialized under a
         // single mutex (edge f, RFC 359f9162).
         let engine = self.engine.lock().await;
+
+        // GARDE 4 (RFC 8bf78218): a write permit is only justified during an
+        // RFC's approved -> implemented window. Resolve rfc_id in the index,
+        // verify kind == "rfc", then read the source-of-truth YAML status and
+        // require "approved" (a draft/review/rejected RFC, an implemented RFC,
+        // a non-rfc artifact, or an unindexed id are all refused). Done BEFORE
+        // the idempotence lookup so no permit is ever created for an
+        // unapproved RFC.
+        match engine.get_artifact(&params.rfc_id.to_string()) {
+            Ok(Some(artifact)) if artifact.kind == "rfc" => {
+                match engine.read_artifact_status(&self.root_path, &artifact.file_path) {
+                    Ok(status) if status == "approved" => { /* proceed */ }
+                    Ok(status) => {
+                        return err(Diagnostic::error(C, "Write permit refused")
+                            .with_context(format!("grant_write_permit(rfc_id={})", params.rfc_id))
+                            .with_reason(format!(
+                                "rfc_id {} does not reference an approved RFC (found: rfc/{status})",
+                                params.rfc_id
+                            ))
+                            .with_fix("Approve the RFC via the review cycle first. A permit is only valid during the approved -> implemented window")
+                            .to_string());
+                    }
+                    Err(e) => {
+                        return err(Diagnostic::error(C, "Write permit refused: cannot read RFC status")
+                            .with_context(format!("grant_write_permit(rfc_id={})", params.rfc_id))
+                            .with_reason(format!("failed to read metadata.status from the RFC YAML: {e}"))
+                            .with_fix("Ensure the RFC file referenced by the index is readable and valid YAML")
+                            .to_string());
+                    }
+                }
+            }
+            Ok(Some(artifact)) => {
+                return err(Diagnostic::error(C, "Write permit refused")
+                    .with_context(format!("grant_write_permit(rfc_id={})", params.rfc_id))
+                    .with_reason(format!(
+                        "rfc_id {} does not reference an approved RFC (found: {}/...)",
+                        params.rfc_id, artifact.kind
+                    ))
+                    .with_fix("The id must reference an RFC in 'approved' status. Approve the RFC via the review cycle first")
+                    .to_string());
+            }
+            Ok(None) => {
+                return err(Diagnostic::error(C, "Write permit refused")
+                    .with_context(format!("grant_write_permit(rfc_id={})", params.rfc_id))
+                    .with_reason(format!(
+                        "rfc_id {} does not reference an approved RFC (not indexed)",
+                        params.rfc_id
+                    ))
+                    .with_fix("Approve the RFC via the review cycle first")
+                    .to_string());
+            }
+            Err(e) => {
+                return err(
+                    Diagnostic::error(C, "Write permit refused: RFC lookup failed")
+                        .with_context(format!("grant_write_permit(rfc_id={})", params.rfc_id))
+                        .with_reason(format!("{e}"))
+                        .with_fix("Check database connectivity and DB integrity")
+                        .to_string(),
+                );
+            }
+        }
 
         // (a) IDEMPOTENCE (decision CEO 3): replaying the same grant key
         //     (rfc_id + granted_to + normalized target_paths) returns the
@@ -827,6 +1053,49 @@ impl OrchestratorServer {
                 .to_string());
         }
         let engine = self.engine.lock().await;
+
+        // GARDE 3 (RFC 8bf78218, commit-puis-consume): before consuming the
+        // permit, verify the worktree is clean on its target paths. A permit
+        // consumed before the code is committed would make the commit
+        // impossible (defense-in-depth Layer 2 rejects commits whose permit is
+        // already consumed). Order: token (above) -> permit lookup -> worktree
+        // check -> engine.consume_permit.
+        match engine.get_permit(params.permit_id) {
+            Ok(Some(permit)) => {
+                match check_worktree_clean(&self.root_path, &permit.target_paths) {
+                    WorktreeCheck::Clean => { /* fall through to consume */ }
+                    WorktreeCheck::Dirty(files) => {
+                        return err(Diagnostic::error(C, "Permit consumption refused: uncommitted changes")
+                            .with_context(format!("consume_write_permit(permit_id={})", params.permit_id))
+                            .with_reason(format!("uncommitted changes on target paths:\n{files}"))
+                            .with_fix("Commit your code FIRST (git add && git commit), then consume the permit (write_permit_full_sequence step 4)")
+                            .to_string());
+                    }
+                    WorktreeCheck::GitUnavailable(cause) => {
+                        return err(Diagnostic::error(C, "Permit consumption refused: cannot verify worktree")
+                            .with_context(format!("consume_write_permit(permit_id={})", params.permit_id))
+                            .with_reason(format!("git unavailable, cannot verify worktree cleanliness: {cause}"))
+                            .with_fix("git is a hard prerequisite (RFC 359f9162). Ensure git is installed and the repo is accessible, then retry")
+                            .to_string());
+                    }
+                }
+            }
+            Ok(None) => {
+                // Permit not found: defer to engine.consume_permit so the
+                // existing PermitNotFound error/message is produced unchanged.
+            }
+            Err(e) => {
+                return err(Diagnostic::error(C, "Failed to look up write permit")
+                    .with_context(format!(
+                        "consume_write_permit(permit_id={})",
+                        params.permit_id
+                    ))
+                    .with_reason(format!("{e}"))
+                    .with_fix("Check database connectivity and DB integrity")
+                    .to_string());
+            }
+        }
+
         match engine.consume_permit(params.permit_id) {
             Ok(()) => ok(r#"{"consumed": true}"#.to_string()),
             Err(e) => err(Diagnostic::error(C, "Failed to consume write permit")
@@ -911,6 +1180,9 @@ impl OrchestratorServer {
             Ok(config) => {
                 let new_max = config.flow_control.max_review_iterations;
                 self.engine.lock().await.set_max_iterations(new_max);
+                // GARDE 5 (RFC 8bf78218): refresh the in-memory review protocol
+                // so reviewers_by_artifact_type changes take effect on hot-reload.
+                *self.review_protocol.write().await = config.review_protocol;
                 ok(serde_json::to_string_pretty(&serde_json::json!({
                     "reloaded": true,
                     "max_iterations": new_max
@@ -1413,6 +1685,10 @@ async fn run_server() -> anyhow::Result<()> {
 
     let config = CompanyConfig::load(&root)?;
     let max_iterations = config.flow_control.max_review_iterations;
+    // GARDE 5 (RFC 8bf78218): share the loaded review protocol behind an
+    // Arc<RwLock<_>> so both hot-reload paths (watcher + reload_config) can
+    // refresh it while the server reads it under initiate_review_round.
+    let review_protocol = Arc::new(RwLock::new(config.review_protocol.clone()));
 
     let db_dir = format!("{root}/{}", constants::DATA_DIR);
     std::fs::create_dir_all(&db_dir)?;
@@ -1542,6 +1818,7 @@ async fn run_server() -> anyhow::Result<()> {
         validator.clone(),
         root.clone(),
         watcher_alive.clone(),
+        review_protocol.clone(),
     );
 
     let (stdin, stdout) = rmcp::transport::io::stdio();
@@ -1579,6 +1856,11 @@ async fn run_server() -> anyhow::Result<()> {
                 let root = root.clone();
                 let schemas_dir = schemas_dir.clone();
                 let watcher_alive = watcher_alive.clone();
+                // GARDE 5 (RFC 8bf78218): clone the Arc BEFORE the async move so
+                // the watcher's Config branch can refresh the review protocol.
+                // It is read textually below (the .write()), so Rust 2024
+                // disjoint capture moves it into the future (lesson ea6e9dd1).
+                let review_protocol = review_protocol.clone();
                 let task_handle = tokio::spawn(async move {
                     // The guard (and the RecommendedWatcher it owns) MUST
                     // live as long as this consumer task. Without this
@@ -1608,6 +1890,10 @@ async fn run_server() -> anyhow::Result<()> {
                                 Ok(config) => {
                                     let new_max = config.flow_control.max_review_iterations;
                                     engine.lock().await.set_max_iterations(new_max);
+                                    // GARDE 5 (RFC 8bf78218): refresh the review
+                                    // protocol on hot-reload so the per-kind
+                                    // minimum reviewer set stays current.
+                                    *review_protocol.write().await = config.review_protocol;
                                     tracing::info!(
                                         "Auto-reloaded config (max_iterations={new_max})"
                                     );
@@ -1722,9 +2008,68 @@ async fn run_server() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use companyos_orchestrator::{OrchestratorDb, OrchestratorEngine, PathPattern};
+    use companyos_config::ReviewProtocol;
+    use companyos_orchestrator::{
+        EMBEDDING_DIM, IndexedArtifact, OrchestratorDb, OrchestratorEngine, PathPattern,
+    };
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    /// A review protocol for tests: rfc -> [all], design-doc -> [pm, implementer].
+    /// Mirrors the real review-protocol.yml mapping closely enough to exercise
+    /// GARDE 5 (the "all" expansion and a concrete-list case).
+    fn test_review_protocol() -> ReviewProtocol {
+        let mut m: HashMap<ArtifactKind, Vec<PersonaId>> = HashMap::new();
+        m.insert(ArtifactKind::Rfc, vec![PersonaId::All]);
+        m.insert(
+            ArtifactKind::DesignDoc,
+            vec![PersonaId::Pm, PersonaId::Implementer],
+        );
+        ReviewProtocol {
+            reviewers_by_artifact_type: m,
+        }
+    }
+
+    /// Write a minimal valid artifact YAML into `root/<file_path>` and index it
+    /// directly via `db.upsert_artifact` with a zero embedding (the test harness
+    /// uses `new_without_embedder`, so `index_artifact` is unavailable). Fixtures
+    /// are built with explicit `\n` and indentation, never the Rust backslash
+    /// continuation that would collapse YAML indentation (lesson f3fc4a5d).
+    /// Must be called BEFORE the engine is constructed (db is moved into it).
+    fn seed_artifact(db: &mut OrchestratorDb, root: &Path, id: Uuid, kind: &str, status: &str) {
+        let (dir, fname) = match kind {
+            "rfc" => ("company/rfcs", format!("{id}.yml")),
+            "lesson-learned" => ("company/lessons", format!("{id}.yml")),
+            other => panic!("seed_artifact: unsupported kind '{other}'"),
+        };
+        let file_path = format!("{dir}/{fname}");
+        let abs_dir = root.join(dir);
+        std::fs::create_dir_all(&abs_dir).unwrap();
+
+        let mut yaml = String::new();
+        yaml.push_str("api_version: companyos/v1\n");
+        yaml.push_str(&format!("kind: {kind}\n"));
+        yaml.push_str("metadata:\n");
+        yaml.push_str(&format!("  id: {id}\n"));
+        yaml.push_str("  title: Fixture\n");
+        yaml.push_str("  author: architect\n");
+        yaml.push_str("  created_at: \"2026-06-10\"\n");
+        yaml.push_str(&format!("  status: {status}\n"));
+        std::fs::write(root.join(&file_path), yaml).unwrap();
+
+        let artifact = IndexedArtifact {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            title: "Fixture".into(),
+            description: String::new(),
+            tags: vec![],
+            file_path,
+            indexed_at: "2026-06-10T00:00:00Z".into(),
+        };
+        db.upsert_artifact(&artifact, "", &vec![0.0f32; EMBEDDING_DIM], &[])
+            .expect("seed upsert");
+    }
 
     /// RAII tempdir for tests (lesson f3fc4a5d: a 10-line struct beats a
     /// tempfile dev-dependency). Removed on drop.
@@ -1774,14 +2119,19 @@ mod tests {
     }
 
     /// Build a test server rooted at `root`, with an on-disk DB at
-    /// company/data/orchestrator.db and the CEO already authenticated.
-    /// Returns (server, ceo_token).
-    async fn setup_server(root: &Path) -> (OrchestratorServer, String) {
+    /// company/data/orchestrator.db and the CEO already authenticated. Seeds a
+    /// default APPROVED RFC fixture (so grant tests pass GARDE 4) and returns
+    /// its id. Returns (server, ceo_token, approved_rfc_id).
+    async fn setup_server(root: &Path) -> (OrchestratorServer, String, Uuid) {
         let db_dir = root.join(constants::DATA_DIR);
         std::fs::create_dir_all(&db_dir).unwrap();
         let db_path = db_dir.join(constants::DB_FILENAME);
-        let db = OrchestratorDb::open(&db_path).unwrap();
+        let mut db = OrchestratorDb::open(&db_path).unwrap();
         db.migrate().unwrap();
+        // Seed a default approved RFC BEFORE the engine takes ownership of db
+        // (GARDE 4: grant_write_permit now requires an indexed approved RFC).
+        let approved_rfc = Uuid::new_v4();
+        seed_artifact(&mut db, root, approved_rfc, "rfc", "approved");
         let engine = OrchestratorEngine::new_without_embedder(db, 3);
         // Validator points at an empty schemas dir (never exercised by the
         // permit path).
@@ -1792,9 +2142,10 @@ mod tests {
             Arc::new(RwLock::new(validator)),
             root.to_string_lossy().to_string(),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(RwLock::new(test_review_protocol())),
         );
         let token = server.tokens.authenticate("ceo").await;
-        (server, token)
+        (server, token, approved_rfc)
     }
 
     fn result_text(result: &CallToolResult) -> String {
@@ -1835,6 +2186,7 @@ mod tests {
             ))),
             tmp.path().to_string_lossy().to_string(),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(RwLock::new(test_review_protocol())),
         );
 
         let hash = server
@@ -1877,6 +2229,7 @@ mod tests {
             ))),
             tmp.path().to_string_lossy().to_string(),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(RwLock::new(test_review_protocol())),
         );
 
         let res = server.seal_db_commit(Uuid::new_v4(), Uuid::new_v4());
@@ -1900,8 +2253,7 @@ mod tests {
     async fn test_grant_write_permit_nominal_seals() {
         let tmp = LocalTempDir::new("grant-nominal");
         init_git_repo(tmp.path());
-        let (server, token) = setup_server(tmp.path()).await;
-        let rfc = Uuid::new_v4();
+        let (server, token, rfc) = setup_server(tmp.path()).await;
 
         let res = server
             .grant_write_permit(grant_params(&token, rfc, vec!["crates/x/src/a.rs"]))
@@ -1956,8 +2308,7 @@ mod tests {
     async fn test_grant_write_permit_seal_failure_rolls_back() {
         let tmp = LocalTempDir::new("grant-nogit");
         // No git init.
-        let (server, token) = setup_server(tmp.path()).await;
-        let rfc = Uuid::new_v4();
+        let (server, token, rfc) = setup_server(tmp.path()).await;
 
         let res = server
             .grant_write_permit(grant_params(&token, rfc, vec!["crates/x/src/a.rs"]))
@@ -1990,8 +2341,7 @@ mod tests {
     async fn test_grant_write_permit_idempotent_replay() {
         let tmp = LocalTempDir::new("grant-idem");
         init_git_repo(tmp.path());
-        let (server, token) = setup_server(tmp.path()).await;
-        let rfc = Uuid::new_v4();
+        let (server, token, rfc) = setup_server(tmp.path()).await;
 
         let r1 = server
             .grant_write_permit(grant_params(&token, rfc, vec!["a.rs", "b.rs"]))
@@ -2032,10 +2382,30 @@ mod tests {
     async fn test_grant_write_permit_coexisting_permits() {
         let tmp = LocalTempDir::new("grant-coexist");
         init_git_repo(tmp.path());
-        let (server, token) = setup_server(tmp.path()).await;
+        let root = tmp.path();
 
+        // Two distinct approved RFCs (GARDE 4 requires each grant's rfc_id to
+        // reference an indexed approved RFC). Seed both BEFORE the engine owns
+        // the db.
+        let db_dir = root.join(constants::DATA_DIR);
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let mut db = OrchestratorDb::open(db_dir.join(constants::DB_FILENAME)).unwrap();
+        db.migrate().unwrap();
         let rfc_a = Uuid::new_v4();
         let rfc_b = Uuid::new_v4();
+        seed_artifact(&mut db, root, rfc_a, "rfc", "approved");
+        seed_artifact(&mut db, root, rfc_b, "rfc", "approved");
+        let engine = OrchestratorEngine::new_without_embedder(db, 3);
+        let registry = SchemaRegistry::load(root.join("no-schemas")).unwrap();
+        let server = OrchestratorServer::new(
+            Arc::new(Mutex::new(engine)),
+            Arc::new(RwLock::new(ArtifactValidator::new(registry))),
+            root.to_string_lossy().to_string(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(RwLock::new(test_review_protocol())),
+        );
+        let token = server.tokens.authenticate("ceo").await;
+
         server
             .grant_write_permit(grant_params(&token, rfc_a, vec!["a.rs"]))
             .await
@@ -2058,8 +2428,7 @@ mod tests {
     async fn test_grant_does_not_consume_permit() {
         let tmp = LocalTempDir::new("grant-active");
         init_git_repo(tmp.path());
-        let (server, token) = setup_server(tmp.path()).await;
-        let rfc = Uuid::new_v4();
+        let (server, token, rfc) = setup_server(tmp.path()).await;
 
         let res = server
             .grant_write_permit(grant_params(&token, rfc, vec!["a.rs"]))
@@ -2130,5 +2499,405 @@ mod tests {
         );
         let note = v.get("note").expect("idempotent case must carry a note");
         assert!(note.as_str().unwrap().contains("idempotent"));
+    }
+
+    // --- GARDE 4: grant requires an approved RFC (RFC 8bf78218) ---
+
+    #[tokio::test]
+    async fn test_grant_refused_rfc_not_indexed() {
+        let tmp = LocalTempDir::new("grant-noidx");
+        init_git_repo(tmp.path());
+        let (server, token, _rfc) = setup_server(tmp.path()).await;
+        let unindexed = Uuid::new_v4();
+        let res = server
+            .grant_write_permit(grant_params(&token, unindexed, vec!["crates/x/src/a.rs"]))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true), "unindexed rfc must be refused");
+        assert!(result_text(&res).contains("not indexed"));
+    }
+
+    #[tokio::test]
+    async fn test_grant_refused_wrong_kind() {
+        let tmp = LocalTempDir::new("grant-wrongkind");
+        init_git_repo(tmp.path());
+        let root = tmp.path();
+        let db_dir = root.join(constants::DATA_DIR);
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let mut db = OrchestratorDb::open(db_dir.join(constants::DB_FILENAME)).unwrap();
+        db.migrate().unwrap();
+        // Index a non-rfc artifact (lesson-learned) and reference it as rfc_id.
+        let lesson_id = Uuid::new_v4();
+        seed_artifact(&mut db, root, lesson_id, "lesson-learned", "approved");
+        let engine = OrchestratorEngine::new_without_embedder(db, 3);
+        let registry = SchemaRegistry::load(root.join("no-schemas")).unwrap();
+        let server = OrchestratorServer::new(
+            Arc::new(Mutex::new(engine)),
+            Arc::new(RwLock::new(ArtifactValidator::new(registry))),
+            root.to_string_lossy().to_string(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(RwLock::new(test_review_protocol())),
+        );
+        let token = server.tokens.authenticate("ceo").await;
+
+        let res = server
+            .grant_write_permit(grant_params(&token, lesson_id, vec!["crates/x/src/a.rs"]))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true), "non-rfc kind must be refused");
+        let text = result_text(&res);
+        assert!(
+            text.contains("lesson-learned"),
+            "refusal must name the real kind: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_grant_refused_rfc_draft() {
+        let tmp = LocalTempDir::new("grant-draft");
+        init_git_repo(tmp.path());
+        let root = tmp.path();
+        let db_dir = root.join(constants::DATA_DIR);
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let mut db = OrchestratorDb::open(db_dir.join(constants::DB_FILENAME)).unwrap();
+        db.migrate().unwrap();
+        let rfc = Uuid::new_v4();
+        seed_artifact(&mut db, root, rfc, "rfc", "draft");
+        let engine = OrchestratorEngine::new_without_embedder(db, 3);
+        let registry = SchemaRegistry::load(root.join("no-schemas")).unwrap();
+        let server = OrchestratorServer::new(
+            Arc::new(Mutex::new(engine)),
+            Arc::new(RwLock::new(ArtifactValidator::new(registry))),
+            root.to_string_lossy().to_string(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(RwLock::new(test_review_protocol())),
+        );
+        let token = server.tokens.authenticate("ceo").await;
+        let res = server
+            .grant_write_permit(grant_params(&token, rfc, vec!["crates/x/src/a.rs"]))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true), "draft rfc must be refused");
+        assert!(result_text(&res).contains("draft"));
+    }
+
+    #[tokio::test]
+    async fn test_grant_refused_rfc_implemented() {
+        let tmp = LocalTempDir::new("grant-impl");
+        init_git_repo(tmp.path());
+        let root = tmp.path();
+        let db_dir = root.join(constants::DATA_DIR);
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let mut db = OrchestratorDb::open(db_dir.join(constants::DB_FILENAME)).unwrap();
+        db.migrate().unwrap();
+        let rfc = Uuid::new_v4();
+        seed_artifact(&mut db, root, rfc, "rfc", "implemented");
+        let engine = OrchestratorEngine::new_without_embedder(db, 3);
+        let registry = SchemaRegistry::load(root.join("no-schemas")).unwrap();
+        let server = OrchestratorServer::new(
+            Arc::new(Mutex::new(engine)),
+            Arc::new(RwLock::new(ArtifactValidator::new(registry))),
+            root.to_string_lossy().to_string(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(RwLock::new(test_review_protocol())),
+        );
+        let token = server.tokens.authenticate("ceo").await;
+        let res = server
+            .grant_write_permit(grant_params(&token, rfc, vec!["crates/x/src/a.rs"]))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true), "implemented rfc must be refused");
+        assert!(result_text(&res).contains("implemented"));
+    }
+
+    #[tokio::test]
+    async fn test_grant_accepted_rfc_approved() {
+        // The default seeded RFC is approved; grant must succeed.
+        let tmp = LocalTempDir::new("grant-approved");
+        init_git_repo(tmp.path());
+        let (server, token, rfc) = setup_server(tmp.path()).await;
+        let res = server
+            .grant_write_permit(grant_params(&token, rfc, vec!["crates/x/src/a.rs"]))
+            .await
+            .unwrap();
+        assert_ne!(
+            res.is_error,
+            Some(true),
+            "approved rfc grant must succeed: {}",
+            result_text(&res)
+        );
+    }
+
+    // --- GARDE 3: consume refuses a dirty worktree (RFC 8bf78218) ---
+
+    /// Helper: grant an active permit on `paths`, returning its id.
+    async fn grant_permit_id(
+        server: &OrchestratorServer,
+        token: &str,
+        rfc: Uuid,
+        paths: Vec<&str>,
+    ) -> Uuid {
+        let res = server
+            .grant_write_permit(grant_params(token, rfc, paths))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&result_text(&res)).unwrap();
+        Uuid::parse_str(v.get("id").unwrap().as_str().unwrap()).unwrap()
+    }
+
+    fn consume_params(token: &str, permit_id: Uuid) -> Parameters<ConsumePermitParams> {
+        Parameters(ConsumePermitParams {
+            token: token.to_string(),
+            persona: "ceo".to_string(),
+            permit_id,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_consume_refused_dirty_worktree() {
+        let tmp = LocalTempDir::new("consume-dirty-lit");
+        init_git_repo(tmp.path());
+        let root = tmp.path();
+        // Create + commit the target file so it is tracked, then dirty it.
+        std::fs::create_dir_all(root.join("crates/x/src")).unwrap();
+        std::fs::write(root.join("crates/x/src/a.rs"), "// v1\n").unwrap();
+        git(root, &["add", "crates/x/src/a.rs"]);
+        git(root, &["commit", "-q", "-m", "add a.rs"]);
+
+        let (server, token, rfc) = setup_server(root).await;
+        let permit_id = grant_permit_id(&server, &token, rfc, vec!["crates/x/src/a.rs"]).await;
+
+        // Dirty the file WITHOUT committing.
+        std::fs::write(root.join("crates/x/src/a.rs"), "// v2 dirty\n").unwrap();
+
+        let res = server
+            .consume_write_permit(consume_params(&token, permit_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.is_error,
+            Some(true),
+            "dirty worktree must refuse consume"
+        );
+        let text = result_text(&res);
+        assert!(text.contains("uncommitted changes"), "diagnostic: {text}");
+        assert!(text.contains("a.rs"), "must list the dirty file: {text}");
+    }
+
+    #[tokio::test]
+    async fn test_consume_refused_dirty_glob_pattern() {
+        let tmp = LocalTempDir::new("consume-dirty-glob");
+        init_git_repo(tmp.path());
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("crates/x/src")).unwrap();
+        std::fs::write(root.join("crates/x/src/a.rs"), "// v1\n").unwrap();
+        git(root, &["add", "crates/x/src/a.rs"]);
+        git(root, &["commit", "-q", "-m", "add a.rs"]);
+
+        let (server, token, rfc) = setup_server(root).await;
+        // Permit on a WILDCARD path — exercises the :(glob) pathspec branch.
+        let permit_id = grant_permit_id(&server, &token, rfc, vec!["crates/x/src/*.rs"]).await;
+
+        // Dirty a file MATCHING the glob, without committing.
+        std::fs::write(root.join("crates/x/src/a.rs"), "// dirty via glob\n").unwrap();
+
+        let res = server
+            .consume_write_permit(consume_params(&token, permit_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.is_error,
+            Some(true),
+            "dirty file matching the glob must refuse consume"
+        );
+        let text = result_text(&res);
+        assert!(text.contains("uncommitted changes"), "diagnostic: {text}");
+        assert!(text.contains("a.rs"), "must list the dirty file: {text}");
+    }
+
+    #[tokio::test]
+    async fn test_consume_accepted_clean_worktree() {
+        let tmp = LocalTempDir::new("consume-clean");
+        init_git_repo(tmp.path());
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("crates/x/src")).unwrap();
+        std::fs::write(root.join("crates/x/src/a.rs"), "// v1\n").unwrap();
+        git(root, &["add", "crates/x/src/a.rs"]);
+        git(root, &["commit", "-q", "-m", "add a.rs"]);
+
+        let (server, token, rfc) = setup_server(root).await;
+        let permit_id = grant_permit_id(&server, &token, rfc, vec!["crates/x/src/a.rs"]).await;
+
+        // Worktree clean on the target path (the grant sealed only the .db).
+        let res = server
+            .consume_write_permit(consume_params(&token, permit_id))
+            .await
+            .unwrap();
+        assert_ne!(
+            res.is_error,
+            Some(true),
+            "clean worktree must allow consume: {}",
+            result_text(&res)
+        );
+        assert!(result_text(&res).contains("consumed"));
+    }
+
+    // --- GARDE 5: reviewers_by_artifact_type enforced (RFC 8bf78218) ---
+
+    fn initiate_params(
+        kind: ArtifactKind,
+        author: PersonaId,
+        reviewers: Vec<PersonaId>,
+    ) -> Parameters<InitiateReviewParams> {
+        Parameters(InitiateReviewParams {
+            artifact_path: ArtifactPath("artifacts/x.yml".into()),
+            artifact_kind: kind,
+            author,
+            required_reviewers: reviewers,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_initiate_refused_below_protocol_minimum() {
+        let tmp = LocalTempDir::new("init-below");
+        let (server, _t, _rfc) = setup_server(tmp.path()).await;
+        // design-doc minimum = {pm, implementer}; omit implementer.
+        let res = server
+            .initiate_review_round(initiate_params(
+                ArtifactKind::DesignDoc,
+                PersonaId::Architect,
+                vec![PersonaId::Pm],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true), "below-minimum must be refused");
+        let text = result_text(&res);
+        assert!(
+            text.contains("implementer"),
+            "must name missing reviewer: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initiate_accepted_at_minimum() {
+        let tmp = LocalTempDir::new("init-min");
+        let (server, _t, _rfc) = setup_server(tmp.path()).await;
+        let res = server
+            .initiate_review_round(initiate_params(
+                ArtifactKind::DesignDoc,
+                PersonaId::Architect,
+                vec![PersonaId::Pm, PersonaId::Implementer],
+            ))
+            .await
+            .unwrap();
+        assert_ne!(
+            res.is_error,
+            Some(true),
+            "exactly-minimum must be accepted: {}",
+            result_text(&res)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initiate_accepted_above_minimum() {
+        let tmp = LocalTempDir::new("init-above");
+        let (server, _t, _rfc) = setup_server(tmp.path()).await;
+        let res = server
+            .initiate_review_round(initiate_params(
+                ArtifactKind::DesignDoc,
+                PersonaId::Architect,
+                vec![PersonaId::Pm, PersonaId::Implementer, PersonaId::Ceo],
+            ))
+            .await
+            .unwrap();
+        assert_ne!(
+            res.is_error,
+            Some(true),
+            "above-minimum must be accepted: {}",
+            result_text(&res)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initiate_all_resolves_to_four_minus_author() {
+        let tmp = LocalTempDir::new("init-all");
+        let (server, _t, _rfc) = setup_server(tmp.path()).await;
+        // rfc minimum = "all" -> {pm, architect, implementer, ceo} minus author
+        // (architect) = {pm, implementer, ceo}.
+        let ok = server
+            .initiate_review_round(initiate_params(
+                ArtifactKind::Rfc,
+                PersonaId::Architect,
+                vec![PersonaId::Pm, PersonaId::Implementer, PersonaId::Ceo],
+            ))
+            .await
+            .unwrap();
+        assert_ne!(
+            ok.is_error,
+            Some(true),
+            "all-minus-author set must be accepted: {}",
+            result_text(&ok)
+        );
+
+        // Omitting one of the three must be refused.
+        let bad = server
+            .initiate_review_round(initiate_params(
+                ArtifactKind::Rfc,
+                PersonaId::Architect,
+                vec![PersonaId::Pm, PersonaId::Implementer],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bad.is_error, Some(true), "missing ceo must be refused");
+        assert!(result_text(&bad).contains("ceo"));
+    }
+
+    #[tokio::test]
+    async fn test_initiate_unmapped_kind_unconstrained() {
+        let tmp = LocalTempDir::new("init-unmapped");
+        let (server, _t, _rfc) = setup_server(tmp.path()).await;
+        // lesson-learned has no mapping in test_review_protocol -> no constraint.
+        let res = server
+            .initiate_review_round(initiate_params(
+                ArtifactKind::LessonLearned,
+                PersonaId::Architect,
+                vec![PersonaId::Pm],
+            ))
+            .await
+            .unwrap();
+        assert_ne!(
+            res.is_error,
+            Some(true),
+            "unmapped kind must be unconstrained: {}",
+            result_text(&res)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hotreload_protocol_via_reload_config() {
+        // After reload_config, a changed protocol is reflected. We mutate the
+        // in-memory protocol the same way reload_config would, then verify the
+        // new minimum is enforced. (The on-disk reload path is exercised by the
+        // reload_config tool; here we assert the server reads the live field.)
+        let tmp = LocalTempDir::new("init-hotreload");
+        let (server, _t, _rfc) = setup_server(tmp.path()).await;
+        {
+            let mut m: HashMap<ArtifactKind, Vec<PersonaId>> = HashMap::new();
+            m.insert(ArtifactKind::DesignDoc, vec![PersonaId::Ceo]);
+            *server.review_protocol.write().await = ReviewProtocol {
+                reviewers_by_artifact_type: m,
+            };
+        }
+        // New minimum for design-doc = {ceo}; a list without ceo is refused.
+        let res = server
+            .initiate_review_round(initiate_params(
+                ArtifactKind::DesignDoc,
+                PersonaId::Architect,
+                vec![PersonaId::Pm, PersonaId::Implementer],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true), "refreshed protocol must apply");
+        assert!(result_text(&res).contains("ceo"));
     }
 }

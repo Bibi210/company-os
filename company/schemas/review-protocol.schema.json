@@ -16,18 +16,19 @@
                 "items": { "type": "string" }
               }
             },
-            "escalation_rules": {
+            "self_review_forbidden": {
               "type": "object",
-              "properties": {
-                "max_iterations_before_ceo": { "type": "integer" },
-                "ceo_cannot_approve_alone": {
-                  "type": "array",
-                  "items": { "type": "string" }
-                }
-              }
+              "properties": { "description": { "type": "string" } },
+              "required": ["description"]
+            },
+            "review_analysis_framework": {
+              "type": "object",
+              "properties": { "description": { "type": "string" } },
+              "required": ["description"]
             }
           },
-          "required": ["reviewers_by_artifact_type"]
+          "required": ["reviewers_by_artifact_type"],
+          "additionalProperties": false
         }
       },
       "required": ["spec"]

@@ -376,6 +376,14 @@ spec:
         Les auteurs ont besoin de reviews honnêtes. Voter approve sur un artifact qu'on sait
         perfectible (au sens des acceptance criteria), c'est faire passer la diplomatie avant
         la qualité.
+
+        GARDE MÉCANIQUE (RFC 8bf78218) : la contradiction approve+findings est désormais
+        REJETÉE côté serveur (engine.submit_vote -> OrchestratorError::ApproveWithFindings)
+        ET au schema des review-report YAML (verdict approve => findings maxItems 0). Le canal
+        légitime pour une observation NON corrective est le paramètre `notes` de submit_review_vote
+        (accepté avec les deux verdicts, n'affecte pas le verdict). Cette règle reste néanmoins
+        en prose car le critère correctif (a) vs hors-scope (b) est un jugement que la machine
+        ne porte pas : la garde empêche seulement la forme contradictoire, pas le mauvais classement.
     affected_files_categorization:
       description: >
         Recommandation (non imposée) sur le remplissage de spec.affected_files dans un RFC.

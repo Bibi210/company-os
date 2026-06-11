@@ -14,6 +14,23 @@ pub enum OrchestratorError {
     #[error("Reviewer '{reviewer}' is not a required reviewer for round {round_id}")]
     NotRequiredReviewer { reviewer: PersonaId, round_id: Uuid },
 
+    #[error(
+        "Self-review forbidden: author '{author}' cannot review their own artifact \
+         ({round_context}). Remove the author from required_reviewers; the author must \
+         never vote on their own artifact (review-protocol: self_review_forbidden)."
+    )]
+    SelfReviewForbidden {
+        author: PersonaId,
+        round_context: String,
+    },
+
+    #[error(
+        "Contradictory vote: approve with {count} finding(s). If a finding is corrective, \
+         vote request_changes. If it is a non-corrective observation, use the 'notes' \
+         parameter instead (shared-rules: review_findings_honesty)."
+    )]
+    ApproveWithFindings { count: usize },
+
     #[error("Write permit not found: {id}")]
     PermitNotFound { id: Uuid },
 

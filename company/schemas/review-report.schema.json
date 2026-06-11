@@ -24,9 +24,16 @@
               "type": "array",
               "items": { "type": "string" }
             },
+            "notes": { "type": "string" },
             "summary": { "type": "string" }
           },
-          "required": ["verdict", "findings"]
+          "required": ["verdict", "findings"],
+          "if": {
+            "properties": { "verdict": { "const": "approve" } }
+          },
+          "then": {
+            "properties": { "findings": { "maxItems": 0 } }
+          }
         }
       },
       "required": ["spec"]

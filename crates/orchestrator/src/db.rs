@@ -2085,6 +2085,7 @@ mod tests {
             reviewer: PersonaId::Pm,
             verdict: ReviewVerdict::Approve,
             findings: vec![Finding("Looks good".into())],
+            notes: None,
             submitted_at: Utc::now(),
         });
         db.update_round(&round).unwrap();
@@ -2105,6 +2106,7 @@ mod tests {
             reviewer: PersonaId::Pm,
             verdict: ReviewVerdict::RequestChanges,
             findings: vec![Finding("Needs work".into()), Finding("Fix naming".into())],
+            notes: None,
             submitted_at: Utc::now(),
         });
         db.create_round(&round).unwrap();
@@ -2114,6 +2116,29 @@ mod tests {
         assert_eq!(fetched.required_reviewers[2], PersonaId::Implementer);
         assert_eq!(fetched.votes[0].findings.len(), 2);
         assert_eq!(fetched.votes[0].findings[1].0, "Fix naming");
+    }
+
+    #[test]
+    fn test_review_vote_notes_roundtrip() {
+        // GARDE 2b (RFC 8bf78218): the optional `notes` field survives the
+        // JSON serialization roundtrip through the votes_json column.
+        let db = setup_db();
+        let id = Uuid::new_v4();
+        let mut round = make_round(id);
+        round.votes.push(ReviewVote {
+            reviewer: PersonaId::Pm,
+            verdict: ReviewVerdict::Approve,
+            findings: vec![],
+            notes: Some("non-corrective observation".into()),
+            submitted_at: Utc::now(),
+        });
+        db.create_round(&round).unwrap();
+
+        let fetched = db.get_round(id).unwrap().unwrap();
+        assert_eq!(
+            fetched.votes[0].notes.as_deref(),
+            Some("non-corrective observation")
+        );
     }
 
     // --- Write Permits ---

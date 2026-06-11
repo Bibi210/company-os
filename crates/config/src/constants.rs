@@ -24,7 +24,6 @@ pub const PROTECTED_ZONES_FILE: &str = "company/config/protected-zones.json";
 // --- File paths (relative to root) ---
 pub const CONFIG_FLOW_CONTROL: &str = "company/config/flow-control.yml";
 pub const CONFIG_REVIEW_PROTOCOL: &str = "company/config/review-protocol.yml";
-pub const CONFIG_HUMAN_REVIEW_TRIGGERS: &str = "company/config/human-review-triggers.yml";
 pub const PERSONAS_DIR: &str = "company/personas";
 pub const SCHEMAS_DIR: &str = "company/schemas";
 pub const LESSONS_DIR: &str = "company/lessons";

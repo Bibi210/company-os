@@ -9,23 +9,10 @@
         "spec": {
           "type": "object",
           "properties": {
-            "max_review_iterations": { "type": "integer", "minimum": 1 },
-            "budget_limits": {
-              "type": "object",
-              "properties": {
-                "max_tokens_per_task": { "type": "integer" },
-                "max_subagent_spawns": { "type": "integer" }
-              }
-            },
-            "circuit_breaker": {
-              "type": "object",
-              "properties": {
-                "consecutive_failures_threshold": { "type": "integer" },
-                "cooldown_seconds": { "type": "integer" }
-              }
-            }
+            "max_review_iterations": { "type": "integer", "minimum": 1 }
           },
-          "required": ["max_review_iterations"]
+          "required": ["max_review_iterations"],
+          "additionalProperties": false
         }
       },
       "required": ["spec"]

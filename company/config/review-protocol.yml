@@ -37,10 +37,3 @@ spec:
       - architect
     diagnostic-report:
       - architect
-  escalation_rules:
-    max_iterations_before_ceo: 3
-    ceo_cannot_approve_alone:
-      - modify-access-matrix
-      - modify-ceo-persona
-      - breaking-schema-change
-      - delete-persona

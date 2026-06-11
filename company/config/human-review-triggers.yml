@@ -5,6 +5,14 @@ metadata:
   title: Human Review Triggers
   author: ceo
   created_at: "2026-03-14"
+  description: >
+    SOURCE UNIQUE des conditions imposant une intervention humaine avant de
+    poursuivre. Absorbe l'ancien champ review-protocol.escalation_rules.
+    ceo_cannot_approve_alone (supprimé par le RFC 8bf78218) : ses 4 catégories
+    (modify-access-matrix, modify-ceo-persona, breaking-schema-change,
+    delete-persona) correspondent 1:1 aux 4 triggers ci-dessous, qui restent
+    inchangés. Toute condition d'escalade utilisateur se déclare désormais ici
+    et nulle part ailleurs.
 
 spec:
   triggers:

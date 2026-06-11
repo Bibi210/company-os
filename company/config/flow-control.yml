@@ -8,9 +8,3 @@ metadata:
 
 spec:
   max_review_iterations: 3
-  budget_limits:
-    max_tokens_per_task: 500000
-    max_subagent_spawns: 10
-  circuit_breaker:
-    consecutive_failures_threshold: 3
-    cooldown_seconds: 300

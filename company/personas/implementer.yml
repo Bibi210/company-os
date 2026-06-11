@@ -23,6 +23,8 @@ rules:
       2. Implementer modifie les fichiers protégés couverts par le permit.
       3. git add <fichiers> && git commit (commit du code).
       4. consume_write_permit() — APRÈS le commit du code, jamais avant.
+         Vérifié mécaniquement par consume_write_permit (GARDE 3 RFC 8bf78218 :
+         refus si le worktree est sale sur les target_paths du permit).
       5. cargo build && cargo test — APRÈS consommation du permit.
       6. reload_config() — EN DERNIER, uniquement si build/test verts.
       Un permit consommé avant le commit rend le commit impossible (hook rejet).
