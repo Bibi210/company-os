@@ -5,7 +5,8 @@ metadata:
   title: "V1 process lot 1 : 5 gardes serveur/schema (self-review, approve+findings, commit-puis-consume, RFC approved au grant, reviewers minimum) + purge des règles mortes"
   author: architect
   created_at: "2026-06-10"
-  status: draft
+  status: approved
+  approved_at: "2026-06-10T10:36:17.965218023+00:00"
   description: >
     Lot 1 du durcissement process (diagnostic c981bf62, phase 2 du
     task-request 11f13a9d, domaine v1-process-hardening de la roadmap
@@ -25,6 +26,25 @@ metadata:
     (additionalProperties: false) pour que la réintroduction échoue
     mécaniquement (pattern bd4650e2 : retirer plutôt qu'interdire).
   changelog:
+    - date: "2026-06-10"
+      author: architect
+      description: >
+        Itération 3 (SCOPE AMENDMENT, RFC approved — aucune décision
+        modifiée, uniquement le recensement de périmètre). L'Implementer a
+        stoppé l'exécution du plan 4b56b1b9 (étape 0, procédure STOP +
+        escalade, lesson 611fde3e) sur une divergence de caller-inventory :
+        engine.submit_vote (changement de signature GARDE 2b, +notes) a 15
+        call-sites supplémentaires dans deux fichiers de tests d'intégration
+        top-level NON listés dans affected_files — tests/integration/
+        user_stories.rs (11) et tests/integration/edge_cases.rs (4),
+        re-vérifiés par l'Architect au moment de l'amendement. Cause : le
+        scan d'inventaire (RFC itération 2 et plan étape 0.2) a couvert
+        crates/ + company/plugins/ + scripts/ + Makefile mais PAS le dossier
+        tests/ top-level du workspace. Fix purement mécanique (ajout du 5e
+        argument None aux 15 call-sites), aucune collision avec les gardes
+        1/2, aucun impact sémantique. tests/ est HORS zone protégée : le
+        permit 286abb1a reste inchangé, aucun re-grant nécessaire. Les deux
+        fichiers sont ajoutés à affected_files.modified (16 -> 18 paths).
     - date: "2026-06-10"
       author: architect
       description: >
@@ -387,3 +407,5 @@ spec:
       - company/config/human-review-triggers.yml
       - company/config/shared-rules.yml
       - company/personas/implementer.yml
+      - tests/integration/user_stories.rs
+      - tests/integration/edge_cases.rs
