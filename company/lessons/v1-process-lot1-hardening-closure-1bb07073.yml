@@ -1,0 +1,215 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 1bb07073-421c-4a4b-b647-1dc7bdac89b5
+  title: "Durcir 5 règles de process dans le harness (lot 1) : early-return + verrou schema marchent ; mais le caller-inventory limité à crates/ a re-raté un caller, malgré DEUX lessons et un RFC déjà dédiés — la prose ne suffit pas"
+  author: implementer
+  created_at: "2026-06-11"
+  description: >
+    Capitalisation de clôture du lot 1 du durcissement process V1 (RFC
+    8bf78218 implemented, plan 4b56b1b9, task-request 11f13a9d done,
+    diagnostic c981bf62). Deux enseignements indissociables : (1) la
+    technique de mécanisation qui marche pour transformer une règle de prose
+    en invariant harness (early-return côté engine/serveur MCP pour les
+    gardes comportementales + additionalProperties:false côté schema pour les
+    purges, pattern bd4650e2) ; (2) l'incident du caller-inventory : malgré la
+    règle persona eb42a8de et les lessons ea6e9dd1 + 611fde3e, j'ai limité le
+    recensement des callers de submit_vote à `rg crates/` et raté le crate de
+    tests TOP-LEVEL `tests/integration/`, découvert seulement au cargo test.
+    C'est la troisième occurrence de la même classe d'oubli APRÈS sa
+    formalisation en persona : preuve empirique que la discipline en prose
+    réduit mais n'annule pas le risque, et motivation directe pour la
+    mécanisation déterministe du pré-check de périmètre (lot 3).
+  tags:
+    - companyos-v1
+    - process
+    - hardening
+    - harness
+    - mechanical-invariant
+    - caller-inventory
+    - affected-files
+    - write-permit
+    - review-protocol
+    - companyos-internals
+    - critical-infra
+    - lessons-from-implementation
+  related:
+    - id: 8bf78218-e1f3-4bc5-864c-2abf618a990d
+      kind: rfc
+      relationship: derived-from
+    - id: 4b56b1b9-bd6f-4913-ae66-189b24824c8a
+      kind: implementation-plan
+      relationship: derived-from
+    - id: c981bf62-9d53-4ea2-8da3-c34af9d3e922
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: ea6e9dd1-93dc-4b19-9854-103328203489
+      kind: lesson-learned
+      relationship: related
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+    - id: eb42a8de-e6a9-4f7b-81d1-c91d7120b626
+      kind: rfc
+      relationship: related
+    - id: 9b2c1951-1d26-4284-add6-a295ff82cc1e
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Le lot 1 du programme v1-process-hardening (task-request 11f13a9d,
+    diagnostic c981bf62) mécanise 5 règles de process jusque-là en prose et
+    violables silencieusement, et purge 4 règles mortes :
+
+    GARDES (early-return) :
+    - GARDE 1 self_review_forbidden : engine.initiate_review_round rejette
+      author ∈ required_reviewers, engine.submit_vote rejette
+      reviewer == round.author (OrchestratorError::SelfReviewForbidden).
+    - GARDE 2 review_findings_honesty : engine.submit_vote rejette
+      approve+findings (ApproveWithFindings) ; canal légitime = nouveau champ
+      ReviewVote.notes (#[serde(default)], rétro-compatible) + paramètre MCP
+      notes ; schema review-report : if verdict==approve then findings
+      maxItems 0.
+    - GARDE 3 commit-puis-consume : consume_write_permit refuse un worktree
+      sale sur les target_paths du permit (git status --porcelain, pathspec
+      :(glob) sur les métacaractères, env git scrubbé, fail-safe si git
+      indisponible).
+    - GARDE 4 grant exige un RFC approved : grant_write_permit lit le YAML
+      source (kind==rfc && metadata.status=="approved") avant l'idempotence ;
+      draft / implemented / wrong-kind / non-indexé refusés.
+    - GARDE 5 reviewers_by_artifact_type : OrchestratorServer détient
+      Arc<RwLock<ReviewProtocol>> (rafraîchi par les 2 chemins de hot-reload :
+      watcher ConfigChangeKind::Config + tool reload_config) ;
+      initiate_review_round exige le minimum protocolaire, "all" résolu en
+      l'ensemble FERMÉ {pm, architect, implementer, ceo} moins l'auteur.
+
+    PURGE (verrou schema) : budget_limits, circuit_breaker (flow-control),
+    escalation_rules (review-protocol, ceo_cannot_approve_alone fusionné dans
+    human-review-triggers devenu source unique), et le chargement Rust de
+    human-review-triggers — chaque purge scellée par additionalProperties:false
+    pour que toute réintroduction échoue mécaniquement à make validate.
+
+    L'implémentation est passée par deux itérations de review du plan
+    (Architect) et un incident d'exécution majeur (ci-dessous), puis tout vert :
+    cargo build + cargo test workspace (152 tests orchestrator, 24
+    orchestrator-server, integration verts) + make ci.
+
+  insight: >
+    DEUX enseignements.
+
+    (1) LA TECHNIQUE DE MÉCANISATION QUI MARCHE. Transformer une règle de
+    prose en invariant harness suit deux patterns selon la nature de la règle :
+
+    - Règle COMPORTEMENTALE (un appel doit être refusé sous condition) ->
+      EARLY-RETURN en tête de la fonction qui détient l'invariant, avec une
+      variante d'erreur dédiée portant un message actionnable. Couche : engine
+      (invariant config-indépendant, ex. self-review, approve+findings) ou
+      serveur MCP (invariant nécessitant root_path / git / la config chargée,
+      ex. worktree-check, RFC-approved, reviewers-minimum). L'early-return est
+      rollback-trivial (le retirer restaure le comportement) et testable en
+      isolation. C'est le bon niveau quand la condition est mécanique même si
+      le CLASSEMENT reste du jugement (ex. GARDE 2 empêche la forme
+      approve+findings mais ne juge pas si un finding est correctif — ce
+      jugement reste en prose, à dessein).
+
+    - Règle de SUPPRESSION (un paramètre mort ne doit jamais réapparaître) ->
+      retirer le champ partout (YAML + struct Rust + constante) ET sceller le
+      schema avec additionalProperties:false (pattern bd4650e2 : retirer
+      plutôt qu'interdire). Le verrou est ce qui rend la purge DURABLE : sans
+      lui, un futur agent réintroduit le champ sans rien casser. Vérifié en
+      vif : budget_limits et escalation_rules réintroduits -> rejetés par
+      make validate ; les clés conservées (self_review_forbidden,
+      review_analysis_framework) doivent être DÉCLARÉES au schema sinon le
+      verrou les casserait (finding bloquant attrapé en review itération 1).
+
+    Corollaire de séquençage : une purge qui retire des champs Rust ET durcit
+    les schemas ET édite les YAML doit être ATOMIQUE (un seul commit), sinon un
+    état intermédiaire est soit non-compilable (Rust retiré, callers pas
+    encore adaptés) soit invalide au schema. J'ai fusionné gardes + purge en un
+    seul commit pour garantir que HEAD compile et passe make ci à tout instant.
+
+    (2) L'INCIDENT DU CALLER-INVENTORY — LA PROSE NE SUFFIT TOUJOURS PAS.
+    submit_vote est une API publique de crate dont j'ai changé la signature
+    (ajout du paramètre notes). Mon Étape 0 (caller-inventory, exigée par la
+    règle persona eb42a8de et les lessons ea6e9dd1/611fde3e) a lancé
+    `rg ".submit_vote(" crates/ company/plugins/ company/scripts/ Makefile` —
+    et a conclu "9 call-sites engine.rs + 1 main.rs, tous dans le permit".
+    FAUX : le workspace a un crate de tests TOP-LEVEL `tests/integration/`
+    (membre Cargo hors de crates/), avec 15 call-sites dans user_stories.rs +
+    edge_cases.rs. Je ne l'ai découvert qu'au `cargo test` (le `cargo build`
+    seul, sans les tests, passait), bien après le commit du code. Il a fallu un
+    amendement formel d'affected_files par l'Architect (commit 021ef0f, scope
+    16 -> 18 paths) pour légitimer la correction.
+
+    Ce qui rend l'incident significatif : c'est la TROISIÈME occurrence de
+    cette classe (après 062ebaa8 et bdee1af4 recensés par le diagnostic
+    56513173) et la PREMIÈRE APRÈS que la discipline a été inscrite en persona
+    (RFC eb42a8de, implemented). Le sanity-check AC6 de ce RFC l'avait prédit
+    mot pour mot : "la discipline en persona NE SUPPRIME PAS le risque
+    d'oubli : elle le réattribue et le rend plus saillant ; c'est un
+    déplacement de probabilité, pas une garantie. Si les oublis persistent
+    malgré la règle persona, le sujet pourra être ré-escaladé vers une
+    mécanisation déterministe." L'edge E3 du même RFC supposait même que les
+    callers de tests "vivent sous crates/**" — l'hypothèse exacte qui a
+    échoué. Mon `rg` était scopé à crates/, le crate de tests est à la racine.
+
+    La leçon n'est PAS "il faut mieux grepper" (c'est ce que la prose dit déjà,
+    trois fois). La leçon est que tant qu'un humain/agent compose à la main le
+    périmètre du grep (quels répertoires, quels globs), l'exhaustivité dépend
+    d'une hypothèse implicite sur la structure du workspace — et cette
+    hypothèse est précisément ce qui casse. Seul un mécanisme déterministe qui
+    dérive le périmètre de la VÉRITÉ du workspace (cargo metadata pour les
+    membres, ou get_references LSP qui connaît tous les crates, ou un
+    pré-check qui compare l'union des callers à target_paths AVANT le grant)
+    ferme la classe. C'est l'argument central du lot 3 (v1-harness-refactor /
+    outillage du pré-check de périmètre), désormais étayé par une donnée
+    empirique post-formalisation, pas seulement par principe.
+
+  recommendation: >
+    POUR MÉCANISER UNE RÈGLE DE PROCESS (futurs lots) :
+    1. Classer la règle : comportementale -> early-return dans la fonction qui
+       détient l'invariant (engine si config-indépendant, serveur MCP si elle
+       a besoin de root_path/git/config) avec variante d'erreur dédiée et
+       message actionnable. Suppression -> retrait complet + verrou
+       additionalProperties:false, et DÉCLARER au schema toute clé conservée
+       voisine sinon le verrou la casse.
+    2. Rendre la purge YAML + schema + Rust ATOMIQUE (un commit) pour que HEAD
+       compile et valide à tout instant.
+    3. Garder en prose UNIQUEMENT le jugement que la machine ne porte pas
+       (ex. correctif vs hors-scope d'un finding) ; mécaniser la FORME, pas le
+       JUGEMENT.
+
+    POUR LE CALLER-INVENTORY D'UNE API PUBLIQUE DE CRATE (immédiatement
+    actionnable, en attendant le lot 3) :
+    4. NE JAMAIS scoper le grep à `crates/` seul. Le périmètre doit être le
+       workspace ENTIER. Concrètement : dériver les membres via
+       `cargo metadata --format-version=1` (ou lire les `members`/`tests`
+       du Cargo.toml racine) AVANT de grepper, ou utiliser get_references LSP
+       qui couvre tous les crates et les re-exports. Au minimum, lancer
+       `rg ".<symbole>(" --glob '!target/**'` SANS restreindre le répertoire,
+       puis classer les hits.
+    5. Inclure explicitement les crates de tests/benches/examples, qu'ils
+       soient sous crates/** OU à la racine (tests/, benches/) : un test qui
+       appelle l'ancienne signature casse `cargo test` même si `cargo build`
+       passe. Le piège est que `cargo build` seul ne révèle pas ces callers.
+    6. Quand la divergence avec le permit est découverte HORS zone protégée
+       (comme tests/), s'arrêter quand même et faire valider l'extension de
+       périmètre (ici : amendement affected_files par l'Architect) : la zone
+       non-protégée n'est pas une licence pour étendre le scope silencieusement.
+
+    POUR LE PROGRAMME V1 (méta) :
+    7. Cet incident est la donnée empirique que le RFC eb42a8de attendait pour
+       ré-escalader la mécanisation déterministe du pré-check de périmètre.
+       Le lot 3 doit livrer un mécanisme qui calcule l'union des callers (ou
+       au moins le périmètre de grep) depuis cargo metadata / LSP et la compare
+       à target_paths AVANT le grant, plutôt que de laisser l'agent composer le
+       périmètre à la main. C'est l'application directe du principe directeur
+       du programme (le harness avant la prose) à la discipline qui a, elle-
+       même, échoué en prose trois fois.
+
+    Empirique : lot 1 livré et vert (RFC 8bf78218 implemented, permit 286abb1a
+    consommé après commit, 5 gardes testées en isolation + une vérifiée en vif
+    sur le serveur rechargé). 16 des 62 règles du recensement c981bf62
+    survivent désormais au test clean-company comme garanties mécaniques
+    (10 avant le lot).

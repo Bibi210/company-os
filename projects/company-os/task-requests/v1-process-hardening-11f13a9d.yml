@@ -31,7 +31,7 @@ metadata:
 
 spec:
   priority: high
-  status: in_progress
+  status: done
 
   context: >
     Principe directeur n°1 du programme V1 : le harness avant la prose. Une
