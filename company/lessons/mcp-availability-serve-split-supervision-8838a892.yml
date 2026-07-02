@@ -1,0 +1,162 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 8838a892-434d-4af3-bd07-1c655212eb1b
+  title: "Disponibilité MCP définitive : séparer le binaire servi du binaire de build supprime le déclencheur à la racine ; un core pur rend l'infra unit-testable ; le protocole MCP re-mord au re-handshake"
+  author: implementer
+  created_at: "2026-07-02"
+  description: >
+    Capitalisation de clôture de l'implémentation du RFC 18011bfc (disponibilité
+    MCP définitive, B+A+C), task-request 415c73c0 done, plan f9b07ef0,
+    diagnostic 79f13f30. Trois enseignements. (1) La stratégie qui marche pour
+    de bon : supprimer le DÉCLENCHEUR (séparation build/exécution target/serve/
+    + promotion atomique) est structurellement supérieur à durcir seulement le
+    superviseur — d9399863 avait durci le proxy mais laissait le binaire servi
+    être une cible mouvante. (2) L'extraction d'un core PUR (computeBackoff,
+    binaryReady, buildUnavailableError, extractPendingRequestIds) avec fs/parse
+    injectés rend une infra runtime critique unit-testable sans spawn ni fs, et
+    déplace la couverture triaxiale du script d'intégration lent vers node --test
+    rapide. (3) Le protocole MCP re-mord exactement là où la lesson c5413270
+    l'avait prédit : mes DRIVERS DE TEST de récupération ont crashé le serveur
+    avec "expect initialized, received initialize" faute d'un handshake complet
+    (initialize -> réponse -> initialized -> requête) — bug de harness, pas de
+    proxy, corrigé en alignant les drivers sur le handshake éprouvé.
+  tags:
+    - companyos-v1
+    - mcp
+    - proxy
+    - availability
+    - supervision
+    - atomic-deploy
+    - resilience
+    - harness
+    - critical-infra
+    - lessons-from-implementation
+  related:
+    - id: 18011bfc-c8ae-4c31-8aca-f994755b93e7
+      kind: rfc
+      relationship: derived-from
+    - id: c5413270-1634-4e44-9540-e205fb523043
+      kind: lesson-learned
+      relationship: related
+    - id: 9b2c1951-1d26-4284-add6-a295ff82cc1e
+      kind: lesson-learned
+      relationship: related
+    - id: 79f13f30-af1a-453e-9b42-962c35f93d26
+      kind: diagnostic-report
+      relationship: related
+
+spec:
+  context: >
+    Le RFC d9399863 avait rendu le proxy MCP résilient aux restarts courts
+    (buffer FIFO, health check, machine à états, circuit breaker), mais le
+    diagnostic 79f13f30 a montré que l'état "définitivement mort nécessitant un
+    humain" restait atteignable PAR DESIGN via trois couches : (1) le binaire
+    servi EST le binaire de build que make ci relink à chaque commit ; (2) le
+    circuit breaker répondait par process.exit(1) sur trois chemins sans
+    réarmement (suicide) ; (3) un spawn échoué émettait 'error'+'close' sans
+    'exit', que le proxy n'écoutait pas (zombie). Le RFC 18011bfc a tranché la
+    solution B+A+C et l'implémentation a suivi le plan f9b07ef0 sans rouvrir de
+    décision architecturale.
+
+    Déroulé d'implémentation notable :
+    - Extraction d'un module core pur (mcp-proxy-core.mjs) importé par le proxy,
+      couvert par 16 tests node --test (triaxial par fonction). Zéro spawn, zéro
+      fs direct : existsSync/accessSync et JSON.parse sont injectés.
+    - Refonte du proxy : circuit breaker et ensureBinary SUPPRIMÉS ; backoff
+      plafonné avec réarmement ; onChildGone unifié ('exit'+'error'+'close')
+      protégé par un latch par incarnation ; watch du répertoire parent filtré
+      basename ; bootstrap waiting_binary sans exit ; plafond 120s -> -32050.
+    - Le script d'intégration a été RÉÉCRIT, pas seulement étendu : l'ancien
+      Test 2 assertait "circuit breaker -> exit non-zéro" ; le volet A garantit
+      l'INVERSE (le proxy ne sort jamais). Le scénario crash-loop remplace donc
+      l'ancien test, assertion inversée (observation : 6 respawns, délais
+      croissants 205ms -> 6078ms, aucun exit).
+
+    Incident de harness révélateur : deux scénarios de RÉCUPÉRATION du script
+    d'intégration (crash-loop recovery, escalation recovery) ont d'abord échoué.
+    Le serveur Rust crashait en boucle avec "expect initialized request, but
+    received: initialize". Investigation : le proxy était CORRECT (un handshake
+    complet manuel passait) ; ce sont mes drivers de test qui envoyaient
+    initialize sans compléter la séquence MCP (réponse -> notifications/
+    initialized -> requête) avant que le child ne soit tué/respawné, ou qui
+    envoyaient une requête après recovery SANS re-handshake préalable. Fix :
+    aligner les drivers de récupération sur la fonction handshake() éprouvée
+    (initialize avec params complets -> attente réponse -> initialized ->
+    requête). Après fix : 10/10 scénarios verts.
+
+  insight: >
+    ENSEIGNEMENT 1 — SUPPRIMER LE DÉCLENCHEUR BAT DURCIR LE SUPERVISEUR.
+    d9399863 avait investi dans la résilience du proxy (superviseur) mais
+    laissait intact le déclencheur systémique : le binaire servi était le
+    binaire de build, relinké à chaque commit. Résultat : le superviseur
+    encaissait des tempêtes de restarts évitables, et les modes de mort
+    restaient atteignables par d'autres causes. La séparation build/exécution
+    (target/serve/ + promotion atomique cp+rename) supprime la CLASSE ENTIÈRE
+    "fenêtre de link" par construction : cargo ne connaît pas target/serve/,
+    donc make ci / cargo build / cargo test / git checkout ne peuvent plus,
+    structurellement, toucher le binaire servi. C'est l'application concrète du
+    principe de défense par couches du diagnostic : B supprime le déclencheur,
+    A supprime l'état terminal, C supprime la compensation par polling. Un fix
+    qui rend une classe de pannes IMPOSSIBLE par construction vaut mieux qu'un
+    fix qui la rend RÉCUPÉRABLE.
+
+    ENSEIGNEMENT 2 — UN CORE PUR REND L'INFRA RUNTIME UNIT-TESTABLE.
+    Le pattern defense-in-depth-core.mjs (core séparé du wrapper) s'applique
+    aussi au proxy. En isolant la logique pure (calcul de backoff, précondition
+    binaire, construction de l'erreur -32050, extraction des ids en attente)
+    dans un module sans effet de bord, avec les dépendances fs et le parser
+    injectés, on obtient une couverture triaxiale rapide (16 tests node --test
+    en < 100ms) là où le script d'intégration est lent et coûteux à écrire.
+    Le core teste la LOGIQUE ; le script d'intégration teste l'ORCHESTRATION
+    (spawn, watch, cycle de vie réel). Les deux sont complémentaires, pas
+    redondants. Bénéfice de bord : le plafond d'escalade a été rendu
+    configurable (MCP_PROXY_UNAVAILABLE_MS, défaut 120000 impératif dans le
+    code) précisément pour que le scénario -32050 soit testable en < 2s au lieu
+    de 120s.
+
+    ENSEIGNEMENT 3 — LE PROTOCOLE MCP RE-MORD AU RE-HANDSHAKE, EXACTEMENT COMME
+    PRÉDIT. La lesson c5413270 (implémentation d9399863) avait capturé que le
+    serveur Rust crashe avec "expect initialized notification" si la séquence
+    initialize -> réponse -> initialized n'est pas respectée. J'ai re-rencontré
+    ce mur — non pas dans le proxy (qui gère correctement le replay de
+    initialize + initialized), mais dans MES DRIVERS DE TEST de récupération,
+    qui prenaient un raccourci sur le handshake. La leçon méta : un invariant
+    de protocole externe qui a déjà mordu une fois mord AUSSI le code de test,
+    pas seulement le code de production. Tout driver qui parle à un serveur MCP
+    doit compléter le handshake, y compris après une récupération d'un état
+    d'indisponibilité — un "fresh child" attend toujours la séquence complète.
+
+  recommendation: >
+    PRATIQUE 1 — Pour toute infra qui exécute un binaire susceptible d'être
+    reconstruit, préférer un chemin d'exécution DÉDIÉ (séparé du chemin de
+    build) plutôt que de durcir la seule tolérance aux pannes. La question à se
+    poser n'est pas "comment mon superviseur survit-il au remplacement du
+    binaire ?" mais "puis-je faire en sorte que le binaire servi ne soit jamais
+    remplacé sous les pieds du superviseur ?". La promotion explicite et
+    atomique (cp .tmp + rename même filesystem) transforme une mise à jour subie
+    en acte volontaire, absorbé proprement par le buffer.
+
+    PRATIQUE 2 — Systématiser le split core-pur / wrapper-impur pour les plugins
+    et l'infra runtime : isoler tout calcul déterministe dans un module aux
+    dépendances injectées, couvert par node --test, et réserver le script
+    d'intégration à l'orchestration réelle. Rendre configurables par variable
+    d'env (avec défaut de production imperatif dans le code) les plafonds
+    temporels longs, pour que les scénarios qui les exercent restent testables
+    rapidement.
+
+    PRATIQUE 3 — Tout driver de test qui parle un protocole à handshake
+    (MCP/JSON-RPC, LSP) doit compléter le handshake AVANT toute requête, y
+    compris après un scénario de récupération : un serveur fraîchement respawné
+    est un pair vierge qui attend initialize -> réponse -> initialized. Réutiliser
+    une fonction handshake() unique et éprouvée dans tous les scénarios plutôt
+    que de dupliquer un handshake abrégé qui prend des raccourcis. Quand un test
+    de récupération échoue avec une erreur protocolaire, suspecter le driver
+    AVANT le code de production, et le confirmer par un handshake manuel complet.
+
+    NOTE DE CLÔTURE (harness avant prose, cf. 9b2c1951 et le principe V1) : ce
+    RFC remplace la règle de prose mcp_reconnect (polling LLM) par un contrat
+    mécanique porté par le proxy (buffer + -32050) et une prose réduite
+    (mcp_availability) qui ne fait que DÉCRIRE le contrat. Le test clean-company
+    est satisfait : le mécanisme vit dans company/plugins/ (préservé par
+    clean-company), pas dans la mémoire YAML effaçable.

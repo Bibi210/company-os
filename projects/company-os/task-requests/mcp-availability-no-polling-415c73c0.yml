@@ -38,7 +38,7 @@ metadata:
 
 spec:
   priority: critical
-  status: in_progress
+  status: done
 
   context: >
     Le RFC d9399863 a rendu le proxy résilient aux restarts courts (buffer
