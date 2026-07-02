@@ -1,0 +1,226 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: c129453c-3a8f-47cf-bf3e-a070e12416b0
+  title: "Ajouter .githooks/ et company/scripts/ aux zones protégées"
+  author: architect
+  created_at: "2026-07-02"
+  status: draft
+  project: company-os
+  description: >
+    Ajoute les prefixes ".githooks/" et "company/scripts/" à
+    company/config/protected-zones.json. Le pre-commit hook est le point
+    d'enforcement Layer 3 du harness : tant qu'il n'est pas en zone protégée,
+    tout agent peut le modifier sans RFC ni write permit (démontré le
+    2026-06-10, commit 916bf1d). Un harness dont le point d'enforcement est
+    librement modifiable par les agents qu'il contraint n'est pas un harness.
+    company/scripts/ est inclus par le même argument : check-artifact-naming.sh
+    est invoqué PAR le plugin defense-in-depth (chaîne d'enforcement) et
+    deploy-serve.sh est exécuté par le proxy (vecteur d'exécution de code).
+    Changement de données pur : les quatre consommateurs de la liste de
+    prefixes la lisent dynamiquement depuis le JSON, aucun code à modifier.
+    protected-zones.json est lui-même en zone protégée (company/config/) :
+    approbation CEO + write permit requis.
+  tags:
+    - companyos-v1
+    - protected-zones
+    - githooks
+    - pre-commit
+    - hardening
+    - security
+    - harness
+    - critical-infra
+  related:
+    - id: 30ab07d5-8c98-4a23-b829-0f1ba72cbfad
+      kind: task-request
+      relationship: input
+    - id: f82847f1-7ee2-4fc7-a4f5-a1685a62c152
+      kind: diagnostic-report
+      relationship: related
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: related
+    - id: c981bf62-3f28-45a3-96b6-4ba9c690d31c
+      kind: diagnostic-report
+      relationship: related
+
+spec:
+  motivation: >
+    DIRECTIVE UTILISATEUR (2026-06-10, task-request 30ab07d5) : le hook
+    pre-commit doit faire partie des fichiers protégés.
+
+    ÉTAT ACTUEL. protected-zones.json couvre company/config/,
+    company/personas/, company/schemas/, company/plugins/, crates/ et
+    opencode.json. Le harness a trois couches : Layer 1 (validation write +
+    permit, plugin defense-in-depth), Layer 2 (guard bash avec snapshot/revert,
+    même plugin), Layer 3 (pre-commit hook : validation YAML des fichiers
+    stagés, audit trail permit sur les zones protégées, make ci). Les couches
+    1 et 2 sont protégées (prefix company/plugins/). La couche 3 ne l'est pas :
+    .githooks/pre-commit (câblé via `git config core.hooksPath .githooks`,
+    Makefile cible setup) est modifiable par n'importe quel agent sans RFC ni
+    permit. Démonstration le 2026-06-10 : l'Implementer a modifié
+    .githooks/pre-commit (fix légitime de la fuite GIT_*, commit 916bf1d,
+    diagnostic f82847f1) sans aucun contrôle. Le fix était bon ; le précédent
+    est mauvais. Un agent malveillant ou confus peut neutraliser le hook
+    (exit 0 en tête de script) exactement de la même façon.
+
+    ANGLE MORT SYMÉTRIQUE : company/scripts/. Le recensement de ce RFC a
+    révélé que la chaîne d'enforcement déborde de company/plugins/ :
+    defense-in-depth-core.mjs délègue le check de naming à
+    company/scripts/check-artifact-naming.sh (appel direct, core.mjs
+    checkNaming). Protéger le plugin mais pas le script auquel il délègue
+    laisse un bypass trivial : modifier le script rend le check inopérant sans
+    toucher à la zone protégée. deploy-serve.sh, créé le 2026-07-02 dans le
+    même répertoire, est exécuté par le proxy lors du déploiement des binaires
+    serve : c'est un vecteur d'exécution de code arbitraire du même calibre
+    que le hook.
+
+    RECENSEMENT DES CONSOMMATEURS (investigation exhaustive rg + lecture).
+    Quatre consommateurs de la liste de prefixes, TOUS dynamiques, AUCUNE
+    duplication en dur de la liste :
+    (1) company/plugins/defense-in-depth-core.mjs — lit ZONES_FILE à l'init,
+        hot-reload via onProtectedZoneWrite quand protected-zones.json change ;
+    (2) .githooks/pre-commit — relit le JSON via python3 à chaque exécution ;
+    (3) crates/config/src/protected_zones.rs — is_protected() lit le JSON
+        (cache invalidé par reload(), déclenché par le watcher quand
+        company/config/ change) ;
+    (4) crates/config/src/watcher.rs — dérive les répertoires surveillés des
+        prefixes AU SPAWN du serveur (liste figée jusqu'au restart, voir
+        impact).
+    La triple divergence notée par le recensement c981bf62 porte sur la
+    logique "un permit couvre-t-il ce path" (SQL LIKE '%file%' dans le
+    pre-commit, startsWith+glob dans le mjs, path_matches dans
+    crates/orchestrator/src/db.rs), PAS sur l'appartenance à une zone.
+    L'ajout d'un prefix est donc uniforme : une seule écriture dans le JSON,
+    zéro modification de code. La divergence permit/path reste un sujet
+    v1-harness-refactor, hors périmètre ici.
+
+  proposal: >
+    CHANGEMENT UNIQUE : dans company/config/protected-zones.json, étendre
+    "prefixes" de
+      ["company/config/", "company/personas/", "company/schemas/",
+       "company/plugins/", "crates/"]
+    à
+      ["company/config/", "company/personas/", "company/schemas/",
+       "company/plugins/", "crates/", ".githooks/", "company/scripts/"]
+    Les champs "files", "personas_dir", "personas_out", "db_path" sont
+    inchangés. Aucun autre fichier à modifier : les quatre consommateurs
+    lisent la liste dynamiquement (cf. motivation).
+
+    DÉCISION TRANCHÉE — company/scripts/ EST INCLUS. Rationale :
+    (a) check-artifact-naming.sh est un maillon de la chaîne d'enforcement
+        Layer 1 (invoqué par le plugin protégé) : le protéger ferme le bypass
+        par délégation ;
+    (b) deploy-serve.sh est exécuté par le proxy : même enjeu de sécurité
+        d'exécution que le hook ;
+    (c) le coût est une ligne de plus dans le même JSON, dans le même circuit
+        RFC + permit — le périmètre reste "ajout de prefixes", pas une refonte.
+    Friction assumée : test-mcp-proxy-restart.sh (script de test itéré
+    fréquemment) passera aussi sous permit. C'est cohérent avec le système
+    existant : crates/ est protégé tests inclus. Si cette friction s'avère
+    excessive, un RFC futur pourra déplacer les scripts de test hors de
+    company/scripts/ ; on ne crée PAS d'exception par fichier ici (la
+    granularité de protected-zones.json est le prefix, et une exception
+    affaiblirait précisément ce qu'on durcit).
+
+    ACCEPTANCE TESTS DU RFC (vérification empirique post-implémentation,
+    exécutée par l'Implementer et consignée dans le rapport de review) :
+    (T1) Écriture bash sans permit sur .githooks/pre-commit (ex. append d'un
+         commentaire) → le guard Layer 2 du plugin defense-in-depth détecte et
+         REVERT ; le fichier est restauré à l'identique (diff vide vs HEAD).
+    (T2) Même tentative sur company/scripts/deploy-serve.sh → même revert.
+    (T3) Modification stagée de .githooks/pre-commit sans permit couvrant ce
+         path → `git commit` est BLOQUÉ par le pre-commit avec le diagnostic
+         "Protected zone: no write permit".
+    (T4) L'écriture LÉGITIME de protected-zones.json elle-même (l'implémentation
+         de ce RFC, sous permit CEO) passe : Layer 1 accepte, le hot-reload du
+         plugin recharge les zones, le commit passe le pre-commit avec l'audit
+         trail du permit.
+    (T5) Contrôle négatif : une écriture hors zone (ex. projects/) reste libre,
+         aucune régression du périmètre.
+
+    LIBELLÉ DU PERMIT (guidance CEO) : target_paths =
+    ["company/config/protected-zones.json"] — path exact, matché par les trois
+    implémentations divergentes de permit/path (LIKE '%path%', startsWith,
+    path_matches). Un seul fichier modifié, pas de fichier créé.
+
+  impact: >
+    QUI PEUT ENCORE MODIFIER LES HOOKS ET COMMENT. Après implémentation, toute
+    modification de .githooks/ ou company/scripts/ suit le circuit normal :
+    RFC → review → approbation CEO → grant_write_permit (target_paths couvrant
+    les fichiers exacts) → écriture → consume_write_permit → commit avec audit
+    trail. Le CEO ne modifie pas lui-même : il granté. Aucun agent, Architect
+    et Implementer compris, ne peut plus toucher ces fichiers sans permit.
+
+    CAS PIÈGE — LE HOOK S'AUTO-PROTÈGE. Le pre-commit s'exécute PENDANT le
+    commit et vérifie les zones protégées, dont désormais son propre
+    répertoire. Analyse :
+    (1) Version exécutée : git exécute le fichier du working tree via
+        core.hooksPath au moment où `git commit` est invoqué, sans cache. Un
+        agent avec permit qui modifie le hook PUIS commit exécute donc le
+        NOUVEAU hook pour ce commit même. Conséquence opérationnelle : toute
+        modification du hook doit être vérifiée AVANT le commit (au minimum
+        `bash -n .githooks/pre-commit` + exécution à blanc), car elle
+        s'applique immédiatement à elle-même.
+    (2) Auto-check : le check de zone du hook s'applique au hook lui-même.
+        C'est data-driven, pas paradoxal : si .githooks/pre-commit est stagé,
+        is_protected() matche le prefix .githooks/ et exige un permit couvrant
+        ce path, comme pour tout autre fichier. Le circuit RFC+permit couvre
+        ce cas nativement.
+    (3) RISQUE DE LOCK-OUT : un hook syntaxiquement cassé SUR DISQUE (committé
+        ou non) fait échouer tout `git commit`, y compris le commit du fix.
+        PARADE, dans l'ordre :
+        (a) hook cassé non committé → restauration depuis HEAD
+            (git restore .githooks/pre-commit) ; c'est une écriture en zone
+            protégée mais elle restaure l'état HEAD à l'identique, le guard
+            Layer 2 la voit comme un non-diff ;
+        (b) hook cassé committé → le CEO peut TOUJOURS granter un permit
+            d'urgence (grant_write_permit est une opération MCP, indépendante
+            de git et du hook) pour écrire le fix ; le COMMIT du fix, bloqué
+            par le hook cassé, passe alors par `git commit --no-verify` —
+            échappatoire HUMAINE documentée ici, JAMAIS utilisable par un
+            agent (aucune persona n'est autorisée à invoquer --no-verify ;
+            un agent face à un hook cassé produit un diagnostic-report et
+            escalade à l'utilisateur) ;
+        (c) préventif : tout futur RFC touchant .githooks/ doit inclure un
+            check de syntaxe et une exécution à blanc du hook dans ses
+            acceptance tests, avant le premier commit post-modification.
+        Note : --no-verify bypasse le Layer 3 seulement ; les Layers 1 et 2
+        (plugin) restent actifs pour les agents, c'est précisément pourquoi la
+        protection plugin + hook se verrouillent mutuellement.
+
+    EFFET DE BORD WATCHER (crates/config/src/watcher.rs). Les répertoires
+    surveillés sont dérivés des prefixes AU SPAWN : le serveur en cours ne
+    surveillera .githooks/ et les nouveaux classements qu'après restart. Sans
+    restart : (i) l'appartenance aux zones reste correcte partout (le mjs
+    hot-reload, le pre-commit relit à chaque run, le cache Rust est invalidé
+    par l'événement Config sur company/config/) — l'ENFORCEMENT est donc
+    effectif immédiatement ; (ii) seul le hot-reload déclenché par un
+    changement DANS .githooks/ manque, ce qui est sans conséquence (aucune
+    config à recharger n'y vit). Après restart, classify() mappera les
+    changements de .githooks/ et company/scripts/ sur ConfigChangeKind::Config
+    (reload de config bénin, idempotent). company/scripts/ est déjà couvert
+    par le watch récursif de company/. Aucun code à changer ; restart serveur
+    recommandé à l'implémentation par hygiène.
+
+    NON-IMPACTS. Aucune signature d'API pub de crate ne change (changement de
+    données JSON pur, la règle de recensement des callers ne s'applique pas).
+    Les tests Rust et mjs existants écrivent leurs propres
+    protected-zones.json en tempdir : insensibles au contenu du fichier réel.
+    make ci inchangé. La divergence triple permit/path (c981bf62) n'est ni
+    aggravée ni corrigée : hors périmètre, réservée à v1-harness-refactor.
+
+  rollback_plan: >
+    Retirer les prefixes ".githooks/" et "company/scripts/" de
+    protected-zones.json pour revenir à l'état antérieur. Ce retrait est
+    lui-même une écriture en zone protégée (company/config/) : il exige un
+    RFC de rollback et un permit CEO, ce qui est voulu — affaiblir le harness
+    doit coûter au moins autant que le durcir. Les quatre consommateurs étant
+    dynamiques, le retrait est effectif immédiatement (restart serveur pour la
+    liste de watch, comme à l'aller). Aucune migration de données, aucun état
+    persistant à nettoyer : les permits émis entre-temps restent valides dans
+    l'audit trail.
+
+  affected_files:
+    modified:
+      - company/config/protected-zones.json
