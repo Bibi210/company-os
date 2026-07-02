@@ -38,6 +38,20 @@ metadata:
       kind: lesson-learned
       relationship: input
   changelog:
+    - date: "2026-07-02"
+      author: pm
+      description: >
+        v1-mcp-availability LIVRÉ définitivement : RFC 18011bfc implemented
+        (diagnostic root cause 79f13f30 en 4 couches, architecture B+A+C :
+        binaires servis dans target/serve avec promotion atomique make
+        deploy-serve, supervision sans abandon dans le proxy avec zéro
+        process.exit et backoff réarmé, readiness événementielle avec
+        erreur -32050 escalate). La règle de prose mcp_reconnect est
+        supprimée au profit du contrat mcp_availability (test clean-company
+        satisfait). 62 tests JS verts, script d'intégration 10/10, make ci
+        vert. Lesson 8838a892. Le nouveau proxy s'active au prochain boot
+        de session opencode ; la mort du vieux proxy pendant le deploy
+        final était sa dernière occurrence possible.
     - date: "2026-06-11"
       author: pm
       description: >
@@ -303,9 +317,9 @@ spec:
       ref:
         type: loose
         category: exploration
-        label: "Task-request 415c73c0 : supervision/respawn événementiel, fin de la règle de prose mcp_reconnect"
-      timeframe: present
-      status: in_progress
+        label: "RFC 18011bfc implemented : target/serve + supervision sans abandon + readiness -32050, mcp_reconnect supprimée"
+      timeframe: past
+      status: done
       target_date: "2026-Q2"
       rationale: >
         Directive utilisateur (2026-06-10) après l'incident du jour : binaire
