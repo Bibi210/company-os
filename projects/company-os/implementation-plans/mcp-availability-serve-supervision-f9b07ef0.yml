@@ -1,0 +1,651 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: f9b07ef0-c3b5-43c0-ac62-df8c67f08bb4
+  title: "Implementation plan : disponibilité MCP définitive (RFC 18011bfc) — B target/serve + promotion atomique, A supervision sans abandon, C readiness événementielle"
+  author: implementer
+  created_at: "2026-07-02"
+  description: >
+    Plan d'implémentation du RFC 18011bfc (disponibilité MCP définitive,
+    architecture B + A + C, fondé sur le diagnostic 79f13f30). B — les
+    binaires servis vivent dans target/serve/, jamais touchés par cargo ;
+    la mise à jour du serveur devient une promotion atomique explicite
+    (make deploy-serve : cargo build -p → cp .tmp → chmod → mv -f). A — le
+    proxy perd tout chemin de mort définitive : circuit breaker supprimé,
+    backoff plafonné avec réarmement, onChildGone unifié + latch par
+    incarnation, watch du répertoire parent, bootstrap waiting_binary sans
+    exit. C — le buffer FIFO est le contrat de readiness ; au-delà de 120s
+    d'indisponibilité, réponse JSON-RPC -32050 (escalate:true) ; la règle
+    de prose mcp_reconnect devient mcp_availability. Le plan ne touche
+    AUCUN fichier Rust et ne lance AUCUN cargo build, à l'exception du
+    PREMIER make deploy-serve en toute fin de séquence (qui build les
+    crates pour peupler target/serve/). Contrainte forte identique à
+    d9399863 : le proxy modifié n'est PAS celui qui sert la session
+    courante ; les binaires servis (target/serve/) n'existent pas encore ;
+    la session actuelle continue d'utiliser l'ANCIEN proxy et
+    target/debug/. Le basculement effectif n'a lieu qu'au prochain boot de
+    session opencode. Les tests s'exécutent en standalone (node --test +
+    script d'intégration en sous-processus), jamais contre le proxy actif.
+    Respecte strictement write_permit_full_sequence : écriture → commit →
+    consume → validation → deploy-serve.
+  tags:
+    - companyos-v1
+    - mcp
+    - proxy
+    - availability
+    - supervision
+    - atomic-deploy
+    - resilience
+    - harness
+    - implementation
+    - write-permit
+    - critical-infra
+  related:
+    - id: 18011bfc-c8ae-4c31-8aca-f994755b93e7
+      kind: rfc
+      relationship: input
+    - id: 415c73c0-eae9-46e0-8f05-e3ff38156b3c
+      kind: task-request
+      relationship: input
+    - id: 79f13f30-af1a-453e-9b42-962c35f93d26
+      kind: diagnostic-report
+      relationship: related
+    - id: d9399863-254e-42f5-a485-ea019ce56a93
+      kind: rfc
+      relationship: related
+    - id: 15f00b90-2201-427e-bd73-c076648e121d
+      kind: implementation-plan
+      relationship: related
+
+spec:
+  steps:
+    - description: >
+        Étape 0 (préalable — check, pas une écriture) : vérifier que le
+        write permit 4678e78c-8fa2-4e60-8218-13c087f43c48 est actif et
+        couvre bien les 10 paths de affected_files du RFC via
+        check_write_permit(persona="implementer", path=...) :
+        company/plugins/mcp-proxy.mjs, company/config/opencode.json,
+        company/config/shared-rules.yml, company/personas/implementer.yml,
+        company/plugins/defense-in-depth-core.mjs, Makefile,
+        company/scripts/test-mcp-proxy-restart.sh,
+        company/scripts/deploy-serve.sh, company/plugins/mcp-proxy-core.mjs,
+        company/plugins/tests/mcp-proxy-core.test.mjs. Le permit atomique
+        RFC 359f9162 scelle déjà la DB au grant (git add -f
+        orchestrator.db + commit atomique côté serveur) : AUCUN scellement
+        manuel n'est requis, contrairement au workflow historique de
+        15f00b90. Si le permit n'est plus actif (session interrompue,
+        déjà consommé), stopper et escalader au PM avant toute écriture.
+        Recensement des "callers" (niveau fichiers, pas API pub Rust) :
+        refaire un rg rapide sur target/debug, mcp-proxy, mcp_reconnect,
+        hotreload pour confirmer que l'inventaire du RFC (opencode.json
+        L30/L37, defense-in-depth-core.mjs L148/L158 + primaire L143/L157,
+        implementer.yml, shared-rules.yml, test-mcp-proxy-restart.sh,
+        Makefile) n'a pas divergé depuis la rédaction du RFC. Si un caller
+        hors des 10 target_paths apparaît, s'arrêter et signaler à
+        l'Architect / PM AVANT écriture (cf. règle recensement des
+        callers). Ce plan n'entre en PHASE 2 (exécution) qu'après
+        approbation par l'Architect.
+      files: []
+
+    - description: >
+        Étape 1 : créer company/plugins/mcp-proxy-core.mjs — module de
+        LOGIQUE PURE testable, sans effet de bord (pas de spawn, pas de
+        fs, pas de process.exit). Même pattern que defense-in-depth-core.mjs
+        (core séparé du wrapper). Ce module exporte des fonctions pures que
+        le proxy (mcp-proxy.mjs) importe, et que les tests node --test
+        exercent en isolation. Contenu (les 4 briques pures citées par le
+        RFC section "COMPATIBILITÉ AVEC LE HARNESS DE TEST") :
+
+        (a) computeBackoff(attempt, opts) — calcul du délai de backoff
+            exponentiel plafonné avec jitter. Paramètres tranchés RFC A2 :
+            BACKOFF_INITIAL_MS=200, facteur 2, BACKOFF_CAP_MS=30000,
+            jitter ±20%. Signature pure : prend le numéro de tentative (ou
+            le délai courant) + un injecteur de random (pour tester le
+            jitter de façon déterministe : opts.random = () => 0.5 par
+            défaut Math.random) et retourne le délai en ms. Formule :
+            base = min(INITIAL * 2^attempt, CAP) ; jittered =
+            base * (1 + (random()*2 - 1) * 0.20) ; clampé à [0, CAP].
+            Exporter aussi les constantes BACKOFF_INITIAL_MS,
+            BACKOFF_CAP_MS, BACKOFF_RESET_AFTER_MS=60000, JITTER_RATIO=0.20.
+
+        (b) binaryReady(path, deps) — précondition binaire (RFC A3) : pure
+            au sens où les accès fs sont injectés via deps
+            ({ existsSync, accessSync, constants }) pour être mockables en
+            test. Retourne true ssi existsSync(path) && accessSync(path,
+            X_OK) ne jette pas. Le proxy passera les vraies fonctions
+            node:fs ; les tests passeront des mocks. (Ce découpage garde le
+            module "pur" au sens testable : aucune dépendance fs importée
+            en dur.)
+
+        (c) buildUnavailableError(id, ctx) — construction de l'erreur
+            JSON-RPC -32050 (RFC C2), STRICTEMENT au format exact spécifié :
+            { jsonrpc:"2.0", id:<id>, error:{ code:-32050,
+              message:"MCP server '<crate>' unavailable for <n>s. Do not
+              retry, do not sleep: report this failure to the user and
+              stop.", data:{ escalate:true, state:"<state>",
+              downtime_ms:<n>, binary:"<path>" } } }
+            ctx = { crate, state, downtimeMs, binary }. <n> dans le message
+            = Math.round(downtimeMs/1000). Retourne l'OBJET (le proxy le
+            sérialisera en NDJSON + "\n"). Reproduire le message mot pour
+            mot depuis le RFC, sans paraphrase.
+
+        (d) extractPendingRequestIds(lines, parse) — extraction des ids des
+            requêtes JSON-RPC EN ATTENTE portant un id (RFC C2 : au-delà du
+            plafond, le proxy répond lui-même aux requêtes en attente qui
+            ont un id ; les notifications sans id sont journalisées et
+            abandonnées). Entrée : un tableau de lignes NDJSON déjà
+            découpées + une fonction parse (JSON.parse par défaut, injectée
+            pour test). Retourne le tableau des ids (msg.id !== undefined
+            && msg.id !== null) ; ignore les lignes non-JSON et les
+            notifications (méthode sans id). Fonction pure.
+
+        Toutes ces fonctions sont sans état interne (le state machine et
+        les timers restent dans mcp-proxy.mjs, wrapper impur). Écriture
+        couverte par le permit (path mcp-proxy-core.mjs).
+      files:
+        - company/plugins/mcp-proxy-core.mjs
+
+    - description: >
+        Étape 2 : créer company/plugins/tests/mcp-proxy-core.test.mjs —
+        tests node:test des 4 fonctions pures de l'Étape 1. Le fichier tombe
+        automatiquement dans le glob de `make test-js`
+        (node --test company/plugins/tests/*.test.mjs, Makefile L31), aucun
+        changement de harness. Le répertoire company/plugins/tests/ existe
+        déjà (defense-in-depth.test.mjs, defense-in-depth-core.test.mjs,
+        hot-reload.test.mjs — vérifié). Couverture triaxiale par fonction :
+
+        computeBackoff — NOMINAL : attempt 0 → ~200ms, attempt 1 → ~400ms,
+        attempt 2 → ~800ms (avec random=0.5 → jitter nul, valeurs exactes).
+        EDGE : plafond — attempt élevé (ex. 20) clampé à BACKOFF_CAP_MS=30000
+        ± jitter ≤ 30000 ; jitter borné — random=0 → -20%, random=1 → +20%,
+        jamais négatif ; réarmement : documenter que BACKOFF_RESET_AFTER_MS
+        est la constante consommée par le wrapper (le reset lui-même est
+        testé côté intégration, la constante est vérifiée exportée).
+
+        binaryReady — NOMINAL : mock existsSync=true + accessSync ne jette
+        pas → true. NÉGATIF : existsSync=false → false (sans appeler
+        accessSync) ; accessSync jette (EACCES / ENOENT) → false. EDGE :
+        accessSync appelé avec constants.X_OK (vérifier l'argument passé).
+
+        buildUnavailableError — NOMINAL : id numérique → objet complet,
+        message contient "unavailable for 120s", data.escalate===true,
+        data.downtime_ms exact, code===-32050. EDGE : id=0 (falsy mais
+        valide JSON-RPC) préservé ; downtimeMs arrondi correctement
+        (150500ms → "150s") ; binary et state reportés tels quels.
+
+        extractPendingRequestIds — NOMINAL : 2 requêtes avec id → [id1,id2].
+        NÉGATIF : ligne non-JSON ignorée sans jeter ; notification (method
+        sans id) exclue. EDGE : id=0 inclus (!== undefined && !== null) ;
+        id=null exclu ; tableau vide → [].
+
+        Critère : node --test passe (0 failed). Écriture couverte par le
+        permit (path tests/mcp-proxy-core.test.mjs).
+      files:
+        - company/plugins/tests/mcp-proxy-core.test.mjs
+
+    - description: >
+        Étape 3 : créer company/scripts/deploy-serve.sh + câbler make
+        deploy-serve. Le script réalise la PROMOTION ATOMIQUE (RFC B2) et
+        le BOOTSTRAP (RFC B4). Structure :
+        (a) `set -euo pipefail`. REPO_ROOT dérivé de $0. SERVE_DIR=
+            "$REPO_ROOT/target/serve". mkdir -p "$SERVE_DIR" (target/ est
+            dans BASH_SAFE_PATHS du hook L38, donc écriture autorisée sans
+            permit — vérifié).
+        (b) Liste des couples (crate, binaire) :
+            (companyos-orchestrator-server, companyos-orchestrator-server),
+            (companyos-yaml-validator, companyos-yaml-validator). Le script
+            accepte un argument optionnel <crate> : si fourni, ne promeut
+            que ce crate (utilisé par le bootstrap du proxy B4 qui appelle
+            deploy-serve.sh <crate>) ; sans argument, promeut les deux (make
+            deploy-serve).
+        (c) Séquence par binaire, EXACTEMENT dans cet ordre (RFC B2) :
+            (1) cargo build -p <crate>  (build debug ; c'est le SEUL cargo
+                build du plan avant la fin — mais deploy-serve n'est appelé
+                qu'en toute fin de séquence, cf. Étape 12, ou par le
+                bootstrap du proxy au prochain boot) ;
+            (2) cp "target/debug/<bin>" "target/serve/.<bin>.tmp" ;
+            (3) chmod +x "target/serve/.<bin>.tmp" ;
+            (4) mv -f "target/serve/.<bin>.tmp" "target/serve/<bin>"
+                (rename POSIX atomique — source ET destination sous
+                target/serve, donc MÊME filesystem, atomicité garantie ;
+                le proxy observe UN seul événement de rename propre, jamais
+                un fichier absent ou partiel).
+        (d) En cas d'échec de cargo build (build cassé) : le script sort en
+            non-zéro avec un message clair. Le proxy, lui, N'EXIT PAS quand
+            le bootstrap échoue (il entre en waiting_binary, cf. Étape 4
+            volet bootstrap) — c'est la responsabilité du PROXY, pas du
+            script, de ne pas mourir.
+        (e) Sortie : log par binaire ("promoted <bin> to target/serve/"),
+            exit 0 si tout est promu.
+        Câblage Makefile : ajouter la cible `deploy-serve` (avec son
+        docstring ## et l'ajouter à .PHONY), et l'invoquer dans `setup`
+        APRÈS le build initial. Actuellement `setup: release ci` (L85) ;
+        nouvelle forme : `setup: release ci deploy-serve` OU ajout d'une
+        ligne de recette `./company/scripts/deploy-serve.sh` dans la recette
+        de setup après release/ci — choix retenu : dépendance de cible
+        `setup: release ci deploy-serve` pour rester déclaratif et cohérent
+        avec le style du Makefile. Ne PAS ajouter deploy-serve à `ci` ni à
+        `test` ni à `build` : la promotion est TOUJOURS explicite (RFC B3),
+        jamais automatique. Écritures couvertes par le permit (paths
+        deploy-serve.sh et Makefile).
+      files:
+        - company/scripts/deploy-serve.sh
+        - Makefile
+
+    - description: >
+        Étape 4 : réécrire company/plugins/mcp-proxy.mjs — refonte du proxy
+        (volet A supervision sans abandon + intégration du core + bootstrap
+        B4 + readiness C). Ce qui est CONSERVÉ de d9399863 (ne PAS casser,
+        cf. rétro-compatibilité RFC) : parser NDJSON avec StringDecoder par
+        direction, buffer FIFO pendingWrites avec backpressure
+        HIGH_WATER=256 / LOW_WATER=64 (pause/resume), replay initialize +
+        notification initialized, avalement de la réponse de re-handshake
+        (isFirstStartup), drain-aware write loop, health check post-respawn
+        (HEALTH_CHECK_TIMEOUT_MS=10000). Ce qui est REMPLACÉ / SUPPRIMÉ :
+
+        (a) SUPPRESSION du circuit breaker : retirer RESTART_WINDOW_MS,
+            MAX_RESTARTS_IN_WINDOW, restartTimestamps, recordRestart(),
+            isCircuitOpen(). Retirer les TROIS process.exit du breaker
+            (anciennement L219-224 handleHealthCheckTimeout, L305-311
+            onChildExit, L372-377 restartChild). Après cette étape, les
+            SEULS process.exit restants (RFC A1) sont : (i) erreur d'usage
+            argv au boot (binaryPath absent, actuel L23-26), (ii) exit(0)
+            du chemin stdin-end (fin de session légitime).
+
+        (b) SUPPRESSION de ensureBinary() (l'ancien execSync cargo build
+            direct dans target/debug + exit(1) sur échec, L78-91).
+            Remplacé par le BOOTSTRAP B4 : au démarrage, si
+            binaryReady(binaryPath) (import du core) est false, invoquer
+            UNE fois company/scripts/deploy-serve.sh <crate> (spawn
+            asynchrone, PAS execSync bloquant ; <crate> = basename du
+            binaire servi). En cas d'échec du script → NE PAS exit : entrer
+            en état waiting_binary, servir les erreurs structurées -32050
+            (cf. volet C ci-dessous) et retenter la promotion quand le
+            watcher du répertoire signale l'apparition du binaire.
+
+        (c) SUPPRESSION du STABILITY_RECHECK_MS + watchBinaryRedebounce
+            (échantillonnage de taille de fichier, anciennement L527-541 /
+            L549-560) : un rename atomique (B2) n'a pas d'état intermédiaire
+            à échantillonner. WATCH_DEBOUNCE_MS tombe de 4000 à 500 (RFC A3).
+
+        (d) WATCH DU RÉPERTOIRE PARENT (RFC A3) : remplacer
+            fs.watch(binaryPath) par fs.watch(dirname(binaryPath)) avec les
+            événements filtrés sur le basename attendu (le rename émet un
+            événement sur le nom de fichier dans le répertoire). inotify sur
+            un répertoire survit aux renames — ferme la cause aggravante (i)
+            du diagnostic (watcher stale après premier remplacement). Le
+            fichier temporaire ".<bin>.tmp" produit AUSSI des événements
+            dans le répertoire mais son basename NE matche PAS le basename
+            servi → ignoré par le filtre. debounce 500ms.
+
+        (e) MACHINE À ÉTATS ÉTENDUE (RFC A1) :
+            starting | ready | stopping | restarting | backoff |
+            waiting_binary | stopped. `stopped` atteignable UNIQUEMENT par
+            la fermeture de stdin par opencode.
+
+        (f) HANDLER UNIFIÉ onChildGone + LATCH PAR INCARNATION (RFC A4) :
+            'exit', 'error' ET 'close' du child sont TOUS routés vers un
+            unique handler onChildGone. Latch par incarnation d'enfant : un
+            compteur/booléen attaché à l'incarnation courante du child
+            garantit que onChildGone s'exécute EXACTEMENT UNE FOIS par
+            enfant, quel que soit l'ordre/la combinaison des événements
+            émis (ex. spawn échoué ENOENT/ETXTBSY émet 'error'+'close' sans
+            'exit' → onChildGone une seule fois → transition vers
+            backoff/waiting_binary + replanification, MÊME chemin qu'un
+            crash). Le mode zombie (couche 3 du diagnostic) devient
+            inatteignable. Le pattern child.once("close") armé APRÈS COUP
+            dans handleHealthCheckTimeout disparaît au profit du même latch
+            (le health-check timeout kill le child ; le 'close' résultant
+            est capté par onChildGone via le latch, pas par un once ad hoc).
+
+        (g) BACKOFF EXPONENTIEL PLAFONNÉ AVEC RÉARMEMENT (RFC A2) : sur
+            onChildGone (hors stopping/restarting volontaire), avant de
+            respawn, calculer le délai via computeBackoff (import du core) ;
+            passer en état backoff ; setTimeout(délai) → à échéance,
+            re-vérifier binaryReady : si OK → startChild ; sinon →
+            waiting_binary (le respawn sera déclenché par le watcher, le
+            timer de backoff n'étant que le filet). RÉARMEMENT : mémoriser
+            l'instant d'entrée en ready ; si l'enfant reste ready ≥
+            BACKOFF_RESET_AFTER_MS (60000, du core), remettre le compteur
+            de tentative à 0 (un enfant sain efface l'historique). Un crash
+            IMMÉDIAT après ready ne repart PAS de 200ms (le compteur n'a pas
+            été réarmé), ce qui évite la boucle serrée. Le backoff DIFFÈRE
+            toujours, il n'abandonne JAMAIS : aucun chemin de code ne mène
+            plus à une mort définitive.
+
+        (h) HEALTH CHECK comme CONFIRMATION post-respawn uniquement (RFC
+            A5) : conservé (replay initialize mémorisé, attente réponse,
+            HEALTH_CHECK_TIMEOUT_MS=10000 inchangé). En cas de timeout :
+            SIGTERM puis SIGKILL après 1s, puis passage en backoff via
+            onChildGone (JAMAIS d'exit). Aucun health check périodique en
+            régime établi. Le mode "vivant mais non répondant" hors restart
+            (saturation ONNX, fa9bd072) reste HORS PÉRIMÈTRE (chantier
+            0e089d1b) — ne rien ajouter à ce sujet.
+
+        (i) READINESS ÉVÉNEMENTIELLE + PLAFOND 120s (RFC C1/C2) : le buffer
+            FIFO reste le contrat (les entrants attendent dans pendingWrites
+            pendant tout état ≠ ready, rejoués après re-handshake).
+            Chronomètre d'indisponibilité : démarré à l'entrée dans un état
+            ≠ ready, REMIS À ZÉRO au retour en ready (RFC C2). Constante
+            UNAVAILABLE_ESCALATION_MS=120000. Au-delà du plafond : le proxy
+            répond LUI-MÊME aux requêtes en attente qui portent un id
+            (utiliser extractPendingRequestIds du core sur les lignes
+            bufferisées parsées), PUIS à toute nouvelle requête tant que
+            l'indisponibilité persiste, via buildUnavailableError du core
+            (id, {crate, state, downtimeMs, binary}) sérialisé en NDJSON +
+            "\n" sur process.stdout. Les notifications (sans id) sont
+            journalisées (log) et abandonnées. Dès le retour en ready, le
+            fonctionnement bufferisé normal reprend (chronomètre à zéro).
+
+        (j) stdin-end (fin de session) : conservé — state="stopping",
+            child?.kill("SIGTERM") (optional chaining sûr même si child est
+            null pendant un backoff/waiting_binary), setTimeout(exit(0), 1s).
+            C'est le SEUL chemin vers `stopped` et l'un des deux seuls
+            process.exit restants.
+
+        (k) Imports : importer computeBackoff, binaryReady,
+            buildUnavailableError, extractPendingRequestIds et les
+            constantes depuis ./mcp-proxy-core.mjs. Mettre à jour le
+            commentaire d'en-tête du fichier (retirer les mentions circuit
+            breaker / debounce 4s / ensureBinary, ajouter la référence RFC
+            18011bfc et le nouveau contrat).
+
+        Écriture couverte par le permit (path mcp-proxy.mjs). RAPPEL
+        contrainte : ce fichier réécrit ne devient actif qu'au prochain
+        boot opencode ; la session courante continue avec l'ancien proxy.
+      files:
+        - company/plugins/mcp-proxy.mjs
+
+    - description: >
+        Étape 5 : basculer company/config/opencode.json sur target/serve/
+        (RFC B1). Modifier mcp.orchestrator.command (L30) de
+        "./target/debug/companyos-orchestrator-server" vers
+        "./target/serve/companyos-orchestrator-server", et
+        mcp.yaml-validator.command (L37) de
+        "./target/debug/companyos-yaml-validator" vers
+        "./target/serve/companyos-yaml-validator". Aucune autre clé
+        modifiée (type local, environment COMPANYOS_ROOT inchangés). cargo
+        ne connaît pas target/serve/ : make ci / cargo build / cargo test
+        ne peuvent plus toucher les binaires servis, par construction
+        (acceptance criterion 4 du task-request satisfait
+        structurellement). target/ étant déjà dans BASH_SAFE_PATHS, aucune
+        modification de whitelist requise. NOTE : opencode.json n'est PAS
+        du YAML — validate_file (yaml-validator) ne s'applique pas ; la
+        validation est une relecture JSON manuelle (json parse). Écriture
+        couverte par le permit (path opencode.json). RAPPEL : ce changement
+        ne prend effet qu'au prochain boot opencode (la session courante a
+        déjà lu l'ancien opencode.json au démarrage).
+      files:
+        - company/config/opencode.json
+
+    - description: >
+        Étape 6 : basculer company/plugins/defense-in-depth-core.mjs sur
+        target/serve/ (RFC B5) — AVEC la précision de ma note de review n°1.
+        Le hook a DEUX chemins par fonction, pas un seul :
+        - validateYaml : PRIMAIRE ./target/release/companyos-yaml-validator
+          (L143), FALLBACK ./target/debug/companyos-yaml-validator (L148) ;
+        - autoIndex : PRIMAIRE ./target/release/companyos-orchestrator-server
+          (L157), FALLBACK ./target/debug/companyos-orchestrator-server
+          (L158).
+        JUSTIFICATION (note de review n°1, à consigner dans le commit et ici) :
+        make ci build en DEBUG (cargo test --workspace / cargo run -p, sans
+        --release). Les binaires RELEASE ne sont donc JAMAIS relinkés par ci ;
+        le chemin PRIMAIRE (release) du hook est DÉJÀ immunisé contre la
+        fenêtre de link. Le bénéfice réel de B5 porte sur le FALLBACK debug
+        (L148/L158), qui lui pointait sur un binaire relinké par ci. La
+        formulation du RFC "mêmes binaires stables" sous-entend un risque sur
+        le primaire qui n'existe pas en pratique.
+        DÉCISION D'IMPLÉMENTATION (tranchée ici, cohérente avec l'intent B5
+        "plus aucune validation/indexation ne peut échouer pour cause de
+        binaire en cours de link") : faire pointer le FALLBACK (L148 et L158)
+        sur ./target/serve/<bin>, qui sont désormais les binaires stables
+        servis. CONSERVER le PRIMAIRE release (L143/L157) tel quel : il reste
+        le chemin rapide préféré et est déjà stable ; le rétablir vers serve
+        n'apporterait rien et couplerait le hook à la promotion. Résultat :
+        primaire release (stable) → fallback serve (stable) ; le fallback
+        debug relinké-par-ci disparaît. Écriture couverte par le permit
+        (path defense-in-depth-core.mjs). Validation : ce fichier est
+        exercé par defense-in-depth-core.test.mjs (isSafeBashPath couvre
+        target/ générique, donc target/serve → tests NON impactés, vérifié
+        dans l'inventaire RFC) ; make test-js re-validera à l'Étape 9.
+      files:
+        - company/plugins/defense-in-depth-core.mjs
+
+    - description: >
+        Étape 7 : remplacer la règle de prose mcp_reconnect par
+        mcp_availability dans company/config/shared-rules.yml (RFC C3).
+        Retirer intégralement le bloc mcp_reconnect (avec son polling
+        "attendre quelques secondes, réessayer, jusqu'à 3 tentatives" —
+        c'est LE point condamné par la directive utilisateur) et le
+        remplacer par une règle courte mcp_availability qui DÉCRIT le
+        contrat sans le porter. Texte exact à copier depuis le RFC C3, sans
+        paraphrase :
+        « Le proxy MCP bufferise les appels pendant les indisponibilités du
+        serveur et les rejoue automatiquement : ne jamais retry ni sleep
+        sur une latence MCP. Si un appel retourne l'erreur JSON-RPC -32050
+        (escalate:true), le mécanisme a dépassé son plafond : arrêter le
+        workflow et escalader à l'utilisateur immédiatement. »
+        La règle vit dans le proxy (préservé par clean-company puisque
+        company/plugins/ n'est pas wipé) ; la prose n'est que documentation.
+        Aucune autre règle de shared-rules.yml n'est modifiée ; structure,
+        indentation, ordre des clés et métadonnées inchangés. Écriture
+        couverte par le permit (path shared-rules.yml). Validation :
+        validate_file (yaml-validator MCP) après écriture pour confirmer la
+        conformité schema project-config.
+      files:
+        - company/config/shared-rules.yml
+
+    - description: >
+        Étape 8 : réécrire la règle hotreload_last de
+        company/personas/implementer.yml pour le nouveau flux de promotion
+        (RFC B3 + C3). La règle actuelle (L31-39) affirme "cargo build sans
+        --target-dir déclenche le hot-reload des MCP servers" — cette
+        affirmation devient OBSOLÈTE : avec target/serve/, cargo ne touche
+        plus le binaire servi, donc cargo build ne déclenche plus AUCUN
+        hot-reload. Réécrire la règle pour décrire le NOUVEAU flux standard
+        d'implémentation Rust (RFC B3) : code → make ci vert →
+        consume_write_permit → `make deploy-serve` (promotion atomique =
+        acte volontaire de mise à jour du serveur, qui déclenche un restart
+        contrôlé absorbé par le buffer du proxy) → reload_config() en
+        DERNIER, uniquement si la config YAML a changé. Points à préserver
+        dans la réécriture : reload_config reste la dernière étape ;
+        conditions préalables = permits consommés + make ci vert. Points à
+        retirer : la mention "cargo build sans --target-dir déclenche le
+        hot-reload". Renommer éventuellement la règle reste optionnel (le
+        RFC parle de la "règle hotreload_last réécrite", pas renommée) —
+        conserver le nom hotreload_last pour ne pas casser d'éventuelles
+        références, mais réécrire sa description. Écriture couverte par le
+        permit (path implementer.yml). Validation : validate_file
+        (yaml-validator MCP) pour confirmer la conformité schema persona.
+      files:
+        - company/personas/implementer.yml
+
+    - description: >
+        Étape 9 : étendre company/scripts/test-mcp-proxy-restart.sh avec les
+        4 nouveaux scénarios (RFC section COMPATIBILITÉ) — ET réécrire le
+        Test 2 existant, conformément à ma note de review n°2. POINT
+        CRITIQUE (note de review n°2) : le Test 2 EXISTANT (L260-338) asserte
+        "circuit breaker tripped → proxy exit non-zéro < 15s". Le volet A
+        SUPPRIME le circuit breaker et garantit que le proxy N'EXIT JAMAIS
+        sur échec de respawn. L'assertion du Test 2 est donc INVERSÉE, pas
+        seulement étendue : "reste exécutable tel quel dans son principe"
+        (formulation du RFC) est optimiste. Le harness reste le même (bash +
+        wrapper node en heredoc, spawn du proxy en sous-processus, interface
+        inchangée node mcp-proxy.mjs <binary-path>), mais les assertions
+        changent. Adapter aussi les commentaires d'en-tête (retirer la
+        mention circuit breaker). Les 4 scénarios (RFC) :
+
+        Scénario 1 — promotion atomique → restart contrôlé UNIQUE : copier
+        le binaire yaml-validator dans un TMPDIR simulant target/serve ;
+        spawn proxy contre lui ; faire une promotion atomique (cp .tmp +
+        chmod + mv -f) ; envoyer tools/list pendant/après ; vérifier UNE
+        seule transition de restart et que la réponse revient. (Remplace
+        l'ancien Test 1 nominal touch-based ; le touch/utimes est remplacé
+        par un vrai rename atomique, aligné sur le nouveau debounce 500ms
+        au lieu de 4000ms.)
+
+        Scénario 2 — binaire supprimé → waiting_binary SANS exit puis
+        respawn à réapparition : spawn proxy contre un binaire, le rm ;
+        vérifier que le proxy N'EXIT PAS (reste vivant, état waiting_binary)
+        et bufferise ; recréer le binaire (cp atomique) ; vérifier que le
+        proxy respawn et répond. Assertion clé : proxy TOUJOURS vivant tout
+        du long.
+
+        Scénario 3 — crash-loop → backoff CROISSANT SANS exit (REMPLACE le
+        Test 2 circuit-breaker, assertion INVERSÉE) : spawn proxy contre un
+        faux binaire crashant (#!/bin/bash exit 1) ; vérifier sur une
+        fenêtre (ex. 20s) que le proxy NE SORT PAS (l'ancien test attendait
+        l'inverse : exit non-zéro < 15s), que les délais entre tentatives
+        de respawn CROISSENT (observer les logs de backoff), et qu'il reste
+        superviseur. Puis remplacer le faux binaire par un binaire sain
+        (cp atomique) et vérifier la récupération. Assertion clé : exit
+        code du proxy reste "toujours vivant" (kill par le driver en fin de
+        test, pas un self-exit).
+
+        Scénario 4 — indisponibilité > plafond → réception de l'erreur
+        -32050 PUIS récupération : spawn proxy contre un binaire absent
+        (waiting_binary) ; envoyer une requête avec id ; réduire le plafond
+        pour le test si le proxy expose une variable d'env de tuning (sinon
+        documenter que le test attend UNAVAILABLE_ESCALATION_MS ; préférer
+        rendre le plafond configurable via env pour un test rapide — à
+        trancher à l'écriture, option : env MCP_PROXY_UNAVAILABLE_MS lue par
+        le proxy avec défaut 120000) ; vérifier la réception d'une réponse
+        JSON-RPC error code=-32050, data.escalate===true, au même id ; puis
+        créer le binaire (cp atomique) et vérifier que le fonctionnement
+        bufferisé normal reprend (une nouvelle requête reçoit un result).
+
+        Sortie TAP-like conservée, exit 0 si tout passe. Écriture couverte
+        par le permit (path test-mcp-proxy-restart.sh).
+      files:
+        - company/scripts/test-mcp-proxy-restart.sh
+
+    - description: >
+        Étape 10 : validation locale AVANT commit, SANS toucher au serveur
+        de session courante. Aucune de ces validations ne lance cargo build
+        (sauf éventuellement le pré-check du binaire de test s'il est
+        absent, mais ce build cible target/debug et n'affecte pas la session
+        qui, elle, utilise encore target/debug via l'ANCIEN opencode.json en
+        mémoire — et de toute façon l'ancien proxy est celui qui sert). Ordre :
+        (a) chmod +x company/scripts/deploy-serve.sh et
+            company/scripts/test-mcp-proxy-restart.sh si nécessaire.
+        (b) make test-js → doit être VERT (0 failed). Exerce
+            mcp-proxy-core.test.mjs (nouveau), defense-in-depth*.test.mjs et
+            hot-reload.test.mjs (non impactés). C'est la CI interne des
+            plugins JS.
+        (c) Exécuter le script d'intégration standalone :
+            ./company/scripts/test-mcp-proxy-restart.sh → doit être VERT
+            (TAP tous ok, exit 0). Le script spawn le proxy MODIFIÉ en
+            sous-processus avec son propre stdin/stdout ; l'instance qui
+            sert la session opencode courante n'est PAS affectée.
+        (d) Cas d'échec : NE PAS commiter, NE PAS consommer le permit.
+            Produire un diagnostic-report (projects/company-os/
+            diagnostic-reports/…) avec le symptôme précis (sortie TAP, logs
+            proxy, ligne qui échoue), revenir au PM. Le permit reste actif
+            pour un fix.
+      files: []
+
+    - description: >
+        Étape 11 : commit local (AVANT consume — GARDE 3 RFC 8bf78218 le
+        vérifie : consume refuse si le worktree est sale sur les
+        target_paths). Conformément à write_permit_full_sequence points 3-4 :
+        (a) git add des 10 fichiers couverts par le permit + le présent
+            implementation-plan :
+            company/plugins/mcp-proxy.mjs, company/plugins/mcp-proxy-core.mjs,
+            company/plugins/tests/mcp-proxy-core.test.mjs,
+            company/scripts/deploy-serve.sh,
+            company/scripts/test-mcp-proxy-restart.sh,
+            company/config/opencode.json, company/config/shared-rules.yml,
+            company/personas/implementer.yml,
+            company/plugins/defense-in-depth-core.mjs, Makefile,
+            projects/company-os/implementation-plans/mcp-availability-serve-supervision-f9b07ef0.yml
+        (b) git status : vérifier qu'AUCUN autre fichier n'est staged (la DB
+            orchestrator.db a déjà été scellée automatiquement au grant du
+            permit, RFC 359f9162 — ne PAS la restager).
+        (c) git commit, message :
+            "feat(mcp): definitive MCP availability — serve/ split + atomic deploy + supervision + event readiness (RFC 18011bfc)"
+            corps : référencer RFC 18011bfc, task-request 415c73c0,
+            diagnostic 79f13f30, plan f9b07ef0 ; lister B/A/C ; consigner
+            les deux notes de review appliquées (B5 primaire release cité +
+            fallback serve ; Test 2 assertion inversée). PAS de push.
+        (d) Si le commit est rejeté par les hooks defense-in-depth :
+            corriger le point signalé et créer un commit ADDITIONNEL (pas
+            d'amend, cf. règle git globale).
+        NB : NE PAS lancer cargo build ici — aucun fichier Rust modifié,
+        le hot-reload subi n'existe plus (target/serve).
+      files: []
+
+    - description: >
+        Étape 12 : séquence finale post-commit, dans l'ordre strict.
+        (a) consume_write_permit(token=<token implementer>,
+            persona="implementer",
+            permit_id="4678e78c-8fa2-4e60-8218-13c087f43c48"). APRÈS le
+            commit (GARDE 3 vérifie worktree propre sur les target_paths).
+            Si erreur "worktree dirty" : un fichier couvert n'est pas
+            committé → git status, committer, re-consume. Si "already
+            consumed"/"expired" : diagnostic-report + PM.
+        (b) rfc_set_implemented(id="18011bfc-c8ae-4c31-8aca-f994755b93e7") —
+            transition approved → implemented (server-side, aucun permit
+            requis).
+        (c) task-request 415c73c0 → status done : le task-request est un
+            artifact PROJET (non protégé) ; l'éditer via Edit pour passer
+            spec.status (ou le champ de statut du schema task-request) à
+            "done", puis validate_file. Auto-indexé par le hook. (Vérifier
+            le nom exact du champ statut dans le schema task-request avant
+            édition.)
+        (d) lesson-learned de clôture : d'abord search() sur "mcp proxy
+            availability atomic deploy supervision backoff" pour situer la
+            nouvelle lesson dans la chaîne (lessons liées : c5413270 "test
+            scripté révèle des bugs que les RFC ne capturent pas", 611fde3e
+            "affected_files doit inventorier created", et le fil
+            mcp/proxy/resilience). Créer la lesson (kind lesson-learned,
+            global, company/lessons/) capturant : (1) la stratégie qui
+            marche = séparer le binaire servi du binaire de build supprime
+            le déclencheur à la racine, plus efficace que durcir le
+            superviseur seul ; (2) le harness avant la prose = remplacer un
+            polling LLM (mcp_reconnect) par un contrat mécanique
+            (buffer + -32050) ; (3) l'extraction d'un core pur testable
+            (backoff, précondition, erreur, ids) rend une infra critique
+            unit-testable sans spawn. Lier via metadata.related
+            (derived-from RFC 18011bfc ; related c5413270 ; supersedes si
+            une lesson mcp_reconnect devenue fausse est trouvée).
+        (e) PREMIER make deploy-serve : `make deploy-serve` (ou
+            ./company/scripts/deploy-serve.sh) — c'est le SEUL cargo build
+            du plan. Il build les deux crates en debug et peuple
+            target/serve/ avec les binaires servis, prêts pour le PROCHAIN
+            boot de session opencode (qui lira le nouveau opencode.json
+            pointant sur target/serve et lancera le nouveau proxy). NB : ce
+            deploy-serve n'affecte PAS la session courante — l'ancien proxy
+            sert encore target/debug ; target/serve est simplement prêt.
+        (f) reload_config() n'est PAS requis ici : aucune modification n'a
+            porté sur la config orchestrator côté Rust (le protocole
+            reload_config est inchangé, RFC fa9bd072/proposal). Les
+            changements de config sont YAML de personas/shared-rules,
+            rechargés par opencode au prochain boot, pas par reload_config.
+            Ne PAS appeler reload_config (éviterait de couper la session
+            courante pour rien).
+        (g) Note au PM (retour du Task tool) : implémentation committée et
+            permit consommé ; le basculement effectif (proxy réécrit +
+            opencode.json target/serve) n'a lieu qu'au PROCHAIN boot
+            opencode ; recommander un resume utilisateur quand il le
+            souhaite ; aucune urgence, l'ancien proxy continue avec ses
+            limites connues jusque-là.
+      files: []
+
+  dependencies:
+    - "Write permit 4678e78c-8fa2-4e60-8218-13c087f43c48 actif et couvrant les 10 target_paths (vérifié à l'Étape 0). DB scellée automatiquement au grant (RFC 359f9162), aucun scellement manuel requis."
+    - "node (>= 18) disponible dans le PATH — déjà requis par le proxy et les plugins, dépendance implicite. node:test disponible pour make test-js."
+    - "cargo/rust toolchain disponible pour le PREMIER make deploy-serve (Étape 12e) et le pré-check éventuel du binaire de test (Étape 10). Aucun autre cargo build dans le plan."
+    - "Approbation préalable de ce plan par l'Architect (review round) avant d'entrer en PHASE 2 d'exécution (write_permit_gate)."
+    - "target/ est dans BASH_SAFE_PATHS du hook defense-in-depth (L38) : deploy-serve.sh peut écrire target/serve/ sans permit. Vérifié."
+
+  risks:
+    - "Risque 1 — Session courante utilise l'ANCIEN proxy et target/debug pendant toute l'implémentation. Les binaires servis (target/serve) n'existent qu'après l'Étape 12e. Le basculement effectif (nouveau proxy + opencode.json) n'a lieu qu'au prochain boot opencode. Mitigation : c'est le comportement ATTENDU et sûr (identique à d9399863) ; la preuve du fix vient des tests standalone (Étapes 2/10), pas de l'absence de régression dans la session courante. Aucun cargo build sur target/debug n'est lancé avant l'Étape 12, donc l'ancien proxy n'est pas perturbé par ce plan."
+    - "Risque 2 — Le rename atomique mv -f n'est atomique que sur le MÊME filesystem. Mitigation : source (.<bin>.tmp) et destination (<bin>) sont TOUTES DEUX sous target/serve/, donc même filesystem par construction ; l'atomicité POSIX est garantie. deploy-serve.sh crée le .tmp dans target/serve/, pas dans /tmp."
+    - "Risque 3 — Test 2 existant du script d'intégration asserte l'INVERSE du nouveau comportement (exit sur circuit breaker vs jamais d'exit). Mitigation : ma note de review n°2 est intégrée à l'Étape 9 ; le scénario 3 REMPLACE (assertion inversée) le Test 2, il ne l'étend pas. Le risque est de croire la formulation RFC 'reste exécutable tel quel dans son principe' et d'oublier d'inverser l'assertion — l'Étape 9 le prévient explicitement."
+    - "Risque 4 — B5 : le hook a un chemin primaire release (L143/L157) non cité par le RFC, en plus du fallback debug (L148/L158). Mitigation : ma note de review n°1 est intégrée à l'Étape 6 ; décision tranchée = fallback → serve, primaire release conservé (déjà stable, non relinké par ci qui build en debug). Documenté dans le commit."
+    - "Risque 5 — spawn du bootstrap deploy-serve.sh (Étape 4b) échoue (build cassé). Mitigation : le proxy N'EXIT PAS (waiting_binary), sert -32050 au-delà du plafond, retente à l'apparition du binaire via le watcher. C'est précisément le comportement A/B/C ; aucun chemin de mort."
+    - "Risque 6 — Le watch du répertoire capte les événements du fichier .<bin>.tmp en plus du binaire servi. Mitigation : filtre sur le basename attendu (Étape 4d) ; le basename .<bin>.tmp ne matche pas <bin>, donc ignoré. Le rename final émet un événement sur <bin>, capté."
+    - "Risque 7 — Latch par incarnation mal implémenté → onChildGone exécuté deux fois (double respawn) ou zéro fois (zombie de retour). Mitigation : latch attaché à l'incarnation courante du child (un jeton par spawn), vérifié+consommé atomiquement en tête de onChildGone ; couvert par le scénario 3 (crash-loop) du script d'intégration qui observerait un double respawn comme anomalie de cadence de backoff."
+    - "Risque 8 — Le plafond 120s rend le scénario 4 du test d'intégration très lent. Mitigation : rendre UNAVAILABLE_ESCALATION_MS configurable via variable d'env (défaut 120000), lue par le proxy, pour un test rapide (Étape 9 scénario 4). À trancher à l'écriture ; si non configurable, le test devra tolérer 120s ou être marqué long."
+    - "Risque 9 — Commit rejeté par les hooks defense-in-depth (schema, naming, ou permit incomplet). Mitigation : les 10 paths sont couverts par le permit (vérifié Étape 0) ; en cas de rejet, commit additionnel après fix (pas d'amend, règle git globale)."
+    - "Risque 10 — consume_write_permit refusé par GARDE 3 (worktree sale sur un target_path). Mitigation : l'Étape 11 (commit) précède strictement l'Étape 12a (consume) ; git status vérifié avant consume ; tous les target_paths committés ensemble."
