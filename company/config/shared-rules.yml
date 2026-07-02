@@ -230,26 +230,13 @@ spec:
         pour obtenir un token secret. Ce token est requis pour les opérations privilégiées :
         grant_write_permit (CEO uniquement), submit_review_vote, consume_write_permit.
         Ne jamais écrire le token dans un fichier ni le partager avec un autre agent.
-    mcp_reconnect:
+    mcp_availability:
       description: >
-        Le proxy MCP (company/plugins/mcp-proxy.mjs) gère de manière transparente
-        les restarts du binaire serveur déclenchés par cargo build ou
-        reload_config(). Les messages MCP envoyés pendant un restart sont
-        bufferisés et rejoués après health check, donc les appels doivent
-        normalement réussir sans intervention de l'agent (le seul délai
-        observable est le temps de re-handshake, typiquement 1 à 5 secondes).
-
-        Si malgré tout un appel MCP échoue avec une erreur de connexion
-        (timeout, connection refused, broken pipe, EOF, tool not found), c'est
-        le signe d'un problème plus profond (proxy lui-même cassé, OOM,
-        circuit breaker du proxy ouvert sur restart loop, etc.). NE PAS
-        considérer l'opération comme échouée immédiatement. Procédure :
-        attendre quelques secondes, puis réessayer l'appel. Répéter jusqu'à 3
-        tentatives espacées de quelques secondes. Si après 3 tentatives le
-        serveur ne répond toujours pas, produire un diagnostic-report et
-        escalader à l'utilisateur.
-        Ne jamais abandonner un workflow en cours à cause d'une coupure MCP
-        transitoire.
+        Le proxy MCP bufferise les appels pendant les indisponibilités du
+        serveur et les rejoue automatiquement : ne jamais retry ni sleep sur
+        une latence MCP. Si un appel retourne l'erreur JSON-RPC -32050
+        (escalate:true), le mécanisme a dépassé son plafond : arrêter le
+        workflow et escalader à l'utilisateur immédiatement.
     continuous_improvement:
       description: >
         Chaque agent doit être consciencieux et proactif dans l'amélioration des processus.

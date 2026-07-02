@@ -30,13 +30,24 @@ rules:
       Un permit consommé avant le commit rend le commit impossible (hook rejet).
   hotreload_last:
     description: >
-      reload_config() est TOUJOURS la dernière étape d'un workflow d'implémentation.
-      Conditions préalables obligatoires :
-      (a) tous les write permits actifs consommés via consume_write_permit(),
-      (b) cargo build (sans --target-dir) exécuté avec succès — c'est cet appel précis, sans --target-dir, qui déclenche le hot-reload des MCP servers,
-      (c) cargo test exécuté avec succès (0 failed).
-      Raison : reload_config() peut recharger le binaire MCP et couper la connexion active,
-      perdant le contexte de session.
+      Flux de promotion du serveur MCP (RFC 18011bfc). Depuis la séparation
+      build/exécution, les binaires servis vivent dans target/serve/ et cargo
+      ne les touche plus : un cargo build / make ci / git checkout n'a plus
+      AUCUN effet sur la session MCP. Il n'y a donc plus de hot-reload subi.
+      La mise à jour du serveur est un acte VOLONTAIRE et explicite.
+      Ordre du workflow standard d'implémentation Rust :
+      (a) code → make ci vert (CI interne : build + tests + lint + validate) ;
+      (b) tous les write permits actifs consommés via consume_write_permit() ;
+      (c) `make deploy-serve` — promotion atomique (cp + rename) qui remplace
+          les binaires servis et déclenche un restart CONTRÔLÉ, absorbé de
+          façon transparente par le buffer FIFO du proxy (aucun retry, aucun
+          sleep côté agent) ;
+      (d) reload_config() EN DERNIER, uniquement si la config orchestrator
+          côté Rust a effectivement changé — c'est l'ultime étape.
+      Raison : reload_config() peut recharger la config active et perturber la
+      session ; il reste donc la dernière étape. La promotion (deploy-serve)
+      est ce qui met réellement le nouveau serveur en service, au moment que
+      l'Implementer choisit.
   write_permit_gate:
       description: >
         Tout RFC approuvé ciblant des fichiers en zone protégée doit disposer d'un implementation-plan

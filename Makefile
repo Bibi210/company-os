@@ -1,4 +1,4 @@
-.PHONY: build check fmt clippy lint test test-js validate check-naming release ci setup clean
+.PHONY: build check fmt clippy lint test test-js validate check-naming release ci deploy-serve setup clean
 
 ## Default target
 all: setup
@@ -45,6 +45,13 @@ release:
 ## Full CI pipeline
 ci: lint test test-js validate check-naming
 
+## Promote MCP server binaries into target/serve/ (atomic deploy, RFC 18011bfc).
+## Explicit act ONLY — never invoked by ci/test/build. This is the deliberate
+## "update the served server now" step; the controlled restart it triggers is
+## absorbed by the proxy buffer.
+deploy-serve:
+	./company/scripts/deploy-serve.sh
+
 ## Clean build artifacts
 clean:
 	cargo clean
@@ -81,7 +88,7 @@ clean-company: clean
 	rm -f company/agent-messages/*.yml   # TRANSITIONAL: removed by RFC 3d9f0b0c (agent-message kind retirement)
 	@echo "All artifacts wiped. Personas/config/schemas preserved. Run 'make setup' to rebuild."
 
-## Full setup: git hooks + release build + CI (run once after clone)
-setup: release ci
+## Full setup: git hooks + release build + CI + serve promotion (run once after clone)
+setup: release ci deploy-serve
 	git config core.hooksPath .githooks
-	@echo "Setup complete: git hooks configured, release binaries built, CI passed."
+	@echo "Setup complete: git hooks configured, release binaries built, CI passed, served binaries promoted to target/serve/."

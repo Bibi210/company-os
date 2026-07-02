@@ -27,14 +27,14 @@
   "mcp": {
     "orchestrator": {
       "type": "local",
-      "command": ["node", "./company/plugins/mcp-proxy.mjs", "./target/debug/companyos-orchestrator-server"],
+      "command": ["node", "./company/plugins/mcp-proxy.mjs", "./target/serve/companyos-orchestrator-server"],
       "environment": {
         "COMPANYOS_ROOT": "."
       }
     },
     "yaml-validator": {
       "type": "local",
-      "command": ["node", "./company/plugins/mcp-proxy.mjs", "./target/debug/companyos-yaml-validator"],
+      "command": ["node", "./company/plugins/mcp-proxy.mjs", "./target/serve/companyos-yaml-validator"],
       "environment": {
         "COMPANYOS_ROOT": "."
       }

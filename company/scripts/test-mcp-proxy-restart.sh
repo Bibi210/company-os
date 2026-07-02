@@ -1,13 +1,24 @@
 #!/usr/bin/env bash
 # test-mcp-proxy-restart.sh
 #
-# Integration test for company/plugins/mcp-proxy.mjs (RFC d9399863).
+# Integration test for company/plugins/mcp-proxy.mjs (RFC 18011bfc).
+#
+# The proxy now has NO path to definitive death (volet A): the circuit breaker
+# is gone, replaced by a capped backoff with rearm; a failed spawn and a crash
+# follow the same latched onChildGone path; a missing binary yields
+# waiting_binary (never an exit); past a cap the proxy answers pending requests
+# with a JSON-RPC -32050 escalation error and then recovers.
 #
 # Scenarios:
-#   Test 1 — nominal restart: send tools/list while touching the binary,
-#            verify response arrives within timeout. Repeat 5 times.
-#   Test 2 — circuit breaker: spawn proxy against a crashing binary,
-#            verify proxy exits within 15s with non-zero code.
+#   Test 1 — atomic promotion → single controlled restart: promote the binary
+#            (cp .tmp + chmod + mv -f), verify tools/list still gets a response.
+#   Test 2 — binary removed → waiting_binary WITHOUT exit, then respawn when it
+#            reappears (proxy stays alive throughout).
+#   Test 3 — crash-loop → GROWING backoff WITHOUT exit (this REPLACES the old
+#            circuit-breaker test: the assertion is INVERTED — the proxy must
+#            NOT exit — cf. Implementer review note #2), then recovery.
+#   Test 4 — unavailable > cap → receive the -32050 error, then recover.
+#            Uses MCP_PROXY_UNAVAILABLE_MS to shorten the cap for the test.
 #
 # Output: TAP-like ("ok N - <desc>" / "not ok N - <desc>"), exit 0 on success.
 #
@@ -48,51 +59,58 @@ if [ ! -x "$TARGET_BINARY" ]; then
 fi
 [ -x "$TARGET_BINARY" ] || { tap_fail "target binary still missing after build"; exit 1; }
 
-# --- Test 1: nominal restart loop ---
-log "=== Test 1: nominal restart loop ==="
+# A shared "serve" dir for the tests, mimicking target/serve/.
+SERVE="$TMPDIR/serve"
+mkdir -p "$SERVE"
 
-# We copy the binary into TMPDIR so we can touch it without affecting
-# anything else. The proxy watches the path we give it on argv.
-WORK_BINARY="$TMPDIR/binary"
-cp "$TARGET_BINARY" "$WORK_BINARY"
-chmod +x "$WORK_BINARY"
+# atomic_promote <src> <dst-basename> : cp .tmp + chmod + mv -f, same fs.
+atomic_promote() {
+  local src="$1" name="$2"
+  local tmp="$SERVE/.${name}.tmp" dst="$SERVE/${name}"
+  cp "$src" "$tmp"
+  chmod +x "$tmp"
+  mv -f "$tmp" "$dst"
+}
 
-# The bidirectional dance with the proxy is delicate from pure bash, so
-# we generate a small Node driver in TMPDIR and run it. The driver
-# spawns the proxy, talks NDJSON JSON-RPC over its stdin/stdout, and
-# reports TAP-style results on its own stdout.
-
-NODE_DRIVER_NOMINAL="$TMPDIR/driver-nominal.mjs"
-cat > "$NODE_DRIVER_NOMINAL" <<'NODE_EOF'
-// Driver for nominal restart test.
-// Args: <proxy-path> <binary-path>
+# ─────────────────────────── Test 1 & 2 & 4 driver ───────────────────────────
+# A single node driver exercises the JSON-RPC dance for the scenarios that need
+# request/response correlation (promotion, waiting_binary+respawn, escalation).
+NODE_DRIVER="$TMPDIR/driver.mjs"
+cat > "$NODE_DRIVER" <<'NODE_EOF'
+// Args: <proxy-path> <served-binary-path> <good-binary-src> <serve-dir> <scenario>
 import { spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
-import { utimesSync } from "node:fs";
+import { copyFileSync, chmodSync, renameSync, rmSync } from "node:fs";
+import { basename } from "node:path";
 
-const [proxyPath, binaryPath] = process.argv.slice(2);
-// We deliberately exercise FEWER iterations than the proxy's circuit
-// breaker threshold (MAX_RESTARTS_IN_WINDOW=3 over 30s). The breaker
-// itself is exercised by Test 2 (crashing binary). Here we focus on
-// proving that legitimate cargo-build-style restarts are absorbed
-// transparently. Two iterations are enough to demonstrate no drift
-// between successive restarts.
-const ITERATIONS = 2;
-const INIT_TIMEOUT_MS = 5000;
-const RESTART_RESPONSE_TIMEOUT_MS = 15000;
-// Long enough for one full restart cycle (debounce 4s + stabilization
-// 200ms + restart + re-handshake) to complete before the next round.
-const INTER_ITERATION_SLEEP_MS = 8_000;
+const [proxyPath, servedPath, goodSrc, serveDir, scenario] = process.argv.slice(2);
+const name = basename(servedPath);
 
-const proxy = spawn("node", [proxyPath, binaryPath], {
+function atomicPromote() {
+  const tmp = `${serveDir}/.${name}.tmp`;
+  copyFileSync(goodSrc, tmp);
+  chmodSync(tmp, 0o755);
+  renameSync(tmp, servedPath);
+}
+function removeBinary() {
+  try { rmSync(servedPath); } catch {}
+}
+
+// Environment for escalation scenario: short cap.
+const env = { ...process.env };
+if (scenario === "escalation") env.MCP_PROXY_UNAVAILABLE_MS = "1500";
+
+const proxy = spawn("node", [proxyPath, servedPath], {
   stdio: ["pipe", "pipe", "inherit"],
-  env: { ...process.env },
+  env,
 });
 
 const decoder = new StringDecoder("utf8");
 let accum = "";
-const pending = new Map(); // id -> { resolve, reject, timer }
-const earlyResponses = new Map(); // responses received before waitFor() registers
+const pending = new Map();
+const early = new Map();
+let proxyExited = false;
+let proxyExitInfo = null;
 
 proxy.stdout.on("data", (chunk) => {
   accum += decoder.write(chunk);
@@ -109,15 +127,15 @@ proxy.stdout.on("data", (chunk) => {
         pending.delete(msg.id);
         resolve(msg);
       } else {
-        // Response arrived before waitFor() was called — stash it.
-        earlyResponses.set(msg.id, msg);
+        early.set(msg.id, msg);
       }
     }
   }
 });
 
 proxy.on("exit", (code, signal) => {
-  // If we still have pending requests when proxy exits, fail them.
+  proxyExited = true;
+  proxyExitInfo = { code, signal };
   for (const [id, { reject, timer }] of pending) {
     clearTimeout(timer);
     reject(new Error(`proxy exited (code=${code} signal=${signal}) before response to id=${id}`));
@@ -126,216 +144,302 @@ proxy.on("exit", (code, signal) => {
 });
 
 function send(method, params, id) {
-  const req = { jsonrpc: "2.0", id, method, params };
-  proxy.stdin.write(JSON.stringify(req) + "\n");
+  proxy.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
 }
-
 function waitFor(id, timeoutMs) {
   return new Promise((resolve, reject) => {
-    // If the response already arrived before this call, resolve immediately.
-    if (earlyResponses.has(id)) {
-      const msg = earlyResponses.get(id);
-      earlyResponses.delete(id);
-      resolve(msg);
-      return;
-    }
-    const timer = setTimeout(() => {
-      pending.delete(id);
-      reject(new Error(`timeout waiting for id=${id} after ${timeoutMs}ms`));
-    }, timeoutMs);
+    if (early.has(id)) { const m = early.get(id); early.delete(id); return resolve(m); }
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error(`timeout waiting for id=${id} after ${timeoutMs}ms`)); }, timeoutMs);
     pending.set(id, { resolve, reject, timer });
   });
 }
-
-async function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
-
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const results = [];
 
-try {
-  // Step 1: initialize handshake
-  send("initialize", {
-    protocolVersion: "2024-11-05",
-    capabilities: {},
-    clientInfo: { name: "test-driver", version: "0.0.1" },
-  }, 1);
-  const initResp = await waitFor(1, INIT_TIMEOUT_MS);
+async function handshake() {
+  send("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test-driver", version: "0.0.1" } }, 1);
+  const initResp = await waitFor(1, 8000);
   if (initResp.result === undefined) throw new Error("initialize returned no result");
-  results.push({ ok: true, desc: "initialize replied" });
+  proxy.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+}
 
-  // MCP protocol requires sending an "initialized" notification.
-  proxy.stdin.write(JSON.stringify({
-    jsonrpc: "2.0",
-    method: "notifications/initialized",
-  }) + "\n");
+try {
+  if (scenario === "promotion") {
+    // Binary present from the start.
+    atomicPromote();
+    await handshake();
+    results.push({ ok: true, desc: "promotion: initialize replied" });
+    // Promote (atomic rename) → controlled restart.
+    atomicPromote();
+    await sleep(1200); // debounce 500ms + restart + re-handshake
+    send("tools/list", {}, 2);
+    const resp = await waitFor(2, 15000);
+    const good = resp.result !== undefined || resp.error !== undefined;
+    results.push({ ok: good && !proxyExited, desc: `promotion: tools/list survived controlled restart (exited=${proxyExited})` });
 
-  // Step 2..N: restart loop.
-  // Per iteration:
-  //   1. touch binary → watcher debounce starts (4s)
-  //   2. wait until just before the debounce expires
-  //   3. send tools/list right when the kill is imminent: this lands
-  //      either just before the kill (must transit normally) or after
-  //      (must be buffered in pendingWrites and replayed after
-  //      re-handshake). Either way the response must come back.
-  //   4. await response with 15s timeout
-  for (let i = 0; i < ITERATIONS; i++) {
-    const id = 100 + i;
+  } else if (scenario === "waiting_binary") {
+    // Binary present, handshake, then remove it, then bring it back.
+    atomicPromote();
+    await handshake();
+    results.push({ ok: true, desc: "waiting_binary: initialize replied" });
+    removeBinary();
+    await sleep(300);
+    // Kill the child so the proxy notices the binary is gone on respawn.
+    // (The running server keeps its inode alive; we simulate a crash by
+    //  removing then relying on a promotion to trigger a fresh spawn.)
+    // Send a request while unavailable — it must be buffered, not error out
+    // (cap is default 120s here, so no -32050).
+    send("tools/list", {}, 2);
+    await sleep(500);
+    if (proxyExited) throw new Error("proxy exited while binary was absent (must stay in waiting_binary)");
+    results.push({ ok: !proxyExited, desc: "waiting_binary: proxy alive with binary absent" });
+    // Bring the binary back → respawn + buffered request replayed.
+    atomicPromote();
+    const resp = await waitFor(2, 15000);
+    const good = resp.result !== undefined || resp.error !== undefined;
+    results.push({ ok: good && !proxyExited, desc: `waiting_binary: buffered request answered after respawn (exited=${proxyExited})` });
 
-    // Trigger restart by touching the binary (mtime change).
-    const now = new Date();
-    try { utimesSync(binaryPath, now, now); }
-    catch (e) { throw new Error(`utimesSync failed: ${e.message}`); }
-
-    // Sleep until the restart is in progress. Debounce 4000ms +
-    // stabilization 200ms = ~4200ms before kill; restart cycle (kill +
-    // spawn + initialize replay + health check) takes ~200-400ms. We aim
-    // for 4300ms so tools/list arrives squarely inside the restart window.
-    await sleep(4300);
-
-    const t0 = Date.now();
-    send("tools/list", {}, id);
-
+  } else if (scenario === "escalation") {
+    // Binary ABSENT from the start → waiting_binary; short cap → -32050.
+    removeBinary();
+    // No handshake possible (no child yet). Send a request with an id.
+    send("tools/list", {}, 42);
+    // Cap is 1500ms; wait past it.
+    const resp = await waitFor(42, 8000);
+    const isEsc = resp.error && resp.error.code === -32050 && resp.error.data && resp.error.data.escalate === true;
+    results.push({ ok: isEsc && !proxyExited, desc: `escalation: received -32050 escalate=true (exited=${proxyExited})` });
+    // Now recover: promote the binary, then re-handshake (the fresh server
+    // expects initialize → initialized before any request), then a fresh call.
+    atomicPromote();
+    await sleep(1500);
     try {
-      const resp = await waitFor(id, RESTART_RESPONSE_TIMEOUT_MS);
-      const dt = Date.now() - t0;
-      if (resp.result === undefined && resp.error === undefined) {
-        results.push({ ok: false, desc: `tools/list run ${i+1} returned malformed response` });
-      } else {
-        results.push({ ok: true, desc: `tools/list survived restart (run ${i+1}, ${dt}ms)` });
-      }
+      // Re-handshake against the now-present server. Use a fresh init id.
+      send("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test-driver", version: "0.0.1" } }, 50);
+      const initResp = await waitFor(50, 15000);
+      if (initResp.result === undefined) throw new Error("recovery initialize returned no result");
+      proxy.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+      await sleep(200);
+      send("tools/list", {}, 43);
+      const r2 = await waitFor(43, 15000);
+      const good = r2.result !== undefined || r2.error !== undefined;
+      // After recovery a fresh request should NOT be a -32050.
+      const recovered = good && !(r2.error && r2.error.code === -32050);
+      results.push({ ok: recovered, desc: `escalation: normal operation resumed after recovery` });
     } catch (e) {
-      results.push({ ok: false, desc: `tools/list run ${i+1}: ${e.message}` });
+      results.push({ ok: false, desc: `escalation: recovery failed: ${e.message}` });
     }
-    // Gap between iterations: long enough for the restart cycle to fully
-    // complete, and to keep the rolling circuit-breaker window from
-    // accumulating restarts (we use ITERATIONS < threshold).
-    await sleep(INTER_ITERATION_SLEEP_MS);
   }
 } catch (e) {
-  results.push({ ok: false, desc: `driver error: ${e.message}` });
+  results.push({ ok: false, desc: `${scenario}: driver error: ${e.message}` });
 } finally {
   try { proxy.kill("SIGTERM"); } catch {}
   await sleep(300);
   try { proxy.kill("SIGKILL"); } catch {}
 }
 
-// Output TAP-ish summary on stdout (single-line JSON per result).
-for (const r of results) {
-  console.log(JSON.stringify(r));
-}
+for (const r of results) console.log(JSON.stringify(r));
 process.exit(0);
 NODE_EOF
 
-log "Running nominal restart driver..."
-NOMINAL_OUT="$TMPDIR/nominal-out.txt"
-set +e
-node "$NODE_DRIVER_NOMINAL" "$PROXY" "$WORK_BINARY" >"$NOMINAL_OUT" 2>"$TMPDIR/nominal-err.txt"
-DRIVER_EXIT=$?
-set -e
-if [ "$DRIVER_EXIT" -ne 0 ]; then
-  tap_fail "nominal restart driver crashed (exit=$DRIVER_EXIT)"
-  log "driver stderr:"; cat "$TMPDIR/nominal-err.txt" >&2 || true
-else
-  # Each line in NOMINAL_OUT is a JSON object {ok, desc}. Parse it via a
-  # single node invocation that processes the whole file (more reliable
-  # than per-line bash subshells with set -e).
-  PARSED="$(node -e '
-    const fs = require("node:fs");
-    const path = process.argv[1];
-    const lines = fs.readFileSync(path, "utf8").split("\n").filter(Boolean);
-    for (const l of lines) {
-      try {
-        const j = JSON.parse(l);
-        process.stdout.write((j.ok ? "OK\t" : "FAIL\t") + (j.desc || "") + "\n");
-      } catch (e) {
-        process.stdout.write("FAIL\tunparseable: " + l + "\n");
-      }
-    }
-  ' "$NOMINAL_OUT")"
+run_driver_scenario() {
+  local scenario="$1" servedname="$2"
+  local served="$SERVE/$servedname"
+  local out="$TMPDIR/${scenario}-out.txt"
+  set +e
+  node "$NODE_DRIVER" "$PROXY" "$served" "$TARGET_BINARY" "$SERVE" "$scenario" \
+    >"$out" 2>"$TMPDIR/${scenario}-err.txt"
+  local rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    tap_fail "$scenario driver crashed (exit=$rc)"
+    cat "$TMPDIR/${scenario}-err.txt" >&2 || true
+    return
+  fi
+  local parsed
+  parsed="$(node -e '
+    const fs=require("node:fs");
+    const lines=fs.readFileSync(process.argv[1],"utf8").split("\n").filter(Boolean);
+    for(const l of lines){try{const j=JSON.parse(l);process.stdout.write((j.ok?"OK\t":"FAIL\t")+(j.desc||"")+"\n");}catch{process.stdout.write("FAIL\tunparseable: "+l+"\n");}}
+  ' "$out")"
   while IFS=$'\t' read -r verdict desc; do
     [ -z "$verdict" ] && continue
     if [ "$verdict" = "OK" ]; then tap_ok "$desc"; else tap_fail "$desc"; fi
-  done <<< "$PARSED"
-fi
+  done <<< "$parsed"
+}
 
-# --- Test 2: circuit breaker ---
-log "=== Test 2: circuit breaker on crash loop ==="
+log "=== Test 1: atomic promotion → single controlled restart ==="
+run_driver_scenario "promotion" "companyos-yaml-validator"
 
-FAKE_BIN="$TMPDIR/fake-crashing-bin"
+log "=== Test 2: binary removed → waiting_binary without exit, then respawn ==="
+run_driver_scenario "waiting_binary" "companyos-yaml-validator"
+
+# ─────────────────────────── Test 3: crash-loop backoff ───────────────────────────
+# ASSERTION INVERTED vs the old circuit-breaker test: the proxy must NOT exit.
+log "=== Test 3: crash-loop → growing backoff WITHOUT exit (assertion inverted) ==="
+
+CRASH_SERVE="$TMPDIR/crash-serve"
+mkdir -p "$CRASH_SERVE"
+FAKE_BIN="$CRASH_SERVE/companyos-yaml-validator"
 cat > "$FAKE_BIN" <<'FAKE_EOF'
 #!/usr/bin/env bash
-# Crash immediately with non-zero exit code.
 exit 1
 FAKE_EOF
 chmod +x "$FAKE_BIN"
 
-# Spawn proxy and wait for it to exit (should happen within 15s thanks
-# to the circuit breaker). We feed it stdin so it doesn't get stuck on
-# read; we send nothing meaningful (the binary won't respond anyway).
-log "Spawning proxy against crashing binary, expecting exit within 15s..."
-
 NODE_DRIVER_CB="$TMPDIR/driver-cb.mjs"
 cat > "$NODE_DRIVER_CB" <<'CBNODE_EOF'
-// Driver for circuit breaker test.
-// Args: <proxy-path> <fake-binary-path>
-// Spawns the proxy with stdin kept open (a pipe whose write end we hold
-// but never write to), waits for proxy to exit, prints "EXIT <code> <ms>".
+// Args: <proxy-path> <crashing-binary-path>
+// Spawn proxy against a crashing binary; hold stdin open; verify it does NOT
+// exit within the observation window and that backoff delays GROW.
 import { spawn } from "node:child_process";
 
 const [proxyPath, binaryPath] = process.argv.slice(2);
-const start = Date.now();
+const proxy = spawn("node", [proxyPath, binaryPath], { stdio: ["pipe", "pipe", "pipe"] });
 
-const proxy = spawn("node", [proxyPath, binaryPath], {
-  stdio: ["pipe", "pipe", "inherit"],
+let exited = false;
+let exitInfo = null;
+const respawnDelays = [];
+let stderrAccum = "";
+
+proxy.stderr.on("data", (b) => {
+  stderrAccum += b.toString();
+  // Parse "Respawn scheduled in <n>ms" lines to observe growth.
+  const re = /Respawn scheduled in (\d+)ms/g;
+  let m;
+  while ((m = re.exec(stderrAccum)) !== null) {
+    const v = Number(m[1]);
+    if (!respawnDelays.includes(v)) respawnDelays.push(v);
+  }
+  process.stderr.write(b);
 });
+proxy.stdout.on("data", () => {});
+proxy.on("exit", (code, signal) => { exited = true; exitInfo = { code, signal }; });
 
-// Hold the stdin write end open intentionally; never write anything.
-// This prevents the proxy from observing "end" on its stdin.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const safetyTimer = setTimeout(() => {
-  console.log(`EXIT timeout ${Date.now() - start}`);
+(async () => {
+  // Observe for 12s: with initial 200ms backoff, factor 2, we should see
+  // several scheduled respawns with increasing delays, and no exit.
+  await sleep(12_000);
+  const grew = respawnDelays.length >= 2 &&
+    respawnDelays[respawnDelays.length - 1] > respawnDelays[0];
+  console.log(JSON.stringify({
+    exited,
+    exitInfo,
+    respawnCount: respawnDelays.length,
+    firstDelay: respawnDelays[0] ?? null,
+    lastDelay: respawnDelays[respawnDelays.length - 1] ?? null,
+    grew,
+  }));
   try { proxy.kill("SIGKILL"); } catch {}
   process.exit(0);
-}, 18_000);
-
-proxy.on("exit", (code, signal) => {
-  clearTimeout(safetyTimer);
-  console.log(`EXIT ${code ?? "null"} ${Date.now() - start}`);
-  process.exit(0);
-});
-
-// Just drain stdout so the proxy doesn't block on write.
-proxy.stdout.on("data", () => {});
+})();
 CBNODE_EOF
 
-CB_START=$(date +%s)
 set +e
 node "$NODE_DRIVER_CB" "$PROXY" "$FAKE_BIN" >"$TMPDIR/cb-out.txt" 2>"$TMPDIR/cb-err.txt"
-CB_DRIVER_EXIT=$?
 set -e
-CB_END=$(date +%s)
-# Parse "EXIT <code> <ms>" from driver output.
-CB_LINE="$(cat "$TMPDIR/cb-out.txt" | tail -n 1)"
-CB_EXIT="$(echo "$CB_LINE" | awk '{print $2}')"
-CB_MS="$(echo "$CB_LINE" | awk '{print $3}')"
-CB_DURATION=$((CB_END - CB_START))
-log "Driver returned: $CB_LINE (driver exit=$CB_DRIVER_EXIT, wall=${CB_DURATION}s)"
-CB_DURATION=$((CB_END - CB_START))
+CB_JSON="$(tail -n 1 "$TMPDIR/cb-out.txt")"
+log "crash-loop observation: $CB_JSON"
 
-log "Proxy stderr tail:"; tail -n 20 "$TMPDIR/cb-err.txt" >&2 || true
+CB_EXITED="$(node -e 'const j=JSON.parse(process.argv[1]);process.stdout.write(String(j.exited))' "$CB_JSON" 2>/dev/null || echo "parse_error")"
+CB_GREW="$(node -e 'const j=JSON.parse(process.argv[1]);process.stdout.write(String(j.grew))' "$CB_JSON" 2>/dev/null || echo "parse_error")"
+CB_COUNT="$(node -e 'const j=JSON.parse(process.argv[1]);process.stdout.write(String(j.respawnCount))' "$CB_JSON" 2>/dev/null || echo "0")"
 
-# Success criteria:
-#   - proxy exit code != 0 (the breaker should produce non-zero)
-#   - proxy exited on its own (CB_EXIT != "timeout")
-#   - elapsed time on proxy < 15000ms
-if [ "$CB_EXIT" = "timeout" ]; then
-  tap_fail "proxy did not exit within 18s (circuit breaker did not trip)"
-elif [ "$CB_EXIT" = "0" ]; then
-  tap_fail "proxy exited with code 0 (unexpected — breaker should produce non-zero)"
-elif [ -n "$CB_MS" ] && [ "$CB_MS" -lt 15000 ]; then
-  tap_ok "circuit breaker tripped on crash loop (exit=$CB_EXIT, ${CB_MS}ms)"
+if [ "$CB_EXITED" = "false" ]; then
+  tap_ok "crash-loop: proxy did NOT exit (no more circuit-breaker suicide)"
 else
-  tap_fail "proxy exited but too slowly (exit=$CB_EXIT, ${CB_MS}ms)"
+  tap_fail "crash-loop: proxy exited (expected: stays alive with growing backoff)"
 fi
+
+if [ "$CB_GREW" = "true" ]; then
+  tap_ok "crash-loop: backoff delays grew across $CB_COUNT respawns"
+else
+  tap_fail "crash-loop: backoff did not grow as expected ($CB_JSON)"
+fi
+
+# Recovery: replace the crashing binary with a good one (atomic), spawn a fresh
+# proxy to confirm it comes up (the crash-loop proxy above was killed).
+log "=== Test 3b: crash-loop recovery (good binary promoted) ==="
+cp "$TARGET_BINARY" "$CRASH_SERVE/.companyos-yaml-validator.tmp"
+chmod +x "$CRASH_SERVE/.companyos-yaml-validator.tmp"
+mv -f "$CRASH_SERVE/.companyos-yaml-validator.tmp" "$FAKE_BIN"
+
+NODE_DRIVER_REC="$TMPDIR/driver-rec.mjs"
+cat > "$NODE_DRIVER_REC" <<'RECNODE_EOF'
+import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
+const [proxyPath, binaryPath] = process.argv.slice(2);
+const proxy = spawn("node", [proxyPath, binaryPath], { stdio: ["pipe", "pipe", "inherit"] });
+const decoder = new StringDecoder("utf8");
+let accum = "";
+const pending = new Map();
+proxy.stdout.on("data", (c) => {
+  accum += decoder.write(c);
+  const lines = accum.split("\n"); accum = lines.pop();
+  for (const l of lines) { if(!l) continue; let m; try{m=JSON.parse(l);}catch{continue;}
+    if (m.id !== undefined && pending.has(m.id)) { const {resolve,timer}=pending.get(m.id); clearTimeout(timer); pending.delete(m.id); resolve(m); } }
+});
+function send(method, params, id){ proxy.stdin.write(JSON.stringify({jsonrpc:"2.0",id,method,params})+"\n"); }
+function waitFor(id, ms){ return new Promise((res,rej)=>{ const t=setTimeout(()=>{pending.delete(id);rej(new Error("timeout"));},ms); pending.set(id,{resolve:res,reject:rej,timer:t}); }); }
+const sleep=(ms)=>new Promise(r=>setTimeout(r,ms));
+(async()=>{
+  let ok=false;
+  try {
+    // Full MCP handshake (initialize → wait reply → initialized → tools/list),
+    // identical to the proven handshake() of the main driver.
+    send("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "rec-driver", version: "0.0.1" } }, 1);
+    const ir=await waitFor(1,10000);
+    if (ir.result!==undefined){
+      proxy.stdin.write(JSON.stringify({jsonrpc:"2.0",method:"notifications/initialized"})+"\n");
+      await sleep(200);
+      send("tools/list", {}, 2);
+      const r2 = await waitFor(2, 10000);
+      ok = (r2.result !== undefined || r2.error !== undefined);
+    }
+  } catch(e){ ok=false; }
+  console.log(JSON.stringify({ recovered: ok }));
+  try{proxy.kill("SIGKILL");}catch{}
+  process.exit(0);
+})();
+RECNODE_EOF
+
+set +e
+node "$NODE_DRIVER_REC" "$PROXY" "$FAKE_BIN" >"$TMPDIR/rec-out.txt" 2>"$TMPDIR/rec-err.txt"
+set -e
+REC_JSON="$(tail -n 1 "$TMPDIR/rec-out.txt")"
+REC_OK="$(node -e 'const j=JSON.parse(process.argv[1]);process.stdout.write(String(j.recovered))' "$REC_JSON" 2>/dev/null || echo "false")"
+if [ "$REC_OK" = "true" ]; then
+  tap_ok "crash-loop recovery: proxy came up after good binary promoted"
+else
+  tap_fail "crash-loop recovery: proxy did not recover ($REC_JSON)"
+fi
+
+# ─────────────────────────── Test 4: escalation -32050 ───────────────────────────
+log "=== Test 4: unavailable > cap → -32050 escalation, then recovery ==="
+# Use a dedicated serve dir so the binary is truly absent at start.
+ESC_SERVE="$TMPDIR/esc-serve"
+mkdir -p "$ESC_SERVE"
+run_driver_scenario_esc() {
+  local out="$TMPDIR/escalation-out.txt"
+  set +e
+  MCP_PROXY_UNAVAILABLE_MS=1500 node "$NODE_DRIVER" "$PROXY" "$ESC_SERVE/companyos-yaml-validator" "$TARGET_BINARY" "$ESC_SERVE" "escalation" \
+    >"$out" 2>"$TMPDIR/escalation-err.txt"
+  local rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then tap_fail "escalation driver crashed (exit=$rc)"; cat "$TMPDIR/escalation-err.txt" >&2 || true; return; fi
+  local parsed
+  parsed="$(node -e '
+    const fs=require("node:fs");
+    const lines=fs.readFileSync(process.argv[1],"utf8").split("\n").filter(Boolean);
+    for(const l of lines){try{const j=JSON.parse(l);process.stdout.write((j.ok?"OK\t":"FAIL\t")+(j.desc||"")+"\n");}catch{process.stdout.write("FAIL\tunparseable: "+l+"\n");}}
+  ' "$out")"
+  while IFS=$'\t' read -r verdict desc; do
+    [ -z "$verdict" ] && continue
+    if [ "$verdict" = "OK" ]; then tap_ok "$desc"; else tap_fail "$desc"; fi
+  done <<< "$parsed"
+}
+run_driver_scenario_esc
 
 # --- Summary ---
 log "=== Summary: $PASS passed, $FAIL failed ==="

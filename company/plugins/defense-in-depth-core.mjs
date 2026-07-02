@@ -138,6 +138,13 @@ function hasActivePermit(rootDir, filePath) {
   return false;
 }
 
+// RFC 18011bfc B5: the fallback path is switched from target/debug (relinked by
+// `make ci`, which builds in debug) to target/serve (stable served binary,
+// never touched by cargo). The PRIMARY release path is kept as-is: `make ci`
+// builds in debug only, so the release binaries are already immune to the link
+// window; rebinding the primary to serve would only couple the hook to the
+// promotion without any benefit. Result: release (stable) → serve (stable),
+// the ci-relinked debug fallback is gone.
 function validateYaml(rootDir, filePath) {
   const result = run(
     `./target/release/companyos-yaml-validator --file "${filePath}"`,
@@ -145,7 +152,7 @@ function validateYaml(rootDir, filePath) {
   );
   if (result === null) {
     return run(
-      `./target/debug/companyos-yaml-validator --file "${filePath}"`,
+      `./target/serve/companyos-yaml-validator --file "${filePath}"`,
       rootDir,
     );
   }
@@ -155,7 +162,7 @@ function validateYaml(rootDir, filePath) {
 function autoIndex(rootDir, filePath) {
   return (
     run(`./target/release/companyos-orchestrator-server --index "${filePath}"`, rootDir) ??
-    run(`./target/debug/companyos-orchestrator-server --index "${filePath}"`, rootDir)
+    run(`./target/serve/companyos-orchestrator-server --index "${filePath}"`, rootDir)
   );
 }
 
