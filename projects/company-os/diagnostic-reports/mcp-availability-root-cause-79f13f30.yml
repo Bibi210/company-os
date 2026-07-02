@@ -1,0 +1,251 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: 79f13f30-af1a-453e-9b42-962c35f93d26
+  title: "Disponibilité MCP : root cause des coupures définitives — proxy suicidaire (circuit breaker sans réarmement), non supervisé, exécutant le binaire de build"
+  author: architect
+  created_at: "2026-07-02"
+  project: company-os
+  description: >
+    Investigation root cause du task-request 415c73c0 (3 coupures MCP en 24h,
+    chacune résolue par un reboot manuel de session). Conduite par lecture du
+    code réel (company/plugins/mcp-proxy.mjs, company/config/opencode.json,
+    Makefile, .githooks/pre-commit via f82847f1) et recoupement des 4
+    diagnostics antérieurs (e84b641d, fa9bd072, 95ee5480, f82847f1).
+    Conclusion : l'état "définitivement mort nécessitant un humain" est
+    atteignable par DEUX mécanismes distincts du proxy (suicide par
+    process.exit(1) du circuit breaker sans réarmement, et zombie par
+    spawn-error non traité comme événement de cycle de vie), déclenchés
+    systématiquement parce que le binaire servi EST le binaire de build que
+    make ci relink à chaque commit, et irréversibles parce que personne ne
+    supervise le proxy. La compensation actuelle (règle de prose mcp_reconnect,
+    sleeps + retries LLM) est du polling inopérant dans les deux modes
+    terminaux. Recommandation : combiner séparation build/exécution
+    (déploiement atomique), supervision sans abandon définitif, et readiness
+    événementielle permettant la suppression de mcp_reconnect.
+  tags:
+    - companyos-v1
+    - mcp
+    - proxy
+    - availability
+    - resilience
+    - circuit-breaker
+    - supervision
+    - critical-infra
+    - harness
+  related:
+    - id: 415c73c0-eae9-46e0-8f05-e3ff38156b3c
+      kind: task-request
+      relationship: input
+    - id: d9399863-254e-42f5-a485-ea019ce56a93
+      kind: rfc
+      relationship: related
+    - id: e84b641d-1266-473e-b93c-cd709aa14ac9
+      kind: diagnostic-report
+      relationship: related
+    - id: fa9bd072-a132-4a37-8163-1895f531f723
+      kind: diagnostic-report
+      relationship: related
+    - id: 95ee5480-d5d4-4d66-88f3-3a3b7e3c1469
+      kind: diagnostic-report
+      relationship: related
+    - id: f82847f1-7ee2-4fc7-a4f5-a1685a62c152
+      kind: diagnostic-report
+      relationship: related
+
+spec:
+  symptom: >
+    Trois coupures MCP en 24 heures (2026-06-10/11), chacune nécessitant un
+    reboot manuel de la session opencode par l'utilisateur. Scénario
+    récurrent : cargo build/relink (le plus souvent via make ci, déclenché
+    automatiquement par le pre-commit hook à CHAQUE git commit) remplace les
+    binaires companyos-orchestrator-server et companyos-yaml-validator pendant
+    que les serveurs tournent ; le proxy mcp-proxy.mjs tue et tente de
+    respawner l'enfant ; la session finit "Not connected" ou "Connection
+    closed" et aucun retry (sleeps 5/10/15s dans e84b641d, 5/8/15/20s dans
+    95ee5480, retries "conformes à mcp_reconnect" dans f82847f1) ne la
+    ressuscite.
+
+    Deux formes terminales observées :
+    (a) le proxy a DISPARU de la table des processus (95ee5480 : "inspection
+    des processus confirmait l'absence du proxy MCP orchestrator" ;
+    f82847f1 : "le serveur MCP orchestrator + son proxy se sont arrêtés sans
+    être respawnés") ;
+    (b) la session ne répond plus alors que des processus existent encore
+    (fa9bd072 : freeze perçu, serveur vivant mais saturé ; task-request
+    415c73c0 : "le proxy terminé pendant le relink n'a jamais été respawné,
+    bloquant generate_id et l'indexation pour toute la fin de session").
+
+    Dans tous les cas, la seule issue effective a été humaine : quitter et
+    relancer la session. La règle de prose mcp_reconnect (shared-rules)
+    prescrit exactement le polling (attendre, réessayer 3 fois, escalader)
+    que la directive utilisateur condamne, et ce polling n'a JAMAIS rétabli
+    une session dans les incidents documentés.
+
+  root_cause: >
+    Root cause architecturale en quatre couches, chacune vérifiée dans le
+    code réel. L'état "définitivement mort nécessitant un humain" n'est pas
+    un accident : il est ATTEIGNABLE PAR DESIGN, et son déclencheur est un
+    événement NOMINAL du workflow (commit → pre-commit → make ci → relink).
+
+    COUCHE 1 — DÉCLENCHEUR SYSTÉMIQUE : le binaire servi est le binaire de
+    build. opencode.json (mcp.orchestrator.command, L30 ; mcp.yaml-validator,
+    L37) pointe directement sur ./target/debug/<bin>. Or make ci
+    (Makefile L46 : lint test test-js validate check-naming) relink ces
+    binaires : `cargo test --workspace` (L27) recompile et relink les bin
+    targets du workspace, et `cargo run -p companyos-yaml-validator`
+    (target validate, L35) rebuild/relink le yaml-validator avant de
+    l'exécuter. Comme le pre-commit hook exécute make ci (cf. f82847f1),
+    CHAQUE git commit remplace les binaires sous les pieds des serveurs en
+    cours d'exécution. La "fenêtre de link" (binaire absent pendant le
+    rename du linker, ou nouveau fichier partiellement écrit) est donc
+    traversée plusieurs fois par session, à chaque commit. Un relink ne tue
+    pas le processus serveur en soi (l'inode reste vivant) : c'est le PROXY
+    qui tue l'enfant quand son watcher détecte le changement
+    (restartChild, mcp-proxy.mjs L366-405), puis échoue à le faire renaître.
+
+    COUCHE 2 — MÉCANISME DE MORT n°1, le suicide volontaire du proxy. Le
+    circuit breaker (MAX_RESTARTS_IN_WINDOW=3, RESTART_WINDOW_MS=30s,
+    L33-34 ; isCircuitOpen L139-141) répond à son ouverture par
+    process.exit(1) sur TROIS chemins : handleHealthCheckTimeout L219-224,
+    onChildExit (crash inattendu) L305-311, restartChild L372-377. Il n'y a
+    ni backoff, ni cooldown, ni réarmement : l'ouverture du breaker est un
+    abandon définitif. Or un respawn tenté pendant la fenêtre de link échoue
+    ou crashe en sous-seconde (binaire absent → ENOENT ; en cours d'écriture
+    → crash immédiat ou ETXTBSY) : accumuler 3 échecs en moins de 30
+    secondes est quasi garanti. Le breaker, conçu contre les boucles de
+    restart pathologiques, convertit donc l'événement NOMINAL "make ci en
+    cours" en mort définitive. Quand le proxy exit, opencode ne respawne pas
+    un serveur MCP local mort : la session affiche "Not connected" jusqu'au
+    reboot humain. C'est la forme terminale (a) des symptômes.
+
+    COUCHE 3 — MÉCANISME DE MORT n°2, le zombie par spawn-error non géré.
+    Quand spawn() échoue (ENOENT/ETXTBSY pendant la fenêtre de link), Node
+    émet 'error' puis 'close', mais PAS 'exit'. Or le proxy n'attache sa
+    logique de cycle de vie qu'à 'exit' (child.on("exit", onChildExit),
+    L344) ; le handler 'error' se contente de logger (L341-343). Résultat :
+    state reste "starting", rien ne redémarre. Le filet suivant,
+    handleHealthCheckTimeout (armé 10s, L355-359), aggrave le cas : il
+    attache child.once("close", ...) (L216) alors que 'close' a déjà été
+    émis des secondes plus tôt → le callback ne sera JAMAIS rappelé → state
+    reste "stopping" pour toujours, healthCheckTimer n'est pas réarmé, et
+    TOUT le trafic entrant est bufferisé sans fin (onStdinData, chemin
+    buffered L484-492). Proxy vivant, session morte, aucun log d'erreur
+    fatal : c'est la forme terminale (b), cohérente avec l'incident du
+    task-request où generate_id et l'indexation sont restés bloqués
+    "malgré les retries" toute la fin de session.
+
+    COUCHE 4 — ABSENCE DE SUPERVISION : le dernier étage de défense est un
+    SPOF non surveillé. Personne ne supervise le proxy : opencode le spawn
+    une fois (opencode.json L27-42) et ne redémarre jamais un serveur MCP
+    local dont le processus est mort ou muet. Un composant dont le rôle est
+    précisément d'être l'étage de résilience contient des process.exit()
+    volontaires (couche 2) et des états d'arrêt silencieux (couche 3), sans
+    qu'aucun mécanisme au-dessus ne puisse le faire renaître. C'est la
+    réponse directe à la question "pourquoi un état définitivement mort
+    nécessitant un humain est-il atteignable ?" : parce que le seul
+    superviseur au-dessus du proxy est l'utilisateur.
+
+    CAUSES AGGRAVANTES (fragilisent la détection, sans être terminales) :
+    (i) fs.watch(binaryPath) (L510) suit l'inode via inotify ; un relink par
+    rename délie l'inode surveillé, rendant le watcher silencieusement stale
+    après le premier remplacement : les relinks suivants peuvent ne plus
+    être détectés (binaire stale servi, cf. lesson 80f7b27a sur le tool-list
+    figé) ou n'être détectés que partiellement. (ii) Le stability check par
+    échantillonnage de taille à 200ms (STABILITY_RECHECK_MS L37, L527-541)
+    est une heuristique de polling incapable de distinguer "link terminé"
+    d'une pause du linker ; le debounce 4s (WATCH_DEBOUNCE_MS L36) peut
+    déclencher un restart en plein milieu d'un make ci multi-phases.
+    (iii) Le health check n'existe qu'au (re)démarrage : un serveur vivant
+    mais non répondant (saturation CPU ONNX, fa9bd072, chantier séparé
+    0e089d1b) est invisible pour le proxy.
+
+    CARTOGRAPHIE EXHAUSTIVE DES POINTS DE POLLING/SLEEP/RETRY de la chaîne :
+    - mcp-proxy.mjs : WATCH_DEBOUNCE_MS=4000 (L36) ; STABILITY_RECHECK_MS=200
+      + re-debounce en boucle (L527-541, L549-560) = polling de taille de
+      fichier ; HEALTH_CHECK_TIMEOUT_MS=10000 one-shot (L35) ; killTimer
+      SIGKILL 1s (L211-215, L388-392) ; délai d'exit 1s sur stdin end
+      (L504) ; fenêtre circuit breaker 30s/3 (L33-34) ; ensureBinary :
+      execSync cargo build bloquant, timeout 300s (L82-85).
+    - Règle de prose mcp_reconnect (shared-rules) : "attendre quelques
+      secondes, réessayer, jusqu'à 3 tentatives" = polling exécuté par des
+      LLMs, dernier recours humain. C'est LE point condamné par la
+      directive ; inopérant dans les deux modes terminaux.
+    - Comportements d'agents observés (conséquence de la règle) : sleeps
+      5/10/15s (e84b641d), 5/8/15/20s (95ee5480), retries "par analogie"
+      même sur un échec déterministe non-MCP (f82847f1) : la règle induit
+      du polling même hors de son périmètre.
+    - defense-in-depth.mjs : AUCUN polling (vérifié ; en-tête L7 "No mtime
+      polling"). Son rôle dans 95ee5480 (purge des permits) est une
+      conséquence du contournement SQL, pas une cause de la coupure.
+    - Côté serveur (hors périmètre disponibilité mais recensés) : spin-wait
+      du pool ONNX = busy-polling interne (fa9bd072, task 0e089d1b) ;
+      debounce 500ms du file watcher d'indexation (contourné par index_now).
+
+  resolution: >
+    Options de solution. Le RFC (acceptance criterion 2 du task-request
+    415c73c0) tranchera les détails ; le présent report fixe le diagnostic
+    et la direction.
+
+    OPTION A — Supervision robuste : respawn inconditionnel, backoff sans
+    abandon. Supprimer les trois process.exit() du breaker et les remplacer
+    par un backoff exponentiel plafonné avec réarmement (le breaker DIFFÈRE,
+    il n'abandonne jamais). Conditionner chaque respawn à un événement
+    "binaire présent et stable" plutôt qu'à un timer. Traiter 'error' de
+    spawn comme un événement de cycle de vie à part entière (transition
+    d'état + replanification), et corriger la race once('close') de
+    handleHealthCheckTimeout. Surveiller le RÉPERTOIRE parent du binaire
+    (inotify sur dir survit aux renames) au lieu du fichier. Traite les
+    couches 2 et 3 et l'aggravante (i).
+
+    OPTION B — Séparer binaire de build et binaire d'exécution (déploiement
+    atomique). Le binaire servi vit sous un chemin d'exécution dédié (ex.
+    target/serve/<bin>), jamais touché par cargo. La promotion d'une
+    nouvelle version est un acte explicite et atomique (copie + rename +
+    restart contrôlé à un instant sûr), effectué par le proxy ou un step de
+    déploiement outillé. opencode.json pointe sur le chemin d'exécution.
+    Effet : make ci, cargo test, cargo run ne peuvent PLUS jamais tuer ni
+    déstabiliser le serveur ; la classe entière "fenêtre de link" disparaît,
+    et l'acceptance criterion 4 ("un kill du binaire pendant un cargo
+    build/relink ne nécessite plus jamais un reboot") est satisfait par
+    construction. Traite la couche 1 (le déclencheur).
+
+    OPTION C — Readiness événementielle intégrale, suppression de
+    mcp_reconnect. Le buffer FIFO + replay du handshake (RFC d9399863)
+    existe déjà et est le bon mécanisme : pendant une indisponibilité, les
+    appels MCP ATTENDENT dans le buffer au lieu d'échouer, donc les agents
+    n'ont jamais à retry. Ce contrat n'est aujourd'hui pas tenable parce
+    que le proxy peut mourir (couches 2-4) ; une fois A en place, il le
+    devient, et la règle de prose mcp_reconnect est supprimée ou réduite à
+    un pointeur vers le mécanisme (acceptance criterion 3). Compléter par
+    une borne de sûreté événementielle : si l'indisponibilité excède un
+    plafond (ordre de grandeur : minutes), le proxy répond aux requêtes en
+    attente par une erreur JSON-RPC structurée signalant l'escalade,
+    plutôt que de laisser pourrir un timeout silencieux. Traite la couche
+    de compensation (polling agents) et donne l'escalade structurée.
+
+    OPTION D — make ci qui ne touche jamais le serveur, sans B : target-dir
+    séparé pour la CI ou exclusion des bin targets. Écartée en tant
+    qu'option autonome : double compilation et double empreinte disque pour
+    un effet que B obtient gratuitement et plus complètement (B protège
+    aussi des cargo build manuels, pas seulement de make ci).
+
+    RECOMMANDATION DE L'ARCHITECT : B + A + C combinées (D devient sans
+    objet par construction via B). Justification par alignement
+    défense/couches : B supprime le DÉCLENCHEUR (le binaire servi n'est
+    plus une cible mouvante), A supprime l'ÉTAT TERMINAL (aucun chemin de
+    code ne mène plus à une mort définitive : le pire cas devient une
+    attente bornée), C supprime la COMPENSATION PAR POLLING (le harness
+    remplace la prose, conformément au principe V1). A sans B laisserait le
+    proxy encaisser des tempêtes de restarts évitables ; B sans A
+    laisserait les modes de mort 2 et 3 atteignables par d'autres causes
+    (crash du binaire, OOM) ; A+B sans C laisserait la règle mcp_reconnect
+    et son polling LLM en vie. Les trois ensemble rendent la panne du
+    binaire un événement géré de bout en bout, et l'humain n'est sollicité
+    que par une escalade explicite, jamais comme mécanisme de récupération.
+    Hors périmètre mais à tracer dans le RFC comme limite assumée : le mode
+    "serveur vivant non répondant" (fa9bd072) relève du chantier ONNX
+    0e089d1b ; un health check périodique en régime établi pourrait être
+    évalué dans le RFC, en veillant à ne pas réintroduire du polling agressif.
+
+  status: resolved
