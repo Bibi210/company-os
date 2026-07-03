@@ -38,6 +38,17 @@ metadata:
       kind: lesson-learned
       relationship: input
   changelog:
+    - date: "2026-07-03"
+      author: pm
+      description: >
+        v1-protect-githooks LIVRÉ : RFC c129453c implemented. .githooks/ et
+        company/scripts/ ajoutés aux zones protégées (l'investigation a
+        révélé le bypass par délégation : check-artifact-naming.sh invoqué
+        par le plugin protégé, deploy-serve.sh exécuté par le proxy).
+        Acceptance tests T1-T5 tous verts en vif (revert Layer 2, blocage
+        pre-commit Layer 3, hot-reload, contrôle négatif). Parade lock-out
+        documentée, échappatoire --no-verify strictement humaine. Lesson
+        aa8c4d52. Le harness verrouille désormais toutes ses couches.
     - date: "2026-07-02"
       author: pm
       description: >
@@ -335,9 +346,9 @@ spec:
       ref:
         type: loose
         category: hotfix
-        label: "Task-request 30ab07d5 : ajouter .githooks/ à protected-zones.json via RFC"
-      timeframe: future
-      status: planned
+        label: "RFC c129453c implemented : .githooks/ ET company/scripts/ protégés, T1-T5 verts"
+      timeframe: past
+      status: done
       target_date: "2026-Q2"
       rationale: >
         Directive utilisateur (2026-06-10) : un harness dont le point
