@@ -4,7 +4,9 @@
     "company/personas/",
     "company/schemas/",
     "company/plugins/",
-    "crates/"
+    "crates/",
+    ".githooks/",
+    "company/scripts/"
   ],
   "files": [
     "opencode.json"
