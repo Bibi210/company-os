@@ -1,0 +1,573 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 438cc31d-8093-4e80-b30f-5496f4d525a5
+  title: "Implementation-plan : V1 process lot 2 — 7 mécanismes de durcissement (schemas triaxial/design-doc stricts, placement kind-chemin, supersede_artifact, gate reload_config, CEO no-write, permit lié à granted_to)"
+  author: implementer
+  created_at: "2026-07-03"
+  description: >
+    Plan d'implémentation du RFC a4ee8b6a (approuvé, round dfbb25b4).
+    Mécanise dans le harness les 7 mécanismes du lot 2 du durcissement
+    process (recensement c981bf62 items 7 à 13, suite du lot 1 RFC
+    8bf78218 implemented). Les 7 mécanismes sont indépendants entre eux ;
+    un seul couplage interne (purge ceo.yml produces + blocage hook CEO
+    no-write + régénération personas.yml) va dans le MÊME commit. HEAD
+    compile et passe make ci à chaque commit (contrainte RFC, ordre
+    d'implémentation). Le permit 24e91083-d5a8-46a3-ba56-ef1f8531b10b
+    couvre les 18 paths (17 modified + 1 created placement.rs). Consume
+    APRÈS tous les commits (lesson 8fd49300 + GARDE 3 du lot 1) puis
+    make deploy-serve (promotion contrôlée des binaires, RFC 18011bfc /
+    règle hotreload_last réécrite) puis reload_config EN DERNIER (le gate
+    du mécanisme 11 sera actif après promotion mais tous les permits
+    seront déjà consommés à ce moment : l'ordre consume→deploy→reload est
+    exactement celui que le gate exige). Caller-inventory conduit au
+    moment T sur le workspace ENTIER, tests/ top-level inclus (lesson
+    1bb07073, incident lot 1). Décisions du RFC reprises à l'identique :
+    schemas 7/8 stricts sans anyOf (stock existant vide / 100% conforme
+    vérifié), placement.rs table 13 kinds + exception shared-rules.yml +
+    builder with_root + fail-open hors root, supersede_artifact édition
+    textuelle deux écritures ordre ancien-d'abord + rollback + validation
+    avant écriture + idempotence + supersession_warnings, gate
+    reload_config via list_active_permits, hook before CEO no-write,
+    hasActivePermit croise granted_to.
+  tags:
+    - companyos-v1
+    - process
+    - hardening
+    - harness
+    - mechanical-invariant
+    - review-protocol
+    - write-permit
+    - file-placement
+    - supersession
+    - companyos-internals
+    - critical-infra
+  related:
+    - id: a4ee8b6a-ebcd-4a76-96eb-7e31785c8ae6
+      kind: rfc
+      relationship: input
+    - id: 0935d0df-be16-4361-b71b-03f0a43fb77c
+      kind: task-request
+      relationship: input
+
+spec:
+  dependencies:
+    - "RFC a4ee8b6a approuvé (round dfbb25b4 : pm approve, implementer approve ; en attente vote ceo)."
+    - "Write permit 24e91083-d5a8-46a3-ba56-ef1f8531b10b actif, couvre les 18 target_paths (17 modified + placement.rs créé)."
+    - "Trigger humain 'rfc modifies ceo persona' (mécanisme 12b modifie ceo.yml) : approbation utilisateur requise, actée par le PM (délégation du 2026-06-10)."
+    - "État de départ vérifié en review : zéro review-report YAML ; 12 design-docs conformes ; superseded-by déjà dans l'enum _base.schema.json L55 ; company/lessons et company/rfcs hors protected-zones.json."
+
+  steps:
+    # =================================================================
+    - description: >
+        ÉTAPE 0 — Caller-inventory FINAL au moment T (workspace ENTIER, rg
+        NON scopé à crates/, tests/ top-level et benches inclus ; lesson
+        1bb07073 : le lot 1 a re-raté un caller pour avoir scopé à crates/).
+        Recensement conduit dans cette session, à confirmer juste avant
+        d'écrire du code :
+        - ArtifactValidator::new : 19 call-sites au total dans 6 fichiers —
+          tests/integration/user_stories.rs (x1), tests/integration/edge_cases.rs
+          (x1), crates/validation/src/validator.rs (x1, test inline
+          setup_validator), crates/mcp-servers/yaml/src/main.rs (x5 : L114
+          reload_schemas, L175 run_server, L208 watcher, L239 run_single_file,
+          L281 run_batch), crates/mcp-servers/orchestrator/src/main.rs (x10,
+          dont fixtures de tests), crates/orchestrator/tests/integration_search.rs
+          (x1). Le builder with_root est ADDITIF : new(registry) préservé à
+          l'identique, TOUS ces call-sites restent intacts. SEUL le binaire
+          companyos-yaml-validator (yaml/src/main.rs) chaîne .with_root() sur
+          ses 5 points de construction.
+        - engine.index_artifact : 4 call-sites, signature PRÉSERVÉE —
+          crates/mcp-servers/orchestrator/src/main.rs L1165 (index_now),
+          L1340 (tool index_artifact), L1656 (CLI --index) ;
+          crates/orchestrator/src/engine.rs L1374 (dans reindex_all). Le
+          warning d'asymétrie passe par une MÉTHODE SÉPARÉE
+          (supersession_warnings), pas par un changement de signature.
+        - hasActivePermit : L116 (def) + 3 call-sites internes au module —
+          L466 (Layer 1 write/edit), L527 (Layer 2 bash aftermath), L556
+          (filtre commits non autorisés). Non exportée aujourd'hui.
+        - reload_config : aucun caller code hors le tool (main.rs L1178) ;
+          aucun test existant ne l'appelle (le test L2877
+          test_hotreload_protocol_via_reload_config mute le protocole EN
+          MÉMOIRE, il n'invoque PAS le tool). Le gate mécanisme 11 ne casse
+          donc aucun test.
+        Livrable : si la liste diverge du périmètre du permit (18 paths),
+        s'ARRÊTER et signaler à l'Architect/PM AVANT toute écriture (règle
+        persona : jamais contourner un permit incomplet). Aucune écriture
+        dans cette étape.
+      files: []
+
+    # =================================================================
+    - description: >
+        ÉTAPE 1 — MÉCANISME 7 : schema review-report triaxial structurel
+        (couche schema JSON, commit séparable). Éditer
+        company/schemas/review-report.schema.json :
+        - Ajouter spec.axes : objet REQUIS, additionalProperties: false,
+          properties {nominal, negative, edge} REQUISES, chacune un objet
+          {verdict: enum [approve, request_changes] REQUIS ; notes: string
+          optionnel} avec additionalProperties: false (verrou pattern
+          bd4650e2 : un 4e axe ou un champ parasite échoue).
+        - spec.required : [verdict, findings] -> [verdict, findings, axes].
+        - ÉTENDRE le conditional existant du lot 1 (if verdict==approve
+          then findings maxItems 0) : dans la branche then, ajouter
+          axes.nominal.verdict const "approve", axes.negative.verdict const
+          "approve", axes.edge.verdict const "approve" (cohérence mécanique :
+          un axe en request_changes force le verdict global request_changes).
+        DÉCISION SANS ANYOF (tranchée dans le RFC) : zéro review-report YAML
+        existant, aucune branche legacy. La garde serveur approve+findings
+        du lot 1 reste la garde du canal MCP ; ce schema gouverne le canal
+        YAML. La QUALITÉ de l'analyse par axe reste prose/LLM.
+      files:
+        - company/schemas/review-report.schema.json
+
+    # =================================================================
+    - description: >
+        ÉTAPE 2 — MÉCANISME 8 : schema design-doc complet (couche schema
+        JSON, commit séparable). Éditer
+        company/schemas/design-doc.schema.json :
+        - spec.required : [overview] -> [overview, components, decisions].
+        - Ajouter minItems: 1 sur components ET sur decisions (un tableau
+          vide serait un contournement de forme).
+        DÉCISION STRICT SANS MIGRATION (tranchée dans le RFC) : les 12
+        design-docs existants ont components+decisions non vides (vérifié
+        un par un en review), et la fixture design_yaml de
+        tests/integration/user_stories.rs L68-84 est déjà conforme. Zéro
+        migration, zéro test cassé. Le test edge_cases.rs
+        test_validate_all_shipped_artifacts ne scanne que company/ (aucun
+        design-doc n'y vit), donc non affecté.
+      files:
+        - company/schemas/design-doc.schema.json
+
+    # =================================================================
+    - description: >
+        ÉTAPE 3 — MÉCANISME 9a : nouveau module placement.rs (couche crate
+        validation). Créer crates/validation/src/placement.rs avec la table
+        kind -> règle de chemin, EXHAUSTIVE sur les 13 kinds. Signature
+        pub fn check_placement(kind: ArtifactKind, rel_path: &Path) ->
+        Option<String> (Some(message) = erreur ; None = conforme ou non
+        vérifiable). Règles :
+        - Kinds PROJET (fichier DIRECTEMENT sous le dossier, pas de
+          sous-dossier), motif projects/<slug>/<dossier>/<fichier>.yml où
+          <slug> = un segment non vide sans slash :
+          task-request->task-requests, design-doc->design-docs,
+          implementation-plan->implementation-plans,
+          review-report->review-reports,
+          diagnostic-report->diagnostic-reports, project-config->config
+          AVEC EXCEPTION EXACTE company/config/shared-rules.yml (config
+          système, exception de la règle file_placement de shared-rules).
+        - Kinds GLOBAUX : lesson-learned->company/lessons/,
+          persona->company/personas/, rfc->company/rfcs/,
+          roadmap->company/roadmaps/, flow-control + review-protocol +
+          human-review-triggers -> company/config/.
+        La validité du NOM de fichier reste hors périmètre (domaine de
+        check-artifact-naming.sh, séparation inchangée). Tests inline dans
+        placement.rs (portés par ce fichier créé, cf. étape 12).
+        Enregistrer le module dans crates/validation/src/lib.rs (mod
+        placement; + éventuel re-export).
+      files:
+        - crates/validation/src/placement.rs
+        - crates/validation/src/lib.rs
+
+    # =================================================================
+    - description: >
+        ÉTAPE 4 — MÉCANISME 9c : builder with_root + résolution du chemin
+        relatif (couche crate validation). Dans
+        crates/validation/src/validator.rs :
+        - Ajouter le champ root: Option<PathBuf> à ArtifactValidator.
+        - ArtifactValidator::new(registry) PRÉSERVÉ à l'identique (root =
+          None) — ne casse AUCUN des 19 call-sites (étape 0).
+        - Ajouter le builder additif pub fn with_root(mut self, root:
+          PathBuf) -> Self { self.root = Some(root); self }.
+        Sémantique de résolution (dans validate_file/validate_dir, étape 5) :
+        rel = canonicalize(root) + canonicalize(path) + strip_prefix(root).
+        Si le path est HORS root (strip_prefix échoue) OU si root == None,
+        le check de placement est SKIPPÉ (validation schema-only) —
+        FAIL-OPEN assumé et documenté. Les fixtures tempdir des tests
+        (hors arbre repo) tombent dans ce skip, d'où zéro test cassé. La
+        canonicalize résout aussi les symlinks des deux côtés (root et
+        path), donc un lien symbolique sous le repo se compare bien.
+      files:
+        - crates/validation/src/validator.rs
+
+    # =================================================================
+    - description: >
+        ÉTAPE 5 — MÉCANISME 9b : application du check dans validate_file et
+        validate_dir (couche crate validation). Dans validator.rs, après la
+        validation schema, si self.root est Some ET que le path se résout
+        SOUS root, appeler placement::check_placement(kind, rel) ; en cas de
+        Some(message), pousser une ERREUR BLOQUANTE dans report.errors
+        (message : kind, chemin constaté, chemin attendu) et is_valid=false.
+        validate_yaml_str (string sans path, tool MCP validate_yaml) NE PEUT
+        PAS vérifier le placement : comportement INCHANGÉ, documenté par un
+        commentaire. Les validators construits SANS with_root (engine
+        d'indexation orchestrator, tous les tests) gardent EXACTEMENT le
+        comportement actuel.
+      files:
+        - crates/validation/src/validator.rs
+
+    # =================================================================
+    - description: >
+        ÉTAPE 6 — MÉCANISME 9c (câblage binaire) : configurer with_root sur
+        les 5 points de construction du binaire companyos-yaml-validator.
+        Dans crates/mcp-servers/yaml/src/main.rs, chaîner .with_root(root)
+        après chaque ArtifactValidator::new, root = std::env::var(
+        constants::ENV_COMPANYOS_ROOT).unwrap_or_else(|_| ".".into())
+        (déjà lu en L171/L235/L277) :
+        - L175 run_server ; L208 watcher (auto-reload schemas) ; L239
+          run_single_file (hook --file + pre-commit) ; L281 run_batch (make
+          validate) ; L114 reload_schemas (tool) — pour ce dernier, root
+          doit être capturé/stocké (le serveur connaît déjà schemas_dir
+          dérivé de root ; ajouter root au YamlValidatorServer si besoin ou
+          re-lire l'ENV). Vérifier que run_batch, appelé avec dir=company/,
+          fonctionne : canonicalize(root)=repo, canonicalize(company/x.yml)
+          sous repo, strip_prefix OK.
+        Interfaces INCHANGÉES : mêmes flags (--file, --batch), mêmes appels
+        hook/pre-commit/Makefile, aucun script modifié.
+        AUCUN autre binaire ne configure with_root : l'engine d'indexation
+        orchestrator (main.rs L1647 CLI --index, etc.) reste sur new() nu,
+        donc son index_artifact fait une validation schema-only (pas de
+        double check placement ; l'enforcement placement vit au hook
+        validateYaml qui appelle ce binaire).
+      files:
+        - crates/mcp-servers/yaml/src/main.rs
+
+    # =================================================================
+    - description: >
+        ÉTAPE 7 — MÉCANISME 10 (erreurs + db) : préparer les fondations de
+        supersede_artifact (couche error + db). 
+        a) Dans crates/orchestrator/src/error.rs, ajouter deux variantes
+           thiserror (messages actionnables, pattern lot 1) :
+           SelfSupersession (old_id == new_id) et SupersedeProtectedZone
+           { path } (l'un des deux file_path en zone protégée). ArtifactNotFound
+           existant réutilisé pour un id non résolu dans l'index.
+        b) Dans crates/orchestrator/src/db.rs, ajouter pub fn
+           list_active_permits(&self) -> Result<Vec<WritePermit>,
+           OrchestratorError> : SELECT ... WHERE status='active', réutilise
+           PermitRow + into_permit existant (modelé sur check_permit L721).
+           Sert AUSSI au mécanisme 11 (étape 10).
+      files:
+        - crates/orchestrator/src/error.rs
+        - crates/orchestrator/src/db.rs
+
+    # =================================================================
+    - description: >
+        ÉTAPE 8 — MÉCANISME 10 (engine) : supersede_artifact + rollback +
+        idempotence + supersession_warnings (couche engine, pattern
+        set_rfc_implemented). Dans crates/orchestrator/src/engine.rs :
+        a) pub fn supersede_artifact(&mut self, old_id, new_id, note:
+           Option<String>, root) -> Result<..., OrchestratorError>. Séquence :
+           1. Early-returns : old_id==new_id -> SelfSupersession ; chaque id
+              résolu via db.get_artifact (comme set_rfc_implemented L476),
+              sinon ArtifactNotFound ; lire les file_path des deux ; si l'UN
+              est en zone protégée (zones via companyos-config
+              protected-zones) -> SupersedeProtectedZone. Cas nominal :
+              company/lessons/ et company/rfcs/ sont HORS zones.
+           2. Calcul des DEUX nouveaux contenus EN MÉMOIRE par édition
+              textuelle ciblée (MÊME FAMILLE que update_rfc_status_in_file
+              L370 : string replace, préserve formatting et block scalars,
+              PAS de round-trip serde_yaml) :
+              - NOUVEAU : ajouter {id: old_id, kind: <kind ancien>,
+                relationship: supersedes} dans metadata.related s'il est
+                absent (créer le bloc related si nécessaire).
+              - ANCIEN : ajouter {id: new_id, kind: <kind nouveau>,
+                relationship: superseded-by} dans metadata.related s'il est
+                absent, ET insérer en TÊTE de metadata.description une
+                mention datée "[SUPERSEDED-BY <new_id 8 chars> le <date>]"
+                suivie de la note éventuelle. La description peut être un
+                block scalar (>) ou une string quotée : l'insertion doit
+                gérer les deux (repérer la ligne "description:" / le début du
+                bloc et insérer la mention comme premier contenu). superseded-by
+                figure DÉJÀ dans l'enum _base.schema.json (RFC 2cb9201f) :
+                zéro changement de schema.
+           3. Valider les DEUX contenus modifiés (validate_yaml_str) AVANT
+              toute écriture disque ; si l'un est invalide -> abort SANS rien
+              écrire (fail-safe contre un bug d'édition textuelle).
+           4. Écritures : l'ANCIEN d'ABORD (l'annotation d'obsolescence est
+              la pièce structurellement manquante, lesson 9b2c1951), puis le
+              NOUVEAU. Si la 2e écriture échoue : rollback best-effort de la
+              1re depuis le contenu original gardé en mémoire (pattern
+              rollback_permit ; log si le rollback échoue) + erreur.
+           5. Ré-indexer les deux fichiers via self.index_artifact (signature
+              inchangée) pour que search() reflète immédiatement la
+              description annotée.
+           Idempotence : rejouer avec les mêmes ids ne duplique NI les
+           entrées related NI le marqueur description (détection des
+           existants) et retourne un succès idempotent.
+        b) pub fn supersession_warnings(&self, root, artifact:
+           &IndexedArtifact) -> Vec<String> : pour chaque related
+           relationship==supersedes de l'artifact indexé, résoudre la cible
+           dans l'index et vérifier que le YAML cible contient la réciproque
+           superseded-by pointant en retour ; sinon warning explicite
+           ("supersedes sans réciproque : la cible <id> ne porte pas
+           superseded-by ; utiliser supersede_artifact"). Non bloquant par
+           construction (le LLM juge QUOI superseder, l'algorithme vérifie
+           les deux écritures ; préférence 4e5c109b).
+      files:
+        - crates/orchestrator/src/engine.rs
+
+    # =================================================================
+    - description: >
+        ÉTAPE 9 — MÉCANISME 10 (serveur MCP) : tool supersede_artifact +
+        champ warnings (couche serveur MCP). Dans
+        crates/mcp-servers/orchestrator/src/main.rs :
+        a) Nouveau tool supersede_artifact(old_id, new_id, note?) SANS token
+           ni permit (même modèle que rfc_set_implemented, décision CEO 2 du
+           RFC 1c0f2570 : transition de cycle de vie exécutée par le
+           processus serveur, hors interception hook). Le note optionnel
+           porte le jugement de supersession PARTIELLE (lesson 9b2c1951).
+           Appelle engine.supersede_artifact, renvoie la réponse JSON
+           (deux fichiers touchés, marqueur posé).
+        b) Les tools index_now (L1158) et index_artifact (L1333) appellent
+           engine.supersession_warnings sur l'artifact indexé et ajoutent un
+           champ warnings à leur réponse JSON. Le CLI --index (L1656) les
+           imprime sur stderr ; reindex_all (engine.rs L1343) les loggue via
+           tracing::warn. Signature de engine.index_artifact PRÉSERVÉE (étape
+           0), les warnings passent par la méthode séparée.
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+
+    # =================================================================
+    - description: >
+        ÉTAPE 10 — MÉCANISME 11 : reload_config refuse si des permits actifs
+        subsistent (couche serveur MCP). Dans
+        crates/mcp-servers/orchestrator/src/main.rs, tool reload_config
+        (L1178) :
+        a) Ajouter passthrough engine.list_active_permits() (délègue à
+           db.list_active_permits de l'étape 7b).
+        b) Early-return AVANT CompanyConfig::load : s'il existe au moins un
+           permit actif, refus avec message explicite listant CHAQUE permit
+           (id, granted_to, rfc_id, target_paths) et le fix : "terminer la
+           séquence write_permit d'abord : commit du code puis
+           consume_write_permit, puis relancer reload_config". Cohérent avec
+           la GARDE 3 du lot 1 (consume exige un worktree propre) : la chaîne
+           commit -> consume -> reload est mécaniquement ordonnée. Les
+           permits consumed ou révoqués NE bloquent PAS.
+        c) NE PAS gater le hot-reload AUTOMATIQUE par file watcher
+           (ConfigChangeKind::Config) : il réagit à un changement déjà
+           légitimé en amont (l'écriture en zone protégée a exigé un permit).
+           Le gate porte sur l'INTENTION d'agent (l'appel explicite du tool),
+           pas sur la réaction du système. Décision assumée.
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+
+    # =================================================================
+    - description: >
+        ÉTAPE 11 — MÉCANISMES 12 + 13 (hook JS, COMMIT COUPLÉ) : CEO no-write,
+        hasActivePermit croise granted_to, purge ceo.yml produces,
+        régénération personas.yml. Ces éléments vont dans le MÊME commit (le
+        seul couplage interne du lot).
+        a) MÉCANISME 12a — company/plugins/defense-in-depth-core.mjs, handler
+           tool.execute.before (L379) : si input.agent === "ceo" ET
+           input.tool ∈ {write, edit, mcp_write, mcp_edit}, throw avec
+           diagnostic explicite (fix : "le CEO agit via les MCP tools :
+           votes, permits, arbitrages ; déléguer toute écriture au persona
+           compétent"). Blocage PRÉVENTIF dans before (contrairement au
+           Layer 1 en after+revert) : rien à valider ni à revert, bloquer
+           avant exécution est strictement plus sûr. Preuve empirique que
+           input.agent est peuplé : la garde authenticate cross-persona L384
+           l'utilise déjà.
+        b) MÉCANISME 13 — hasActivePermit(rootDir, filePath) devient
+           hasActivePermit(rootDir, filePath, agent) : la requête SELECT
+           ajoute granted_to ; un permit ne matche que si granted_to ===
+           agent EN PLUS du path-match (logique de matching de chemin
+           INCHANGÉE : exact, préfixe, glob suffixe *). agent absent/falsy
+           -> AUCUN match (fail-safe strict). Les 3 call-sites passent
+           input.agent : L466 (Layer 1 write/edit), L527 (Layer 2 bash
+           aftermath), L556 (filtre commits non autorisés). Messages
+           enrichis : "no active permit granted to agent '<agent>' covers
+           <path>". Ajouter hasActivePermit aux exports du module pour test
+           direct (précédent RFC cc4d9f8a).
+        c) MÉCANISME 12b — company/personas/ceo.yml : retirer lesson-learned
+           de artifacts.produces (promesse morte, pattern bd4650e2) ; annoter
+           le never "Écrire des fichiers directement" avec "vérifié
+           mécaniquement par le hook". company/config/personas.yml est
+           régénéré AUTOMATIQUEMENT par le wrapper (generatePersonasYml via
+           onProtectedZoneWrite) au write de ceo.yml sous permit — écriture
+           wrapper (pas un tool write), donc non bloquée par 12a.
+        RÉSIDUELS documentés (hors scope) : le canal bash du CEO n'est pas
+        bloqué (E60, lot 3) ; le pre-commit (matching LIKE active|consumed
+        sans agent) reste INCHANGÉ (v1-harness-refactor).
+      files:
+        - company/plugins/defense-in-depth-core.mjs
+        - company/personas/ceo.yml
+        - company/config/personas.yml
+
+    # =================================================================
+    - description: >
+        ÉTAPE 12 — TESTS aux TROIS AXES (fichiers de tests EXISTANTS ;
+        placement.rs porte ses tests inline). Écrire AVANT ou avec chaque
+        mécanisme, tous exécutés par make ci.
+        MÉCANISME 9 (crates/validation, placement.rs + validator.rs inline) :
+          Nominal : chaque kind à sa place (13 kinds) accepté ; project-config
+          dans projects/<slug>/config/ accepté. Négatif : design-doc placé
+          dans company/lessons/ refusé ; rfc dans projects/ refusé ;
+          lesson-learned dans company/rfcs/ refusé. Edge : exception
+          shared-rules.yml (company/config/shared-rules.yml) acceptée ;
+          sous-dossier sous un dossier de kind refusé ; path hors root
+          skippé (schema-only) ; validator sans with_root inchangé.
+        MÉCANISMES 10/11 (crates/orchestrator, engine.rs + db.rs inline) :
+          Nominal : supersede de deux lessons FIXTURES (les deux fichiers
+          portent les liens + le marqueur description, ré-indexés) ; reload
+          autorisé à zéro permit actif. Négatif : id inconnu (ArtifactNotFound),
+          self-supersede (SelfSupersession), cible en zone protégée
+          (SupersedeProtectedZone), contenu invalide au schema après édition
+          (abort sans écriture), 2e écriture en échec (rollback de la 1re) ;
+          reload refusé avec un permit actif, message listant le permit.
+          Edge : idempotence du supersede rejoué ; artifact ancien SANS bloc
+          related préexistant (création du bloc) ; warning d'asymétrie émis
+          sur un supersedes unilatéral et ABSENT sur un couple réciproque ;
+          permit consumed NE bloquant PAS le reload. NB fixtures : le harness
+          engine peut nécessiter un embedder (index_artifact l'exige) ; pour
+          les tests de supersede qui ré-indexent, réutiliser le pattern de
+          setup embedder des tests engine existants (ou fixtures via
+          upsert_artifact si new_without_embedder, cf. lot 1 étape 14).
+        MÉCANISMES 10/11 (crates/mcp-servers/orchestrator, main.rs inline) :
+          réponse JSON du tool supersede_artifact ; champ warnings de
+          index_now/index_artifact ; refus reload_config listant les permits.
+        MÉCANISMES 12/13 (company/plugins/tests/defense-in-depth-core.test.mjs) :
+          Nominal : l'implementer écrit sous SON permit actif (granted_to
+          match). Négatif : write/edit/mcp_write/mcp_edit bloqués pour agent
+          ceo ; write d'un agent B sous le permit de A reverté ; bash de B
+          modifiant un path couvert par le permit de A reverté. Edge : agent
+          undefined refusé (fail-safe) ; permit consumed sans effet ; bash du
+          ceo hors zone protégée NON bloqué (résiduel 12d) ; tool non-write
+          du ceo (bash, MCP) NON bloqué.
+        MÉCANISMES 7/8 (validations yaml-validator, en mémoire via
+          validate_yaml / tests validator inline) : review-report triaxial
+          valide accepté ; report SANS axes / axe manquant / verdict global
+          approve avec un axe request_changes / champ parasite dans axes
+          rejetés. design-doc complet accepté ; design-doc sans decisions /
+          components vide rejetés.
+      files:
+        - crates/validation/src/placement.rs
+        - crates/validation/src/validator.rs
+        - crates/orchestrator/src/engine.rs
+        - crates/orchestrator/src/db.rs
+        - crates/mcp-servers/orchestrator/src/main.rs
+        - company/plugins/tests/defense-in-depth-core.test.mjs
+
+    # =================================================================
+    - description: >
+        ÉTAPE 13 — PROSE AMENDÉE (pointe le mécanisme ; jamais supprimée
+        quand elle porte un critère de jugement). Ces éditions sont en zone
+        protégée (company/config, company/personas), couvertes par le permit.
+        - company/config/shared-rules.yml : file_placement -> mention de la
+          validation mécanique kind-chemin par le validator (hook/pre-commit/
+          make validate) ; lessons + lesson_chaining -> pointer
+          supersede_artifact comme canal canonique de la supersession à deux
+          écritures ; review_protocol -> mention de la forme triaxiale
+          mécanisée par le schema review-report (le fond reste prose).
+        - company/config/review-protocol.yml : review_analysis_framework
+          annotée "forme vérifiée par le schema (spec.axes), la qualité de
+          l'analyse reste du jugement".
+        - company/personas/architect.yml : règle "design docs complets"
+          annotée "vérifié mécaniquement par le schema design-doc".
+        - company/personas/implementer.yml : hotreload_last annotée
+          "l'exigence permits consommés avant reload est vérifiée
+          mécaniquement par reload_config".
+        (ceo.yml déjà traité à l'étape 11c.) La régénération de personas.yml
+        au write d'architect.yml/implementer.yml est automatique (wrapper).
+      files:
+        - company/config/shared-rules.yml
+        - company/config/review-protocol.yml
+        - company/personas/architect.yml
+        - company/personas/implementer.yml
+        - company/config/personas.yml
+
+    # =================================================================
+    - description: >
+        ÉTAPE 14 — CI INTERNE : make ci VERT. La séquence write_permit exige
+        cargo build + cargo test verts (règle must : CI = source de vérité
+        du done ; pour CompanyOS lui-même les étapes cargo build + cargo test
+        constituent la CI interne). make ci = build + tests (Rust) + lint +
+        validate + tests JS. DOIT être vert AVANT tout commit final. Les 7
+        mécanismes sont indépendants ; HEAD compile et passe make ci à
+        chaque commit (contrainte RFC). En cas d'échec : diagnostic-report
+        puis correction, jamais de contournement.
+      files: []
+
+    # =================================================================
+    - description: >
+        ÉTAPE 15 — COMMITS (AVANT consume, jamais après ; lesson 8fd49300 +
+        GARDE 3 du lot 1). Découpage recommandé (les schemas 7/8 n'exigent
+        aucune migration YAML simultanée, commits séparables) :
+        C1 schema review-report (mécanisme 7) ; C2 schema design-doc
+        (mécanisme 8) ; C3 placement.rs + validator with_root + câblage yaml
+        (mécanisme 9) ; C4 supersede_artifact engine+db+error+tool+warnings
+        (mécanisme 10) ; C5 gate reload_config (mécanisme 11) ; C6 COUPLÉ
+        hook CEO no-write + hasActivePermit granted_to + ceo.yml purge +
+        personas.yml régénéré (mécanismes 12+13, un seul commit) ; C7 prose
+        amendée + tests restants si non déjà commités avec leur mécanisme.
+        Chaque commit : git add des fichiers concernés (jamais git add -A),
+        vérifier git status/diff, message concis style repo référant le RFC
+        a4ee8b6a. git commit local, PAS de push. Le .db n'est PAS touché par
+        ces commits (le permit a été scellé au grant, RFC 359f9162).
+      files: []
+
+    # =================================================================
+    - description: >
+        ÉTAPE 16 — SÉQUENCE FINALE (nouveau flux de promotion RFC 18011bfc /
+        hotreload_last réécrite). ORDRE NON-NÉGOCIABLE :
+        (a) make ci VERT confirmé (étape 14) et TOUS les commits faits (étape
+            15). Worktree propre sur les target_paths du permit (exigé par
+            GARDE 3 au consume).
+        (b) consume_write_permit(permit_id=24e91083-d5a8-46a3-ba56-ef1f8531b10b,
+            persona=implementer) — APRÈS les commits. GARDE 3 refuse si le
+            worktree est sale sur les target_paths.
+        (c) make deploy-serve — promotion atomique (cp + rename) qui remplace
+            les binaires servis par ceux portant les nouveaux tools/validations
+            (supersede_artifact, gate reload_config, placement) et déclenche un
+            restart CONTRÔLÉ absorbé par le buffer FIFO du proxy (aucun retry,
+            aucun sleep côté agent). C'est CET acte qui met le nouveau serveur
+            en service.
+        (d) reload_config() EN DERNIER. NB ordre du gate mécanisme 11 : après
+            deploy-serve le gate est ACTIF ; MAIS le permit 24e91083 a été
+            consommé en (b), donc list_active_permits est vide et le reload
+            passe. C'est exactement l'ordre consume→reload que le gate exige.
+            Côté YAML config a priori rien de neuf à recharger
+            (flow-control/review-protocol inchangés sur max_iterations), mais
+            l'appel valide la chaîne et confirme que le gate laisse passer un
+            worktree sans permit actif.
+        (e) rfc_set_implemented(id=a4ee8b6a-ebcd-4a76-96eb-7e31785c8ae6) —
+            transition approved -> implemented, sans permit (transition serveur).
+        (f) task-request 0935d0df -> status done (édition YAML sous permit ?
+            NON : projects/company-os/task-requests/ n'est PAS en zone protégée ;
+            écriture directe, auto-indexée).
+      files:
+        - projects/company-os/task-requests/v1-process-lot2-hardening-0935d0df.yml
+
+    # =================================================================
+    - description: >
+        ÉTAPE 17 — LESSON DE CLÔTURE + TEST EN VIF. 
+        LESSON : chaîner sur 1bb07073 (lot 1, technique de mécanisation +
+        caller-inventory) et 9b2c1951 (supersession deux écritures) via
+        metadata.related. Capturer : ce qui a marché (early-return + require
+        schema + builder additif préservant les call-sites), les surprises
+        (édition textuelle de description block-scalar, fail-open placement),
+        et le résultat clean-company (23/62 règles mécaniques). Chercher
+        d'abord une lesson proche (search) : améliorer plutôt que dupliquer
+        si elle existe. company/lessons/ hors zone protégée : écriture directe.
+        TEST EN VIF (au moins un mécanisme par couche, après deploy-serve) :
+        - Couche SCHEMA : soumettre un review-report YAML mono-axe (sans
+          spec.axes ou un axe manquant) à validate_yaml -> DOIT être rejeté.
+        - Couche SERVEUR : supersede_artifact sur une paire de lessons TEST
+          (ou deux lessons réelles dont l'une périme l'autre) -> vérifier que
+          l'ANCIENNE porte le marqueur [SUPERSEDED-BY ...] + superseded-by et
+          la NOUVELLE porte supersedes, et que search remonte le marqueur ;
+          + vérifier l'idempotence en rejouant.
+        - Couche HOOK : le blocage CEO no-write NE PEUT PAS être testé en vif
+          par l'Implementer (impossible de se faire passer pour agent==ceo,
+          la garde authenticate cross-persona l'interdit) -> DOCUMENTER que la
+          couverture repose sur les tests JS de l'étape 12
+          (defense-in-depth-core.test.mjs) exécutés par make ci, qui simulent
+          input.agent="ceo". hasActivePermit granted_to est couvert
+          indirectement : l'Implementer a écrit sous SON permit tout le lot
+          (preuve nominale vivante).
+      files: []
+
+  risks:
+    - "Édition textuelle de metadata.description en block scalar (>) : l'insertion en tête du contenu du bloc est le point le plus délicat du mécanisme 10. Mitigation : validate_yaml_str sur les DEUX contenus AVANT toute écriture (étape 8.3) ; si l'édition casse le YAML, abort sans écrire. Tests edge dédiés (block scalar ET string quotée, artifact sans bloc related préexistant)."
+    - "Câblage with_root incomplet sur reload_schemas (L114) : ce point n'a pas root en scope local comme les autres. Mitigation : stocker root dans YamlValidatorServer au new (ou relire l'ENV dans reload_schemas). Vérifier qu'un reload_schemas ne DÉCONFIGURE pas le placement (régression silencieuse : le validator rechargé perdrait son root)."
+    - "Fixtures des tests de supersede/reindex : index_artifact exige un embedder. Si le harness engine utilise new_without_embedder, index_artifact est indisponible (cf. lot 1 étape 14). Mitigation : soit charger l'embedder de cache dans ces tests précis, soit tester la partie édition-textuelle+écriture sans la ré-indexation et couvrir la ré-indexation par un test qui a l'embedder."
+    - "Le gate reload_config (mécanisme 11) pourrait bloquer un reload légitime si un permit d'une AUTRE session reste actif. C'est le comportement VOULU (le gate est global sur les permits actifs). Dans la séquence finale, le permit 24e91083 est consommé AVANT le reload, donc pas de blocage. Documenté à l'étape 16(d)."
+    - "make ci doit rester vert à CHAQUE commit (contrainte RFC), pas seulement à la fin. Risque si un commit introduit un mécanisme dont le test dépend d'un autre. Mitigation : les 7 mécanismes sont indépendants ; commiter mécanisme + ses tests ensemble (étape 15), le seul couplage est C6 (12+13)."
+    - "personas.yml est régénéré par le wrapper, pas édité à la main. Si la régénération ne se déclenche pas (ex. write hors onProtectedZoneWrite), personas.yml divergerait de ceo.yml. Mitigation : vérifier après le write de ceo.yml que personas.yml reflète bien la purge du produces avant de committer C6."
