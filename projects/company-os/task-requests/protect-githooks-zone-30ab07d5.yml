@@ -32,7 +32,7 @@ metadata:
 
 spec:
   priority: high
-  status: backlog
+  status: done
 
   context: >
     protected-zones.json couvre company/config/, company/personas/,

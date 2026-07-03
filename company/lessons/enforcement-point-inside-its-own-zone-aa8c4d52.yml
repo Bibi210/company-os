@@ -1,0 +1,93 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: aa8c4d52-12b2-4d1f-b931-008951231a11
+  title: "Le point d'enforcement doit vivre dans la zone qu'il enforce ; protéger l'appelant sans l'appelé ne protège rien"
+  author: implementer
+  created_at: "2026-07-03"
+  description: >
+    Capitalisation de clôture du RFC c129453c (task-request 30ab07d5 done) :
+    ajout de .githooks/ et company/scripts/ aux prefixes de
+    protected-zones.json. Deux enseignements. (1) Un harness dont le point
+    d'enforcement (le pre-commit hook, Layer 3) est librement modifiable par
+    les agents qu'il contraint n'est pas un harness : le point d'enforcement
+    doit vivre DANS la zone qu'il enforce, sinon il s'auto-neutralise (un agent
+    pose exit 0 en tête de hook, démontré le 2026-06-10 commit 916bf1d, fix
+    légitime mais précédent dangereux). (2) L'investigation a révélé un angle
+    mort symétrique : le bypass par DÉLÉGATION. Le plugin protégé
+    (company/plugins/) déléguait à company/scripts/check-artifact-naming.sh un
+    script NON protégé ; protéger l'appelant sans protéger l'appelé ne protège
+    rien (modifier le script rend le check inopérant sans toucher la zone
+    protégée). deploy-serve.sh, exécuté par le proxy, est un vecteur d'exécution
+    du même calibre. Chaîne d'enforcement = tous les maillons doivent être
+    protégés, pas seulement le premier.
+  tags:
+    - companyos-v1
+    - protected-zones
+    - githooks
+    - pre-commit
+    - hardening
+    - security
+    - harness
+    - enforcement-chain
+    - delegation-bypass
+    - critical-infra
+    - lessons-from-implementation
+  related:
+    - id: 1afcbe17-74d5-42db-b0de-b381e73910ea
+      kind: lesson-learned
+      relationship: related
+    - id: 1bb07073-421c-4a4b-b647-1dc7bdac89b5
+      kind: lesson-learned
+      relationship: related
+    - id: c129453c-3a8f-47cf-bf3e-a070e12416b0
+      kind: rfc
+      relationship: derived-from
+    - id: 30ab07d5-8c98-4a23-b829-0f1ba72cbfad
+      kind: task-request
+      relationship: input
+
+spec:
+  context: >
+    protected-zones.json couvrait company/config/, company/personas/,
+    company/schemas/, company/plugins/, crates/ et opencode.json, mais PAS
+    .githooks/ ni company/scripts/. Le pre-commit hook (Layer 3 du harness :
+    validation YAML, naming, audit trail permit, make ci) était donc modifiable
+    par tout agent sans RFC ni permit (démontré 2026-06-10, commit 916bf1d,
+    diagnostic f82847f1 / lesson 1afcbe17 : le fix de la fuite GIT_* était bon,
+    mais le précédent d'une modif sans contrôle du point d'enforcement était
+    mauvais). Le recensement du RFC a de plus révélé que la chaîne d'enforcement
+    débordait de company/plugins/ : le plugin protégé délègue le check de naming
+    à company/scripts/check-artifact-naming.sh (non protégé), et deploy-serve.sh
+    y est exécuté par le proxy.
+  insight: >
+    Deux principes indissociables. (1) UN POINT D'ENFORCEMENT DOIT ÊTRE DANS LA
+    ZONE QU'IL ENFORCE. Un harness qui laisse son propre mécanisme de contrainte
+    hors de sa protection s'auto-neutralise : l'agent qu'il contraint peut le
+    désactiver. Le hook s'auto-protège désormais de façon data-driven (is_protected
+    matche le prefix .githooks/ pour le hook lui-même), sans paradoxe.
+    (2) BYPASS PAR DÉLÉGATION : protéger l'appelant sans l'appelé ne protège rien.
+    Une chaîne d'enforcement n'est aussi forte que son maillon le moins protégé ;
+    tout script/binaire invoqué par un composant protégé (délégation) ou exécuté
+    par l'infra (proxy) est lui-même un maillon et doit être protégé.
+    Corollaire de coût : comme les 4 consommateurs de la liste de prefixes la
+    lisent dynamiquement (2 mjs à l'init+hot-reload, pre-commit à chaque run,
+    Rust protected_zones.rs cache+reload, watcher au spawn), durcir une nouvelle
+    zone est un changement de DONNÉES pur (une ligne JSON), pas de refonte code :
+    le rapport valeur/coût du durcissement est excellent quand la liste est déjà
+    consommée dynamiquement partout.
+  recommendation: >
+    Quand on ajoute ou audite un point d'enforcement (hook, plugin, garde
+    serveur), vérifier systématiquement : (a) le point d'enforcement est-il
+    lui-même dans une zone protégée ? sinon il est neutralisable ; (b) recenser
+    TOUS les scripts/binaires qu'il invoque par délégation ou que l'infra exécute
+    (proxy, watcher), et les protéger AUSSI — la granularité de protected-zones.json
+    est le prefix, préférer protéger le répertoire entier (company/scripts/) plutôt
+    que fichier par fichier (une exception par fichier affaiblirait précisément ce
+    qu'on durcit). Accepter la friction sur les scripts de test itérés
+    (test-mcp-proxy-restart.sh passe sous permit) : c'est cohérent avec crates/
+    protégé tests inclus ; si excessive, la traiter par un RFC futur qui déplace
+    les scripts de test hors de la zone, pas par une exception. Empiriquement
+    vérifié à l'implémentation : T1/T2 (guard Layer 2 revert bash sans permit sur
+    .githooks/pre-commit et company/scripts/deploy-serve.sh), T3 (pre-commit bloque
+    le commit stagé sans permit), T5 (écriture hors zone reste libre) — tous verts.
