@@ -1,6 +1,20 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://companyos.dev/schemas/review-report.schema.json",
+  "$defs": {
+    "axis": {
+      "type": "object",
+      "properties": {
+        "verdict": {
+          "type": "string",
+          "enum": ["approve", "request_changes"]
+        },
+        "notes": { "type": "string" }
+      },
+      "required": ["verdict"],
+      "additionalProperties": false
+    }
+  },
   "allOf": [
     { "$ref": "_base.schema.json" },
     {
@@ -24,15 +38,40 @@
               "type": "array",
               "items": { "type": "string" }
             },
+            "axes": {
+              "type": "object",
+              "properties": {
+                "nominal": { "$ref": "#/$defs/axis" },
+                "negative": { "$ref": "#/$defs/axis" },
+                "edge": { "$ref": "#/$defs/axis" }
+              },
+              "required": ["nominal", "negative", "edge"],
+              "additionalProperties": false
+            },
             "notes": { "type": "string" },
             "summary": { "type": "string" }
           },
-          "required": ["verdict", "findings"],
+          "required": ["verdict", "findings", "axes"],
           "if": {
             "properties": { "verdict": { "const": "approve" } }
           },
           "then": {
-            "properties": { "findings": { "maxItems": 0 } }
+            "properties": {
+              "findings": { "maxItems": 0 },
+              "axes": {
+                "properties": {
+                  "nominal": {
+                    "properties": { "verdict": { "const": "approve" } }
+                  },
+                  "negative": {
+                    "properties": { "verdict": { "const": "approve" } }
+                  },
+                  "edge": {
+                    "properties": { "verdict": { "const": "approve" } }
+                  }
+                }
+              }
+            }
           }
         }
       },
