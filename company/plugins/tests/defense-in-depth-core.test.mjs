@@ -126,11 +126,21 @@ function setupRoot(permits) {
 }
 
 // Initialise un repo git dans rootDir et commit la DB courante (la scelle en HEAD).
+// Hermétique contre la config utilisateur (RFC 324e8a33, symétrie avec le helper
+// Rust hermetic_git_cmd) : GIT_CONFIG_GLOBAL/SYSTEM=/dev/null neutralisent un
+// commit.gpgsign=true global (qui déclencherait gpg/pinentry sans TTY sous
+// make test-js), et commit.gpgsign=false en config LOCALE double la ceinture.
 function gitCommitDb(rootDir) {
-  execSync("git init -q", { cwd: rootDir });
-  execSync('git config user.email t@t.t && git config user.name t', { cwd: rootDir });
-  execSync(`git add -f "${DB_REL}"`, { cwd: rootDir });
-  execSync('git commit -q -m seal', { cwd: rootDir });
+  const env = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+  };
+  execSync("git init -q", { cwd: rootDir, env });
+  execSync('git config user.email t@t.t && git config user.name t', { cwd: rootDir, env });
+  execSync("git config commit.gpgsign false", { cwd: rootDir, env });
+  execSync(`git add -f "${DB_REL}"`, { cwd: rootDir, env });
+  execSync('git commit -q -m seal', { cwd: rootDir, env });
 }
 
 // Lit l'ensemble des ids actuellement dans la DB (pour assertions).

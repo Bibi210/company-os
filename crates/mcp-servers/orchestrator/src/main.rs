@@ -566,9 +566,17 @@ impl OrchestratorServer {
             return Err(SealError::GitFailed { stderr });
         }
 
-        // (2) git commit -m "chore: seal write permit <id> for RFC <rfc>"
+        // (2) git -c commit.gpgsign=false commit -m "chore: seal write permit <id> for RFC <rfc>"
+        // DECISION B (RFC 324e8a33): the seal is a machine commit emitted by the
+        // headless MCP server. It is NEVER verified by signature (the
+        // defense-in-depth hook reads the DB CONTENT at HEAD, not signatures),
+        // and a blocking pinentry during a grant would freeze the engine lock
+        // then fail the grant in a commit.gpgsign=true environment. Disable
+        // signing explicitly so availability/atomicity of the grant prevails.
         let msg = format!("chore: seal write permit {permit_id} for RFC {rfc_id}");
-        let commit = git().args(["commit", "-m", &msg]).output();
+        let commit = git()
+            .args(["-c", "commit.gpgsign=false", "commit", "-m", &msg])
+            .output();
         let commit = match commit {
             Ok(o) => o,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -2222,9 +2230,33 @@ mod tests {
         }
     }
 
+    /// Build a `git` Command rooted at `root` that is HERMETIC against the
+    /// ambient environment (RFC 324e8a33, generalizes lesson 1afcbe17 to the
+    /// CONFIG channel). Neutralizes:
+    /// - the user/system git config (GIT_CONFIG_GLOBAL/SYSTEM=/dev/null) so a
+    ///   `commit.gpgsign=true` in ~/.gitconfig can never drag gpg/pinentry into
+    ///   a headless `cargo test` (the incident that turned make ci red);
+    /// - the locale (LC_ALL/LANG=C) so stdout/stderr markers stay English;
+    /// - the inherited GIT_* state variables (GIT_DIR/GIT_INDEX_FILE/
+    ///   GIT_WORK_TREE/GIT_PREFIX) so the invocation resolves ITS OWN repo from
+    ///   its cwd, never the outer repo's index (consistent with
+    ///   check_worktree_clean and lesson 1afcbe17 / hook fix 916bf1d).
+    fn hermetic_git_cmd(root: &Path) -> Command {
+        let mut c = Command::new("git");
+        c.current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_PREFIX");
+        c
+    }
+
     fn git(root: &Path, args: &[&str]) {
-        let out = Command::new("git")
-            .current_dir(root)
+        let out = hermetic_git_cmd(root)
             .args(args)
             .output()
             .expect("git spawn");
@@ -2241,6 +2273,13 @@ mod tests {
         git(root, &["init", "-q"]);
         git(root, &["config", "user.email", "test@companyos.local"]);
         git(root, &["config", "user.name", "Test"]);
+        // A4 (RFC 324e8a33): disable commit signing in the temp repo's LOCAL
+        // config. Indispensable and NOT redundant with hermetic_git_cmd: the
+        // PRODUCTION seal_db_commit path is exercised in-process by the tests
+        // and does NOT go through hermetic_git_cmd; the local config (which
+        // takes precedence over the global) keeps the seal tests green
+        // regardless of the host machine's ~/.gitconfig.
+        git(root, &["config", "commit.gpgsign", "false"]);
         std::fs::write(root.join("README.md"), "test\n").unwrap();
         git(root, &["add", "README.md"]);
         git(root, &["commit", "-q", "-m", "init"]);
@@ -2323,8 +2362,7 @@ mod tests {
         assert_eq!(hash.len(), 40, "expected a 40-char git sha, got '{hash}'");
 
         // The commit must touch ONLY the .db file (VOLATILE class).
-        let stat = Command::new("git")
-            .current_dir(tmp.path())
+        let stat = hermetic_git_cmd(tmp.path())
             .args(["show", "--stat", "--name-only", "--format=", "HEAD"])
             .output()
             .unwrap();
@@ -2415,8 +2453,7 @@ mod tests {
         drop(engine);
 
         // The seal commit must touch ONLY the .db.
-        let stat = Command::new("git")
-            .current_dir(tmp.path())
+        let stat = hermetic_git_cmd(tmp.path())
             .args(["show", "--stat", "--name-only", "--format=", "HEAD"])
             .output()
             .unwrap();

@@ -1,0 +1,97 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: 5e1e6b0b-cf93-48bd-aba3-1e9648a17ca4
+  title: "make ci rouge : les tests git-based héritent de commit.gpgsign=true global, pinentry timeout"
+  author: architect
+  created_at: "2026-07-11"
+  project: company-os
+  description: >
+    Depuis la réactivation de la signature GPG dans ~/.gitconfig (commit.gpgsign=true),
+    les 13 tests git-based de crates/mcp-servers/orchestrator/src/main.rs
+    (test_seal_db_commit_*, test_grant_*, test_consume_*) échouent : les dépôts git
+    temporaires qu'ils créent héritent de la config GLOBALE de l'utilisateur, git commit
+    déclenche gpg → pinentry sans TTY → timeout. make ci est rouge sur HEAD, donc le
+    pre-commit hook (qui lance make ci) bloque TOUT commit. Même classe que la lesson
+    1afcbe17 (fuite d'environnement git vers les processus enfants) : ici la fuite passe
+    par la CONFIG (~/.gitconfig, config système) et non par les variables GIT_* déjà
+    neutralisées par le fix 916bf1d. Le harness mjs du plugin defense-in-depth
+    (gitCommitDb, exécuté par make test-js, lui aussi dans make ci) a la même faille.
+  tags:
+    - git
+    - gpg
+    - gpgsign
+    - pinentry
+    - hermeticite
+    - environment-leak
+    - ci
+    - pre-commit
+    - testing
+    - harness
+    - companyos-internals
+    - critical-infra
+  related:
+    - id: 1afcbe17-74d5-42db-b0de-b381e73910ea
+      kind: lesson-learned
+      relationship: related
+    - id: f82847f1-7ee2-4fc7-a4f5-a1685a62c152
+      kind: diagnostic-report
+      relationship: related
+    - id: 359f9162-18f2-4b72-85b0-7d0e44608959
+      kind: rfc
+      relationship: related
+    - id: 324e8a33-db8a-46d8-aea9-78e2fa050d60
+      kind: rfc
+      relationship: related
+
+spec:
+  symptom: >
+    make ci est rouge sur HEAD ; le pre-commit hook bloque par conséquent tout commit du
+    dépôt (incluant le commit du fix lui-même : cycle hotfix requis). Les 13 tests
+    git-based de l'orchestrator MCP (test_seal_db_commit_ok_returns_hash,
+    test_grant_write_permit_* et test_grant_*, test_consume_*) échouent par timeout.
+    Reproduction minimale confirmée hors cargo : dans un dépôt git fraîchement init en
+    tempdir avec identité locale posée, `timeout 10 git commit -q -m test` sort en
+    exit=124 (pendu sur pinentry). `git config --global commit.gpgsign` retourne true.
+  root_cause: >
+    Les helpers de test qui spawnent git ne sont pas hermétiques contre la config
+    utilisateur. Trois surfaces, toutes dans la classe de la lesson 1afcbe17 (un
+    processus qui spawn git doit être hermétique contre l'environnement ambiant) :
+
+    (1) Helpers Rust du module tests de crates/mcp-servers/orchestrator/src/main.rs :
+    fn git() (L2225), init_git_repo() (L2240) et deux invocations inline `git show`
+    (L2326, L2418) ne posent ni GIT_CONFIG_GLOBAL ni GIT_CONFIG_SYSTEM. Le git commit
+    d'init_git_repo hérite de ~/.gitconfig : commit.gpgsign=true → gpg → pinentry sans
+    TTY dans le contexte cargo test → blocage/timeout. L'identité (user.name/email) est
+    déjà posée en config locale, mais gpgsign, hooksPath et tout autre réglage global
+    fuient.
+
+    (2) Code de PRODUCTION seal_db_commit (main.rs L527, introduit par le RFC 359f9162) :
+    le `git commit` de scellement hérite lui aussi de la config utilisateur. Les tests
+    l'exercent in-process, donc même un fix limité aux helpers (1) ne suffirait que via
+    la config locale du repo temporaire ; et en réel, un grant_write_permit exécuté avec
+    commit.gpgsign=true depuis le serveur MCP headless (pinentry inaccessible) bloque le
+    commit de seal en tenant l'engine lock, puis échoue → grant refusé (rollback
+    correct, mais tool inutilisable dans l'environnement actuel).
+
+    (3) Harness mjs company/plugins/tests/defense-in-depth-core.test.mjs : gitCommitDb()
+    (L129) fait git init + git commit via execSync sans isolation de config → même
+    blocage dans make test-js, également membre de make ci.
+
+    Le problème était LATENT depuis l'écriture de ces tests : masqué parce que la
+    signature GPG avait été temporairement désactivée pendant le lot 2 (make ci vert
+    alors), révélé à sa réactivation. Le fix 916bf1d (lesson 1afcbe17) ne couvrait que
+    les variables GIT_* exportées par les hooks, pas le canal config.
+  resolution: >
+    RFC hotfix 324e8a33 (draft, cycle rapide) : (a) hermétisation de TOUS les spawns git
+    des tests (Rust et mjs) via GIT_CONFIG_GLOBAL=/dev/null + GIT_CONFIG_SYSTEM=/dev/null
+    + identité locale + commit.gpgsign=false explicite en config locale du repo
+    temporaire ; (b) décision prod tranchée : le commit de seal machine de
+    seal_db_commit passe en `-c commit.gpgsign=false` (les commits de seal ne portent
+    aucune garantie par signature — le hook defense-in-depth compare le CONTENU de la DB
+    en HEAD, pas les signatures — et l'atomicité/disponibilité du grant prime sur une
+    signature que personne ne vérifie). Les commits humains restent signés, aucun autre
+    comportement prod modifié. NOTE : ce diagnostic et le RFC ne peuvent pas être
+    commités tant que make ci est rouge (le pre-commit lance make ci) ; ils seront
+    commités avec/après l'implémentation du fix.
+  status: resolved
