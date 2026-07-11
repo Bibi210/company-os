@@ -11,6 +11,7 @@ import {
   buildBaseline,
   revertPermitTampering,
   snapshotPermits,
+  hasActivePermit,
 } from "../defense-in-depth-core.mjs";
 import { writeFileSync, mkdirSync, rmSync, existsSync, readdirSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
@@ -394,6 +395,112 @@ describe("revertPermitTampering — EDGE", () => {
       assert.equal(after.size, before.size, "pas de fuite /tmp même en échec");
     } finally {
       cleanup(rootDir);
+    }
+  });
+});
+
+// =====================================================================
+// Mechanism 13 (RFC a4ee8b6a): hasActivePermit croise granted_to == agent
+// =====================================================================
+
+// Setup a root with a full write_permits table (granted_to + target_paths).
+function setupPermitRoot(rows) {
+  const rootDir = mkdtempSync(join(tmpdir(), "did-granted-"));
+  const cfgDir = join(rootDir, "company", "config");
+  mkdirSync(cfgDir, { recursive: true });
+  writeFileSync(
+    join(cfgDir, "protected-zones.json"),
+    JSON.stringify({ prefixes: ["crates/", "company/"], files: [], db_path: DB_REL }),
+  );
+  loadProtectedZones(rootDir);
+  const dbAbs = join(rootDir, DB_REL);
+  mkdirSync(join(rootDir, "company", "data"), { recursive: true });
+  sql(
+    rootDir,
+    dbAbs,
+    "CREATE TABLE write_permits (id TEXT PRIMARY KEY, status TEXT, granted_to TEXT, target_paths TEXT)",
+  );
+  let i = 0;
+  for (const [status, grantedTo, paths] of rows) {
+    const pj = JSON.stringify(paths).replace(/'/g, "''");
+    sql(
+      rootDir,
+      dbAbs,
+      `INSERT INTO write_permits (id, status, granted_to, target_paths) VALUES ('p${i++}', '${status}', '${grantedTo}', '${pj}')`,
+    );
+  }
+  return { rootDir };
+}
+
+describe("hasActivePermit (mechanism 13: granted_to == agent)", () => {
+  it("nominal: matches when granted_to === agent AND path covered", () => {
+    const { rootDir } = setupPermitRoot([
+      ["active", "implementer", ["crates/x.rs"]],
+    ]);
+    try {
+      assert.equal(
+        hasActivePermit(rootDir, "crates/x.rs", "implementer"),
+        true,
+        "beneficiary writing a covered path is allowed",
+      );
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("negative: permit of agent A does NOT cover agent B", () => {
+    const { rootDir } = setupPermitRoot([
+      ["active", "architect", ["crates/x.rs"]],
+    ]);
+    try {
+      assert.equal(
+        hasActivePermit(rootDir, "crates/x.rs", "implementer"),
+        false,
+        "an agent cannot write under another agent's permit",
+      );
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("edge: agent undefined → no match (fail-safe strict)", () => {
+    const { rootDir } = setupPermitRoot([
+      ["active", "implementer", ["crates/x.rs"]],
+    ]);
+    try {
+      assert.equal(hasActivePermit(rootDir, "crates/x.rs", undefined), false);
+      assert.equal(hasActivePermit(rootDir, "crates/x.rs", ""), false);
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("edge: consumed permit does not match even for the beneficiary", () => {
+    const { rootDir } = setupPermitRoot([
+      ["consumed", "implementer", ["crates/x.rs"]],
+    ]);
+    try {
+      assert.equal(
+        hasActivePermit(rootDir, "crates/x.rs", "implementer"),
+        false,
+        "only active permits count",
+      );
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("edge: glob suffix pattern still matches for the beneficiary", () => {
+    const { rootDir } = setupPermitRoot([
+      ["active", "implementer", ["crates/sub/*"]],
+    ]);
+    try {
+      assert.equal(
+        hasActivePermit(rootDir, "crates/sub/deep/y.rs", "implementer"),
+        true,
+      );
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
     }
   });
 });

@@ -113,26 +113,42 @@ function runSqliteWithTimeout(dbPath, sql, cwd) {
   );
 }
 
-function hasActivePermit(rootDir, filePath) {
+// Mechanism 13 (RFC a4ee8b6a): a permit only covers its BENEFICIARY. The
+// query selects granted_to alongside target_paths, and a permit matches only
+// when granted_to === agent IN ADDITION to the path match. The path-matching
+// logic (exact, prefix, glob suffix '*') is unchanged. `agent` absent/falsy →
+// NO match (fail-safe strict): we prefer a noisy false block (explicit
+// message, non-destructive revert for tracked files) to a silent hole.
+function hasActivePermit(rootDir, filePath, agent) {
+  if (!agent) return false; // fail-safe: no agent → no permit matches
   const dbPath = resolve(rootDir, _zones.db_path);
   if (!existsSync(dbPath)) return false;
 
   const rel = relative(rootDir, resolve(rootDir, filePath));
 
-  const query = `SELECT target_paths FROM write_permits WHERE status = 'active'`;
+  // Row-encode granted_to and target_paths so a JSON array containing a '|'
+  // is never confused with the column separator: granted_to (a persona id)
+  // never contains '|'.
+  const query = `SELECT granted_to || '|' || target_paths FROM write_permits WHERE status = 'active'`;
   const result = runSqliteWithTimeout(dbPath, query, rootDir);
   if (!result) return false;
 
   for (const line of result.split("\n")) {
+    if (!line) continue;
+    const sep = line.indexOf("|");
+    if (sep < 0) continue;
+    const grantedTo = line.slice(0, sep);
+    const rest = line.slice(sep + 1);
+    if (grantedTo !== agent) continue; // permit only covers its beneficiary
     try {
-      const paths = JSON.parse(line);
+      const paths = JSON.parse(rest);
       for (const pattern of paths) {
         if (rel.startsWith(pattern) || rel === pattern) return true;
         if (pattern.endsWith("*") && rel.startsWith(pattern.slice(0, -1)))
           return true;
       }
     } catch {
-      if (rel.startsWith(line) || rel === line) return true;
+      if (rel.startsWith(rest) || rel === rest) return true;
     }
   }
   return false;
@@ -354,6 +370,7 @@ export {
   permitIdsFromHeadDb,
   buildBaseline,
   revertPermitTampering,
+  hasActivePermit,
 };
 
 export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
@@ -377,6 +394,28 @@ export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
     // Layer 0 (before): Auth & DB access guard
     // -----------------------------------------------------------------
     "tool.execute.before": async (input) => {
+      // Mechanism 12a (RFC a4ee8b6a): the CEO never writes files directly.
+      // Preventive block in `before` (unlike Layer 1's after+revert): the
+      // guard does not depend on the written content, so there is nothing to
+      // validate or revert — blocking before execution is strictly safer.
+      // input.agent is populated in production (the authenticate cross-persona
+      // guard below relies on it too).
+      if (
+        input.agent === "ceo" &&
+        (input.tool === "write" ||
+          input.tool === "edit" ||
+          input.tool === "mcp_write" ||
+          input.tool === "mcp_edit")
+      ) {
+        throw new Error(
+          diag("ERROR", "CEO cannot write files directly", {
+            context: `${input.tool} by agent 'ceo'`,
+            reason: `The CEO acts through MCP tools only (votes, permits, arbitrations) and never writes files directly.`,
+            fix: `Delegate any file write to the competent persona (PM, Architect, Implementer).`,
+          }),
+        );
+      }
+
       // Block cross-persona authentication
       if (input.tool === "mcp_orchestrator_authenticate") {
         const persona = input.args?.persona;
@@ -463,12 +502,12 @@ export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
         }
 
         if (isInProtectedZone(rel)) {
-          if (!hasActivePermit(rootDir, filePath)) {
+          if (!hasActivePermit(rootDir, filePath, input.agent)) {
             revertFile(rootDir, rel);
             throw new Error(
               diag("ERROR", `Write blocked in protected zone: ${rel}`, {
                 context: `${input.tool}(file_path=${rel})`,
-                reason: `File is in a protected zone and no active write permit covers it. Change reverted.`,
+                reason: `No active permit granted to agent '${input.agent}' covers ${rel}. Change reverted.`,
                 fix: `Request a write permit via grant_write_permit (CEO only, requires an approved RFC)`,
               }),
             );
@@ -524,12 +563,15 @@ export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
             if (isVolatile(file)) continue;
             if (diffBefore.has(file)) continue;
 
-            if (isInProtectedZone(file) && !hasActivePermit(rootDir, file)) {
+            if (
+              isInProtectedZone(file) &&
+              !hasActivePermit(rootDir, file, input.agent)
+            ) {
               revertFile(rootDir, file);
               throw new Error(
                 diag("ERROR", `Bash modified protected zone: ${file}`, {
                   context: `bash command aftermath check`,
-                  reason: `The bash command modified a protected file without a write permit. Change reverted.`,
+                  reason: `No active permit granted to agent '${input.agent}' covers ${file}. Change reverted.`,
                   fix: `Request a write permit via grant_write_permit before modifying protected zones`,
                 }),
               );
@@ -553,7 +595,7 @@ export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
                   !isSafeBashPath(f) &&
                   !isVolatile(f) &&
                   isInProtectedZone(f) &&
-                  !hasActivePermit(rootDir, f),
+                  !hasActivePermit(rootDir, f, input.agent),
               );
             if (unauthorized.length > 0) {
               run(`git reset --soft ${state.gitHead}`, rootDir);

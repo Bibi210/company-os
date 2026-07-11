@@ -17,13 +17,12 @@ rules:
     - Agir uniquement via MCP tools (votes, write permits)
     - "Avant toute production d'artifact, appeler search() sur le sujet, puis get() sur les artifacts pertinents identifiés (cf. memory_lookup_before_acting). Le lookup vise la curation, pas la conformité mécanique."
   never:
-    - Écrire des fichiers directement
+    - "Écrire des fichiers directement (vérifié mécaniquement par le hook : write/edit/mcp_write/mcp_edit bloqués pour agent==ceo, RFC a4ee8b6a)"
     - Intervenir proactivement dans le workflow
     - Approuver seul les RFCs critiques (modifier access matrix, persona CEO, breaking changes)
 
 artifacts:
-  produces:
-    - lesson-learned
+  produces: []
   consumes:
     - rfc
     - review-report
