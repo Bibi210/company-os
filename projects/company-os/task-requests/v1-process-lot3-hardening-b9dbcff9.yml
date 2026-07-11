@@ -1,0 +1,75 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: b9dbcff9-a168-46e7-803e-ce05924386f5
+  title: "V1 process lot 3 : pré-check permits, triggers humains path-matchables, matrice author-produces, intégrité related, rappels de capitalisation, régénération personas.yml"
+  author: pm
+  created_at: "2026-07-11"
+  project: company-os
+  description: >
+    Lot 3 et dernier du durcissement process (recensement c981bf62, items 14
+    à 19) plus deux frictions découvertes aux lots précédents. Items :
+    (14) pré-check de périmètre au grant (union affected_files
+    modified+created du RFC comparée aux target_paths, warning sur les
+    oublis, ferme la classe des lessons 611fde3e/1bb07073, trois incidents
+    observés), (15) human-review-triggers path-matchables (D23 access
+    matrix, D24 persona ceo, D26 suppression de persona ; D25 breaking
+    schema reste prose), (16) matrice author-produces validée à
+    l'indexation, (17) validation référentielle des related[].id à
+    l'indexation (warning), (18) write_permit_gate : grant vérifie qu'un
+    implementation-plan approuvé lié au RFC existe quand le RFC touche du
+    code, (19) rappel non bloquant de lesson manquante sur
+    rfc_set_implemented et diagnostic resolved. Frictions : (20)
+    réconcilier personas.yml auto-généré avec le pre-commit (rejeté
+    faute d'api_version, désormais périmé vs ceo.yml), (21) warning de
+    supersession dans reindex_all (tracing absent du crate orchestrator).
+  tags:
+    - companyos-v1
+    - process
+    - hardening
+    - harness
+    - mechanical-invariant
+  related:
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: input
+    - id: c981bf62-9d53-4ea2-8da3-c34af9d3e922
+      kind: diagnostic-report
+      relationship: input
+    - id: 0935d0df-be16-4361-b71b-03f0a43fb77c
+      kind: task-request
+      relationship: related
+
+spec:
+  priority: high
+  status: in_progress
+
+  context: >
+    Dernier lot du recensement c981bf62. L'item 14 est le plus rentable :
+    trois incidents de périmètre de permit observés (fichier à créer oublié
+    611fde3e, types.rs oublié côté refonte search, tests/ top-level oublié
+    au lot 1 malgré DEUX lessons et une règle persona, preuve définitive que
+    la prose ne suffit pas sur ce point). L'item 15 mécanise trois des
+    quatre human-review-triggers, jusqu'ici de la prose CEO jamais évaluée
+    par du code, en donnant enfin un consommateur au fichier
+    human-review-triggers.yml. Les items 16-17 durcissent l'indexation
+    (matrice author-produces depuis personas.yml, intégrité référentielle
+    des related). L'item 18 ferme le write_permit_gate complet (plan
+    approuvé requis en plus du RFC approved du lot 1). L'item 19 outille la
+    règle lesson_after_every_artifact en rappel non bloquant. Les items 20
+    et 21 soldent les frictions du lot 2. L'Architect PEUT rescoper
+    (reporter un item à v1-harness-refactor avec justification) si le
+    rapport coût/valeur s'avère mauvais à l'investigation : le recensement
+    les classait M/L et "opportunistes".
+
+  acceptance_criteria:
+    - "Un RFC (ou deux si le découpage le justifie) couvre les items retenus avec comportements exacts et affected_files FORME B exhaustif ; tout item écarté est explicitement rescopé vers v1-harness-refactor avec justification"
+    - "L'item 14 (pré-check de périmètre au grant) est OBLIGATOIREMENT retenu : c'est la classe d'incident la plus récurrente du programme"
+    - "Les mécanismes retenus sont implémentés via le cycle complet et testés aux trois axes"
+    - "human-review-triggers.yml gagne un consommateur code pour les triggers path-matchables, ou est explicitement réduit à sa partie prose"
+    - "personas.yml auto-généré redevient cohérent avec ses sources et committable (ou son exclusion du contrôle est mécanisée et documentée)"
+
+  constraints:
+    - "Warnings non bloquants par défaut pour les checks d'intégrité (14, 17, 19) : le LLM juge, l'algorithme signale (préférence 4e5c109b) ; blocage dur uniquement quand le recensement le justifie (15, 16, 18 à trancher par l'Architect)"
+    - "Pas de push : commits locaux uniquement"
+    - "Rétro-compatibilité : les artifacts existants restent valides"
