@@ -1,0 +1,623 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 0197fbe5-949e-4917-a4d8-2eb63e028ce6
+  title: "V1 process lot 3 : pré-check de périmètre au grant, triggers humains path-matchables, matrice author-produces, intégrité des related, gate plan-approuvé, rappels de capitalisation, personas.yml et warnings reindex_all"
+  author: architect
+  created_at: "2026-07-12"
+  status: draft
+  description: >
+    Lot 3 et dernier du durcissement process (recensement c981bf62 items 14
+    à 19 + frictions 20-21 du lot 2, task-request b9dbcff9, suite des lots
+    1 (RFC 8bf78218) et 2 (RFC a4ee8b6a) implemented, domaine
+    v1-process-hardening de la roadmap a410bb43). Huit mécanismes, TOUS
+    retenus (zéro rescope) : (14) pré-check de périmètre au grant — union
+    affected_files modified+created+deleted du RFC comparée aux
+    target_paths, WARNING non bloquant dans la réponse du grant (3
+    incidents observés, lessons 611fde3e/1bb07073) ; (15) triggers humains
+    path-matchables D23/D24/D26 — champs machine-readable `match` dans
+    human-review-triggers.yml (qui gagne enfin un consommateur code),
+    BLOCAGE dur du grant sans user_approval_confirmed=true, +
+    affected_files.deleted au schema RFC ; (16) matrice author-produces à
+    l'indexation — WARNING, source unique personas (produces des persona
+    YAML mis en cohérence avec l'artifact_catalog), cutoff created_at pour
+    l'historique ; (17) validation référentielle des related[].id —
+    WARNING (2 liens pendants réels trouvés dont un typo d'UUID) ; (18)
+    write_permit_gate plan-approuvé — WARNING au grant quand le RFC touche
+    du code sans implementation-plan lié dont un round est fermé en
+    consensus (rounds éphémères, blocage dur écarté) ; (19) rappels de
+    capitalisation non bloquants sur rfc_set_implemented et diagnostic
+    resolved ; (20) personas.yml auto-généré exempté de la validation
+    artifact par le validator (fichier généré, exemption exacte, toutes
+    surfaces cohérentes) et réconcilié avec ses sources ; (21) reindex_all
+    retourne {count, warnings} (changement de signature, 9 call-sites
+    inventoriés workspace entier). Après ce lot : 27 des 62 règles du
+    recensement survivent au test clean-company comme garanties mécaniques
+    (23 aujourd'hui), et les 16 règles mécanisables du recensement sont
+    toutes traitées.
+  tags:
+    - companyos-v1
+    - process
+    - hardening
+    - harness
+    - mechanical-invariant
+    - write-permit
+    - affected-files
+    - caller-inventory
+    - human-review-triggers
+    - indexing
+    - companyos-internals
+    - critical-infra
+  related:
+    - id: b9dbcff9-a168-46e7-803e-ce05924386f5
+      kind: task-request
+      relationship: input
+    - id: c981bf62-9d53-4ea2-8da3-c34af9d3e922
+      kind: diagnostic-report
+      relationship: input
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: input
+    - id: 1bb07073-421c-4a4b-b647-1dc7bdac89b5
+      kind: lesson-learned
+      relationship: input
+    - id: 8bf78218-e1f3-4bc5-864c-2abf618a990d
+      kind: rfc
+      relationship: related
+    - id: a4ee8b6a-ebcd-4a76-96eb-7e31785c8ae6
+      kind: rfc
+      relationship: related
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: related
+
+spec:
+  motivation: >
+    Le recensement c981bf62 (62 règles) a classé 16 règles mécanisables ;
+    les lots 1 (violations observées) et 2 (valeur haute) en ont fermé 12.
+    Ce lot 3 ferme les 4 restantes (items 14-19 : A14, D23/D24/D26, E32,
+    A3, E47b, A11) et solde deux frictions découvertes au lot 2.
+
+    (14) PRÉ-CHECK DE PÉRIMÈTRE AU GRANT — l'item le plus rentable du lot,
+    OBLIGATOIRE par le task-request. TROIS incidents de la même classe :
+    fichier à créer oublié du permit (lesson 611fde3e, blocage hook +
+    permit complémentaire b4f09f5d) ; types.rs oublié pendant la refonte
+    search ; tests/ top-level raté au lot 1 MALGRÉ deux lessons et une
+    règle persona (lesson 1bb07073 : troisième occurrence APRÈS la
+    formalisation en persona eb42a8de, dont le sanity-check AC6 avait
+    prédit mot pour mot que la prose ne serait qu'un déplacement de
+    probabilité). La conclusion empirique de 1bb07073 est exactement le
+    mécanisme proposé ici : comparer l'union des affected_files du RFC aux
+    target_paths AVANT le grant, de manière déterministe, plutôt que de
+    laisser un agent composer le périmètre à la main.
+
+    (15) TRIGGERS HUMAINS PATH-MATCHABLES — human-review-triggers.yml est
+    la SOURCE UNIQUE des conditions d'escalade utilisateur (lot 1, fusion
+    de ceo_cannot_approve_alone) mais AUCUN code ne l'évalue : le lot 1 a
+    même purgé son chargement Rust mort. Trois des quatre triggers sont
+    des conditions de path-matching pur (D23 protected-zones.json, D24
+    ceo.yml, D26 suppression sous company/personas/) : de la prose CEO
+    jamais évaluée par une machine, sur les fichiers les plus sensibles du
+    système. Le lot 2 a d'ailleurs dû SIGNALER manuellement dans son
+    propre texte que modifier ceo.yml déclenchait D24 — preuve que le
+    trigger ne vit que si un agent pense à le lire.
+
+    (16) MATRICE AUTHOR-PRODUCES — E32 : rien n'empêche un design-doc
+    author: pm ou un implementation-plan author: architect. La config
+    personas est parsée par crates/config (champ CompanyConfig.personas)
+    avec ZÉRO caller — le hors-scope explicite du lot 1 désignait ce lot
+    comme son consommateur naturel. Vérification empirique préalable
+    (scan des 191 artifacts indexables) : 21 artifacts historiques
+    violeraient une lecture littérale des produces, dont 13
+    diagnostic-reports author: architect (recensements et investigations,
+    y compris c981bf62 lui-même) — ce qui prouve que les produces des
+    personas sont INCOMPLETS par rapport à l'artifact_catalog qui déclare
+    diagnostic-report et lesson-learned productibles par tout agent. La
+    mécanisation doit donc commencer par réconcilier la source de vérité.
+
+    (17) INTÉGRITÉ RÉFÉRENTIELLE DES RELATED — A3 : la structure des
+    related est validée (schema) mais pas leur résolution. Vérification
+    empirique : 2 liens pendants réels dans le corpus actuel, dont un TYPO
+    d'UUID (le RFC c129453c référence c981bf62-3f28-... au lieu de
+    c981bf62-9d53-... : préfixe correct, suffixe corrompu). Le graphe de
+    connaissances a déjà des arêtes mortes silencieuses ; related() les
+    retourne vides sans que personne ne le voie.
+
+    (18) WRITE_PERMIT_GATE PLAN-APPROUVÉ — E47b : la séquence prose exige
+    un implementation-plan approuvé avant le permit quand le RFC touche du
+    code, mais le grant ne vérifie que le statut du RFC (GARDE 4, lot 1).
+    Les données nécessaires existent : les relations plan→RFC sont dans
+    l'index (table artifact_relations, bidirectionnelle), les rounds et
+    leurs votes sont en DB (compute_consensus est recalculable).
+
+    (19) RAPPELS DE CAPITALISATION — A11 : lesson_after_every_artifact est
+    intrinsèquement prose (une lesson forcée serait de la complaisance),
+    mais les MOMENTS déclencheurs (RFC implemented, diagnostic resolved)
+    sont détectables mécaniquement. Un rappel non bloquant au bon moment
+    outille la règle sans la dénaturer.
+
+    (20) PERSONAS.YML — friction lot 2 : company/config/personas.yml
+    (généré par le plugin defense-in-depth pour l'injection instructions
+    d'opencode.json, SANS api_version) est rejeté par le pre-commit
+    (validator --file exit 1, vérifié en vif : InvalidApiVersion). Sa
+    régénération au boot est revertée par le hook (pas de permit), son
+    commit est bloqué par le pre-commit : il est donc PÉRIMÉ (il affiche
+    encore ceo produces: lesson-learned, purgé par le lot 2). Un fichier
+    injecté dans le system-prompt de TOUS les agents qui ment sur les
+    contrats des personas est pire qu'inutile.
+
+    (21) WARNINGS REINDEX_ALL — friction lot 2 : le mécanisme 10c prévoyait
+    que reindex_all loggue les warnings de supersession via tracing::warn,
+    mais la dépendance tracing est absente du crate orchestrator (vérifié
+    Cargo.toml) : reindex_all ne surface AUCUN warning aujourd'hui. Les
+    items 16 et 17 ajoutent des familles de warnings : le canal doit
+    exister.
+
+  proposal: >
+    MÉCANISME 14 : pré-check de périmètre au grant (couche : serveur MCP +
+    engine ; NON BLOQUANT — le CEO peut avoir raison de scoper plus étroit,
+    préférence 4e5c109b : le LLM juge, l'algorithme signale).
+    a) grant_write_permit lit DÉJÀ le YAML du RFC pour la GARDE 4. Nouvelle
+       méthode engine.rfc_scope_warnings(root, rfc_file_path,
+       &target_paths) -> Vec<String> : extrait spec.affected_files (FORME A
+       array plat, ou FORME B objet {modified, created, deleted — cf.
+       mécanisme 15c}), calcule l'UNION, et pour chaque fichier de l'union
+       vérifie qu'au moins un target_path le couvre. La sémantique de
+       couverture est CELLE DES PERMITS : la fonction privée
+       db::path_matches (exact, préfixe, glob) passe pub(crate) et est
+       réutilisée telle quelle — pas une 4e implémentation du matching
+       (l'unification des 3 existantes reste réservée à
+       v1-harness-refactor).
+    b) Chaque fichier non couvert produit un warning explicite ("RFC
+       affected_files: <path> n'est couvert par aucun target_path — si ce
+       fichier sera écrit pendant l'implémentation, le hook la bloquera ;
+       étendre target_paths ou assumer le scoping étroit"). Un RFC SANS
+       affected_files produit un warning dédié ("pré-check de périmètre
+       impossible : le RFC ne déclare pas affected_files").
+    c) Les warnings sont retournés dans la RÉPONSE JSON du grant (champ
+       scope_warnings de permit_response_json, présent aussi sur le rejeu
+       idempotent) : visibles du CEO au moment exact d'émettre, ce qui est
+       tout l'objet (fermer la boucle AVANT le blocage hook, pas après).
+       Le grant n'est JAMAIS refusé pour un gap de scope.
+
+    MÉCANISME 15 : triggers humains path-matchables (couche : serveur MCP +
+    schema + config YAML ; BLOQUANT — c'est la nature d'un trigger humain :
+    exiger une affirmation explicite, pas la suggérer).
+    a) human-review-triggers.yml gagne un consommateur code. Chaque trigger
+       path-matchable gagne un bloc machine-readable optionnel `match` :
+       - "rfc modifies access matrix" (D23) : match {paths:
+         [company/config/protected-zones.json], on: any}
+       - "rfc modifies ceo persona" (D24) : match {paths:
+         [company/personas/ceo.yml], on: any}
+       - "rfc deletes persona" (D26) : match {paths:
+         [company/personas/*], on: deleted}
+       - "rfc introduces breaking schema change" (D25) : PAS de match —
+         qualifier "breaking" est un jugement sémantique, reste prose CEO
+         (classement du recensement, inchangé).
+       Sémantique de `on` : any = évalué contre les target_paths du grant
+       (comme patterns, via path_matches — un glob target qui COUVRE le
+       fichier déclenche, comportement conservateur) ET contre l'union
+       affected_files du RFC (littéraux) ; deleted = évalué contre
+       affected_files.deleted uniquement (une suppression n'est pas
+       inférable des target_paths).
+    b) grant_write_permit évalue les triggers APRÈS la GARDE 4 et AVANT
+       l'idempotence, par LECTURE FRAÎCHE de
+       company/config/human-review-triggers.yml à chaque grant (pas de
+       cache ni de hot-reload à plomber : le grant est rare, la fraîcheur
+       prime ; types de parsing locaux, le chargement boot purgé au lot 1
+       n'est PAS ressuscité). Si au moins un trigger matche et que le
+       nouveau paramètre optionnel user_approval_confirmed != Some(true) :
+       REFUS avec erreur listant chaque trigger déclenché et le fix
+       ("obtenir l'accord utilisateur (ou agir sous délégation documentée),
+       puis rappeler grant_write_permit avec user_approval_confirmed=true").
+       Le flag accepté est repris en écho dans la réponse JSON du grant (champ
+       user_approval_confirmed) pour la trace d'audit ; pas de colonne DB
+       (pas de migration, la réponse + le cycle de review du RFC portent la
+       trace). Fail-safe : si human-review-triggers.yml est illisible ou
+       invalide, le grant est REFUSÉ avec une erreur distincte (même
+       philosophie que GARDE 3 quand git est indisponible : un garde-fou
+       qui ne peut pas être évalué ne laisse pas passer).
+    c) company/schemas/rfc.schema.json : la FORME B d'affected_files gagne
+       une clé optionnelle `deleted` (array de strings, "fichiers existants
+       qui seront SUPPRIMÉS"). C'est le signal machine-readable dont D26 a
+       besoin, et l'union du mécanisme 14 l'inclut (une suppression en zone
+       protégée est une écriture au sens du hook). Additif pur : anyOf
+       inchangé, FORME A toujours valide.
+    d) company/schemas/human-review-triggers.schema.json : déclaration du
+       bloc match {paths: array minItems 1, on: enum [any, deleted]},
+       required [paths, on], additionalProperties: false sur match, sur les
+       items triggers ET sur spec (verrou pattern bd4650e2, cohérent avec
+       les schemas durcis des lots 1-2 ; les 3 clés existantes
+       condition/action/description restent déclarées).
+    e) Résiduels documentés : un RFC qui MENT (suppression non déclarée
+       dans deleted) échappe à D26 — c'est le rôle de la review du RFC et
+       de la prose CEO ; et modifier human-review-triggers.yml lui-même
+       n'est couvert par aucun trigger (méta-trou préexistant, zone
+       protégée + cycle RFC restent la garde ; signalé au CEO, hors scope).
+
+    MÉCANISME 16 : matrice author-produces à l'indexation (couche : engine ;
+    NON BLOQUANT — décision tranchée : WARNING, pas rejet. Un artifact
+    présent sur disque mais refusé à l'indexation deviendrait INVISIBLE de
+    search() : pour la mémoire collective, c'est pire que la violation
+    qu'on veut signaler. Le blocage dur n'est pas justifié par le
+    recensement, qui classe E32 "valeur moyenne, violation rare").
+    a) PRÉALABLE — réconcilier la source de vérité : le scan empirique
+       montre 13 diagnostic-reports author: architect et 2 author: pm,
+       légitimes selon l'artifact_catalog ("peut être produit par tout
+       agent confronté à un problème technique") mais absents des produces.
+       Les persona YAML sont mis en cohérence avec le catalog :
+       - architect.yml : produces += diagnostic-report, review-report
+       - pm.yml : produces += diagnostic-report, review-report
+       - implementer.yml : produces += review-report
+       (review-report : "produit par le reviewer désigné" — tout persona
+       review ; ceo.yml reste produces: [] — le CEO n'écrit pas de
+       fichiers, mécanisme 12 du lot 2). La matrice mécanique lit alors
+       UNIQUEMENT les persona YAML : pas de constante "kinds universels"
+       en dur dans le code qui divergerait de la config (le pattern de
+       duplication que le recensement dénonce).
+    b) Nouvelle méthode engine.author_produces_warnings(root, &artifact)
+       -> Vec<String> : lit company/personas/<author>.yml (lecture directe
+       du YAML, fraîche), et si artifact.kind n'est pas dans
+       artifacts.produces, émet un warning ("author '<author>' ne produit
+       pas le kind '<kind>' selon sa persona (artifacts.produces) —
+       vérifier l'attribution ou amender la persona par RFC").
+    c) Périmètre et rétro-compat, tranchés :
+       - KINDS SYSTÈME EXEMPTS : persona, project-config, flow-control,
+         review-protocol, human-review-triggers — artifacts de gouvernance,
+         author: ceo par convention historique, gardés par les zones
+         protégées + cycle RFC, aucun produces ne les revendique.
+       - AUTHOR INCONNU (pas de persona YAML) : skip silencieux — vérifier
+         l'existence des personas n'est pas le job de ce check.
+       - CUTOFF HISTORIQUE : les artifacts avec metadata.created_at
+         antérieur au 2026-07-12 (constante documentée
+         AUTHOR_PRODUCES_CUTOFF, date de ce RFC) sont exempts. Cela couvre
+         les 4 lessons author: ceo (2026-03-15, produces purgé au lot 2 —
+         on ne réécrit pas l'histoire, author est factuel) et les 2 RFCs
+         early author: ceo/pm (2026-03-15). Vérifié : après réconciliation
+         (a) + exemptions (c), le corpus actuel de 191 artifacts produit
+         ZÉRO warning — le check ne crie que sur les violations futures.
+
+    MÉCANISME 17 : validation référentielle des related[].id (couche :
+    engine + db ; NON BLOQUANT, imposé par le task-request).
+    a) Surface single-file : engine.related_integrity_warnings(&artifact) :
+       pour chaque related[].id de l'artifact indexé, db.get_artifact(id) ;
+       si introuvable, warning ("related[].id <id> introuvable dans l'index
+       — lien pendant : id erroné (typo ?) ou artifact supprimé/jamais
+       créé"). Edge documenté : deux artifacts neufs se référencant
+       mutuellement peuvent produire un faux warning transitoire selon
+       l'ordre d'écriture (non bloquant, disparaît à l'indexation du
+       second ; reindex_all n'a pas ce problème).
+    b) Surface bulk (reindex_all) : passe SQL unique APRÈS l'indexation
+       complète (SELECT source_id, target_id FROM artifact_relations WHERE
+       target_id NOT IN (SELECT id FROM artifacts)) — aucune sensibilité à
+       l'ordre de parcours, coût une requête.
+    c) Les 2 liens pendants existants (typo c981bf62-3f28 dans le RFC
+       c129453c ; cible 4ade4e7c disparue du diagnostic 56513173)
+       remonteront comme warnings dès le premier reindex_all : c'est le
+       comportement VOULU (valeur immédiate du mécanisme) ; leur correction
+       est un suivi éditorial PM hors scope de ce RFC.
+
+    MÉCANISME 18 : write_permit_gate plan-approuvé (couche : serveur MCP +
+    engine + db ; NON BLOQUANT — décision tranchée : WARNING dans la
+    réponse du grant, pas refus. Justification : (i) les review rounds
+    sont des données ÉPHÉMÈRES perdues à chaque autorepair PILIER D
+    (dette documentée, lesson 611fde3e) — un blocage dur rendrait le grant
+    impossible après un autorepair alors que le plan a réellement été
+    approuvé ; (ii) le lien plan→RFC dans metadata.related n'est imposé
+    par aucun mécanisme — un plan légitime non lié produirait un faux
+    blocage ; (iii) le CEO au moment du grant est exactement le bon juge
+    pour ce signal, préférence 4e5c109b. La faisabilité du check lui-même
+    est CONFIRMÉE : relations bidirectionnelles en DB (artifact_relations,
+    consommées par le tool related), rounds + votes en DB avec
+    compute_consensus recalculable).
+    a) Au grant, si l'union affected_files du RFC (mécanisme 14, déjà
+       calculée) touche crates/** ou company/plugins/** (du code) :
+       résoudre les relations de rfc_id (deux directions), filtrer
+       kind == implementation-plan.
+       - Aucun plan lié → warning ("le RFC touche du code mais aucun
+         implementation-plan lié n'existe dans l'index
+         (write_permit_gate) — vérifier que le plan existe et le lier au
+         RFC via metadata.related").
+       - Plan(s) lié(s) : nouvelle méthode
+         db.list_rounds_by_artifact_path(path) (comparaison sur chemins
+         relatifs normalisés — même forme que file_path de l'index) ; si
+         AUCUN round du plan n'est status Closed avec
+         compute_consensus == ConsensusReached (recalculé depuis les votes
+         stockés), warning ("plan <id8> lié mais aucun review round fermé
+         en consensus trouvé — NB : les rounds sont éphémères, perdus à
+         l'autorepair ; si le plan a été approuvé avant un autorepair, ce
+         warning est un faux positif attendu").
+    b) Warnings retournés dans le même champ scope_warnings que le
+       mécanisme 14 (un seul canal de signal au grant).
+
+    MÉCANISME 19 : rappels de capitalisation non bloquants (couche :
+    serveur MCP + engine + db).
+    a) Nouvelle méthode db.has_linked_lesson(id) -> bool : existe-t-il une
+       relation (dans un sens ou l'autre) entre id et un artifact
+       kind == lesson-learned.
+    b) rfc_set_implemented : la réponse JSON gagne un champ optionnel
+       capitalization_reminder quand aucune lesson n'est liée au RFC
+       ("RFC implemented sans lesson liée — la règle
+       lesson_after_every_artifact attend une capitalisation : chercher
+       une lesson existante (search), puis créer/améliorer et lier via
+       metadata.related"). Additif, jamais une erreur.
+    c) Diagnostic resolved : nouvelle méthode
+       engine.capitalization_reminders(root, &artifact) — si
+       kind == diagnostic-report ET spec.status == resolved (lu du YAML)
+       ET !has_linked_lesson : rappel analogue. Émise UNIQUEMENT sur les
+       surfaces single-file (tool index_artifact, index_now, CLI --index —
+       donc au moment où le hook auto-indexe l'écriture qui passe le
+       diagnostic à resolved), PAS dans reindex_all : le rappel concerne le
+       MOMENT de la résolution ; en bulk, il spammerait chaque rebuild avec
+       l'historique des diagnostics resolved sans lesson (distinct des
+       warnings d'INTÉGRITÉ 16/17 qui décrivent un état défectueux
+       permanent et appartiennent aussi au bulk).
+
+    MÉCANISME 20 : personas.yml généré, exempté et réconcilié (couche :
+    crate validation + données).
+    a) DÉCISION (parmi les trois options du task-request) : EXEMPTION
+       EXACTE dans le validator — ni en-tête d'artifact (personas.yml
+       n'est PAS un artifact : c'est une VUE générée pour l'injection
+       opencode.json instructions ; lui donner un kind exigerait un schema,
+       un id stable dans un générateur, une entrée de placement et une
+       pollution de l'index pour un cache de prompt), ni déplacement hors
+       company/config/ (opencode.json et protected-zones.json
+       personas_out le référencent ; le déplacer modifie protected-zones
+       .json, déclenche D23 et casse l'injection au premier boot d'un
+       clone frais), ni exclusion bash dans le pre-commit seul (patch
+       d'une seule surface, dupliquerait la connaissance du chemin).
+       L'exemption dans ArtifactValidator (validate_file + validate_dir,
+       chemin relatif exact company/config/personas.yml, même machinerie
+       de résolution root que l'exception shared-rules.yml du module
+       placement, lot 2) rend hook --file, pre-commit et make validate
+       cohérents GRATUITEMENT — un seul point de vérité, mécanisé.
+       validate_file retourne un rapport valide avec note "generated
+       file, skipped (not an artifact)" ; validate_dir idem (aujourd'hui
+       le batch le tolère déjà via l'erreur InvalidApiVersion, le test
+       tests/integration/edge_cases.rs accepte les deux formes, vérifié).
+       Résiduel assumé : un personas.yml corrompu ne serait plus signalé
+       par le schema — gardes restantes : l'en-tête "do not edit", la zone
+       protégée (permit requis pour l'éditer), et les tests du générateur
+       (company/plugins/tests/hot-reload.test.mjs).
+    b) RÉCONCILIATION : les éditions des persona YAML du mécanisme 16a
+       déclenchent la régénération automatique par le wrapper
+       defense-in-depth (onProtectedZoneWrite → generatePersonasYml,
+       mécanisme existant) SOUS le permit de ce RFC qui couvre
+       company/config/personas.yml ; le fichier régénéré (qui reflète
+       enfin ceo produces: [] du lot 2 ET les produces réconciliés du 16a)
+       est committé — désormais possible puisque le pre-commit ne le
+       rejette plus. La régénération au boot redevient un no-op idempotent
+       (contenu identique à HEAD → pas de diff → pas de revert hook).
+
+    MÉCANISME 21 : warnings dans reindex_all (couche : engine ; DÉCISION :
+    retourner les warnings dans la valeur de retour — PAS d'ajout de la
+    dépendance tracing au crate orchestrator : un lib crate qui loggue
+    impose son canal au caller, alors que les callers de reindex_all ont
+    des canaux hétérogènes : réponse JSON (tool), tracing (serveur boot/
+    watcher), stderr (CLI). La donnée appartient à la valeur de retour ;
+    le caller choisit son canal).
+    a) engine.reindex_all(root, validator) retourne désormais
+       ReindexOutcome { count: usize, warnings: Vec<String> } (struct
+       publique). Warnings collectés : supersession (10c, par artifact),
+       intégrité related (17b, passe SQL globale), author-produces (16,
+       par artifact). PAS les rappels de capitalisation (19c, surfaces
+       single-file uniquement).
+    b) CHANGEMENT DE SIGNATURE d'API publique de crate — caller-inventory
+       conduit sur le WORKSPACE ENTIER (rg non scopé + membres du
+       Cargo.toml racine, lesson 1bb07073 ; tests/ top-level et benches
+       inclus, benches inexistants) : 9 call-sites, TOUS dans
+       affected_files — crates/mcp-servers/orchestrator/src/main.rs x5
+       (tool reindex_all L1491 — la réponse JSON gagne warnings, additif ;
+       rebuild autorepair L1908 ; post-migrate boot L1930 ; boot count
+       L1970 ; watcher Artifacts L2050 — les 4 chemins serveur logguent
+       via tracing::warn, disponible dans CE crate) et
+       crates/orchestrator/tests/integration_search.rs x4 (L215, L349,
+       L395, L465 — adaptation mécanique .count). AUCUN call-site dans
+       tests/integration/ top-level ni dans les plugins (le hook passe par
+       le CLI --index / le tool, surfaces de réponse additives, vérifié).
+    c) Agrégateur single-file : engine.artifact_warnings(root, &artifact)
+       = supersession_warnings + related_integrity_warnings +
+       author_produces_warnings. supersession_warnings reste publique et
+       INCHANGÉE (rétro-compat) ; les 3 call-sites serveur existants
+       (index_now L1231, tool index_artifact L1466, CLI --index L1792)
+       basculent sur artifact_warnings (+ capitalization_reminders), leurs
+       champs de réponse warnings existants s'enrichissent sans changement
+       de forme.
+
+    TESTS (tous aux trois axes ; AUCUN fichier de test créé, tests inline
+    et fichiers existants) :
+    - crates/orchestrator (engine.rs, db.rs inline) : 14 — union FORME A /
+      FORME B (modified+created+deleted), gap détecté, couverture par glob
+      et par préfixe, RFC sans affected_files, affected_files vide ; 16 —
+      author légitime silencieux, kind hors produces warné, kind système
+      exempt, author inconnu skippé, created_at pré-cutoff exempt,
+      post-cutoff warné ; 17 — related résolus silencieux, id pendant
+      warné, artifact sans related, passe bulk SQL détecte le pendant
+      qu'importe l'ordre ; 18 — RFC code sans plan lié warné, plan lié
+      sans round warné, plan avec round Closed+consensus silencieux, round
+      Closed sans consensus (escalade CEO) warné, RFC pur-YAML non évalué ;
+      19 — has_linked_lesson deux directions, diagnostic resolved sans
+      lesson rappelé, resolved avec lesson silencieux, investigating
+      silencieux ; 21 — ReindexOutcome porte count et les 3 familles de
+      warnings, corpus propre → warnings vide.
+    - crates/mcp-servers/orchestrator (main.rs inline) : 14 — réponse du
+      grant porte scope_warnings (gap, RFC sans affected_files, rejeu
+      idempotent) et grant JAMAIS refusé pour un gap ; 15 — grant refusé
+      sans flag sur target_path couvrant protected-zones.json / ceo.yml,
+      sur deleted sous company/personas/, accepté avec
+      user_approval_confirmed=true (flag échoué dans la réponse), grant
+      ordinaire sans trigger ni flag accepté, triggers YAML illisible →
+      refus fail-safe, glob target couvrant ceo.yml → déclenché
+      (conservateur) ; 18 — warning plan manquant dans scope_warnings ;
+      19 — réponse rfc_set_implemented avec/sans capitalization_reminder,
+      rejeu idempotent cohérent ; 21 — réponse du tool reindex_all porte
+      warnings.
+    - crates/validation (validator.rs inline) : 20 — validate_file exempte
+      exactement company/config/personas.yml (exit valide, note), un
+      personas.yml AILLEURS n'est pas exempté, validate_dir cohérent,
+      validator sans root : comportement documenté inchangé.
+    - Schemas (fixtures YAML dans les tests validation existants) : 15c/d —
+      RFC FORME B avec deleted valide, FORME A toujours valide, trigger
+      avec match valide, match avec clé parasite rejeté, on hors enum
+      rejeté, trigger sans match (D25) valide.
+
+  impact: >
+    BREAKING CHANGES CONTRÔLÉS :
+    (1) MÉCANISME 15 — surface MCP : un grant dont les target_paths ou les
+    affected_files du RFC touchent protected-zones.json ou ceo.yml, ou
+    dont le RFC déclare une suppression sous company/personas/, EST REFUSÉ
+    sans user_approval_confirmed=true. C'est le but : ces trois conditions
+    exigeaient DÉJÀ l'accord utilisateur en prose ; seul le canal devient
+    mécanique. Workflows ordinaires inchangés (le flag est optionnel et
+    ignoré quand aucun trigger ne matche).
+    (2) MÉCANISME 21 — API de crate : engine.reindex_all change de type de
+    retour (usize -> ReindexOutcome). 9 call-sites inventoriés workspace
+    entier, tous dans affected_files, adaptation mécanique.
+    Tout le reste est ADDITIF : warnings et rappels dans des réponses JSON
+    (champs nouveaux), paramètre MCP optionnel, clé de schema optionnelle
+    (deleted), bloc match optionnel, méthodes engine/db nouvelles,
+    exemption validator sur un chemin exact.
+
+    RÉTRO-COMPATIBILITÉ DONNÉES, item par item :
+    - (14/18) aucun refus nouveau : warnings purs dans la réponse du grant.
+    - (15) les RFCs existants (FORME A ou B sans deleted) restent valides
+      (anyOf inchangé, deleted optionnel) ; human-review-triggers.yml
+      modifié DANS LE MÊME COMMIT que son schema durci (atomicité, pattern
+      lot 1).
+    - (16) vérifié empiriquement sur les 191 artifacts du corpus : après
+      réconciliation des produces + exemption kinds système + cutoff
+      created_at < 2026-07-12, ZÉRO warning sur l'existant (les 4 lessons
+      ceo et les 2 RFCs early de 2026-03-15 sont couverts par le cutoff ;
+      les 15 diagnostics architect/pm deviennent légitimes par la
+      réconciliation, qui aligne les personas sur l'artifact_catalog
+      plutôt que d'inventer une constante d'exemption dans le code).
+    - (17) 2 warnings apparaîtront sur le corpus actuel : ce sont des
+      défauts RÉELS préexistants (typo d'UUID, cible disparue), pas des
+      faux positifs — correction éditoriale déléguée au PM, hors scope.
+    - (19) rappels purement additifs, jamais des erreurs.
+    - (20) le cas pre-commit qui échouait (personas.yml stagé) passe
+      désormais ; tests/integration/edge_cases.rs
+      (test_validate_all_shipped_artifacts) accepte les deux comportements
+      (Ok valide comme Err InvalidApiVersion), vérifié — aucun test cassé
+      attendu, le fichier reste listé en affected_files par prudence
+      d'inventaire (hors zone protégée).
+    - (21) les votes/rounds/permits en DB ne sont pas touchés.
+
+    CALLER-INVENTORY GLOBAL (workspace ENTIER : rg non scopé, membres
+    Cargo.toml racine dont tests/integration, benches inexistants,
+    company/plugins/, company/scripts/, Makefile, opencode.json —
+    lesson 1bb07073) :
+    - engine.reindex_all (SEUL changement de signature) : 9 call-sites,
+      détail au mécanisme 21b.
+    - engine.supersession_warnings : signature PRÉSERVÉE ; 3 call-sites
+      serveur basculés sur l'agrégateur (main.rs), tests engine.rs inline
+      inchangés.
+    - db::path_matches : privé -> pub(crate), aucun caller externe au
+      crate.
+    - engine.grant_permit, initiate_review_round, submit_vote, validator
+      validate_file/validate_dir : signatures INCHANGÉES —
+      tests/integration/user_stories.rs (grant_permit L330) et
+      edge_cases.rs (validate_dir L159) ne nécessitent aucune adaptation
+      de signature.
+    - GrantPermitParams : champ optionnel additif ; le helper de test
+      grant_params (main.rs) est mis à jour dans le même fichier.
+    - Consommateurs non-Rust : le hook defense-in-depth appelle le CLI
+      --index et les tools MCP (réponses additives) ; opencode.json lit
+      personas.yml (contenu réconcilié, format identique) ; le pre-commit
+      appelle validator --file (comportement corrigé pour le seul
+      personas.yml). Aucun changement de leurs scripts.
+
+    PROSE AMENDÉE (amendée = pointe le mécanisme ; jamais supprimée quand
+    elle porte un critère de jugement, pattern lots 1-2) :
+    - shared-rules affected_files_categorization : mention de la clé
+      deleted (FORME B) et du pré-check mécanique au grant (les oublis de
+      périmètre sont désormais signalés au CEO à l'émission).
+    - shared-rules artifact_catalog (human-review-triggers) : mention du
+      bloc match et de l'évaluation mécanique au grant.
+    - architect.yml (règle caller-inventory API pub) : annotée "filet aval
+      mécanisé : le pré-check de périmètre du grant signale les
+      affected_files non couverts par les target_paths (RFC 0197fbe5)".
+    - human-review-triggers.yml : descriptions des 3 triggers mécanisés
+      annotées "évalué mécaniquement par grant_write_permit" ; D25 annoté
+      "reste prose (jugement)".
+    - Les persona YAML pm/architect/implementer : produces réconciliés
+      (mécanisme 16a) — c'est une mise en cohérence de contrat, pas une
+      annotation.
+
+    ORDRE D'IMPLÉMENTATION : mécanismes indépendants SAUF (i)
+    human-review-triggers.yml + son schema : même commit (atomicité) ;
+    (ii) persona YAML (16a) + régénération personas.yml (20b) : même
+    commit ; (iii) l'exemption validator (20a) doit précéder le commit de
+    personas.yml régénéré (sinon le pre-commit le rejette encore). HEAD
+    compile et passe make ci à chaque commit.
+
+    TRIGGERS HUMAINS SUR CE RFC LUI-MÊME : ce RFC ne modifie NI
+    protected-zones.json NI ceo.yml et ne supprime aucun persona — aucun
+    des 4 triggers actuels ne s'applique. Le changement de schema RFC est
+    additif (non breaking, D25 non déclenché). L'escalade utilisateur
+    reste à l'appréciation du PM/CEO (le RFC touche la définition même des
+    triggers, cf. méta-trou 15e).
+
+    HORS SCOPE (explicitement) : l'unification des 3 implémentations du
+    matching permit/path et l'incohérence pre-commit active|consumed
+    (v1-harness-refactor, constraint du task-request) ; la correction
+    éditoriale des 2 liens pendants existants (suivi PM) ; le pré-calcul
+    des callers par cargo metadata/LSP côté client (recommandation 7 de
+    la lesson 1bb07073 — le pré-check serveur du mécanisme 14 en est le
+    filet aval, le calcul amont reste outillage futur) ; le blocage du
+    canal bash du CEO (résiduel 12d du lot 2) ; l'extension de make
+    validate à projects/ (comportement batch historique).
+
+    Après ce lot : les 16 règles mécanisables du recensement c981bf62 sont
+    toutes traitées ; 27 des 62 règles survivent au test clean-company
+    comme garanties mécaniques (23 aujourd'hui — items 14, 15, 16, 17
+    comptés ; 18 et 19 sont des signaux non bloquants, comptés comme
+    outillage, pas comme garanties).
+
+  rollback_plan: >
+    Les 8 mécanismes sont réversibles indépendamment, aucune migration de
+    données dans les deux sens.
+    (14/18) retirer l'appel aux helpers de warnings dans grant_write_permit
+    et le champ scope_warnings de la réponse ; les méthodes engine/db
+    peuvent rester (lecture seule inerte).
+    (15) retirer l'évaluation des triggers et le paramètre
+    user_approval_confirmed (optionnel : les appels qui le passent restent
+    valides, serde ignore) ; revert des blocs match de
+    human-review-triggers.yml DANS LE MÊME COMMIT que le revert de son
+    schema (atomicité) ; la clé deleted du schema RFC peut rester (les
+    RFCs qui la déclarent restent valides après revert du code, elle est
+    purement déclarative) ou être revertée si aucun RFC ne l'utilise
+    encore.
+    (16) revert des warnings ; les produces réconciliés des personas
+    RESTENT (c'est une correction de contrat vraie indépendamment du
+    mécanisme) ; la constante cutoff disparaît avec le check.
+    (17/19) retirer les méthodes et les champs de réponse ; additifs purs.
+    (20) retirer l'exemption du validator — le pre-commit rejette de
+    nouveau personas.yml stagé (la friction documentée revient, le fichier
+    déjà committé n'est pas re-validé tant qu'il n'est pas re-stagé) ; le
+    contenu réconcilié committé reste correct.
+    (21) revert de la signature ReindexOutcome -> usize + les 9 call-sites
+    (adaptation mécanique inverse) ; aucun état persistant.
+    Chaque garde étant un early-return, un champ de réponse ou une méthode
+    additionnelle, le retrait restaure exactement le comportement
+    antérieur (pattern éprouvé aux lots 1-2, lesson 1bb07073).
+
+  affected_files:
+    modified:
+      - crates/orchestrator/src/engine.rs
+      - crates/orchestrator/src/db.rs
+      - crates/orchestrator/src/error.rs
+      - crates/orchestrator/src/types.rs
+      - crates/orchestrator/tests/integration_search.rs
+      - crates/mcp-servers/orchestrator/src/main.rs
+      - crates/validation/src/validator.rs
+      - crates/validation/src/lib.rs
+      - company/schemas/rfc.schema.json
+      - company/schemas/human-review-triggers.schema.json
+      - company/config/human-review-triggers.yml
+      - company/config/shared-rules.yml
+      - company/config/personas.yml
+      - company/personas/architect.yml
+      - company/personas/pm.yml
+      - company/personas/implementer.yml
+      - tests/integration/edge_cases.rs
