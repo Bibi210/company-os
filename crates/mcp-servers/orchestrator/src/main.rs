@@ -139,6 +139,18 @@ struct RfcSetImplementedParams {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct SupersedeArtifactParams {
+    #[schemars(description = "metadata.id of the OLD artifact being superseded")]
+    old_id: String,
+    #[schemars(description = "metadata.id of the NEW artifact that supersedes the old one")]
+    new_id: String,
+    #[schemars(
+        description = "Optional note describing a PARTIAL supersession (what remains valid in the old artifact)"
+    )]
+    note: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct CheckPermitParams {
     #[schemars(description = "Persona ID to check", with = "String")]
     persona: PersonaId,
@@ -829,6 +841,48 @@ impl OrchestratorServer {
     }
 
     #[tool(
+        description = "Supersede one artifact by another with TWO atomic writes (mechanism 10, RFC a4ee8b6a). The NEW artifact gains a 'supersedes' link; the OLD artifact gains a 'superseded-by' link AND a dated [SUPERSEDED-BY ...] marker at the head of its metadata.description so search() surfaces the obsolescence (lesson 9b2c1951). Server-side lifecycle transition: requires NO token and NO write permit (same model as rfc_set_implemented). Refuses self-supersession, unresolved ids, or either file in a protected zone. Idempotent: replaying does not duplicate links or markers. Both contents are validated against their schema BEFORE any disk write; on partial failure the first write is rolled back. Use the optional 'note' to record a PARTIAL supersession."
+    )]
+    async fn supersede_artifact(
+        &self,
+        params: Parameters<SupersedeArtifactParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let params = params.0;
+        // No token check: lifecycle transition, not a privileged operation.
+        let mut engine = self.engine.lock().await;
+        let validator = self.validator.read().await;
+        match engine.supersede_artifact(
+            &params.old_id,
+            &params.new_id,
+            params.note.as_deref(),
+            &self.root_path,
+            &validator,
+        ) {
+            Ok(outcome) => ok(serde_json::to_string_pretty(&serde_json::json!({
+                "superseded": true,
+                "old_id": outcome.old_id,
+                "new_id": outcome.new_id,
+                "old_file": outcome.old_file,
+                "new_file": outcome.new_file,
+                "old_changed": outcome.old_changed,
+                "new_changed": outcome.new_changed,
+                "idempotent": outcome.idempotent,
+            }))
+            .unwrap_or_default()),
+            Err(e) => err(Diagnostic::error(C, "Failed to supersede artifact")
+                .with_context(format!(
+                    "supersede_artifact(old={}, new={})",
+                    params.old_id, params.new_id
+                ))
+                .with_reason(format!("{e}"))
+                .with_fix(
+                    "Verify both ids exist (use search/get), that they differ, and that neither file is in a protected zone (personas/schemas/configs cannot be superseded through this channel)",
+                )
+                .to_string()),
+        }
+    }
+
+    #[tool(
         description = "Grant a write permit for protected zones (CEO only, after RFC approval). Requires CEO's auth token."
     )]
     async fn grant_write_permit(
@@ -1163,7 +1217,16 @@ impl OrchestratorServer {
         let mut engine = self.engine.lock().await;
         let validator = self.validator.read().await;
         match engine.index_artifact(&self.root_path, &params.path, &validator) {
-            Ok(artifact) => ok(serde_json::to_string_pretty(&artifact).unwrap_or_default()),
+            Ok(artifact) => {
+                // Mechanism 10c: warn when this artifact declares supersedes
+                // toward a target lacking the reciprocal superseded-by.
+                let warnings = engine.supersession_warnings(&self.root_path, &artifact);
+                let mut value = serde_json::to_value(&artifact).unwrap_or_default();
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("warnings".into(), serde_json::json!(warnings));
+                }
+                ok(serde_json::to_string_pretty(&value).unwrap_or_default())
+            }
             Err(e) => err(Diagnostic::error(C, "Failed to index artifact")
                 .with_context(format!("index_now(path={})", params.path))
                 .with_reason(format!("{e}"))
@@ -1176,6 +1239,59 @@ impl OrchestratorServer {
         description = "Reload company config from disk (picks up changes to flow-control.yml, etc.)"
     )]
     async fn reload_config(&self) -> Result<CallToolResult, McpError> {
+        // Mechanism 11 (RFC a4ee8b6a): refuse a hot-reload while a write-permit
+        // window is still open. Reloading the config mid-chantier changes the
+        // rules under the Implementer's feet (rule hotreload_last). This early
+        // return runs BEFORE CompanyConfig::load. Coherent with GARDE 3 of lot 1
+        // (consume requires a clean worktree): the chain commit -> consume ->
+        // reload is now mechanically ordered. The automatic file-watcher
+        // hot-reload is NOT gated (it reacts to an already-legitimated change);
+        // the gate covers only the explicit agent intent (this tool call).
+        {
+            let engine = self.engine.lock().await;
+            match engine.list_active_permits() {
+                Ok(active) if !active.is_empty() => {
+                    let details: Vec<String> = active
+                        .iter()
+                        .map(|p| {
+                            let paths: Vec<String> =
+                                p.target_paths.iter().map(|pp| pp.0.clone()).collect();
+                            format!(
+                                "permit {} (granted_to={}, rfc_id={}, target_paths=[{}])",
+                                p.id,
+                                p.granted_to.as_str(),
+                                p.rfc_id,
+                                paths.join(", ")
+                            )
+                        })
+                        .collect();
+                    return err(Diagnostic::error(
+                        C,
+                        "reload_config refused: active write permit(s) still open",
+                    )
+                    .with_context("reload_config")
+                    .with_reason(format!(
+                        "{} active permit(s): {}",
+                        active.len(),
+                        details.join("; ")
+                    ))
+                    .with_fix(
+                        "Finish the write_permit sequence first: commit the code, then consume_write_permit, then re-run reload_config",
+                    )
+                    .to_string());
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return err(
+                        Diagnostic::error(C, "reload_config: cannot check active permits")
+                            .with_context("reload_config")
+                            .with_reason(format!("{e}"))
+                            .with_fix("Check database connectivity and DB integrity")
+                            .to_string(),
+                    );
+                }
+            }
+        }
         match CompanyConfig::load(&self.root_path) {
             Ok(config) => {
                 let new_max = config.flow_control.max_review_iterations;
@@ -1338,12 +1454,16 @@ impl OrchestratorServer {
         let mut engine = self.engine.lock().await;
         let validator = self.validator.read().await;
         match engine.index_artifact(&self.root_path, &params.path, &validator) {
-            Ok(artifact) => ok(serde_json::to_string_pretty(&serde_json::json!({
-                "indexed": true,
-                "id": artifact.id,
-                "kind": artifact.kind,
-            }))
-            .unwrap_or_default()),
+            Ok(artifact) => {
+                let warnings = engine.supersession_warnings(&self.root_path, &artifact);
+                ok(serde_json::to_string_pretty(&serde_json::json!({
+                    "indexed": true,
+                    "id": artifact.id,
+                    "kind": artifact.kind,
+                    "warnings": warnings,
+                }))
+                .unwrap_or_default())
+            }
             Err(e) => err(Diagnostic::error(C, "Failed to index artifact")
                 .with_context(format!("index_artifact(path={})", params.path))
                 .with_reason(format!("{e}"))
@@ -1660,6 +1780,14 @@ fn run_index(file_path: &str) -> anyhow::Result<()> {
                 Diagnostic::info(C, format!("Indexed: {} ({})", artifact.id, artifact.kind))
                     .with_context(format!("index_artifact(path={file_path})"))
             );
+            // Mechanism 10c: surface supersession asymmetry warnings on stderr.
+            for w in engine.supersession_warnings(&root, &artifact) {
+                eprintln!(
+                    "{}",
+                    Diagnostic::warning(C, w)
+                        .with_context(format!("index_artifact(path={file_path})"))
+                );
+            }
             Ok(())
         }
         Err(e) => {
@@ -2899,5 +3027,57 @@ mod tests {
             .unwrap();
         assert_eq!(res.is_error, Some(true), "refreshed protocol must apply");
         assert!(result_text(&res).contains("ceo"));
+    }
+
+    // --- Mechanism 11: reload_config gated on active permits ---
+
+    #[tokio::test]
+    async fn test_reload_config_refused_with_active_permit() {
+        let tmp = LocalTempDir::new("reload-gate");
+        let (server, _token, rfc) = setup_server(tmp.path()).await;
+        // Insert an active permit directly via the engine (bypasses the git
+        // seal of the grant_write_permit tool, which is irrelevant to the
+        // reload gate under test).
+        server
+            .engine
+            .lock()
+            .await
+            .grant_permit(
+                rfc,
+                PersonaId::Implementer,
+                vec![PathPattern("crates/x.rs".into())],
+            )
+            .unwrap();
+
+        let res = server.reload_config().await.unwrap();
+        assert_eq!(
+            res.is_error,
+            Some(true),
+            "reload must be refused while a permit is active"
+        );
+        let text = result_text(&res);
+        assert!(text.contains("active write permit"), "message: {text}");
+        assert!(
+            text.contains("granted_to"),
+            "message lists the permit: {text}"
+        );
+    }
+
+    // --- Mechanism 10: supersede_artifact tool error path (no schemas needed) ---
+
+    #[tokio::test]
+    async fn test_supersede_tool_self_supersede_errors() {
+        let tmp = LocalTempDir::new("supersede-self");
+        let (server, _t, _rfc) = setup_server(tmp.path()).await;
+        let res = server
+            .supersede_artifact(Parameters(SupersedeArtifactParams {
+                old_id: "same-id-0000".into(),
+                new_id: "same-id-0000".into(),
+                note: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true));
+        assert!(result_text(&res).contains("supersede"));
     }
 }

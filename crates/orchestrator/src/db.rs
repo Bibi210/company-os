@@ -693,6 +693,34 @@ impl OrchestratorDb {
         Ok(None)
     }
 
+    /// List every permit currently in `active` status (mechanism 11, RFC
+    /// a4ee8b6a). Used by `reload_config` to refuse a hot-reload while a
+    /// write-permit window is still open. Consumed or revoked permits are
+    /// excluded.
+    pub fn list_active_permits(&self) -> Result<Vec<WritePermit>, OrchestratorError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, rfc_id, granted_to, target_paths, status, granted_by, granted_at, consumed_at \
+             FROM write_permits WHERE status = ?1",
+        )?;
+
+        let rows: Vec<PermitRow> = stmt
+            .query_map(params![PermitStatus::Active.to_string()], |row| {
+                Ok(PermitRow {
+                    id: row.get(0)?,
+                    rfc_id: row.get(1)?,
+                    granted_to: row.get(2)?,
+                    target_paths: row.get(3)?,
+                    status: row.get(4)?,
+                    granted_by: row.get(5)?,
+                    granted_at: row.get(6)?,
+                    consumed_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.into_iter().map(|r| r.into_permit()).collect()
+    }
+
     pub fn get_permit(&self, id: Uuid) -> Result<Option<WritePermit>, OrchestratorError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, rfc_id, granted_to, target_paths, status, granted_by, granted_at, consumed_at FROM write_permits WHERE id = ?1"

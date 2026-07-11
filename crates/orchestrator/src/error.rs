@@ -40,6 +40,19 @@ pub enum OrchestratorError {
     #[error("Artifact not found in index: {id}")]
     ArtifactNotFound { id: String },
 
+    #[error(
+        "Self-supersession forbidden: an artifact cannot supersede itself (id: {id}). \
+         Pass two distinct artifact ids to supersede_artifact."
+    )]
+    SelfSupersession { id: String },
+
+    #[error(
+        "Supersession refused: '{path}' is in a protected zone. supersede_artifact only \
+         edits non-protected artifacts (e.g. company/lessons/, company/rfcs/); personas, \
+         schemas and configs do not supersede through this channel."
+    )]
+    SupersedeProtectedZone { path: String },
+
     #[error("Cannot read file '{path}': {source}")]
     FileRead {
         path: String,

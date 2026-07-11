@@ -38,6 +38,19 @@ pub struct SetImplementedOutcome {
     pub already_implemented: bool,
 }
 
+/// Outcome of `supersede_artifact` (mechanism 10, RFC a4ee8b6a). Reports
+/// which files were touched and whether the call was an idempotent no-op.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SupersedeOutcome {
+    pub old_id: String,
+    pub new_id: String,
+    pub old_file: String,
+    pub new_file: String,
+    pub old_changed: bool,
+    pub new_changed: bool,
+    pub idempotent: bool,
+}
+
 use crate::db::OrchestratorDb;
 use crate::error::OrchestratorError;
 use crate::roadmap_summary::{
@@ -598,6 +611,181 @@ impl OrchestratorEngine {
         }
     }
 
+    /// Supersede `old_id` by `new_id` with two atomic writes (mechanism 10,
+    /// RFC a4ee8b6a; lesson 9b2c1951). Server-side lifecycle transition,
+    /// requires NO write permit (same model as `set_rfc_implemented`):
+    ///
+    ///   1. Early-returns: self-supersession, unresolved id, or either
+    ///      file in a protected zone → dedicated error, nothing written.
+    ///   2. Both new contents computed IN MEMORY by targeted textual edit
+    ///      (same family as `update_rfc_status_in_file`, preserves block
+    ///      scalars). The NEW gains `supersedes`; the OLD gains
+    ///      `superseded-by` AND a dated `[SUPERSEDED-BY ...]` marker at the
+    ///      head of `metadata.description`.
+    ///   3. Both contents validated against the schema BEFORE any disk
+    ///      write (fail-safe against a textual-edit bug).
+    ///   4. Writes: OLD first (the obsolescence annotation is the
+    ///      structurally missing piece), then NEW; on 2nd-write failure the
+    ///      OLD is rolled back from the original in-memory content.
+    ///   5. Both files re-indexed so `search()` reflects the annotation.
+    ///
+    /// Idempotent: replaying with the same ids duplicates neither the
+    /// `related` links nor the description marker.
+    pub fn supersede_artifact(
+        &mut self,
+        old_id: &str,
+        new_id: &str,
+        note: Option<&str>,
+        root: &str,
+        validator: &ArtifactValidator,
+    ) -> Result<SupersedeOutcome, OrchestratorError> {
+        // 1a. Self-supersession refused.
+        if old_id == new_id {
+            return Err(OrchestratorError::SelfSupersession {
+                id: old_id.to_string(),
+            });
+        }
+
+        // 1b. Resolve both artifacts via the index.
+        let old_art =
+            self.db
+                .get_artifact(old_id)?
+                .ok_or_else(|| OrchestratorError::ArtifactNotFound {
+                    id: old_id.to_string(),
+                })?;
+        let new_art =
+            self.db
+                .get_artifact(new_id)?
+                .ok_or_else(|| OrchestratorError::ArtifactNotFound {
+                    id: new_id.to_string(),
+                })?;
+
+        // 1c. Refuse if either file lives in a protected zone.
+        let root_path = std::path::Path::new(root);
+        for fp in [&old_art.file_path, &new_art.file_path] {
+            if companyos_config::protected_zones::is_protected(root_path, fp) {
+                return Err(OrchestratorError::SupersedeProtectedZone { path: fp.clone() });
+            }
+        }
+
+        let old_full = format!("{root}/{}", old_art.file_path);
+        let new_full = format!("{root}/{}", new_art.file_path);
+
+        let old_orig =
+            std::fs::read_to_string(&old_full).map_err(|source| OrchestratorError::FileRead {
+                path: old_full.clone(),
+                source,
+            })?;
+        let new_orig =
+            std::fs::read_to_string(&new_full).map_err(|source| OrchestratorError::FileRead {
+                path: new_full.clone(),
+                source,
+            })?;
+
+        // 2. Compute both new contents in memory.
+        let date = Utc::now().format("%Y-%m-%d").to_string();
+        let new_updated = add_related_link(&new_orig, old_id, &old_art.kind, "supersedes");
+        let old_with_link = add_related_link(&old_orig, new_id, &new_art.kind, "superseded-by");
+        let old_updated = insert_supersede_marker(&old_with_link, new_id, &date, note);
+
+        // 3. Validate both modified contents BEFORE any disk write.
+        for (label, content) in [("new", &new_updated), ("old", &old_updated)] {
+            let report = validator.validate_yaml_str(content).map_err(|e| {
+                OrchestratorError::ValidationFailed {
+                    id: format!("supersede {label}"),
+                    errors: e.to_string(),
+                }
+            })?;
+            if !report.is_valid {
+                return Err(OrchestratorError::ValidationFailed {
+                    id: format!("supersede {label}"),
+                    errors: report.errors.join("; "),
+                });
+            }
+        }
+
+        // Idempotence: if nothing changed on either side, return early.
+        let old_changed = old_updated != old_orig;
+        let new_changed = new_updated != new_orig;
+
+        // 4. Writes: OLD first, then NEW; rollback OLD on NEW failure.
+        if old_changed {
+            std::fs::write(&old_full, &old_updated).map_err(|source| {
+                OrchestratorError::FileRead {
+                    path: old_full.clone(),
+                    source,
+                }
+            })?;
+        }
+        if new_changed && let Err(source) = std::fs::write(&new_full, &new_updated) {
+            // Rollback best-effort of the OLD write.
+            if old_changed && let Err(rb) = std::fs::write(&old_full, &old_orig) {
+                eprintln!("supersede: NEW write failed AND rollback of OLD failed: {rb}");
+            }
+            return Err(OrchestratorError::FileRead {
+                path: new_full.clone(),
+                source,
+            });
+        }
+
+        // 5. Re-index both files so search() reflects the annotation.
+        // Best-effort: an indexing failure (e.g. no embedder in a test)
+        // must not undo the successful writes.
+        let _ = self.index_artifact(root, &old_art.file_path, validator);
+        let _ = self.index_artifact(root, &new_art.file_path, validator);
+
+        Ok(SupersedeOutcome {
+            old_id: old_id.to_string(),
+            new_id: new_id.to_string(),
+            old_file: old_art.file_path,
+            new_file: new_art.file_path,
+            old_changed,
+            new_changed,
+            idempotent: !old_changed && !new_changed,
+        })
+    }
+
+    /// Warn when an artifact declares `supersedes` toward a target that does
+    /// NOT carry the reciprocal `superseded-by` (mechanism 10c, RFC
+    /// a4ee8b6a). Non-blocking by construction: the LLM judges WHAT to
+    /// supersede, this only checks that both writes happened.
+    pub fn supersession_warnings(&self, root: &str, artifact: &IndexedArtifact) -> Vec<String> {
+        let full = format!("{root}/{}", artifact.file_path);
+        let Ok(content) = std::fs::read_to_string(&full) else {
+            return Vec::new();
+        };
+        let Ok(yaml) = serde_yaml::from_str::<serde_json::Value>(&content) else {
+            return Vec::new();
+        };
+        let mut warnings = Vec::new();
+        for rel in extract_relations(&yaml) {
+            if rel.relationship != "supersedes" {
+                continue;
+            }
+            let Ok(Some(target)) = self.db.get_artifact(&rel.target_id) else {
+                continue;
+            };
+            let target_full = format!("{root}/{}", target.file_path);
+            let has_reciprocal = std::fs::read_to_string(&target_full)
+                .ok()
+                .and_then(|c| serde_yaml::from_str::<serde_json::Value>(&c).ok())
+                .map(|ty| {
+                    extract_relations(&ty)
+                        .iter()
+                        .any(|r| r.relationship == "superseded-by" && r.target_id == artifact.id)
+                })
+                .unwrap_or(false);
+            if !has_reciprocal {
+                warnings.push(format!(
+                    "supersedes sans réciproque : la cible {} ne porte pas superseded-by ; \
+                     utiliser supersede_artifact",
+                    rel.target_id
+                ));
+            }
+        }
+        warnings
+    }
+
     pub fn start_revision(&self, round_id: Uuid) -> Result<ReviewRound, OrchestratorError> {
         let mut round = self
             .db
@@ -714,6 +902,14 @@ impl OrchestratorEngine {
 
     pub fn consume_permit(&self, permit_id: Uuid) -> Result<(), OrchestratorError> {
         self.db.consume_permit(permit_id)
+    }
+
+    /// List every permit currently in `active` status (mechanism 11, RFC
+    /// a4ee8b6a). Passthrough to [`OrchestratorDb::list_active_permits`],
+    /// used by the `reload_config` tool to refuse a hot-reload while a
+    /// write-permit window is still open.
+    pub fn list_active_permits(&self) -> Result<Vec<WritePermit>, OrchestratorError> {
+        self.db.list_active_permits()
     }
 
     /// Opaque blob describing the current state of `write_permits`.
@@ -1467,6 +1663,139 @@ fn collect_strings(value: &serde_json::Value) -> Vec<String> {
     }
 }
 
+/// Add a `{id, kind, relationship}` entry to `metadata.related` by targeted
+/// textual edit (mechanism 10, RFC a4ee8b6a), preserving the file's existing
+/// formatting and block scalars (same family as `update_rfc_status_in_file`).
+/// Idempotent: if an entry with the same `id` AND `relationship` already
+/// exists, the content is returned unchanged. If no `related:` block exists,
+/// one is created right after the `metadata:` line's first field block.
+fn add_related_link(content: &str, target_id: &str, kind: &str, relationship: &str) -> String {
+    // Idempotence: bail if the (id, relationship) pair is already present.
+    // Cheap structural check via a re-parse of the existing relations.
+    if let Ok(yaml) = serde_yaml::from_str::<serde_json::Value>(content) {
+        let already = extract_relations(&yaml)
+            .iter()
+            .any(|r| r.target_id == target_id && r.relationship == relationship);
+        if already {
+            return content.to_string();
+        }
+    }
+
+    let entry =
+        format!("    - id: {target_id}\n      kind: {kind}\n      relationship: {relationship}\n");
+
+    // Case A: a `  related:` line exists under metadata → insert the entry
+    // right after it (as the first list item).
+    if let Some(pos) = content.find("\n  related:") {
+        // Find the end of the `  related:` line.
+        let line_start = pos + 1; // skip the leading '\n'
+        if let Some(nl) = content[line_start..].find('\n') {
+            let insert_at = line_start + nl + 1;
+            let mut out = String::with_capacity(content.len() + entry.len());
+            out.push_str(&content[..insert_at]);
+            out.push_str(&entry);
+            out.push_str(&content[insert_at..]);
+            return out;
+        }
+    }
+
+    // Case B: no related block. Create one just before `\nspec:` (top-level),
+    // which every artifact has. Insert `  related:` + the entry.
+    let block = format!("  related:\n{entry}");
+    if let Some(pos) = content.find("\nspec:") {
+        let insert_at = pos + 1; // before "spec:"
+        let mut out = String::with_capacity(content.len() + block.len());
+        out.push_str(&content[..insert_at]);
+        out.push_str(&block);
+        out.push_str(&content[insert_at..]);
+        return out;
+    }
+
+    // Fallback: append at the end (should not happen for a valid artifact).
+    format!("{content}\n{block}")
+}
+
+/// Insert a dated `[SUPERSEDED-BY <8chars> le <date>]` marker at the HEAD of
+/// `metadata.description` (mechanism 10, RFC a4ee8b6a; lesson 9b2c1951: the
+/// retrieval surface must carry the obsolescence). Handles both a block
+/// scalar (`description: >`) and an inline/quoted string. Idempotent: if a
+/// `[SUPERSEDED-BY` marker is already present anywhere in the description
+/// region, the content is returned unchanged.
+fn insert_supersede_marker(content: &str, new_id: &str, date: &str, note: Option<&str>) -> String {
+    // Idempotence: never stack markers.
+    if content.contains("[SUPERSEDED-BY") {
+        return content.to_string();
+    }
+
+    let short = &new_id[..new_id.len().min(8)];
+    let note_suffix = match note {
+        Some(n) if !n.trim().is_empty() => format!(" {}", n.trim()),
+        _ => String::new(),
+    };
+    let marker_text = format!("[SUPERSEDED-BY {short} le {date}]{note_suffix}");
+
+    // Locate the `  description:` line under metadata.
+    let Some(desc_pos) = content.find("\n  description:") else {
+        return content.to_string();
+    };
+    let line_start = desc_pos + 1;
+    let Some(nl_off) = content[line_start..].find('\n') else {
+        return content.to_string();
+    };
+    let desc_line = &content[line_start..line_start + nl_off];
+    let after_line = line_start + nl_off + 1;
+
+    // Block scalar form: `  description: >` or `  description: |` (with
+    // optional chomping indicator). The content follows on indented lines.
+    let value = desc_line
+        .split_once("description:")
+        .map(|x| x.1)
+        .unwrap_or("")
+        .trim();
+    let is_block_scalar = value.starts_with('>') || value.starts_with('|');
+
+    if is_block_scalar {
+        // Determine the indentation of the first content line and insert the
+        // marker as a new first content line with the same indentation.
+        let rest = &content[after_line..];
+        let indent = rest
+            .lines()
+            .next()
+            .map(|l| &l[..l.len() - l.trim_start().len()])
+            .filter(|ind| !ind.is_empty())
+            .unwrap_or("    ")
+            .to_string();
+        let mut out = String::with_capacity(content.len() + marker_text.len() + indent.len() + 1);
+        out.push_str(&content[..after_line]);
+        out.push_str(&indent);
+        out.push_str(&marker_text);
+        out.push('\n');
+        out.push_str(&content[after_line..]);
+        out
+    } else {
+        // Inline string form: `  description: "..."` or `  description: ...`.
+        // Rewrite the value with the marker prepended, preserving quoting.
+        let (prefix, body) =
+            desc_line.split_at(desc_line.find("description:").unwrap() + "description:".len());
+        let body_trim = body.trim();
+        let new_line =
+            if body_trim.starts_with('"') && body_trim.ends_with('"') && body_trim.len() >= 2 {
+                let inner = &body_trim[1..body_trim.len() - 1];
+                format!("{prefix} \"{marker_text} {inner}\"")
+            } else if body_trim.is_empty() {
+                format!("{prefix} \"{marker_text}\"")
+            } else {
+                format!("{prefix} \"{marker_text} {body_trim}\"")
+            };
+        let mut out = String::with_capacity(content.len() + marker_text.len() + 8);
+        out.push_str(&content[..line_start]);
+        out.push_str(&new_line);
+        out.push('\n');
+        out.push_str(&content[after_line..]);
+        out
+    }
+}
+
 fn extract_relations(yaml: &serde_json::Value) -> Vec<ParsedRelation> {
     yaml.pointer("/metadata/related")
         .and_then(|v| v.as_array())
@@ -1504,12 +1833,13 @@ fn walk_yaml_files(dir: &Path, callback: &mut dyn FnMut(&Path)) {
 #[cfg(test)]
 mod tests {
     use crate::error::OrchestratorError;
-    use crate::types::{ReviewRound, RoundStatus};
+    use crate::types::{PathPattern, ReviewRound, RoundStatus};
     use crate::{
         ArtifactPath, ConsensusResult, Finding, OrchestratorDb, OrchestratorEngine, ReviewVerdict,
     };
     use chrono::Utc;
     use companyos_config::{ArtifactKind, PersonaId};
+    use companyos_validation::ArtifactValidator;
     use uuid::Uuid;
 
     fn setup_engine() -> OrchestratorEngine {
@@ -2897,6 +3227,288 @@ mod tests {
         assert_eq!(
             entries[0].in_progress_count, 1,
             "computed status drives the counter"
+        );
+    }
+
+    // ============================================================
+    // Mechanism 10: supersede_artifact  (RFC a4ee8b6a, lot 2)
+    // ============================================================
+
+    fn workspace_schemas_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("company/schemas")
+    }
+
+    fn test_validator() -> ArtifactValidator {
+        let registry = companyos_validation::SchemaRegistry::load(workspace_schemas_dir())
+            .expect("load schemas");
+        ArtifactValidator::new(registry)
+    }
+
+    /// Write a minimal valid lesson-learned fixture under company/lessons/,
+    /// optionally with a `related` block. Returns the relative path.
+    fn write_lesson(
+        root: &RoadmapTestRoot,
+        id: &str,
+        description: &str,
+        related: Option<&str>,
+    ) -> String {
+        let mut c = String::new();
+        c.push_str("api_version: companyos/v1\n");
+        c.push_str("kind: lesson-learned\n");
+        c.push_str("metadata:\n");
+        c.push_str(&format!("  id: {id}\n"));
+        c.push_str(&format!("  title: \"Lesson {id}\"\n"));
+        c.push_str("  author: implementer\n");
+        c.push_str("  created_at: \"2026-07-03\"\n");
+        c.push_str(&format!("  description: >\n    {description}\n"));
+        c.push_str("  tags:\n    - test\n");
+        if let Some(r) = related {
+            c.push_str(r);
+        }
+        c.push_str("spec:\n");
+        c.push_str("  context: \"ctx\"\n");
+        c.push_str("  insight: \"ins\"\n");
+        c.push_str("  recommendation: \"rec\"\n");
+        let rel = format!("company/lessons/{id}.yml");
+        std::fs::create_dir_all(root.path.join("company/lessons")).ok();
+        root.write_raw(&rel, &c);
+        rel
+    }
+
+    // NOMINAL: two lessons superseded, both files updated, re-read confirms.
+    #[test]
+    fn test_supersede_nominal_two_lessons() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let validator = test_validator();
+        let old = "c0000000-0000-4000-8000-000000000001";
+        let new = "c0000000-0000-4000-8000-000000000002";
+        let old_path = write_lesson(&root, old, "old lesson body", None);
+        let new_path = write_lesson(&root, new, "new lesson body", None);
+        index_artifact_with_kind(&mut engine, old, "lesson-learned", &old_path);
+        index_artifact_with_kind(&mut engine, new, "lesson-learned", &new_path);
+
+        let outcome = engine
+            .supersede_artifact(
+                old,
+                new,
+                Some("partie X reste valide"),
+                root.root_str(),
+                &validator,
+            )
+            .expect("supersede ok");
+        assert!(outcome.old_changed && outcome.new_changed);
+        assert!(!outcome.idempotent);
+
+        let old_yaml = std::fs::read_to_string(root.path.join(&old_path)).unwrap();
+        let new_yaml = std::fs::read_to_string(root.path.join(&new_path)).unwrap();
+        assert!(old_yaml.contains("[SUPERSEDED-BY"), "old carries marker");
+        assert!(old_yaml.contains("partie X reste valide"), "note preserved");
+        assert!(old_yaml.contains("superseded-by"), "old carries link");
+        assert!(new_yaml.contains("supersedes"), "new carries link");
+        // Both still valid against schema.
+        assert!(validator.validate_yaml_str(&old_yaml).unwrap().is_valid);
+        assert!(validator.validate_yaml_str(&new_yaml).unwrap().is_valid);
+    }
+
+    // NEGATIVE: unknown id.
+    #[test]
+    fn test_supersede_unknown_id() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let validator = test_validator();
+        let new = "c0000000-0000-4000-8000-000000000012";
+        let new_path = write_lesson(&root, new, "n", None);
+        index_artifact_with_kind(&mut engine, new, "lesson-learned", &new_path);
+        let res = engine.supersede_artifact(
+            "c0000000-0000-4000-8000-0000000000ff",
+            new,
+            None,
+            root.root_str(),
+            &validator,
+        );
+        assert!(matches!(
+            res,
+            Err(OrchestratorError::ArtifactNotFound { .. })
+        ));
+    }
+
+    // NEGATIVE: self-supersession.
+    #[test]
+    fn test_supersede_self_refused() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let validator = test_validator();
+        let id = "c0000000-0000-4000-8000-000000000021";
+        let p = write_lesson(&root, id, "x", None);
+        index_artifact_with_kind(&mut engine, id, "lesson-learned", &p);
+        let res = engine.supersede_artifact(id, id, None, root.root_str(), &validator);
+        assert!(matches!(
+            res,
+            Err(OrchestratorError::SelfSupersession { .. })
+        ));
+    }
+
+    // NEGATIVE: target in a protected zone (persona under company/personas/).
+    #[test]
+    fn test_supersede_protected_zone_refused() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let validator = test_validator();
+        // Copy the real protected-zones config so is_protected resolves.
+        std::fs::create_dir_all(root.path.join("company/config")).ok();
+        let zones = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("company/config/protected-zones.json");
+        std::fs::copy(
+            &zones,
+            root.path.join("company/config/protected-zones.json"),
+        )
+        .ok();
+        companyos_config::protected_zones::reload();
+
+        let old = "c0000000-0000-4000-8000-000000000031";
+        let new = "c0000000-0000-4000-8000-000000000032";
+        let old_path = write_lesson(&root, old, "o", None);
+        // new_path lives under company/personas/ (protected).
+        std::fs::create_dir_all(root.path.join("company/personas")).ok();
+        let new_path = "company/personas/c0000000.yml".to_string();
+        root.write_raw(&new_path, "kind: persona\n");
+        index_artifact_with_kind(&mut engine, old, "lesson-learned", &old_path);
+        index_artifact_with_kind(&mut engine, new, "persona", &new_path);
+
+        let res = engine.supersede_artifact(old, new, None, root.root_str(), &validator);
+        assert!(matches!(
+            res,
+            Err(OrchestratorError::SupersedeProtectedZone { .. })
+        ));
+        companyos_config::protected_zones::reload();
+    }
+
+    // EDGE: idempotence — replaying does not duplicate links or markers.
+    #[test]
+    fn test_supersede_idempotent_replay() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let validator = test_validator();
+        let old = "c0000000-0000-4000-8000-000000000041";
+        let new = "c0000000-0000-4000-8000-000000000042";
+        let old_path = write_lesson(&root, old, "o", None);
+        let new_path = write_lesson(&root, new, "n", None);
+        index_artifact_with_kind(&mut engine, old, "lesson-learned", &old_path);
+        index_artifact_with_kind(&mut engine, new, "lesson-learned", &new_path);
+
+        engine
+            .supersede_artifact(old, new, None, root.root_str(), &validator)
+            .unwrap();
+        let outcome2 = engine
+            .supersede_artifact(old, new, None, root.root_str(), &validator)
+            .unwrap();
+        assert!(outcome2.idempotent, "replay must be a no-op");
+
+        let old_yaml = std::fs::read_to_string(root.path.join(&old_path)).unwrap();
+        assert_eq!(
+            old_yaml.matches("[SUPERSEDED-BY").count(),
+            1,
+            "marker must not be stacked"
+        );
+        assert_eq!(
+            old_yaml.matches("superseded-by").count(),
+            1,
+            "link must not be duplicated"
+        );
+    }
+
+    // EDGE: old artifact WITHOUT a pre-existing related block gets one.
+    #[test]
+    fn test_supersede_creates_related_block() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let validator = test_validator();
+        let old = "c0000000-0000-4000-8000-000000000051";
+        let new = "c0000000-0000-4000-8000-000000000052";
+        let old_path = write_lesson(&root, old, "o", None); // no related:
+        let new_path = write_lesson(&root, new, "n", None);
+        index_artifact_with_kind(&mut engine, old, "lesson-learned", &old_path);
+        index_artifact_with_kind(&mut engine, new, "lesson-learned", &new_path);
+
+        engine
+            .supersede_artifact(old, new, None, root.root_str(), &validator)
+            .unwrap();
+        let old_yaml = std::fs::read_to_string(root.path.join(&old_path)).unwrap();
+        assert!(old_yaml.contains("related:"), "related block created");
+        assert!(validator.validate_yaml_str(&old_yaml).unwrap().is_valid);
+    }
+
+    // EDGE: supersession_warnings emitted on a one-sided supersedes, absent
+    // on a reciprocal couple.
+    #[test]
+    fn test_supersession_warnings_asymmetry() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let a = "c0000000-0000-4000-8000-000000000061";
+        let b = "c0000000-0000-4000-8000-000000000062";
+        // A supersedes B, but B does NOT carry superseded-by (unilateral).
+        let a_related = format!(
+            "  related:\n    - id: {b}\n      kind: lesson-learned\n      relationship: supersedes\n"
+        );
+        let a_path = write_lesson(&root, a, "a", Some(&a_related));
+        let b_path = write_lesson(&root, b, "b", None);
+        index_artifact_with_kind(&mut engine, a, "lesson-learned", &a_path);
+        index_artifact_with_kind(&mut engine, b, "lesson-learned", &b_path);
+
+        let a_art = engine.get_artifact(a).unwrap().unwrap();
+        let warns = engine.supersession_warnings(root.root_str(), &a_art);
+        assert_eq!(warns.len(), 1, "unilateral supersedes must warn");
+        assert!(warns[0].contains(b));
+
+        // Now make B reciprocal → no warning.
+        let b_related = format!(
+            "  related:\n    - id: {a}\n      kind: lesson-learned\n      relationship: superseded-by\n"
+        );
+        write_lesson(&root, b, "b", Some(&b_related));
+        let warns2 = engine.supersession_warnings(root.root_str(), &a_art);
+        assert!(warns2.is_empty(), "reciprocal couple must not warn");
+    }
+
+    // ============================================================
+    // Mechanism 11: reload gate via list_active_permits
+    // ============================================================
+
+    #[test]
+    fn test_list_active_permits_empty_by_default() {
+        let engine = setup_engine();
+        assert!(engine.list_active_permits().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_list_active_permits_reflects_active_and_consumed() {
+        let engine = setup_engine();
+        let rfc_id = Uuid::new_v4();
+        let permit = engine
+            .grant_permit(
+                rfc_id,
+                PersonaId::Implementer,
+                vec![PathPattern("crates/x.rs".into())],
+            )
+            .unwrap();
+        assert_eq!(
+            engine.list_active_permits().unwrap().len(),
+            1,
+            "an active permit is listed"
+        );
+        engine.consume_permit(permit.id).unwrap();
+        assert!(
+            engine.list_active_permits().unwrap().is_empty(),
+            "a consumed permit is not listed"
         );
     }
 }
