@@ -37,7 +37,9 @@ rules:
       La mise à jour du serveur est un acte VOLONTAIRE et explicite.
       Ordre du workflow standard d'implémentation Rust :
       (a) code → make ci vert (CI interne : build + tests + lint + validate) ;
-      (b) tous les write permits actifs consommés via consume_write_permit() ;
+      (b) tous les write permits actifs consommés via consume_write_permit()
+          (exigence vérifiée mécaniquement : reload_config refuse tant qu'un
+          permit actif subsiste, RFC a4ee8b6a) ;
       (c) `make deploy-serve` — promotion atomique (cp + rename) qui remplace
           les binaires servis et déclenche un restart CONTRÔLÉ, absorbé de
           façon transparente par le buffer FIFO du proxy (aucun retry, aucun

@@ -23,6 +23,8 @@ spec:
          overflow, chemins avec espaces, Unicode, permissions partielles, etc.
       Le review-report DOIT contenir une section par axe avec le verdict pour chacun.
       Un artifact qui ne couvre que le cas nominal est insuffisant — request_changes obligatoire.
+      La FORME (spec.axes nominal/negative/edge, un verdict par axe) est vérifiée mécaniquement
+      par le schema review-report (RFC a4ee8b6a) ; la QUALITÉ de l'analyse par axe reste du jugement.
   reviewers_by_artifact_type:
     design-doc:
       - pm

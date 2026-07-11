@@ -21,7 +21,7 @@ rules:
   must:
     - Documenter les décisions architecturales avec leur rationale
     - Vérifier que l'implémentation respecte le design doc lors du code review
-    - Produire des design docs complets avec overview, components, et decisions
+    - "Produire des design docs complets avec overview, components, et decisions (vérifié mécaniquement par le schema design-doc, RFC a4ee8b6a)"
     - "Avant toute production d'artifact, appeler search() sur le sujet, puis get() sur les artifacts pertinents identifiés (cf. memory_lookup_before_acting). Le lookup vise la curation, pas la conformité mécanique."
     - "Avant de figer la signature d'une API publique de crate (un symbole `pub` qui traverse une frontière de crate : fonction OU type) dans un design-doc ou un RFC, recenser tous ses callers existants dans le workspace via rg ou get_references LSP. L'union des fichiers retournés (callers + fichier de définition) doit figurer dans affected_files (forme structurée modified/created, RFC a4eb3ee7) afin que le target_paths du permit soit exhaustif. Si la liste n'est pas triviale, la documenter dans le RFC ou le design-doc. Ne concerne pas les symboles internes (`pub(crate)`, helpers privés) ni les RFCs purement YAML/config."
   never:

@@ -186,6 +186,10 @@ spec:
         (le filtre kind a été retiré de search, RFC 1d3a3581).
         Si une lesson similaire existe : soit tu l'ameliore ou tu en crée une nouvelle améliorée,
         et lie les deux avec related (relationship: supersedes vers l'ancienne, derived-from depuis la nouvelle).
+        La supersession à deux écritures (lien côté nouvelle + annotation d'obsolescence côté ancienne)
+        est portée par le tool MCP supersede_artifact (canal canonique, RFC a4ee8b6a) : il pose
+        supersedes/superseded-by ET insère le marqueur [SUPERSEDED-BY ...] en tête de la description
+        de l'ancienne, en une transition serveur atomique sans permit.
         Si aucune lesson similaire n'existe : crée-en une nouvelle via direct write.
     related_artifacts:
       description: >
@@ -212,6 +216,10 @@ spec:
         Kinds globaux : lesson-learned, persona, rfc, flow-control, review-protocol,
                         human-review-triggers, roadmap
         Le project-slug doit être un identifiant kebab-case unique et immuable.
+        La cohérence kind↔chemin est désormais vérifiée MÉCANIQUEMENT par le validator
+        (module placement.rs, RFC a4ee8b6a) : un artifact mal placé est rejeté à l'écriture
+        (hook), au commit (pre-commit) et à make validate. L'exception exacte
+        company/config/shared-rules.yml reste admise.
     review_protocol:
       description: >
         Le protocole de review est défini dans company/config/review-protocol.yml. Consulte-le avant chaque review round.
@@ -222,6 +230,9 @@ spec:
         cas négatif (erreurs, échecs, inputs invalides), et edge cases (valeurs limites, concurrence, etc.).
         Le review-report doit contenir un verdict par axe. Un artifact qui ne couvre que le cas nominal
         est insuffisant et doit recevoir request_changes.
+        La FORME triaxiale (spec.axes nominal/negative/edge, un verdict par axe) est désormais
+        vérifiée MÉCANIQUEMENT par le schema review-report (RFC a4ee8b6a) ; le FOND (la qualité
+        de l'analyse par axe) reste du jugement prose/LLM.
         Les reviewers listés sont le minimum requis — un agent peut ajouter d'autres reviewers
         s'il estime que leur expertise est pertinente pour l'artifact en question.
     authentication:
@@ -311,7 +322,9 @@ spec:
 
         Types de liens à utiliser :
         - `supersedes` : la nouvelle lesson corrige ou remplace une ancienne (ex. : apprentissage
-          contredit par l'expérience)
+          contredit par l'expérience). Poser ce lien via le tool supersede_artifact (canal
+          canonique, RFC a4ee8b6a) : il écrit la réciproque superseded-by et annote la description
+          de l'ancienne en une transition atomique.
         - `derived-from` : la nouvelle lesson est une spécialisation d'une lesson plus générale
           (ex. : « erreur de validation YAML en RFC » dérive de « erreur de validation YAML »)
         - `related` : deux lessons parlent du même pattern sans que l'une remplace l'autre
