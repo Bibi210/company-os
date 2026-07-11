@@ -1,4 +1,5 @@
 pub mod error;
+pub mod placement;
 pub mod schema_registry;
 pub mod validator;
 

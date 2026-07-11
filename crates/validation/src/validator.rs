@@ -19,14 +19,35 @@ pub struct ValidationReport {
 /// Main validation entry point.
 pub struct ArtifactValidator {
     registry: SchemaRegistry,
+    /// Repo root used to resolve relative paths for placement validation
+    /// (mechanism 9, RFC a4ee8b6a). `None` = placement check skipped
+    /// (schema-only), preserving the legacy behaviour of every non-configured
+    /// call-site.
+    root: Option<PathBuf>,
 }
 
 impl ArtifactValidator {
     pub fn new(registry: SchemaRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            root: None,
+        }
+    }
+
+    /// Additive builder: configure the repo root so `validate_file` /
+    /// `validate_dir` also enforce kind↔path placement. Only the
+    /// `companyos-yaml-validator` binary sets this; every other caller keeps
+    /// schema-only validation.
+    pub fn with_root(mut self, root: PathBuf) -> Self {
+        self.root = Some(root);
+        self
     }
 
     /// Validate a YAML string against its schema (kind is extracted from the YAML).
+    ///
+    /// NOTE: a bare string carries no path, so placement CANNOT be checked
+    /// here (tool `validate_yaml`). Placement is enforced only through
+    /// `validate_file` / `validate_dir`, which know the path.
     pub fn validate_yaml_str(&self, yaml: &str) -> Result<ValidationReport, ValidationError> {
         let yaml_value: serde_yaml::Value = serde_yaml::from_str(yaml)?;
         let json_value: serde_json::Value =
@@ -35,10 +56,13 @@ impl ArtifactValidator {
         self.validate_json_value(&json_value)
     }
 
-    /// Validate a YAML file.
+    /// Validate a YAML file. When a root is configured and `path` resolves
+    /// under it, kind↔path placement is enforced as a blocking error.
     pub fn validate_file(&self, path: &Path) -> Result<ValidationReport, ValidationError> {
         let content = std::fs::read_to_string(path)?;
-        self.validate_yaml_str(&content)
+        let mut report = self.validate_yaml_str(&content)?;
+        self.check_placement(path, &mut report);
+        Ok(report)
     }
 
     /// Batch validate all YAML files under a directory (recursive).
@@ -54,6 +78,32 @@ impl ArtifactValidator {
             }
         }
         results
+    }
+
+    /// Mechanism 9 (RFC a4ee8b6a): enforce kind↔path placement as a blocking
+    /// error when a root is configured AND `path` resolves under it. Skipped
+    /// (schema-only) when no root is set or when the path lies outside the
+    /// root (fail-open, e.g. test fixtures in tempdirs). `report` is only
+    /// touched when a placement error is found, so a report already invalid
+    /// on schema grounds is unaffected.
+    fn check_placement(&self, path: &Path, report: &mut ValidationReport) {
+        let Some(root) = &self.root else {
+            return;
+        };
+        // Resolve both sides through canonicalize so symlinks and relative
+        // segments compare correctly. If either side cannot be canonicalized
+        // (path missing, permissions), skip: fail-open.
+        let (Ok(root_c), Ok(path_c)) = (root.canonicalize(), path.canonicalize()) else {
+            return;
+        };
+        let Ok(rel) = path_c.strip_prefix(&root_c) else {
+            // Path is outside the root → skip (fail-open).
+            return;
+        };
+        if let Some(msg) = crate::placement::check_placement(report.kind, rel) {
+            report.errors.push(msg);
+            report.is_valid = false;
+        }
     }
 
     fn validate_json_value(
@@ -282,5 +332,111 @@ metadata:
             !report.errors.is_empty(),
             "errors should be non-empty when spec is missing"
         );
+    }
+
+    // --- Mechanism 9: placement enforcement via with_root ---
+
+    const RFC_YAML: &str = r#"
+api_version: "companyos/v1"
+kind: "rfc"
+metadata:
+  id: "a0000009-0000-4000-8000-000000000009"
+  title: "Placement test RFC"
+  author: "architect"
+  created_at: "2026-07-03"
+  status: draft
+spec:
+  motivation: "m"
+  proposal: "p"
+  impact: "i"
+"#;
+
+    fn setup_validator_with_root(root: &std::path::Path) -> ArtifactValidator {
+        let schemas_dir = workspace_root().join("company/schemas");
+        let registry = crate::SchemaRegistry::load(&schemas_dir).unwrap();
+        ArtifactValidator::new(registry).with_root(root.to_path_buf())
+    }
+
+    #[test]
+    fn test_placement_correct_location_accepted() {
+        let tmp = std::env::temp_dir().join(format!("placement-ok-{}", std::process::id()));
+        let dir = tmp.join("company/rfcs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("placement-a0000009.yml");
+        std::fs::write(&file, RFC_YAML).unwrap();
+
+        let validator = setup_validator_with_root(&tmp);
+        let report = validator.validate_file(&file).unwrap();
+        assert!(
+            report.is_valid,
+            "rfc under company/rfcs/ must pass placement: {:?}",
+            report.errors
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_placement_wrong_location_rejected() {
+        let tmp = std::env::temp_dir().join(format!("placement-ko-{}", std::process::id()));
+        // rfc placed under company/lessons/ → wrong.
+        let dir = tmp.join("company/lessons");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("misplaced-a0000009.yml");
+        std::fs::write(&file, RFC_YAML).unwrap();
+
+        let validator = setup_validator_with_root(&tmp);
+        let report = validator.validate_file(&file).unwrap();
+        assert!(
+            !report.is_valid,
+            "rfc under company/lessons/ must fail placement"
+        );
+        assert!(
+            report.errors.iter().any(|e| e.contains("placement error")),
+            "expected a placement error, got {:?}",
+            report.errors
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_placement_skipped_without_root() {
+        // Same misplaced file, but a validator WITHOUT with_root must ignore
+        // placement entirely (schema-only) — preserves legacy behaviour.
+        let tmp = std::env::temp_dir().join(format!("placement-noroot-{}", std::process::id()));
+        let dir = tmp.join("company/lessons");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("misplaced-a0000009.yml");
+        std::fs::write(&file, RFC_YAML).unwrap();
+
+        let validator = setup_validator(); // no root
+        let report = validator.validate_file(&file).unwrap();
+        assert!(
+            report.is_valid,
+            "without root, placement must be skipped: {:?}",
+            report.errors
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_placement_path_outside_root_skipped() {
+        // File lives OUTSIDE the configured root → fail-open skip.
+        let root = std::env::temp_dir().join(format!("placement-root-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let other = std::env::temp_dir().join(format!("placement-other-{}", std::process::id()));
+        let dir = other.join("company/lessons");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("misplaced-a0000009.yml");
+        std::fs::write(&file, RFC_YAML).unwrap();
+
+        let validator = setup_validator_with_root(&root);
+        let report = validator.validate_file(&file).unwrap();
+        assert!(
+            report.is_valid,
+            "path outside root must skip placement: {:?}",
+            report.errors
+        );
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&other).ok();
     }
 }

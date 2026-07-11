@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -20,6 +21,9 @@ const C: &str = constants::COMPONENT_YAML_VALIDATOR;
 struct YamlValidatorServer {
     validator: Arc<RwLock<ArtifactValidator>>,
     schemas_dir: String,
+    /// Repo root, propagated into every rebuilt validator so placement
+    /// validation survives a `reload_schemas` (mechanism 9, RFC a4ee8b6a).
+    root: String,
     tool_router: ToolRouter<Self>,
 }
 
@@ -45,10 +49,11 @@ fn err(msg: String) -> Result<CallToolResult, McpError> {
 
 #[tool_router]
 impl YamlValidatorServer {
-    fn new(validator: Arc<RwLock<ArtifactValidator>>, schemas_dir: String) -> Self {
+    fn new(validator: Arc<RwLock<ArtifactValidator>>, schemas_dir: String, root: String) -> Self {
         Self {
             validator,
             schemas_dir,
+            root,
             tool_router: Self::tool_router(),
         }
     }
@@ -111,7 +116,8 @@ impl YamlValidatorServer {
         match SchemaRegistry::load(&self.schemas_dir) {
             Ok(registry) => {
                 let kinds: Vec<_> = registry.kinds().iter().map(|k| k.as_str()).collect();
-                let new_validator = ArtifactValidator::new(registry);
+                let new_validator =
+                    ArtifactValidator::new(registry).with_root(PathBuf::from(&self.root));
                 *self.validator.write().await = new_validator;
                 ok(serde_json::to_string_pretty(&serde_json::json!({
                     "reloaded": true,
@@ -172,8 +178,10 @@ async fn run_server() -> anyhow::Result<()> {
     let schemas_dir = format!("{root}/{}", constants::SCHEMAS_DIR);
 
     let registry = SchemaRegistry::load(&schemas_dir)?;
-    let validator = Arc::new(RwLock::new(ArtifactValidator::new(registry)));
-    let server = YamlValidatorServer::new(validator.clone(), schemas_dir.clone());
+    let validator = Arc::new(RwLock::new(
+        ArtifactValidator::new(registry).with_root(PathBuf::from(&root)),
+    ));
+    let server = YamlValidatorServer::new(validator.clone(), schemas_dir.clone(), root.clone());
 
     // RFC 062ebaa8 — shared flag set right before the service exits so
     // the `WatcherGuard` Drop impl emits info!, not error!, on a clean
@@ -194,6 +202,7 @@ async fn run_server() -> anyhow::Result<()> {
             let watcher::FileWatcherHandle { mut rx, _guard } = handle;
             let validator = validator.clone();
             let schemas_dir = schemas_dir.clone();
+            let root = root.clone();
             tokio::spawn(async move {
                 // MUST keep the guard alive for as long as `rx` is
                 // consumed. DO NOT remove this binding even if it looks
@@ -205,7 +214,8 @@ async fn run_server() -> anyhow::Result<()> {
                         match SchemaRegistry::load(&schemas_dir) {
                             Ok(registry) => {
                                 let count = registry.kinds().len();
-                                *validator.write().await = ArtifactValidator::new(registry);
+                                *validator.write().await = ArtifactValidator::new(registry)
+                                    .with_root(PathBuf::from(&root));
                                 tracing::info!("Auto-reloaded {count} schema(s)");
                             }
                             Err(e) => tracing::warn!("Auto-reload schemas failed: {e}"),
@@ -236,7 +246,7 @@ fn run_single_file(path: &str) -> anyhow::Result<()> {
     let schemas_dir = format!("{root}/{}", constants::SCHEMAS_DIR);
 
     let registry = SchemaRegistry::load(&schemas_dir)?;
-    let validator = ArtifactValidator::new(registry);
+    let validator = ArtifactValidator::new(registry).with_root(PathBuf::from(&root));
 
     match validator.validate_file(std::path::Path::new(path)) {
         Ok(report) if report.is_valid => {
@@ -278,7 +288,7 @@ fn run_batch(dir: &str) -> anyhow::Result<()> {
     let schemas_dir = format!("{root}/{}", constants::SCHEMAS_DIR);
 
     let registry = SchemaRegistry::load(&schemas_dir)?;
-    let validator = ArtifactValidator::new(registry);
+    let validator = ArtifactValidator::new(registry).with_root(PathBuf::from(&root));
 
     let results = validator.validate_dir(std::path::Path::new(dir));
     let mut has_errors = false;
