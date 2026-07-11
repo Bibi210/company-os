@@ -1,0 +1,139 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 50409fb0-4f74-4825-a68d-84ce219506c4
+  title: "Lot 2 du durcissement process : le builder additif with_root préserve 19 call-sites sans en changer un seul ; l'édition textuelle d'un block scalar et la régénération de personas.yml bloquée au pre-commit sont les deux surprises"
+  author: implementer
+  created_at: "2026-07-11"
+  description: >
+    Capitalisation de clôture du lot 2 du durcissement process V1 (RFC
+    a4ee8b6a implemented, plan 438cc31d, task-request 0935d0df done,
+    diagnostic c981bf62, domaine v1-process-hardening de la roadmap
+    a410bb43). Sept mécanismes livrés d'un coup, make ci vert à chaque
+    commit : schemas review-report triaxial et design-doc stricts (sans
+    anyOf, stock vide/conforme), placement kind-chemin via un builder
+    ADDITIF with_root (les 19 call-sites de ArtifactValidator::new
+    intacts, seul le binaire yaml-validator câble le root), tool MCP
+    supersede_artifact à deux écritures (superseded-by + marqueur
+    description, matérialise enfin la lesson 9b2c1951), gate reload_config
+    sur permits actifs, garde hook CEO no-write, hasActivePermit croisant
+    granted_to. Trois enseignements : (1) le builder additif est la bonne
+    réponse au caller-inventory (contraste avec le lot 1 où changer la
+    signature de submit_vote avait touché tous les callers) ; (2) l'édition
+    textuelle ciblée d'un block scalar YAML (marqueur en tête de
+    description) marche à condition de valider les DEUX contenus avant
+    toute écriture disque ; (3) personas.yml auto-généré (sans api_version)
+    est rejeté par le pre-commit : il ne se committe pas, il se régénère au
+    runtime, ce que le RFC n'avait pas anticipé en le listant dans
+    affected_files.
+  tags:
+    - companyos-v1
+    - process
+    - hardening
+    - harness
+    - mechanical-invariant
+    - review-protocol
+    - write-permit
+    - file-placement
+    - supersession
+    - companyos-internals
+    - critical-infra
+    - lessons-from-implementation
+  related:
+    - id: a4ee8b6a-ebcd-4a76-96eb-7e31785c8ae6
+      kind: rfc
+      relationship: input
+    - id: 438cc31d-8093-4e80-b30f-5496f4d525a5
+      kind: implementation-plan
+      relationship: input
+    - id: 1bb07073-421c-4a4b-b647-1dc7bdac89b5
+      kind: lesson-learned
+      relationship: derived-from
+    - id: 9b2c1951-1d26-4284-add6-a295ff82cc1e
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Implémentation du lot 2 (7 mécanismes) en une session, sous le permit
+    24e91083 couvrant 18 target_paths. Le plan 438cc31d avait recensé au
+    moment T : 19 call-sites de ArtifactValidator::new dans 6 fichiers
+    (dont tests/ top-level, leçon du lot 1), 4 call-sites de
+    engine.index_artifact, hasActivePermit + ses 3 call-sites, aucun
+    caller de reload_config hors le tool. Séquence finale exécutée dans
+    l'ordre imposé par la règle hotreload_last réécrite (RFC 18011bfc) :
+    make ci vert, 7 commits AVANT consume, consume_write_permit,
+    make deploy-serve (promotion des binaires portant supersede_artifact /
+    gate reload_config / placement), reload_config (passé car le permit
+    était consommé — preuve en vif que le gate du mécanisme 11 laisse
+    passer un worktree sans permit actif), rfc_set_implemented,
+    task-request done. Test en vif couche schema : un review-report
+    mono-axe soumis au validator promu est bien rejeté ("axes is a
+    required property").
+
+  insight: >
+    (1) LE BUILDER ADDITIF EST L'ARME CONTRE LE CALLER-INVENTORY. Le lot 1
+    avait changé la signature de engine.submit_vote et dû toucher tous ses
+    callers (avec l'incident du caller raté dans tests/ top-level, lesson
+    1bb07073). Le lot 2 avait le même risque sur ArtifactValidator::new
+    (19 call-sites). La réponse structurelle : ne PAS changer new(), ajouter
+    un with_root(self) -> Self qui pose un champ Option<PathBuf> = None par
+    défaut. Résultat : les 19 call-sites compilent inchangés, seul le binaire
+    qui a besoin du placement chaîne .with_root(). Un caller oublié n'est
+    plus un risque parce qu'il n'y a rien à mettre à jour. Quand un
+    changement peut être rendu additif plutôt que modificatif, l'additif
+    dissout le problème du recensement au lieu de le gérer.
+
+    (2) ÉDITER UN BLOCK SCALAR YEML EN TEXTE, PAS EN SERDE. Insérer le
+    marqueur [SUPERSEDED-BY ...] en tête de metadata.description sans
+    round-trip serde_yaml (qui normaliserait tout le fichier) suit la même
+    famille que update_rfc_status_in_file : repérer la ligne description,
+    distinguer block scalar (>|) d'inline quoté, insérer en respectant
+    l'indentation. Le filet de sécurité indispensable : valider les DEUX
+    contenus modifiés au schema AVANT toute écriture disque, et écrire
+    l'ANCIEN d'abord (l'annotation d'obsolescence est la pièce
+    structurellement manquante) avec rollback best-effort si la 2e écriture
+    échoue. L'idempotence se teste par un simple contains sur le marqueur et
+    un décompte des entrées related.
+
+    (3) UN FICHIER AUTO-GÉNÉRÉ SANS api_version NE SE COMMITTE PAS. Le RFC
+    listait company/config/personas.yml dans affected_files.modified, mais
+    le pre-commit valide chaque .yml staged sans exception et personas.yml
+    (généré par le wrapper à partir des personas) n'a pas d'api_version : il
+    échoue à la validation, commit bloqué. La bonne lecture : personas.yml
+    est un ARTEFACT DE BUILD régénéré au runtime par onProtectedZoneWrite,
+    pas un artifact à committer à la main. La source de vérité (ceo.yml, qui
+    perd produces:lesson-learned) est committée ; personas.yml se
+    reconstruit. Un RFC ne devrait pas lister un fichier auto-généré dans
+    affected_files comme s'il était éditable.
+
+  recommendation: >
+    - PRÉFÉRER UN BUILDER ADDITIF à un changement de signature dès qu'un
+      symbole public a plus de deux ou trois callers. new() reste, with_x()
+      s'ajoute, le champ a un défaut neutre : le caller-inventory devient une
+      vérification de complétude du câblage (ici : les 5 points du binaire),
+      pas une chasse à tous les usages.
+    - POUR TOUTE ÉDITION TEXTUELLE D'UN YAML EXISTANT (statut, related,
+      description), valider le résultat au schema en mémoire AVANT d'écrire,
+      et ordonner les écritures multiples pour que la pièce structurellement
+      manquante survive à un échec partiel. Ne jamais round-tripper via
+      serde_yaml un fichier dont on veut préserver le formatting.
+    - NE PAS LISTER LES FICHIERS AUTO-GÉNÉRÉS (personas.yml) dans
+      affected_files d'un RFC comme des cibles éditables ; les traiter comme
+      des artefacts de build régénérés au runtime. Un futur durcissement
+      (candidat lot 3) pourrait soit exclure explicitement personas.yml du
+      pre-commit, soit lui donner un en-tête minimal validable, pour lever
+      l'ambiguïté définitivement.
+    - LE TOOL supersede_artifact EST DÉSORMAIS LE CANAL CANONIQUE de la
+      supersession à deux écritures (matérialise 9b2c1951). L'audit mémoire
+      avait trouvé 11 lessons unilatéralement périmées ; elles peuvent
+      maintenant être réparées en un appel (ex. 611fde3e, ciblée par le
+      supersedes de 23de8594 sans réciproque). Le warning d'asymétrie à
+      l'indexation les signale.
+    - LIMITE DE SESSION OBSERVÉE : un tool MCP ajouté dans la session
+      courante n'est pas appelable en vif tant que le client MCP n'a pas
+      re-enregistré la liste des tools (le proxy bufferise les appels, pas la
+      découverte des tools). La preuve en vif d'un NOUVEAU tool serveur passe
+      donc par une session client fraîche ; entre-temps, les tests unitaires
+      end-to-end sur I/O fichier réel + schemas réels (ici 6 tests engine +
+      1 serveur) sont la garantie.

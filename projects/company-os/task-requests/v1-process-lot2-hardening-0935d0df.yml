@@ -1,0 +1,65 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 0935d0df-be16-4361-b71b-03f0a43fb77c
+  title: "V1 process lot 2 : 7 mécanismes de durcissement (schemas triaxial/design-doc, file_placement, supersession, reload gate, gardes CEO et granted_to)"
+  author: pm
+  created_at: "2026-07-03"
+  project: company-os
+  description: >
+    Lot 2 du durcissement process (recensement c981bf62, items 7 à 13),
+    suite du lot 1 livré (RFC 8bf78218). Sept mécanismes coût S/M, valeur
+    haute, sans violation observée à ce jour : (7) schema review-report
+    triaxial structurel (spec.axes nominal/negative/edge, rétro-compatible),
+    (8) schema design-doc exigeant components et decisions, (9) validation
+    kind↔chemin dans le yaml-validator (file_placement), (10) supersession
+    à deux écritures (tool MCP supersede_artifact + warning d'asymétrie à
+    l'indexation, lesson 9b2c1951), (11) reload_config refuse si des permits
+    actifs subsistent, (12) hook : write/edit bloqués pour agent==ceo,
+    (13) hook : hasActivePermit croise l'agent écrivain avec granted_to
+    (ferme le trou "un agent écrit sous le permit d'un autre").
+  tags:
+    - companyos-v1
+    - process
+    - hardening
+    - harness
+    - mechanical-invariant
+  related:
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: input
+    - id: c981bf62-9d53-4ea2-8da3-c34af9d3e922
+      kind: diagnostic-report
+      relationship: input
+    - id: 11f13a9d-467b-4e5b-b4c3-a5e45ce1e080
+      kind: task-request
+      relationship: related
+
+spec:
+  priority: high
+  status: done
+
+  context: >
+    Le recensement c981bf62 a classé 62 règles de process ; le lot 1
+    (violations observées, RFC 8bf78218) est implémenté et vérifié en vif.
+    Le lot 2 regroupe les mécanismes à valeur haute restants : deux
+    durcissements de schemas (review-report triaxial, design-doc complet),
+    une validation de placement kind↔chemin côté binaire validator (donc
+    hook + pre-commit + make validate gratuits), l'outillage de la
+    supersession à deux écritures (11 lessons silencieusement périmées
+    découvertes à l'audit mémoire faute de réciprocité des liens), un gate
+    sur reload_config (permits actifs), et deux durcissements du hook
+    defense-in-depth (CEO ne peut pas écrire, granted_to vérifié à
+    l'écriture). Après ce lot, 23 des 62 règles du recensement survivent
+    au test clean-company comme garanties mécaniques (16 aujourd'hui).
+
+  acceptance_criteria:
+    - "Un RFC couvre les 7 mécanismes avec comportements exacts, rétro-compatibilité analysée (notamment le schema review-report en anyOf, pattern a4eb3ee7), et affected_files FORME B exhaustif"
+    - "Les 7 mécanismes sont implémentés via le cycle complet (review, approbation CEO, permit, plan si nécessaire) et vérifiés par des tests aux trois axes"
+    - "Le test clean-company passe de 16 à 23 garanties mécaniques"
+    - "Aucune duplication de logique nouvelle entre couches (les deux durcissements hook restent dans le plugin, les validations de schema dans les schemas, les gates dans le serveur)"
+
+  constraints:
+    - "Rétro-compatibilité obligatoire pour les schemas (les artifacts existants doivent rester valides)"
+    - "Pas de push : commits locaux uniquement"
+    - "Les incohérences inter-couches recensées (matching permit/path triple, active vs consumed) restent hors périmètre, réservées à v1-harness-refactor"
