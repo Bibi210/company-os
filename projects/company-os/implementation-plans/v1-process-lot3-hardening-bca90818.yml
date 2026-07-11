@@ -1,0 +1,575 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: bca90818-a6d9-49f7-b8ec-f9851f339f39
+  title: "Implementation-plan : V1 process lot 3 — 8 mécanismes de durcissement (pré-check périmètre au grant, triggers humains path-matchables, matrice author-produces, intégrité related, gate plan-approuvé, rappels capitalisation, exemption personas.yml, warnings reindex_all)"
+  author: implementer
+  created_at: "2026-07-12"
+  description: >
+    Plan d'implémentation du RFC 0197fbe5 (approved, round 1dcf0ed5 :
+    pm approve, implementer approve, ceo approve). Mécanise les 8 derniers
+    items du recensement c981bf62 (lot 3, suite des lots 1 RFC 8bf78218 et
+    2 RFC a4ee8b6a implemented), domaine v1-process-hardening de la roadmap
+    a410bb43. Permit 5ddca363-c881-4118-86a0-3c4791bbdf9b actif, couvre les
+    17 target_paths = affected_files.modified du RFC. Caller-inventory
+    conduit au moment T sur le workspace ENTIER (lesson 1bb07073, incident
+    lot 1) : SEUL engine.reindex_all change de signature (usize ->
+    ReindexOutcome), 9 call-sites (main.rs x5, integration_search.rs x4),
+    tous dans affected_files. supersession_warnings préservée (3 call-sites
+    serveur basculés sur l'agrégateur). db::path_matches privé -> pub(crate),
+    1 seul caller interne (db.rs L778), aucun caller externe. Ordre imposé
+    par la règle hotreload_last (RFC 18011bfc) : make ci vert à chaque
+    commit, commits AVANT consume, consume, make deploy-serve, reload_config
+    EN DERNIER (uniquement si config Rust changée). Décisions du RFC reprises
+    à l'identique, aucun rescope. Note de review Implementer intégrée :
+    l'exemption personas.yml (M20) est root-gated — un validator schema-only
+    sans root ne l'exempte pas et renvoie InvalidApiVersion, sans conséquence
+    car les 3 surfaces réelles posent with_root.
+  tags:
+    - companyos-v1
+    - process
+    - hardening
+    - harness
+    - mechanical-invariant
+    - write-permit
+    - affected-files
+    - caller-inventory
+    - human-review-triggers
+    - indexing
+    - companyos-internals
+    - critical-infra
+  related:
+    - id: 0197fbe5-949e-4917-a4d8-2eb63e028ce6
+      kind: rfc
+      relationship: input
+    - id: b9dbcff9-a168-46e7-803e-ce05924386f5
+      kind: task-request
+      relationship: input
+
+spec:
+  steps:
+    - description: >
+        ÉTAPE 0 — CALLER-INVENTORY FINAL AU MOMENT T (lesson 1bb07073,
+        incident lot 1 : recensement limité à crates/ ayant raté tests/
+        top-level). Recenser sur le WORKSPACE ENTIER (rg non scopé + membres
+        du Cargo.toml racine dont tests/integration/ et benches — benches
+        inexistants), pour chaque symbole dont le RFC touche la surface :
+        (a) engine.reindex_all — SEUL changement de signature (usize ->
+        ReindexOutcome). Inventaire au moment T (vérifié, stable) : 9
+        call-sites .rs — crates/mcp-servers/orchestrator/src/main.rs L1491
+        (tool), L1908 (rebuild autorepair), L1930 (post-migrate boot), L1970
+        (boot count, `.unwrap_or(0)`), L2050 (watcher Artifacts) ;
+        crates/orchestrator/tests/integration_search.rs L215, L349, L395,
+        L465. AUCUN caller non-Rust (rg reindex_all sur company/scripts/,
+        Makefile, company/plugins/, opencode.json = néant, vérifié).
+        (b) engine.supersession_warnings — signature PRÉSERVÉE (rétro-compat) :
+        3 call-sites serveur (main.rs L1231 index_now, L1466 tool
+        index_artifact, L1792 CLI --index) basculent sur le nouvel
+        agrégateur artifact_warnings ; les 2 call-sites de test inline dans
+        engine.rs (L3469, L3478 test_supersession_warnings_asymmetry) restent
+        inchangés.
+        (c) db::path_matches — passe privé -> pub(crate) : 1 seul caller
+        interne (db.rs L778, dans check_permit), aucun caller externe au
+        crate, la visibilité pub(crate) suffit.
+        (d) GrantPermitParams — champ optionnel additif user_approval_confirmed :
+        le helper de test grant_params (main.rs L2327) est le seul point à
+        mettre à jour, dans le même fichier.
+        LIVRABLE : si l'inventaire diverge du périmètre du permit 5ddca363
+        (un caller hors des 17 target_paths), S'ARRÊTER et signaler à
+        l'Architect/PM pour extension du permit AVANT toute écriture (règle
+        persona : ne jamais contourner un permit incomplet). À ce stade
+        l'inventaire est dans le périmètre.
+      files:
+        - crates/orchestrator/src/engine.rs
+        - crates/orchestrator/src/db.rs
+        - crates/mcp-servers/orchestrator/src/main.rs
+        - crates/orchestrator/tests/integration_search.rs
+
+    - description: >
+        MÉCANISME 21 — reindex_all retourne {count, warnings} (FONDATION,
+        implémenté EN PREMIER car les M16/M17 y branchent leurs familles de
+        warnings et les autres call-sites en dépendent). DÉCISION RFC : PAS
+        d'ajout de la dépendance tracing au crate orchestrator (un lib crate
+        n'impose pas son canal au caller ; les callers ont des canaux
+        hétérogènes : réponse JSON, tracing, stderr). La donnée appartient à
+        la valeur de retour.
+        (a) Déclarer struct publique ReindexOutcome { count: usize, warnings:
+        Vec<String> } dans crates/orchestrator/src/types.rs, ré-exportée via
+        lib.rs.
+        (b) engine.reindex_all(root, validator) -> Result<ReindexOutcome, _> :
+        après la boucle d'indexation, collecter warnings = supersession (10c,
+        par artifact) + intégrité related (17b, passe SQL globale, cf. M17) +
+        author-produces (16, par artifact, cf. M16). PAS les rappels de
+        capitalisation (19c, surfaces single-file uniquement).
+        (c) Adapter les 9 call-sites (adaptation mécanique) :
+        main.rs L1491 (tool) — la réponse JSON gagne un champ warnings
+        additif ({reindexed, count: outcome.count, warnings: outcome.warnings}) ;
+        L1908, L1930 — `.count` sur l'Ok (`.reindex_all(...)?.count` ou
+        équivalent selon le map_err existant) ; L1970 —
+        `.map(|o| o.count).unwrap_or(0)` ; L2050 — matcher Ok(outcome), logguer
+        outcome.count via tracing::info et outcome.warnings via tracing::warn
+        (tracing disponible dans le crate mcp-server, déjà utilisé L1972/2052).
+        Les 4 call-sites de test integration_search.rs : `.expect(...).count`
+        ou `let outcome = ...; outcome.count`.
+        TESTS 3 AXES (crates/orchestrator engine.rs inline) : NOMINAL —
+        ReindexOutcome porte count et les 3 familles de warnings sur un corpus
+        de fixtures avec supersession asymétrique + related pendant + author
+        hors produces ; NÉGATIF — corpus propre (aucun défaut) -> warnings
+        vide, count > 0 ; EDGE — corpus vide -> count 0, warnings vide (pas de
+        panic).
+      files:
+        - crates/orchestrator/src/types.rs
+        - crates/orchestrator/src/lib.rs
+        - crates/orchestrator/src/engine.rs
+        - crates/mcp-servers/orchestrator/src/main.rs
+        - crates/orchestrator/tests/integration_search.rs
+
+    - description: >
+        MÉCANISME 17 — validation référentielle des related[].id (NON
+        BLOQUANT, imposé par le task-request). Branche une famille de warnings
+        dans reindex_all (M21) et dans l'agrégateur single-file (M18/M19
+        partagent l'agrégateur).
+        (a) Surface single-file : engine.related_integrity_warnings(&artifact)
+        — pour chaque related[].id de l'artifact, db.get_artifact(id) ; si
+        introuvable, warning ("related[].id <id> introuvable dans l'index —
+        lien pendant : id erroné (typo ?) ou artifact supprimé/jamais créé").
+        Suit le pattern de supersession_warnings (engine.rs L752 : lire YAML,
+        extract_relations, db.get_artifact).
+        (b) Surface bulk (reindex_all) : nouvelle méthode db retournant les
+        liens pendants via UNE passe SQL APRÈS indexation complète (SELECT
+        source_id, target_id FROM artifact_relations WHERE target_id NOT IN
+        (SELECT id FROM artifacts)) — insensible à l'ordre de parcours, coût
+        une requête, index idx_relations_target présent (db.rs L101).
+        EDGE DOCUMENTÉ (RFC 17a) : deux artifacts neufs se référençant
+        mutuellement peuvent produire un faux warning transitoire single-file
+        selon l'ordre d'écriture (disparaît à l'indexation du second ;
+        reindex_all n'a pas ce problème via la passe SQL globale).
+        TESTS 3 AXES (engine.rs / db.rs inline) : NOMINAL — related résolus ->
+        silencieux ; NÉGATIF — id pendant -> warné, artifact sans related ->
+        silencieux ; EDGE — passe bulk SQL détecte le pendant quel que soit
+        l'ordre d'insertion.
+      files:
+        - crates/orchestrator/src/engine.rs
+        - crates/orchestrator/src/db.rs
+
+    - description: >
+        MÉCANISME 16 — matrice author-produces à l'indexation (NON BLOQUANT :
+        WARNING, pas rejet — un artifact refusé à l'indexation deviendrait
+        INVISIBLE de search(), pire que la violation signalée).
+        (a) PRÉALABLE — réconcilier la source de vérité (les persona YAML sont
+        la SOURCE UNIQUE lue par la matrice, pas de constante "kinds
+        universels" en dur) : company/personas/architect.yml produces +=
+        diagnostic-report, review-report ; company/personas/pm.yml produces +=
+        diagnostic-report, review-report ; company/personas/implementer.yml
+        produces += review-report. Justification alignée sur l'artifact_catalog
+        (diagnostic-report/lesson-learned productibles par tout agent ;
+        review-report "produit par le reviewer désigné"). ceo.yml reste
+        produces: [] (mécanisme 12 lot 2, déjà en place). NB : ces 3 éditions
+        de persona (zone protégée company/personas/) déclenchent la
+        régénération de personas.yml — cf. MÉCANISME 20b (même commit).
+        (b) engine.author_produces_warnings(root, &artifact) -> Vec<String> :
+        lit company/personas/<author>.yml (lecture directe YAML, fraîche), et
+        si artifact.kind absent de artifacts.produces, warning ("author
+        '<author>' ne produit pas le kind '<kind>' selon sa persona
+        (artifacts.produces) — vérifier l'attribution ou amender la persona
+        par RFC").
+        (c) Périmètre tranché (RFC 16c) : KINDS SYSTÈME EXEMPTS (persona,
+        project-config, flow-control, review-protocol, human-review-triggers —
+        gouvernance, gardés par zones protégées + cycle RFC) ; AUTHOR INCONNU
+        (pas de persona YAML) -> skip silencieux ; CUTOFF HISTORIQUE — constante
+        documentée AUTHOR_PRODUCES_CUTOFF = "2026-07-12" (date du RFC) : les
+        artifacts avec metadata.created_at antérieur sont exempts. Vérifié par
+        échantillon au moment T : le SEUL artifact à created_at >= cutoff est
+        le RFC 0197fbe5 lui-même (author architect, kind rfc = match légitime)
+        -> ZÉRO warning sur le corpus après réconciliation (a) + exemptions (c).
+        TESTS 3 AXES (engine.rs inline) : NOMINAL — author légitime silencieux ;
+        NÉGATIF — kind hors produces warné, author inconnu skippé ; EDGE — kind
+        système exempt silencieux, created_at pré-cutoff exempt, post-cutoff
+        warné, created_at == cutoff exact NON exempt (borne stricte "antérieur").
+      files:
+        - crates/orchestrator/src/engine.rs
+        - company/personas/architect.yml
+        - company/personas/pm.yml
+        - company/personas/implementer.yml
+
+    - description: >
+        MÉCANISME 19 — rappels de capitalisation non bloquants (surfaces
+        single-file uniquement, PAS reindex_all : le rappel concerne le MOMENT
+        de la résolution, en bulk il spammerait l'historique).
+        (a) db.has_linked_lesson(id) -> bool : existe-t-il une relation (dans
+        un sens ou l'autre, get_relations bidirectionnel existe db.rs
+        L1313/1338) entre id et un artifact kind == lesson-learned.
+        (b) rfc_set_implemented (main.rs, tool) : la réponse JSON gagne un
+        champ optionnel capitalization_reminder quand aucune lesson n'est liée
+        au RFC ("RFC implemented sans lesson liée — la règle
+        lesson_after_every_artifact attend une capitalisation..."). Additif,
+        jamais une erreur ; cohérent sur le rejeu idempotent.
+        (c) Diagnostic resolved : engine.capitalization_reminders(root,
+        &artifact) — si kind == diagnostic-report ET spec.status == resolved
+        (lu du YAML) ET !has_linked_lesson : rappel analogue. Émise UNIQUEMENT
+        sur les surfaces single-file (index_artifact, index_now, CLI --index),
+        via l'agrégateur artifact_warnings enrichi (cf. M18/agrégateur).
+        TESTS 3 AXES : NOMINAL (engine/main.rs inline) — resolved avec lesson
+        liée -> silencieux, rfc implemented avec lesson -> pas de reminder ;
+        NÉGATIF — resolved sans lesson -> rappelé, rfc implemented sans lesson
+        -> reminder ; EDGE — has_linked_lesson détecte les DEUX directions,
+        diagnostic status investigating -> silencieux, rejeu rfc_set_implemented
+        cohérent.
+      files:
+        - crates/orchestrator/src/engine.rs
+        - crates/orchestrator/src/db.rs
+        - crates/mcp-servers/orchestrator/src/main.rs
+
+    - description: >
+        MÉCANISME 14 + agrégateur single-file — pré-check de périmètre au
+        grant (NON BLOQUANT : le CEO peut scoper plus étroit à raison,
+        préférence 4e5c109b, l'algorithme signale, le LLM juge).
+        (a) engine.rfc_scope_warnings(root, rfc_file_path, &target_paths) ->
+        Vec<String> : grant_write_permit lit DÉJÀ le YAML du RFC pour la
+        GARDE 4 (via read_artifact_status, engine.rs L866, qui résout
+        file_path). Extraire spec.affected_files (FORME A array plat ; ou
+        FORME B objet {modified, created, deleted — cf. M15c}), calculer
+        l'UNION, et pour chaque fichier vérifier qu'au moins un target_path le
+        couvre via db::path_matches(target_path, fichier) (pub(crate), même
+        sémantique exact/préfixe/glob que les permits — PAS une 4e
+        implémentation, l'unification reste réservée à v1-harness-refactor).
+        (b) Chaque fichier non couvert -> warning explicite ("RFC
+        affected_files: <path> n'est couvert par aucun target_path — si ce
+        fichier sera écrit pendant l'implémentation, le hook la bloquera ;
+        étendre target_paths ou assumer le scoping étroit"). RFC SANS
+        affected_files -> warning dédié ("pré-check de périmètre impossible :
+        le RFC ne déclare pas affected_files").
+        (c) Warnings retournés dans le champ scope_warnings de
+        permit_response_json, présent AUSSI sur le rejeu idempotent (branche
+        main.rs L980-1008 qui retourne tôt) : les warnings DOIVENT donc être
+        calculés AVANT le lookup d'idempotence (note de review). Le grant n'est
+        JAMAIS refusé pour un gap de scope.
+        (d) AGRÉGATEUR single-file : engine.artifact_warnings(root, &artifact)
+        = supersession_warnings + related_integrity_warnings (M17) +
+        author_produces_warnings (M16). supersession_warnings reste publique et
+        INCHANGÉE ; les 3 call-sites serveur (main.rs L1231, L1466, L1792)
+        basculent sur artifact_warnings (+ capitalization_reminders M19c),
+        leurs champs warnings existants s'enrichissent sans changement de forme.
+        TESTS 3 AXES (main.rs inline) : NOMINAL — la réponse du grant porte
+        scope_warnings, couverture par glob et par préfixe -> pas de warning ;
+        NÉGATIF — gap détecté warné, RFC sans affected_files -> warning dédié ;
+        EDGE — rejeu idempotent porte scope_warnings, union FORME A / FORME B
+        (modified+created+deleted), affected_files vide, grant JAMAIS refusé
+        pour un gap.
+      files:
+        - crates/orchestrator/src/engine.rs
+        - crates/orchestrator/src/db.rs
+        - crates/mcp-servers/orchestrator/src/main.rs
+
+    - description: >
+        MÉCANISME 15 — triggers humains path-matchables + affected_files.deleted
+        (BLOQUANT — un trigger humain exige une affirmation explicite). COMMIT
+        ATOMIQUE : human-review-triggers.yml + son schema dans le MÊME commit
+        (pattern lot 1).
+        (a) company/schemas/rfc.schema.json : FORME B d'affected_files gagne
+        une clé optionnelle `deleted` (array de strings). Additif pur : anyOf
+        inchangé, FORME A toujours valide, additionalProperties: false conservé
+        sur l'objet FORME B (les 3 clés modified/created/deleted déclarées).
+        (b) company/schemas/human-review-triggers.schema.json : déclarer le
+        bloc match {paths: array minItems 1, on: enum [any, deleted]}, required
+        [paths, on], additionalProperties: false sur match, sur les items
+        triggers ET sur spec (verrou pattern bd4650e2 ; les 3 clés existantes
+        condition/action/description restent déclarées).
+        (c) company/config/human-review-triggers.yml : ajouter le bloc match aux
+        3 triggers path-matchables — D23 "rfc modifies access matrix" : match
+        {paths: [company/config/protected-zones.json], on: any} ; D24 "rfc
+        modifies ceo persona" : match {paths: [company/personas/ceo.yml], on:
+        any} ; D26 "rfc deletes persona" : match {paths: [company/personas/*],
+        on: deleted}. D25 "rfc introduces breaking schema change" : PAS de match
+        (jugement sémantique, reste prose). Annoter les descriptions ("évalué
+        mécaniquement par grant_write_permit" / D25 "reste prose (jugement)").
+        (d) Types de parsing locaux (le chargement boot purgé au lot 1 n'est PAS
+        ressuscité). GrantPermitParams gagne user_approval_confirmed:
+        Option<bool> (#[serde(default)], schemars description) ; helper de test
+        grant_params (main.rs L2327) mis à jour.
+        (e) grant_write_permit évalue les triggers APRÈS la GARDE 4 (main.rs
+        L974) et AVANT l'idempotence (L979), par LECTURE FRAÎCHE de
+        human-review-triggers.yml. Sémantique de `on` : any = évalué contre les
+        target_paths (comme patterns, path_matches(target, trigger_path) — un
+        glob target qui COUVRE le fichier déclenche, conservateur) ET contre
+        l'union affected_files (littéraux, path_matches(trigger_path,
+        affected_file)) ; deleted = évalué contre affected_files.deleted
+        uniquement. Si >= 1 trigger matche ET user_approval_confirmed !=
+        Some(true) : REFUS avec erreur listant chaque trigger déclenché + le fix
+        ("obtenir l'accord utilisateur..., puis rappeler grant_write_permit avec
+        user_approval_confirmed=true"). Flag repris en écho dans la réponse JSON
+        (champ user_approval_confirmed) pour l'audit ; pas de colonne DB.
+        FAIL-SAFE : si human-review-triggers.yml illisible ou invalide, grant
+        REFUSÉ avec une erreur distincte (nouvelle variante error.rs, philosophie
+        GARDE 3 : un garde-fou inévaluable ne laisse pas passer).
+        RÉSIDUELS DOCUMENTÉS (RFC 15e, hors scope, signalés au CEO) : un RFC qui
+        ment (suppression non déclarée) échappe à D26 ; modifier
+        human-review-triggers.yml lui-même n'est couvert par aucun trigger
+        (méta-trou, zone protégée + cycle RFC restent la garde).
+        TESTS 3 AXES (main.rs inline + fixtures schema) : NOMINAL — grant
+        ordinaire sans trigger ni flag accepté, grant accepté avec
+        user_approval_confirmed=true (flag échoué dans la réponse), RFC FORME B
+        avec deleted valide, trigger avec match valide, trigger sans match (D25)
+        valide ; NÉGATIF — grant refusé sans flag sur target_path couvrant
+        protected-zones.json / ceo.yml, sur deleted sous company/personas/,
+        triggers YAML illisible -> refus fail-safe, match avec clé parasite
+        rejeté au schema, on hors enum rejeté ; EDGE — glob target couvrant
+        ceo.yml -> déclenché (conservateur), FORME A legacy toujours valide.
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+        - crates/orchestrator/src/error.rs
+        - crates/orchestrator/src/engine.rs
+        - company/schemas/rfc.schema.json
+        - company/schemas/human-review-triggers.schema.json
+        - company/config/human-review-triggers.yml
+
+    - description: >
+        MÉCANISME 18 — write_permit_gate plan-approuvé (NON BLOQUANT : WARNING
+        dans scope_warnings, pas refus. Justification RFC : rounds éphémères
+        perdus à l'autorepair PILIER D, lien plan->RFC non imposé, CEO bon juge
+        au grant).
+        (a) Au grant, si l'union affected_files du RFC (déjà calculée par M14)
+        touche crates/** ou company/plugins/** (du code) : résoudre les
+        relations de rfc_id (deux directions via get_relations), filtrer kind ==
+        implementation-plan. Aucun plan lié -> warning ("le RFC touche du code
+        mais aucun implementation-plan lié n'existe dans l'index
+        (write_permit_gate)..."). Plan(s) lié(s) : nouvelle méthode
+        db.list_rounds_by_artifact_path(path) (comparaison sur chemins relatifs
+        normalisés — même forme que file_path de l'index) ; si AUCUN round du
+        plan n'est status Closed avec compute_consensus == ConsensusReached
+        (recalculé depuis les votes stockés, compute_consensus est pur engine.rs
+        L1580), warning ("plan <id8> lié mais aucun review round fermé en
+        consensus trouvé — NB : rounds éphémères, faux positif attendu après
+        autorepair").
+        (b) Warnings retournés dans le MÊME champ scope_warnings que M14 (un seul
+        canal au grant).
+        TESTS 3 AXES (engine.rs + main.rs inline) : NOMINAL — plan avec round
+        Closed+consensus -> silencieux ; NÉGATIF — RFC code sans plan lié warné,
+        plan lié sans round warné ; EDGE — round Closed SANS consensus (escalade
+        CEO) warné, RFC pur-YAML (n'touche pas crates/ ni plugins/) non évalué,
+        warning plan manquant présent dans scope_warnings.
+      files:
+        - crates/orchestrator/src/engine.rs
+        - crates/orchestrator/src/db.rs
+        - crates/mcp-servers/orchestrator/src/main.rs
+
+    - description: >
+        MÉCANISME 20a — exemption personas.yml dans le validator (crate
+        validation). DÉCISION RFC : EXEMPTION EXACTE dans ArtifactValidator (ni
+        en-tête d'artifact, ni déplacement hors company/config/, ni exclusion
+        bash dans le pre-commit seul).
+        (a) Ajouter une constante PERSONAS_YML_EXEMPTION = "company/config/
+        personas.yml" et l'exemption dans validate_file (crates/validation/src/
+        validator.rs) : lorsqu'un root est configuré ET que le chemin résout
+        exactement sur company/config/personas.yml (même machinerie de
+        résolution root que l'exception shared-rules.yml du module placement,
+        lot 2 : canonicalize + strip_prefix), retourner un ValidationReport
+        valide avec une note ("generated file, skipped (not an artifact)") SANS
+        parser le contenu (personas.yml n'a pas d'api_version, validate_yaml_str
+        échouerait sinon en InvalidApiVersion — l'exemption est donc placée EN
+        TÊTE de validate_file, avant read_to_string/validate_yaml_str).
+        validate_dir hérite gratuitement (il appelle validate_file). Les 3
+        surfaces réelles (MCP validate_file, CLI --file, CLI batch) posent
+        with_root, donc l'exemption est effective sur toutes.
+        (b) NOTE DE REVIEW INTÉGRÉE — comportement schema-only sans root : un
+        validator construit sans with_root (Option<PathBuf> = None ; ex.
+        setup_validator des tests d'intégration edge_cases.rs L19) ne peut PAS
+        calculer le chemin relatif et n'applique donc PAS l'exemption : il
+        renvoie Err(InvalidApiVersion) sur personas.yml, comportement inchangé.
+        C'est SANS conséquence fonctionnelle : le test
+        test_validate_all_shipped_artifacts (edge_cases.rs L167-176) accepte
+        DÉJÀ les deux formes (Ok valide OU Err InvalidApiVersion), vérifié.
+        Documenter explicitement ce root-gating dans le commentaire de code de
+        l'exemption pour qu'un futur mainteneur ne s'étonne pas d'un
+        InvalidApiVersion en contexte schema-only.
+        TESTS 3 AXES (validator.rs inline) : NOMINAL — validate_file avec root
+        exempte exactement company/config/personas.yml (rapport valide, note),
+        validate_dir cohérent ; NÉGATIF — un personas.yml AILLEURS (autre
+        chemin) n'est PAS exempté et échoue ; EDGE — validator sans root :
+        comportement documenté inchangé (InvalidApiVersion), l'exemption ne
+        déclenche pas.
+      files:
+        - crates/validation/src/validator.rs
+        - crates/validation/src/lib.rs
+
+    - description: >
+        MÉCANISME 20b — régénération de personas.yml (sous permit, désormais
+        committable grâce à l'exemption M20a). MÊME COMMIT que les éditions de
+        persona du M16a (couplage RFC : (ii) persona YAML + régénération dans le
+        même commit ; (iii) l'exemption validator M20a DOIT précéder ce commit,
+        sinon le pre-commit rejette encore personas.yml).
+        Les 3 éditions de persona (M16a) déclenchent la régénération automatique
+        par le wrapper defense-in-depth (onProtectedZoneWrite ->
+        generatePersonasYml, defense-in-depth.mjs L128-130) SOUS le permit
+        5ddca363 qui couvre company/config/personas.yml. Le fichier régénéré
+        reflète enfin ceo produces: [] (lot 2, la ligne produces n'est plus
+        émise car generatePersonasYml n'écrit produces que si non vide, L99) ET
+        les produces réconciliés du M16a. Committer personas.yml régénéré (le
+        pre-commit ne le rejette plus depuis M20a). La régénération au boot
+        redevient un no-op idempotent (contenu identique à HEAD -> pas de diff ->
+        pas de revert hook). VÉRIFICATION : lever la lesson 50409fb0 recommandation
+        3 (le fichier auto-généré cesse d'être une friction), le contenu committé
+        doit être byte-identique à ce que generatePersonasYml produit.
+        RÉSIDUEL ASSUMÉ (RFC 20a) : un personas.yml corrompu ne serait plus
+        signalé par le schema — gardes restantes : en-tête "do not edit", zone
+        protégée (permit requis), tests du générateur
+        (company/plugins/tests/hot-reload.test.mjs).
+      files:
+        - company/config/personas.yml
+
+    - description: >
+        PROSE AMENDÉE (amendée = pointe le mécanisme, jamais supprimée quand elle
+        porte un critère de jugement, pattern lots 1-2).
+        (a) company/config/shared-rules.yml : règle affected_files_categorization
+        — mentionner la clé deleted (FORME B) et le pré-check mécanique au grant
+        (les oublis de périmètre signalés au CEO à l'émission) ; règle
+        artifact_catalog entrée human-review-triggers — mentionner le bloc match
+        et l'évaluation mécanique au grant.
+        (b) company/personas/architect.yml : la règle caller-inventory API pub
+        (must, dernière puce) annotée "filet aval mécanisé : le pré-check de
+        périmètre du grant signale les affected_files non couverts par les
+        target_paths (RFC 0197fbe5)".
+        NB : les annotations descriptions des triggers (human-review-triggers.yml)
+        sont faites en M15c ; les produces réconciliés (architect/pm/implementer)
+        en M16a. Cette étape ne couvre que shared-rules.yml et l'annotation
+        caller-inventory d'architect.yml.
+      files:
+        - company/config/shared-rules.yml
+        - company/personas/architect.yml
+
+    - description: >
+        VALIDATION CI INTERNE (règle write_permit_full_sequence étape 5 + règle
+        must "CI source de vérité" cas 3 CompanyOS = cargo build + cargo test).
+        Exécuter make ci (build + tests + lint + validate) et le rendre VERT.
+        Points d'attention hermeticité git (lessons 1afcbe17, 59875703, d5c9c933) :
+        les tests git-based ajoutés/touchés (M14/M15/M18 sur grant_write_permit
+        exercent seal_db_commit in-process) doivent poser GIT_CONFIG_GLOBAL=/dev/null
+        + GIT_CONFIG_SYSTEM=/dev/null + LC_ALL=C + commit.gpgsign=false en config
+        LOCALE du repo jetable, sinon commit.gpgsign=true de ~/.gitconfig gèle
+        pinentry sous cargo test. Vérifier `git config --global commit.gpgsign`
+        AVANT de lancer make ci si un échec git-timeout apparaît.
+        make ci DOIT être vert avant TOUT commit (le pre-commit lance make ci).
+      files: []
+
+    - description: >
+        COMMITS AVANT CONSUME (invariant commit-puis-consume, lesson 8fd49300,
+        GARDE 3 du lot 1 : consume_write_permit refuse un worktree sale sur les
+        target_paths ; hotreload_last réécrite). Découper en commits cohérents,
+        HEAD compile et passe make ci à chaque commit (contrainte RFC, ordre
+        d'implémentation) :
+        C1 — M21 (types.rs ReindexOutcome + engine.rs + 9 call-sites) ;
+        C2 — M17 (related_integrity, engine + db) ;
+        C3 — M16a+M16b+M20b : persona YAML réconciliés + author_produces_warnings
+        + personas.yml régénéré, MÊME commit (couplage RFC (ii)/(iii), M20a déjà
+        committé avant via C6) ;
+        C4 — M19 (has_linked_lesson + reminders) ;
+        C5 — M14 + agrégateur artifact_warnings (engine + db + main.rs) ;
+        C6 — M20a exemption validator (DOIT précéder C3, réordonner :
+        C6 avant C3) ;
+        C7 — M15 (rfc.schema deleted + human-review-triggers.schema + .yml +
+        GrantPermitParams + trigger eval + fail-safe), COMMIT ATOMIQUE schema+yaml ;
+        C8 — M18 (write_permit_gate) ;
+        C9 — prose amendée (shared-rules.yml + architect.yml annotation).
+        Ordre effectif garantissant HEAD vert : C1, C2, C6, C3, C4, C5, C7, C8,
+        C9 (C6 exemption avant C3 personas.yml régénéré ; les mécanismes engine
+        sont indépendants entre eux). NE PAS committer company/data/orchestrator.db
+        ici (il est scellé par le grant ; le worktree le montre modifié — laisser
+        tel quel, le consume gère la DB). Messages de commit style repo
+        (feat/chore/docs + scope).
+      files: []
+
+    - description: >
+        SÉQUENCE FINALE (ordre non négociable, règles write_permit_full_sequence
+        + hotreload_last).
+        (1) consume_write_permit(5ddca363-c881-4118-86a0-3c4791bbdf9b) — APRÈS
+        tous les commits de code (GARDE 3 : refus si worktree sale sur les
+        target_paths ; tous les fichiers du permit sont committés à ce stade).
+        (2) make deploy-serve — promotion atomique (cp + rename) des binaires
+        servis portant les 8 mécanismes ; restart contrôlé absorbé par le buffer
+        FIFO du proxy (aucun retry, aucun sleep).
+        (3) reload_config() EN DERNIER, UNIQUEMENT si la config orchestrator Rust
+        a effectivement changé (ici la constante AUTHOR_PRODUCES_CUTOFF et les
+        types locaux vivent dans le crate ; la config active au sens
+        CompanyConfig.personas n'est pas rechargée par reload_config — évaluer si
+        reload_config est requis ; le gate reload_config du lot 2 laisse passer
+        car le permit sera déjà consommé). Ne PAS appeler reload_config si rien de
+        la config active n'a changé.
+        (4) rfc_set_implemented(0197fbe5-949e-4917-a4d8-2eb63e028ce6) — transition
+        serveur sans permit ; la réponse peut porter le capitalization_reminder du
+        M19b (aucune lesson liée encore) — attendu, la lesson de clôture est créée
+        à l'étape suivante.
+        (5) task-request b9dbcff9 -> status done (édition YAML du task-request,
+        hors zone protégée).
+      files: []
+
+    - description: >
+        LESSON DE CLÔTURE DU DOMAINE ENTIER (règle lesson_after_every_artifact :
+        RFC implemented + implementation-plan terminé -> lesson). Portée : PAS
+        seulement le lot 3, mais le durcissement process COMPLET (les 3 lots).
+        Chercher via search() une lesson de clôture domaine existante (il y a
+        1bb07073 clôture lot 1 et 50409fb0 clôture lot 2, mais aucune clôture de
+        DOMAINE) — en créer une nouvelle. Angle : qu'est-ce que le durcissement
+        complet nous apprend ? Fil conducteur des 3 lots : (i) les 16 règles
+        mécanisables du recensement c981bf62 sont toutes traitées, 27/62 règles
+        survivent au test clean-company (le test de réussite fixé par
+        l'utilisateur dans 11f13a9d) ; (ii) la LEÇON MÉTA du caller-inventory :
+        lot 1 a raté un caller malgré 2 lessons + 1 RFC (1bb07073), lot 2 a
+        dissous le problème par le builder additif (50409fb0), lot 3 le MÉCANISE
+        en filet aval (le pré-check de périmètre M14 signale ce que la prose ne
+        garantissait pas) — trois réponses graduées au même problème, dont la
+        seule durable est mécanique ; (iii) le pattern early-return + verrou
+        schema (bd4650e2) tient sur 3 lots ; (iv) la friction personas.yml
+        (50409fb0 rec. 3) est enfin levée (M20). related : supersedes/derived-from
+        vers 1bb07073 et 50409fb0 (chaîne des clôtures de lot), related vers
+        59875703 (hermeticité git rencontrée en clôture), input RFC 0197fbe5 +
+        task-request b9dbcff9 + roadmap a410bb43. Utiliser search()+get()
+        parcimonieux avant écriture (memory_lookup_before_acting).
+      files: []
+
+    - description: >
+        TEST EN VIF (preuve fonctionnelle post-déploiement, dans les limites de
+        la session — lesson 50409fb0 rec. limite : un NOUVEAU tool/comportement
+        serveur n'est pleinement exerçable qu'après re-enregistrement client ;
+        les tests unitaires end-to-end sur I/O + schemas réels sont la garantie
+        primaire).
+        (a) M14 — pré-check de périmètre : un grant fictif avec target_paths
+        incomplets vs affected_files N'EST PAS émsettable sans un RFC approuvé
+        dédié (GARDE 4) et polluerait la DB des permits ; DOCUMENTER que la
+        vérification passe par les tests inline main.rs (scope_warnings sur gap /
+        RFC sans affected_files / rejeu idempotent) qui exercent
+        rfc_scope_warnings sur fixtures réelles — les tests SUFFISENT, pas de
+        grant fictif en prod. Optionnel si une session cliente fraîche est
+        disponible : observer scope_warnings dans la réponse d'un futur grant
+        légitime.
+        (b) M17 — reindex_all -> warnings visibles : appeler le tool reindex_all
+        sur le corpus réel ; la réponse JSON doit porter le champ warnings et y
+        faire apparaître les 2 liens pendants RÉELS (RFC c129453c ->
+        c981bf62-3f28-... typo ; diagnostic 56513173 -> 4ade4e7c-... disparu).
+        C'est la valeur immédiate voulue par le RFC (17c). Ceci est exerçable en
+        vif car reindex_all est un tool EXISTANT (pas un nouveau tool).
+        CORRECTION DES 2 LIENS PENDANTS (RFC 17c : correction éditoriale déléguée
+        au PM, hors scope du RFC) : NE PAS les corriger dans ce plan (hors scope
+        RFC + hors zone protégée mais hors périmètre task-request). Les TRACER
+        explicitement en note de clôture / retour au PM : (1) RFC c129453c doit
+        remplacer c981bf62-3f28-45a3-96b6-4ba9c690d31c par
+        c981bf62-9d53-4ea2-8da3-c34af9d3e922 (typo de suffixe, préfixe correct) ;
+        (2) diagnostic 56513173 référence 4ade4e7c-3156-... (ex-agent-message
+        retiré) — annoter/retirer le lien mort. Le mécanisme M17 les fait
+        remonter à chaque reindex_all : leur persistance est visible jusqu'à
+        correction PM.
+      files: []
+
+  dependencies:
+    - "Permit 5ddca363-c881-4118-86a0-3c4791bbdf9b actif (émis par le CEO, RFC 0197fbe5 approved), couvre les 17 target_paths = affected_files.modified"
+    - "RFC 0197fbe5 en statut approved (fenêtre approved -> implemented du permit)"
+    - "make ci vert exigé à chaque commit (le pre-commit hook lance make ci)"
+    - "Ordre interne : M21 (fondation ReindexOutcome) avant M16/M17 (branchent leurs warnings) ; M20a (exemption validator) avant le commit de personas.yml régénéré (M20b/M16a) ; human-review-triggers.yml + son schema dans le même commit (M15)"
+
+  risks:
+    - "M15 BLOQUANT : un grant légitime dont les target_paths couvrent (glob) protected-zones.json ou ceo.yml sera désormais refusé sans user_approval_confirmed=true. C'est le but (ces conditions exigeaient déjà l'accord user en prose) ; workflows ordinaires inchangés (flag optionnel, ignoré si aucun trigger ne matche). Risque de faux positif conservateur sur un glob target large : documenté, comportement voulu."
+    - "M21 changement de signature d'API publique (usize -> ReindexOutcome) : 9 call-sites, adaptation mécanique. Risque = un call-site oublié -> échec de compilation (détecté par make ci, pas silencieux). Caller-inventory workspace entier conduit à l'étape 0."
+    - "M20a root-gating : l'exemption ne s'applique que si with_root est posé. Les 3 surfaces réelles le posent ; les tests schema-only voient InvalidApiVersion (comportement documenté, test edge_cases.rs accepte les deux formes). Risque nul fonctionnellement, documenté en commentaire de code."
+    - "M14c ordre de calcul : scope_warnings doit être calculé AVANT le lookup d'idempotence (la branche idempotente retourne tôt). Risque = warnings absents du rejeu idempotent si mal ordonné. Test EDGE dédié (rejeu idempotent porte scope_warnings)."
+    - "Hermeticité git des tests git-based (M14/M15/M18 exercent seal_db_commit in-process) : commit.gpgsign=true de ~/.gitconfig peut geler pinentry sous cargo test (lesson 59875703). Mitigation : GIT_CONFIG_GLOBAL/SYSTEM=/dev/null + gpgsign=false local dans les tests."
+    - "M16 cutoff : borne stricte 'antérieur au 2026-07-12'. Risque = un artifact créé le jour même par un author-kind non déclaré serait warné. Vérifié : le seul artifact au cutoff est le RFC lui-même (match légitime). Test EDGE created_at == cutoff exact NON exempt."
+    - "Les 2 liens related pendants (M17) sont réels et hors scope de correction (délégués PM) : ils remonteront à chaque reindex_all jusqu'à correction. Tracés explicitement, pas corrigés dans ce plan."
