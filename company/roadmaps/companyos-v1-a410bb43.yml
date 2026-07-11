@@ -41,6 +41,21 @@ metadata:
     - date: "2026-07-03"
       author: pm
       description: >
+        Lot 2 process-hardening LIVRÉ : RFC a4ee8b6a implemented. 7
+        mécanismes : schemas review-report triaxial et design-doc stricts,
+        placement kind-chemin dans le validator, tool supersede_artifact à
+        deux écritures + warnings d'asymétrie, gate reload_config sur
+        permits actifs, CEO no-write au hook, permits nominatifs
+        (granted_to vérifié à l'écriture). 23/62 garanties clean-company
+        (16 avant). GOUVERNANCE : la persona CEO a été modifiée (purge de
+        produces lesson-learned) sous couvert de la délégation utilisateur,
+        human-review-trigger acté dans les votes. Lesson 50409fb0.
+        Candidats lot 3 notés : personas.yml auto-généré vs pre-commit,
+        warning reindex_all sans tracing. Reste : lot 3 (items 14-19 du
+        recensement c981bf62).
+    - date: "2026-07-03"
+      author: pm
+      description: >
         v1-protect-githooks LIVRÉ : RFC c129453c implemented. .githooks/ et
         company/scripts/ ajoutés aux zones protégées (l'investigation a
         révélé le bypass par délégation : check-artifact-naming.sh invoqué
