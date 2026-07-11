@@ -1,0 +1,129 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 59875703-5495-4c25-88aa-ae5185747590
+  title: "L'hermeticité d'un spawn git a DEUX canaux : les variables GIT_* ET la config (~/.gitconfig) ; commit.gpgsign=true casse tout test git-based"
+  author: implementer
+  created_at: "2026-07-11"
+  description: >
+    Capitalisation après l'implémentation du RFC 324e8a33 (hotfix) qui a
+    débloqué make ci, rouge sur HEAD parce que les tests git-based héritaient de
+    commit.gpgsign=true de ~/.gitconfig : git commit déclenchait gpg → pinentry
+    sans TTY sous cargo test → timeout, et le pre-commit (qui lance make ci)
+    bloquait tout commit. Généralise la lesson 1afcbe17 : un spawn git hermétique
+    doit neutraliser NON SEULEMENT les variables GIT_* d'état (canal déjà couvert
+    par le fix hook 916bf1d) mais AUSSI la CONFIG utilisateur et système, via
+    GIT_CONFIG_GLOBAL=/dev/null + GIT_CONFIG_SYSTEM=/dev/null. Documente aussi la
+    décision prod : un commit machine émis par un serveur headless (le seal de
+    seal_db_commit) doit désactiver explicitement la signature (-c
+    commit.gpgsign=false), car un pinentry bloquant gèlerait l'engine lock et
+    aucun consommateur ne vérifie cette signature.
+  tags:
+    - git
+    - gpg
+    - gpgsign
+    - pinentry
+    - hermeticite
+    - environment-leak
+    - config
+    - ci
+    - pre-commit
+    - testing
+    - harness
+    - companyos-internals
+    - lessons-from-implementation
+  related:
+    - id: 1afcbe17-74d5-42db-b0de-b381e73910ea
+      kind: lesson-learned
+      relationship: derived-from
+    - id: d5c9c933-2955-41e1-b2ae-73c9f307f09f
+      kind: lesson-learned
+      relationship: related
+    - id: 5e1e6b0b-cf93-48bd-aba3-1e9648a17ca4
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: 324e8a33-db8a-46d8-aea9-78e2fa050d60
+      kind: rfc
+      relationship: related
+
+spec:
+  context: >
+    make ci était rouge sur HEAD, donc le pre-commit hook (qui lance make ci)
+    bloquait TOUT commit du dépôt, y compris le commit du fix lui-même (cycle
+    hotfix). Cause : après un lot de travail, commit.gpgsign=true avait été
+    réactivé dans ~/.gitconfig. Les 13 tests git-based de l'orchestrator MCP
+    (test_seal_db_commit_*, test_grant_*, test_consume_*) et le harness mjs
+    defense-in-depth (gitCommitDb, exécuté par make test-js) créent des dépôts
+    git jetables en tempdir et y font git commit. Ce commit héritait de la config
+    GLOBALE de l'utilisateur : git lançait gpg, gpg lançait pinentry, pinentry
+    n'avait pas de TTY sous cargo test / node → timeout → échec. Le problème
+    était LATENT depuis l'écriture de ces tests, masqué tant que la signature
+    était désactivée, révélé à sa réactivation. Reproduction minimale confirmée :
+    `git init` en tempdir + identité locale + `timeout 10 git commit` → exit 124.
+
+    Aggravation découverte : les tests exercent IN-PROCESS le code de PRODUCTION
+    seal_db_commit (le commit de scellement machine d'un grant_write_permit).
+    En réel, un grant exécuté depuis le serveur MCP headless (pas de TTY) avec
+    commit.gpgsign=true bloquait sur pinentry EN TENANT l'engine lock, puis
+    échouait : tout grant devenait inutilisable dans l'environnement du jour.
+  insight: >
+    UN SPAWN GIT HERMÉTIQUE A DEUX CANAUX DE FUITE, PAS UN. La lesson 1afcbe17
+    avait identifié le premier : les variables d'ÉTAT GIT_* (GIT_DIR,
+    GIT_INDEX_FILE, GIT_WORK_TREE, GIT_PREFIX, GIT_AUTHOR_*) qu'un git hook
+    exporte vers ses enfants, neutralisées au point de fuite (le hook) par le fix
+    916bf1d via `env -u`. Mais `env -u` ne touche PAS le second canal : la
+    CONFIG git (fichier ~/.gitconfig et config système), qui n'est pas portée par
+    des variables d'environnement listables mais par des fichiers résolus par git
+    à chaque invocation. commit.gpgsign, hooksPath, templates, alias, tout cela
+    fuit par ce second canal indépendamment des GIT_*. C'est la même classe que
+    la neutralisation de la LOCALE (LC_ALL=C, lesson d5c9c933) : l'environnement
+    ambiant change silencieusement la sémantique d'une invocation git.
+
+    Le levier propre pour fermer le canal config est GIT_CONFIG_GLOBAL=/dev/null
+    + GIT_CONFIG_SYSTEM=/dev/null : ces deux variables REDIRIGENT la résolution de
+    la config globale/système vers un fichier vide (/dev/null est une cible config
+    valide et vide), sans toucher la config LOCALE du repo. Vérifié : le commit
+    passe alors même quand ~/.gitconfig porte commit.gpgsign=true, et l'identité
+    posée en config locale du repo temporaire suffit à committer. Ceinture et
+    bretelles souhaitables pour les tests : poser AUSSI commit.gpgsign=false en
+    config LOCALE du repo jetable, car un chemin de prod exercé in-process
+    (seal_db_commit, qui n'utilise pas le helper hermétique des tests) lit la
+    config locale qui prime sur la globale.
+
+    DÉCISION PROD ORTHOGONALE : un commit machine émis par un processus headless
+    (le seal) ne DOIT PAS tenter de signer. La signature n'aboutit pas de façon
+    fiable sans TTY, aucun consommateur ne la vérifie (le hook defense-in-depth
+    compare le CONTENU de la DB en HEAD, jamais les signatures), et un pinentry
+    bloquant gèle une ressource critique (l'engine lock) puis échoue. `git -c
+    commit.gpgsign=false commit` par invocation est la bonne granularité :
+    ciblé sur le commit machine, sans toucher les commits humains du dépôt.
+  recommendation: >
+    1. TOUT SPAWN GIT HERMÉTIQUE POSE GIT_CONFIG_GLOBAL=/dev/null ET
+       GIT_CONFIG_SYSTEM=/dev/null, en plus de l'env_remove des GIT_* d'état
+       (1afcbe17) et du forçage LC_ALL=C/LANG=C (d5c9c933). C'est le troisième
+       réflexe d'hermeticité git, désormais complet : ÉTAT (GIT_*) + LOCALE (LC_*)
+       + CONFIG (GIT_CONFIG_GLOBAL/SYSTEM). Factoriser dans un helper unique
+       (Rust : hermetic_git_cmd(root) -> Command ; mjs : un objet env partagé
+       passé à chaque execSync) plutôt que de répéter les réglages par appel.
+
+    2. TOUT TEST QUI CRÉE UN REPO JETABLE pose l'identité ET commit.gpgsign=false
+       en config LOCALE du repo, en plus du point 1. La config locale prime sur la
+       globale et couvre les chemins de PROD exercés in-process par le test qui,
+       eux, n'utilisent pas le helper hermétique des tests.
+
+    3. UN COMMIT MACHINE HEADLESS NE SIGNE JAMAIS. Tout git commit émis par un
+       serveur/daemon sans TTY doit porter `-c commit.gpgsign=false` explicite.
+       La signature n'a de sens que si un consommateur la vérifie ET qu'un agent
+       gpg interactif est disponible ; sinon elle ne produit que des échecs non
+       déterministes et un risque de gel sur pinentry.
+
+    4. SYMPTÔME -> RÉFLEXE. "make ci vert en isolation mais rouge dès qu'une
+       signature/config utilisateur change" => suspecter le canal CONFIG git, pas
+       seulement les variables GIT_*. Reproduire hors cargo/node : `git init` en
+       tempdir + `timeout N git commit` isole la cause en secondes. Vérifier
+       `git config --global commit.gpgsign` en premier.
+
+    Empirique : fix validé — cargo test -p companyos-orchestrator-server 26/26
+    verts (dont les 13 git-based), make test-js 67/67, make ci exit 0, et le
+    pre-commit hook redevient franchissable (le commit du fix est lui-même passé
+    par le hook). Commit 355ce49.
