@@ -40,9 +40,6 @@ metadata:
     - id: bdee1af4-4944-4bee-b7c0-18efd6c7961f
       kind: rfc
       relationship: related
-    - id: 4ade4e7c-3156-4a98-9bd3-492f658b91d9
-      kind: agent-message
-      relationship: related
 
 spec:
   status: resolved

@@ -42,7 +42,7 @@ metadata:
     - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
       kind: roadmap
       relationship: related
-    - id: c981bf62-3f28-45a3-96b6-4ba9c690d31c
+    - id: c981bf62-9d53-4ea2-8da3-c34af9d3e922
       kind: diagnostic-report
       relationship: related
 
