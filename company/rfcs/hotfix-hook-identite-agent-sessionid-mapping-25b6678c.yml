@@ -1,0 +1,296 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 25b6678c-5c47-4f3c-9f61-804d98fc78b2
+  title: "Hotfix identité d'agent dans le hook : mapping sessionID→persona via authenticate, réparation M13/M12a/garde cross-persona, retrait du hot-reload de code non fiable"
+  author: architect
+  created_at: "2026-07-14"
+  status: draft
+  project: company-os
+  description: >
+    Hotfix de l'incident bloquant diagnostiqué en 9ed7c07c : le mécanisme 13
+    (RFC a4ee8b6a, hasActivePermit exige granted_to === input.agent) bloque
+    TOUTES les écritures en zone protégée parce que l'API plugin opencode ne
+    fournit AUCUN champ agent dans les hooks tool.execute.before/after (vérifié
+    sur les binaires 1.15.13 → 1.17.18). Ce RFC introduit une source d'identité
+    réelle : un mapping sessionID→persona construit par le hook en observant
+    les appels authenticate (dernière authenticate gagne), avec résolution
+    input.agent (si un futur opencode le fournit) → mapping → fail-closed avec
+    message explicite. M13, M12a (CEO no-write) et la garde cross-persona
+    basculent sur cette source. Corrige aussi la détection du nom de tool
+    authenticate (mcp_orchestrator_authenticate jamais matché : le hook voit
+    orchestrator_authenticate) et retire le hot-reload de code du wrapper
+    (import "?t=mtime" non fiable sous Bun, facteur de masquage de l'incident) :
+    tout changement de code plugin exige désormais un restart opencode (pattern
+    promotion explicite, RFC 18011bfc). Application via la parade échappatoire
+    humaine (précédent RFC c129453c) : les agents ne peuvent pas écrire
+    company/plugins/ tant que le bug n'est pas corrigé, l'utilisateur applique
+    et committe lui-même.
+  tags:
+    - companyos-v1
+    - hotfix
+    - defense-in-depth
+    - write-permit
+    - mechanism-13
+    - agent-identity
+    - session-mapping
+    - authenticate
+    - hot-reload
+    - opencode-plugin-api
+    - companyos-internals
+    - critical-infra
+  related:
+    - id: 9ed7c07c-3c2d-45fa-a5ed-7ec9ac7667f7
+      kind: diagnostic-report
+      relationship: input
+    - id: a4ee8b6a-ebcd-4a76-96eb-7e31785c8ae6
+      kind: rfc
+      relationship: related
+    - id: b9dbcff9-a168-46e7-803e-ce05924386f5
+      kind: task-request
+      relationship: related
+    - id: c129453c-3a8f-47cf-bf3e-a070e12416b0
+      kind: rfc
+      relationship: related
+
+spec:
+  motivation: >
+    INCIDENT (diagnostic 9ed7c07c, resolved). Depuis le boot de la session du
+    2026-07-14 (premier chargement effectif du core M13 après l'upgrade opencode
+    1.17.15→1.17.18 du 13/07), toute écriture en zone protégée est rejetée avec
+    "No active permit granted to agent 'undefined'". Le permit 5ddca363 de
+    l'Implementer est valide et actif ; le lot 3 (task-request b9dbcff9, RFC
+    0197fbe5 approved, plan bca90818 approuvé) est gelé à l'étape 1.
+
+    ROOT CAUSE. M13 consomme input.agent, un champ que l'API plugin opencode ne
+    fournit pas et n'a jamais fourni : le payload des hooks
+    tool.execute.before/after est {tool, sessionID, callID}(+args), vérifié par
+    extraction des chaînes des binaires opencode 1.15.13 à 1.17.18 (cache
+    pacman) et par les typings @opencode-ai/plugin. input.agent est undefined
+    pour TOUS les tool calls, agent principal comme sous-agents. Avec le
+    fail-closed de M13 (agent falsy → aucun permit ne matche), le blocage est
+    total et déterministe.
+
+    TROIS GARDES MORTES DU MÊME MAL. (1) M12a (CEO no-write) teste
+    input.agent === "ceo" : jamais vrai, code mort depuis sa livraison.
+    (2) La garde authenticate cross-persona est `if (agent && persona && agent
+    !== persona)` : fail-open sur agent undefined, elle n'a jamais rien
+    vérifié — c'est elle que le commentaire mensonger "input.agent is populated
+    in production" citait comme preuve. (3) Cette même garde teste
+    input.tool === "mcp_orchestrator_authenticate" alors que les tool calls MCP
+    apparaissent sous "orchestrator_authenticate" dans l'historique opencode.db :
+    deuxième motif indépendant de non-déclenchement.
+
+    FACTEUR DE MASQUAGE. M13 est resté dormant du 11 au 13 juillet : le
+    re-import du core par le wrapper (import(url + "?t=" + mtime)) n'a pas pris
+    effet dans le runtime Bun du processus opencode longue durée du lot 2
+    (cache-busting par query-string vérifié fonctionnel sous Node mais sans
+    garantie sous le binaire Bun compilé ; preuve indirecte : les commits des
+    11-12/07 touchant des zones protégées ont survécu au check aftermath, ce qui
+    est impossible si M13 avait été actif). Un mécanisme de "hot-reload" qui ne
+    recharge pas réellement le code est pire que pas de hot-reload : il a fait
+    croire que M13 était testé en production alors qu'il n'avait jamais été
+    exécuté. L'armement différé s'est produit au restart forcé par l'upgrade.
+
+    POURQUOI PAS UN SIMPLE REVERT DE M13. Le trou que M13 ferme ("un agent
+    écrit sous le permit d'un autre") est réel (recensement c981bf62 item 13,
+    RFC a4ee8b6a approuvé). Un fallback "agent undefined → comportement
+    pré-M13" serait un revert déguisé : agent est undefined à 100% dans toutes
+    les versions opencode existantes, le fallback serait le chemin permanent et
+    M13 du code décoratif. Il faut une source d'identité qui existe réellement.
+
+  proposal: >
+    DÉCISION 1 — SOURCE D'IDENTITÉ : MAPPING sessionID→persona OBSERVÉ SUR
+    AUTHENTICATE. La règle authentication des shared-rules impose déjà à chaque
+    persona d'appeler authenticate(persona=<id>) en début de session. Le hook
+    voit passer ces appels (input.tool + input.args.persona + input.sessionID).
+    Le core enregistre, dans la Map sessions déjà partagée par le wrapper (état
+    par sessionID), le champ persona au passage de chaque authenticate observé
+    dans tool.execute.after — after uniquement : opencode ne déclenche pas le
+    hook after quand le tool échoue, donc seuls les authenticate RÉUSSIS
+    alimentent le mapping. Un args.persona absent ou vide n'est pas enregistré.
+
+    RÉSOLUTION D'IDENTITÉ (fonction unique resolveAgent(input, state), utilisée
+    par TOUTES les gardes) :
+      (1) input.agent si présent et non vide — priorité au runtime si un futur
+          opencode fournit le champ ;
+      (2) sinon sessions.get(input.sessionID).persona si le mapping existe ;
+      (3) sinon identité inconnue → fail-closed : l'écriture en zone protégée
+          est bloquée et revertée avec le message explicite "session non
+          authentifiée : appelez authenticate(persona=...) avant d'écrire en
+          zone protégée" (diagnostic distinct du mismatch de permit, pour que
+          l'agent bloqué sache immédiatement quoi faire).
+    hasActivePermit garde sa signature (rootDir, filePath, agent) et son
+    fail-safe agent-falsy→false ; ce sont ses TROIS call-sites (Layer 1
+    write/edit, Layer 2 aftermath fichiers, Layer 2 check 2b commits) qui
+    passent désormais resolveAgent(input) au lieu de input.agent brut.
+
+    BASCULE DES GARDES. M13 (hasActivePermit) : résolution ci-dessus. M12a (CEO
+    no-write) : bloque write/edit/mcp_write/mcp_edit quand resolveAgent(input)
+    === "ceo" ; identité inconnue → la garde ne se déclenche pas (une session
+    non authentifiée n'est pas le CEO ; les zones protégées restent couvertes
+    par M13, et un write hors zone par une session non authentifiée était déjà
+    permis avant ce RFC — périmètre inchangé). Garde cross-persona : reste
+    branchée sur input.agent SEUL (source runtime future) ; le mapping ne
+    l'alimente PAS, car il est déclaratif et postérieur à l'authenticate
+    lui-même — s'en servir pour bloquer une ré-authentification contredirait la
+    décision 4 (last-wins) et le cas d'usage réel (session orchestrateur
+    multi-personas). Le commentaire mensonger "input.agent is populated in
+    production" est remplacé par la description factuelle du contrat réel de
+    l'API (payload sans agent, source = mapping).
+
+    DÉCISION 2 — NOMS DE TOOLS. La détection d'authenticate (garde
+    cross-persona ET enregistrement du mapping) matche le nom de tool par
+    suffixe insensible à la casse : /(^|_)orchestrator_authenticate$/i. Formes
+    couvertes : "orchestrator_authenticate" (forme réellement vue par le hook,
+    constatée dans opencode.db), "mcp_orchestrator_authenticate" (forme testée
+    par le code actuel, conservée par robustesse si un environnement préfixe
+    ainsi), "mcp_Orchestrator_authenticate" (casse du nom de serveur MCP).
+    Même correction pour toute autre détection par nom de tool MCP si
+    l'implémentation en rencontre (audit du fichier au moment du patch).
+
+    DÉCISION 3 — HOT-RELOAD DE CODE : RETIRÉ. Le wrapper ne tente plus de
+    ré-importer le core (suppression d'invalidateCore et de la branche
+    correspondante d'onProtectedZoneWrite ; loadCore importe le core UNE fois
+    par processus, sans query-string). Règle honnête et vérifiable : TOUT
+    changement de code plugin (core ou wrapper) exige un restart d'opencode —
+    pattern promotion explicite du RFC 18011bfc (un artefact servi ne change
+    pas sous les pieds du processus qui le sert ; la promotion est un acte
+    déclenché, ici le restart). Les rechargements de DONNÉES restent : reload
+    de protected-zones.json et régénération de personas.yml passent par
+    readFileSync à chaque déclenchement, mécanisme fiable indépendant du cache
+    de modules ESM. Rationale du retrait plutôt que de la réparation : aucun
+    moyen de VÉRIFIER un fix du cache-busting depuis nos tests (ils tournent
+    sous node:test, pas dans le runtime Bun embarqué d'opencode) ; un mécanisme
+    de sécurité invérifiable dans son environnement réel est exactement ce qui
+    a masqué cet incident. Le test hot-reload.test.mjs est recentré sur les
+    rechargements de données (zones, personas) et documente le restart requis.
+
+    DÉCISION 4 — MULTI-PERSONA : DERNIÈRE AUTHENTICATE GAGNE. Une session qui
+    authenticate successivement plusieurs personas (cas réel : la session
+    orchestrateur PM qui authentifie pm puis délègue) voit son mapping écrasé à
+    chaque authenticate réussi. C'est la sémantique la plus simple, elle
+    correspond à l'usage réel, et elle est cohérente avec le modèle de
+    confiance existant : authenticate est déjà déclaratif (aucune preuve
+    d'identité côté serveur), donc le mapping n'affaiblit rien — une session
+    qui veut usurper une persona le peut déjà via authenticate aujourd'hui, et
+    avec ce RFC l'usurpation devient au moins VISIBLE dans l'audit trail des
+    tool calls. Un renforcement réel (vérification serveur du token au moment
+    du write, hook avec client MCP) reste hors périmètre : le runtime plugin
+    n'expose pas de client MCP (contrainte PILIER A déjà documentée dans le
+    core, RFC cdbfee72).
+
+    DÉCISION 5 — MAPPING PERDU AU RESTART : DOCUMENTÉ, PAS PERSISTÉ. La Map
+    sessions vit en mémoire du processus opencode. Après un restart, toute
+    session poursuivie doit ré-authenticate avant sa prochaine écriture en zone
+    protégée — ce que les personas font déjà en début de session (règle
+    authentication). Le message fail-closed de la décision 1 rend le cas
+    auto-explicatif. Persister le mapping sur disque est refusé : un fichier
+    d'identité inscriptible serait une surface d'attaque pire que le problème.
+
+    TESTS (defense-in-depth-core.test.mjs, 3 axes ; les tests M13 existants qui
+    passent agent explicitement restent valides et inchangés) :
+    NOMINAL : authenticate(persona=implementer) observé en after → write en
+    zone protégée sous permit granted_to=implementer → passe ; resolveAgent
+    retourne la persona du mapping ; M12a ne bloque pas un non-CEO.
+    NÉGATIF : session sans authenticate → write en zone protégée bloqué +
+    reverté avec le message "session non authentifiée..." ; authenticate en pm
+    puis write sous permit granted_to=implementer → bloqué (mismatch M13) ;
+    authenticate ÉCHOUÉ (pas d'événement after) → mapping non alimenté ;
+    args.persona vide → non enregistré ; resolveAgent(ceo) + write → M12a
+    bloque, y compris via mcp_write/mcp_edit.
+    EDGE : last-wins (authenticate pm puis implementer → identité implementer) ;
+    input.agent fourni PRIORITAIRE sur un mapping divergent ; les trois formes
+    de nom de tool (orchestrator_authenticate, mcp_orchestrator_authenticate,
+    mcp_Orchestrator_authenticate) alimentent le mapping ; Map sessions vierge
+    (simulation restart) → fail-closed avec le message explicite ; garde
+    cross-persona : input.agent défini + persona différente → throw, input.agent
+    undefined → pas de blocage (fail-open assumé et documenté, source future).
+
+    AUCUNE API PUB RUST TOUCHÉE : changement JS pur (plugins + tests mjs), la
+    règle de recensement des callers de symboles pub ne s'applique pas. Aucun
+    schema, aucune config YAML, aucun binaire Rust modifiés : pas de
+    deploy-serve, pas de reload_config.
+
+  impact: >
+    EFFET IMMÉDIAT. Déblocage du lot 3 : après application + restart, les
+    sous-agents authentifiés écrivent en zone protégée sous leur permit. M13
+    devient réellement effectif pour la première fois (jusqu'ici : soit inactif
+    par hot-reload fantôme, soit bloquant tout). M12a et la détection
+    authenticate deviennent effectives pour la première fois également. Toute
+    session non authentifiée perd l'écriture en zone protégée — durcissement
+    voulu : la règle authentication devient mécaniquement contraignante pour
+    ces écritures, au lieu de prose.
+
+    CONTRAINTE D'APPLICATION INHABITUELLE — LES AGENTS NE PEUVENT PAS ÉCRIRE LE
+    FIX. Le bug bloque lui-même toute écriture agent dans company/plugins/
+    (identité undefined, M13 actif dans la session courante). L'application
+    suit l'échappatoire humaine documentée comme précédent au RFC c129453c
+    (opérations réservées à l'humain, jamais aux agents), séquence impérative :
+    (1) review + approbation CEO de ce RFC (opérations MCP, non affectées par
+        le bug) ;
+    (2) grant_write_permit par le CEO couvrant les 4 target_paths =
+        affected_files.modified (le pre-commit vérifie l'EXISTENCE d'un permit
+        actif couvrant les paths, pas l'identité de l'écrivain : le commit
+        humain passera) ;
+    (3) l'Implementer prépare les contenus EXACTS des 4 fichiers dans
+        /tmp/opencode/ (hors zones protégées, écriture libre) et fait tourner
+        make test-js sur une copie de travail dans /tmp pour vérifier les
+        3 axes AVANT remise ;
+    (4) l'UTILISATEUR applique lui-même (cp) et committe LUI-MÊME dans son
+        terminal — le pre-commit passe grâce au permit du point 2 ;
+    (5) FENÊTRE CRITIQUE : entre le cp (3→4) et la fin du commit utilisateur,
+        AUCUN agent ne doit lancer de bash. Le core BOGUÉ encore chargé
+        exécute l'aftermath Layer 2 avec identité undefined : un commit
+        utilisateur survenant PENDANT un bash agent en vol serait détecté par
+        le check 2b (HEAD déplacé, permit non résolu) → reset --soft du commit
+        utilisateur + revert des fichiers. Les écritures non commitées sont
+        partiellement protégées par le skip diffBefore, mais la règle simple
+        et sûre est : silence bash agent total pendant la fenêtre ;
+    (6) restart d'opencode (charge le plugin corrigé — obligatoire aussi par
+        la décision 3 : plus de hot-reload de code) ;
+    (7) reprise : l'Implementer s'authentifie (repeuple le mapping),
+        consume_write_permit, et le lot 3 reprend à l'étape 1.
+
+    COÛT SÉCURITÉ RÉSIDUEL ASSUMÉ. L'identité mappée est déclarative : elle
+    vaut ce que vaut authenticate, qui n'a jamais eu de preuve d'identité. Le
+    gain de M13 reste entier contre l'erreur honnête (un sous-agent qui écrit
+    par accident sous le permit d'un autre) et rend l'usurpation active visible
+    dans l'audit trail ; il ne prétend pas résister à un agent adversarial —
+    aucune garde actuelle ne le prétend. La garde cross-persona reste fail-open
+    tant qu'opencode ne fournit pas input.agent : documenté dans le code, plus
+    jamais cité comme preuve de quoi que ce soit.
+
+    PERTE DU HOT-RELOAD DE CODE. Les futurs RFCs touchant company/plugins/
+    devront inclure un restart opencode dans leur séquence d'application (à
+    documenter dans leurs impacts). En échange : plus jamais d'écart silencieux
+    entre le code sur disque et le code exécuté — le facteur de masquage qui a
+    retardé cet incident de trois jours disparaît. Les données (zones,
+    personas.yml) continuent de se recharger sans restart.
+
+    NON-IMPACTS. Layer 2 snapshot/revert, tampering permits, naming, validation
+    YAML, auto-index : logique inchangée (seule la source d'identité des appels
+    hasActivePermit change). Aucun changement Rust, schema, ou config. Les
+    permits actifs et l'audit trail existants restent valides. Le RFC lot 3
+    (0197fbe5) et son plan (bca90818) restent valides tels quels : aucun de
+    leurs fichiers n'est touché ici.
+
+  rollback_plan: >
+    git revert du commit d'application (restaure core + wrapper + tests à
+    l'état antérieur), puis restart opencode — le restart est indispensable :
+    sans hot-reload de code (et il n'a jamais fonctionné de façon fiable), le
+    processus continuerait d'exécuter la version corrigée. ATTENTION : l'état
+    restauré est l'état INCIDENT (M13 bloque tout, identité undefined) ; ce
+    rollback n'a de sens que comme étape vers un fix alternatif, pas comme
+    retour à un état sain. Le revert touche company/plugins/ (zone protégée) :
+    même parade d'application humaine que l'aller (permit CEO + commit
+    utilisateur + restart). Aucune migration de données : la Map sessions est
+    en mémoire, les permits en DB ne sont pas touchés, aucun état persistant à
+    nettoyer.
+
+  affected_files:
+    modified:
+      - company/plugins/defense-in-depth-core.mjs
+      - company/plugins/defense-in-depth.mjs
+      - company/plugins/tests/defense-in-depth-core.test.mjs
+      - company/plugins/tests/hot-reload.test.mjs
