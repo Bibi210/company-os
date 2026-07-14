@@ -1,0 +1,130 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: 9ed7c07c-3c2d-45fa-a5ed-7ec9ac7667f7
+  title: "M13 bloque toutes les écritures en zone protégée : input.agent n'a JAMAIS été fourni par l'API plugin opencode"
+  author: architect
+  created_at: "2026-07-14"
+  project: company-os
+  description: >
+    Le mécanisme 13 du lot 2 (RFC a4ee8b6a, hasActivePermit exige granted_to === input.agent,
+    fail-closed sur agent falsy) bloque TOUTES les écritures en zone protégée depuis le boot
+    de la session courante : l'Implementer (permit 5ddca363 valide et actif) a été bloqué sur
+    crates/orchestrator/src/types.rs avec "No active permit granted to agent 'undefined'",
+    gelant l'exécution du lot 3 (RFC 0197fbe5) à l'étape 1. Root cause établie par analyse
+    des binaires opencode : le payload des hooks tool.execute.before/after est
+    {tool, sessionID, callID(, args)} et n'a JAMAIS contenu de champ agent, dans AUCUNE
+    version d'opencode vérifiée (1.15.13 → 1.17.18, binaires du cache pacman + typings SDK
+    @opencode-ai/plugin). M13 repose sur un champ inexistant ; il est resté dormant du 11 au
+    13 juillet parce que le hot-reload du core n'a pas pris effet dans le processus opencode
+    longue durée du lot 2, et s'est armé au reboot consécutif à l'upgrade opencode 1.17.15→1.17.18
+    du 2026-07-13 17:55. Fix recommandé : mapping sessionID→persona observé par le hook sur
+    les appels authenticate (option c), via RFC hotfix.
+  tags:
+    - defense-in-depth
+    - write-permit
+    - mechanism-13
+    - opencode-plugin-api
+    - input-agent
+    - hot-reload
+    - fail-closed
+    - dead-guard
+    - companyos-internals
+    - critical-infra
+  related:
+    - id: b9dbcff9-a168-46e7-803e-ce05924386f5
+      kind: task-request
+      relationship: related
+    - id: a4ee8b6a-ebcd-4a76-96eb-7e31785c8ae6
+      kind: rfc
+      relationship: related
+
+spec:
+  status: resolved
+
+  symptom: >
+    Session courante (2026-07-14, opencode 1.17.18) : tout write/edit en zone protégée est
+    rejeté par le hook defense-in-depth avec "No active permit granted to agent 'undefined'
+    covers <path>. Change reverted.", alors que le permit 5ddca363 (granted_to=implementer,
+    17 target_paths dont crates/orchestrator/src/types.rs) est actif et vérifié via
+    check_write_permit. Premier blocage observé : 2026-07-14 13:42:30 UTC (edit sur
+    crates/orchestrator/src/types.rs par le sous-agent Implementer). Aucune occurrence de ce
+    message entre le 11 et le 14 juillet dans l'historique opencode.db, alors que M13 a été
+    committé le 2026-07-11 16:52 CEST (f64b7b3) et que des écritures en zone protégée ont eu
+    lieu les 11 et 12 juillet (prose lot 2 c58160a sur company/config/ et company/personas/,
+    hotfix 324e8a33 commit 355ce49 sur crates/). L'exécution du lot 3 est gelée à l'étape 1.
+
+  root_cause: >
+    ROOT CAUSE PRIMAIRE (certitude haute, preuve directe) : M13 consomme input.agent, un champ
+    que l'API plugin opencode NE FOURNIT PAS dans les hooks tool.execute.before/after — et n'a
+    jamais fourni. Preuves : (1) les typings @opencode-ai/plugin 1.15.3, 1.17.15 et 1.17.18
+    déclarent input = {tool, sessionID, callID} (+ args dans after), sans champ agent ;
+    (2) l'extraction des chaînes des binaires opencode 1.15.13, 1.16.2, 1.17.3, 1.17.9,
+    1.17.10, 1.17.12, 1.17.13, 1.17.15 et 1.17.18 (cache pacman) montre que TOUS les appels
+    trigger("tool.execute.before", {...}) passent exactement {tool, sessionID, callID} :
+    e.agent.name existe dans le contexte d'exécution interne du tool mais n'est jamais inclus
+    dans le payload du hook. input.agent est donc undefined pour TOUS les tool calls (agent
+    principal comme sous-agents — le rapport d'incident restreignait à tort aux sous-agents :
+    ils ont simplement été les premiers à toucher une zone protégée). Avec le fail-safe strict
+    de M13 (agent falsy → aucun permit ne matche), le hook bloque déterministiquement toute
+    écriture en zone protégée, pour tout le monde.
+
+    Le commentaire du code "input.agent is populated in production (the authenticate
+    cross-persona guard below relies on it too)" est FAUX et n'a jamais été vérifié à runtime.
+    La garde authenticate cross-persona citée comme preuve est `if (agent && persona &&
+    agent !== persona)` : elle est FAIL-OPEN sur agent undefined. Elle "fonctionnait" au sens
+    où elle ne bloquait jamais — indistinguable de "elle n'a jamais rien vérifié". Même
+    conséquence pour M12a (CEO no-write) : input.agent === "ceo" n'est jamais vrai, la garde
+    est du code mort. Constat annexe du même ordre : la garde authenticate teste
+    input.tool === "mcp_orchestrator_authenticate" alors que les tool calls MCP apparaissent
+    sous le nom "orchestrator_authenticate" dans opencode.db — vraisemblablement un deuxième
+    motif de non-déclenchement à confirmer dans le RFC hotfix.
+
+    FACTEUR DE MASQUAGE — pourquoi MAINTENANT et pas le 11 juillet (certitude moyenne-haute,
+    modèle unique cohérent avec toutes les preuves) : M13 n'a jamais été actif avant le boot
+    de la session courante. Chronologie établie via opencode.db et git : le core M13 a été
+    écrit via le tool edit les 11/07 14:36-14:37 UTC (donc onProtectedZoneWrite → invalidateCore
+    a dû être appelé), MAIS les commits bash de 14:51-14:52 UTC (f64b7b3, c58160a) touchant
+    company/plugins/, company/personas/ et company/config/ ont survécu au check aftermath 2b,
+    et les écritures crates/ du hotfix 324e8a33 (17:34-17:38 CEST) sont passées — toutes
+    auraient été bloquées sous M13 avec agent undefined. Le seul modèle cohérent : le
+    re-import du core par le wrapper (import(url + "?t=" + mtime)) n'a pas pris effet dans le
+    runtime Bun du processus opencode longue durée (cache de modules ignorant le cache-buster
+    query-string, comportement vérifié fonctionnel sous Node mais non garanti sous le binaire
+    Bun compilé) ; l'ancien core (hasActivePermit à 2 arguments, sans check granted_to) est
+    resté servi jusqu'à la fin du processus. L'upgrade opencode 1.17.15→1.17.18 du 2026-07-13
+    17:55 (pacman.log) a imposé un redémarrage ; au boot de la session courante, le wrapper a
+    chargé le core M13 depuis le disque pour la première fois, armant la bombe. Hypothèse
+    alternative écartée : "une version antérieure d'opencode passait agent et 1.17.18 l'a
+    retiré" — réfutée par l'analyse binaire (aucune version de 1.15.13 à 1.17.18 ne le passe).
+
+  resolution: >
+    Root cause établie ; le fix relève d'un RFC hotfix (zone protégée company/plugins/,
+    approbation CEO + write permit requis). Options évaluées :
+    (a) extraire l'agent d'une source fiable du payload — IMPOSSIBLE en l'état : le payload
+    du hook ne contient aucune identité d'agent, sous aucun nom (vérifié dans les binaires) ;
+    (b) fallback pré-M13 quand input.agent est undefined + warning — REJETÉ comme fix
+    principal : puisque agent est undefined à 100% dans toutes les versions actuelles, ce
+    "fallback" serait le chemin permanent, M13 deviendrait du code mort décoratif (revert de
+    facto déguisé, coût sécurité maximal pour un gain nul) ;
+    (c) RECOMMANDÉ : mapping sessionID→persona construit par le hook lui-même. Le hook voit
+    passer les appels authenticate (tool.execute.before/after avec args.persona et sessionID) ;
+    il mémorise sessionID→persona dans la Map sessions déjà partagée par le wrapper, et
+    hasActivePermit résout l'identité via ce mapping (input.agent en source primaire si un
+    futur opencode le fournit, mapping en source normale, fail-closed avec message explicite
+    "session non authentifiée" si aucune identité). Propriétés : robuste (chaque persona doit
+    authenticate en début de session — règle authentication des shared-rules, que ce fix rend
+    de surcroît mécaniquement contraignante pour écrire en zone protégée) ; périmètre de
+    confiance inchangé (authenticate est déjà déclaratif, sans preuve d'identité : un agent
+    qui usurperait une persona via authenticate le peut déjà aujourd'hui, et l'usurpation
+    devient au moins visible dans l'audit trail) ; limites à documenter dans le RFC : mapping
+    en mémoire perdu au restart d'opencode en cours de session (mitigation : ré-authenticate),
+    et re-authenticate d'une même session sous une autre persona à trancher (recommandation :
+    dernier authenticate gagne + warning). Le RFC hotfix doit aussi : corriger le commentaire
+    mensonger "input.agent is populated in production", brancher M12a (CEO no-write) et la
+    garde cross-persona sur la même source d'identité, corriger le nom de tool
+    "mcp_orchestrator_authenticate" vers les noms réellement vus par le hook, et remplacer le
+    hot-reload par cache-buster query-string par un mécanisme vérifiable sous Bun (ou
+    documenter que tout changement de core exige un restart opencode — le facteur de masquage
+    de cet incident). Déblocage immédiat du lot 3 : au choix du CEO, appliquer le hotfix (c)
+    en priorité absolue avant toute reprise du lot 3.
