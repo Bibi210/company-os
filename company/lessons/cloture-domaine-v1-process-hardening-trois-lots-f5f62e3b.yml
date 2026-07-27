@@ -1,0 +1,124 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: f5f62e3b-27b4-4bc3-b9f3-74db0cde24cb
+  title: >
+    Clôture du domaine v1-process-hardening (3 lots, 27/62 garanties) : la seule
+    réponse durable au caller-inventory est mécanique, et le pré-check M14 aurait
+    attrapé son propre oubli d'amorçage
+  author: implementer
+  created_at: "2026-07-27"
+  description: >
+    Capitalisation de clôture du DOMAINE ENTIER v1-process-hardening (task-request
+    11f13a9d recensement, diagnostic c981bf62, roadmap a410bb43), soit les trois
+    lots : lot 1 (RFC 8bf78218, 5 gardes serveur/schema + purge des règles mortes),
+    lot 2 (RFC a4ee8b6a, 7 mécanismes dont le builder additif with_root), lot 3
+    (RFC 0197fbe5, 8 mécanismes : M14 pré-check périmètre au grant, M15 triggers
+    humains path-matchables + affected_files.deleted, M16 matrice author-produces,
+    M17 intégrité référentielle des related, M18 write_permit_gate plan-approuvé,
+    M19 rappels de capitalisation, M20 exemption+régénération de personas.yml, M21
+    reindex_all -> ReindexOutcome). Après les trois lots, 27 des 62 règles du
+    recensement survivent au test clean-company (le critère de réussite fixé par
+    l'utilisateur : si make clean-company efface la mémoire YAML, ce qui a été appris
+    doit survivre parce qu'il vit dans le harness). Enseignement méta central : le
+    caller-inventory est la classe d'incident la plus récurrente du programme, et
+    seule sa mécanisation (M14) la ferme durablement ; incident vécu à ce lot même,
+    où le ré-export M21 dans crates/orchestrator/src/lib.rs, oublié des target_paths
+    du permit initial, a été bloqué par le hook — exactement l'oubli que M14 signale.
+    C'est la 4e occurrence de la classe, cette fois relevée par le CEO.
+  tags:
+    - companyos-v1
+    - process
+    - hardening
+    - harness
+    - mechanical-invariant
+    - caller-inventory
+    - write-permit
+    - affected-files
+    - domain-closure
+    - companyos-internals
+    - critical-infra
+    - lessons-from-implementation
+  related:
+    - id: 1bb07073-421c-4a4b-b647-1dc7bdac89b5
+      relationship: derived-from
+    - id: 50409fb0-4f74-4825-a68d-84ce219506c4
+      relationship: derived-from
+    - id: 59875703-5495-4c25-88aa-ae5185747590
+      relationship: related
+    - id: e4e296d6-a70d-4347-a2a6-4f82f8d2117e
+      relationship: related
+    - id: 0197fbe5-949e-4917-a4d8-2eb63e028ce6
+      relationship: input
+    - id: b9dbcff9-a168-46e7-803e-ce05924386f5
+      relationship: input
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      relationship: input
+
+spec:
+  context: >
+    Le domaine v1-process-hardening (roadmap a410bb43) s'ouvrait sur un recensement
+    (c981bf62) de 62 règles de process en prose, classées au test clean-company :
+    10 déjà mécanisées, 16 mécanisables, 33 intrinsèquement prose, 3 mortes. Trois
+    lots ont mécanisé les 16 mécanisables. Lot 1 : les 5 gardes à meilleur rapport
+    valeur/coût (self-review, approve+findings, commit-puis-consume, RFC approved au
+    grant, reviewers minimum), pattern early-return + verrou schema
+    additionalProperties:false (bd4650e2). Lot 2 : 7 mécanismes, dont la révélation
+    du builder additif with_root qui préserve 19 call-sites sans en toucher un
+    (contraste avec le lot 1 où changer la signature de submit_vote avait touché
+    tous les callers). Lot 3 : les 8 derniers, centrés sur le grant (M14 pré-check
+    de périmètre, M15 triggers path-matchables, M18 write_permit_gate) et
+    l'indexation (M16 author-produces, M17 intégrité related, M21 ReindexOutcome),
+    plus la levée des deux frictions du lot 2 (M20 personas.yml enfin committable).
+    Le lot 3 a lui-même vécu l'incident qu'il corrige : le ré-export M21 dans
+    crates/orchestrator/src/lib.rs, absent des target_paths du permit initial
+    5ddca363, a été bloqué par le hook defense-in-depth ; il a fallu un amendement
+    du RFC (affected_files) et un permit complémentaire 62dddab7.
+  insight: >
+    Trois enseignements de domaine. (1) LE CALLER-INVENTORY NE SE DISCIPLINE PAS, IL
+    SE MÉCANISE. La classe d'oubli « un fichier réellement touché absent du périmètre
+    du permit » a résisté à DEUX lessons (ea6e9dd1, 611fde3e), une règle persona
+    (eb42a8de) et un RFC dédié, puis a récidivé au lot 1 (tests/ top-level raté,
+    lesson 1bb07073), s'est dissoute au lot 2 par un choix de conception (builder
+    additif qui évite de changer une signature, 50409fb0), et n'est fermée qu'au
+    lot 3 par un filet MÉCANIQUE (M14 : grant_write_permit calcule l'union
+    affected_files et signale chaque fichier non couvert par un target_path). Preuve
+    empirique en boucle fermée : l'oubli du ré-export lib.rs à CE lot est la 4e
+    occurrence, relevée par le CEO, et c'est précisément ce que M14 émet en
+    scope_warnings. Un mécanisme de durcissement dont le premier bénéficiaire est
+    l'implémentation qui l'introduit est la meilleure validation possible de sa
+    valeur. Trois réponses graduées au même problème (prose, conception, mécanisme),
+    dont la seule durable est la mécanique. (2) LE TEST CLEAN-COMPANY EST UN
+    CLIQUET. 62 règles au départ, 27 garanties mécaniques à l'arrivée : chaque
+    mécanisme retire une règle du domaine « survit seulement si la prose est lue » et
+    la place dans « survit à l'effacement de la mémoire ». Les 35 restantes sont soit
+    intrinsèquement prose (jugement LLM : le FOND d'une review triaxiale, le critère
+    correctif vs hors-scope), soit reportées à v1-harness-refactor. Le harness est le
+    seul dépositaire fiable des interactions conçues comme importantes. (3) LES
+    PATTERNS DE LOT 1-2 TIENNENT SUR 3 LOTS : early-return côté serveur pour les
+    gardes comportementales, additionalProperties:false + enum côté schema pour les
+    purges/formes (M15 : match {paths, on} verrouillé), warning non bloquant quand
+    le LLM doit juger (M14/M17/M18/M19, préférence 4e5c109b : l'algorithme signale,
+    le CEO/LLM tranche), blocage dur seulement quand une affirmation explicite est
+    requise (M15 : user_approval_confirmed). Et la friction personas.yml (50409fb0
+    rec. 3) est enfin levée : l'exemption validator M20a doit être DÉPLOYÉE dans le
+    binaire que le pre-commit exécute (target/release) avant que le commit de
+    personas.yml régénéré passe — l'ordre M20a-effective-puis-M20b n'est pas qu'un
+    ordre de code, c'est un ordre de déploiement du binaire de validation.
+  recommendation: >
+    (1) Pour toute règle de process récurremment violée malgré la prose, ne pas
+    ajouter une Nième lesson : ouvrir un RFC de mécanisation. La lesson documente,
+    le harness garantit. Le critère de décision est le test clean-company :
+    « survivrait-elle à l'effacement de la mémoire YAML ? » ; si non et qu'elle est
+    mécanisable, elle doit devenir un invariant harness. (2) Quand un mécanisme de
+    périmètre/scope existe (M14 scope_warnings au grant), le LIRE : le CEO à
+    l'émission du permit et l'Implementer à la réception doivent traiter
+    scope_warnings comme la liste des oublis probables, pas comme du bruit. Le filet
+    aval ne dispense pas du recensement amont (règle persona architect annotée), il
+    rattrape ce que l'humain oublie. (3) Pour tout mécanisme vivant dans un binaire
+    servi (validator, orchestrator), se rappeler que make ci / cargo build touchent
+    target/debug mais que le pre-commit et le serveur MCP exécutent target/release
+    et target/serve : un mécanisme n'est EFFECTIF qu'après le déploiement du binaire
+    correspondant (rebuild release pour le hook, make deploy-serve pour le serveur).
+    C'est le prolongement de la lesson e4e296d6 : un mécanisme n'est validé qu'observé
+    en vif avec le binaire réellement exécuté.

@@ -5,7 +5,8 @@ metadata:
   title: "V1 process lot 3 : pré-check de périmètre au grant, triggers humains path-matchables, matrice author-produces, intégrité des related, gate plan-approuvé, rappels de capitalisation, personas.yml et warnings reindex_all"
   author: architect
   created_at: "2026-07-12"
-  status: approved
+  status: implemented
+  implemented_at: "2026-07-27T13:12:44.966027674+00:00"
   approved_at: "2026-07-11T23:26:11.541363121+00:00"
   changelog:
     - date: "2026-07-14"

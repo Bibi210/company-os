@@ -42,7 +42,7 @@ metadata:
 
 spec:
   priority: high
-  status: in_progress
+  status: done
 
   context: >
     Dernier lot du recensement c981bf62. L'item 14 est le plus rentable :
