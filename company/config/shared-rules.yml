@@ -150,6 +150,11 @@ spec:
           Sert de filet de sécurité : certaines actions sont trop critiques pour être approuvées
           uniquement par des agents. Exemples : modification de personas, changement de permissions,
           suppression de données, modifications de zones protégées.
+          Un trigger peut porter un bloc match {paths, on: any|deleted} (mechanism 15, RFC 0197fbe5)
+          qui le rend évaluable MÉCANIQUEMENT par grant_write_permit : un permit dont les target_paths
+          couvrent (ou dont les affected_files touchent) un path déclaré est refusé sans
+          user_approval_confirmed=true. Les triggers sans bloc match (ex. breaking schema change)
+          restent du jugement sémantique en prose.
           Artifact global (vit dans company/config/).
         schema: company/schemas/human-review-triggers.schema.json
       roadmap:
@@ -390,12 +395,15 @@ spec:
         Le schema RFC accepte deux formes pour affected_files (RFC a4eb3ee7, anyOf
         rétro-compatible) :
 
-        - FORME B structurée — objet { modified, created } : RECOMMANDÉE pour tout RFC qui
-          touche du code ou crée des fichiers. Renseigner affected_files.modified avec les
-          fichiers DÉJÀ PRÉSENTS dans HEAD qui seront édités, et affected_files.created avec
-          les fichiers NOUVEAUX qui seront créés. Les deux clés sont optionnelles : un RFC
+        - FORME B structurée — objet { modified, created, deleted } : RECOMMANDÉE pour tout RFC qui
+          touche du code, crée ou supprime des fichiers. Renseigner affected_files.modified avec les
+          fichiers DÉJÀ PRÉSENTS dans HEAD qui seront édités, affected_files.created avec
+          les fichiers NOUVEAUX qui seront créés, et affected_files.deleted avec les fichiers
+          qui seront SUPPRIMÉS. Les trois clés sont optionnelles : un RFC
           qui ne fait que créer renseigne seulement created, un RFC qui ne fait que modifier
-          renseigne seulement modified.
+          renseigne seulement modified. La clé deleted (mechanism 15, RFC 0197fbe5) est aussi
+          l'entrée du trigger humain "rfc deletes persona" : un fichier sous company/personas/
+          listé dans deleted déclenche l'exigence d'approbation utilisateur au grant.
 
         - FORME A legacy — array plat de strings : reste VALIDE et acceptée (rétro-compatibilité).
           À privilégier pour les RFCs ne touchant que des artifacts YAML sans création de fichier,
@@ -407,7 +415,11 @@ spec:
         round-trip Implementer → PM → CEO et un permit complémentaire. En rendant la distinction
         explicite et machine-readable, la FORME B permet à un futur outillage de pré-vérification
         de calculer l'union modified+created comme target_paths candidats et de signaler les oublis
-        AVANT le blocage.
+        AVANT le blocage. Ce pré-check est désormais MÉCANISÉ : grant_write_permit calcule l'union
+        modified+created+deleted et signale au CEO, à l'émission du permit (champ scope_warnings),
+        chaque affected_file non couvert par un target_path (mechanism 14, RFC 0197fbe5). Le grant
+        n'est jamais refusé pour un gap de périmètre — le CEO peut scoper plus étroit à raison ;
+        l'algorithme signale, le CEO juge.
 
         REMPLACE LE CONTOURNEMENT DE PROSE. Cette règle ferme, pour les FUTURS auteurs, le chemin
         du contournement qui consistait à expliciter la distinction modified/created EN PROSE dans
