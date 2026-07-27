@@ -16,13 +16,31 @@
                 "properties": {
                   "condition": { "type": "string" },
                   "action": { "type": "string" },
-                  "description": { "type": "string" }
+                  "description": { "type": "string" },
+                  "match": {
+                    "type": "object",
+                    "properties": {
+                      "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1
+                      },
+                      "on": {
+                        "type": "string",
+                        "enum": ["any", "deleted"]
+                      }
+                    },
+                    "required": ["paths", "on"],
+                    "additionalProperties": false
+                  }
                 },
-                "required": ["condition", "action", "description"]
+                "required": ["condition", "action", "description"],
+                "additionalProperties": false
               }
             }
           },
-          "required": ["triggers"]
+          "required": ["triggers"],
+          "additionalProperties": false
         }
       },
       "required": ["spec"]

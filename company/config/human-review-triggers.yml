@@ -18,13 +18,36 @@ spec:
   triggers:
     - condition: rfc modifies access matrix
       action: escalate_user
-      description: Toute modification de l'access matrix doit être approuvée par l'utilisateur.
+      description: >
+        Toute modification de l'access matrix doit être approuvée par l'utilisateur.
+        Évalué mécaniquement par grant_write_permit (mechanism 15, RFC 0197fbe5) :
+        un permit couvrant protected-zones.json est refusé sans user_approval_confirmed=true.
+      match:
+        paths:
+          - company/config/protected-zones.json
+        on: any
     - condition: rfc modifies ceo persona
       action: escalate_user
-      description: Les règles du CEO ne peuvent être modifiées sans approbation utilisateur.
+      description: >
+        Les règles du CEO ne peuvent être modifiées sans approbation utilisateur.
+        Évalué mécaniquement par grant_write_permit (mechanism 15, RFC 0197fbe5) :
+        un permit couvrant ceo.yml est refusé sans user_approval_confirmed=true.
+      match:
+        paths:
+          - company/personas/ceo.yml
+        on: any
     - condition: rfc introduces breaking schema change
       action: escalate_user
-      description: Les changements de schema incompatibles requièrent une approbation utilisateur.
+      description: >
+        Les changements de schema incompatibles requièrent une approbation utilisateur.
+        Reste prose (jugement sémantique) : aucun bloc match, non évalué mécaniquement au grant.
     - condition: rfc deletes persona
       action: escalate_user
-      description: La suppression d'un persona requiert une approbation utilisateur.
+      description: >
+        La suppression d'un persona requiert une approbation utilisateur.
+        Évalué mécaniquement par grant_write_permit (mechanism 15, RFC 0197fbe5) :
+        un affected_files.deleted sous company/personas/ est refusé sans user_approval_confirmed=true.
+      match:
+        paths:
+          - company/personas/*
+        on: deleted

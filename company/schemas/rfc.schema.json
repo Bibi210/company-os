@@ -40,10 +40,15 @@
                       "type": "array",
                       "items": { "type": "string" },
                       "description": "New files that do not yet exist and will be created."
+                    },
+                    "deleted": {
+                      "type": "array",
+                      "items": { "type": "string" },
+                      "description": "Files that exist in HEAD and will be deleted. Evaluated by the path-matchable human-review triggers (mechanism 15, RFC 0197fbe5)."
                     }
                   },
                   "additionalProperties": false,
-                  "description": "Structured form distinguishing files to modify from files to create. Both keys optional; either may be empty or absent."
+                  "description": "Structured form distinguishing files to modify, create, and delete. All three keys optional; any may be empty or absent."
                 }
               ]
             }
