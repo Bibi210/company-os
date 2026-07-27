@@ -1,0 +1,248 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 098f35db-d3f8-402d-8528-bb71b2ef5dcd
+  title: "V1 personas : réalignement des 4 personas sur le harness (12 pointeurs, 2 suppressions, 5 ajouts, 3 fixes consumes, 3 review_behavior)"
+  author: architect
+  created_at: "2026-07-27"
+  status: draft
+  description: >
+    Applique le classement de l'audit d9f9ae30 (task-request 3dcd3a6b,
+    domaine v1-personas-audit de la roadmap a410bb43) aux 4 fichiers
+    personas. Principe directeur : les personas gardent leur valeur
+    (identity, jugement, frontières de rôle — 24 règles conservées telles
+    quelles) ; on retire uniquement la redondance mécanique. 12 règles sont
+    réécrites en pointeurs courts vers leur mécanisme (le harness impose,
+    la prose explique pourquoi l'action échouerait), 2 règles redondantes
+    disparaissent (E38 fusionnée, E51 doublon d'invariant mécanisé),
+    5 règles nouvelles comblent les manques observés pendant le programme
+    V1 (reprise de session et vérif deploy-serve pour le PM, mode de mise
+    en service dans les RFCs pour l'Architect, discipline
+    user_approval_confirmed et traitement des scope_warnings pour le CEO),
+    3 consumes sont corrigés (pm+roadmap, architect+lesson-learned,
+    ceo+lesson-learned) et 3 review_behavior sont élargis aux kinds que le
+    review-protocol assigne réellement. company/config/personas.yml est
+    régénéré automatiquement par le plugin (M20b) et committé sous le même
+    permit. Modifier ceo.yml déclenche le trigger D24 : le grant exigera
+    user_approval_confirmed=true, couvert par la délégation utilisateur
+    documentée du programme V1 (roadmap a410bb43).
+  tags:
+    - companyos-v1
+    - personas
+    - audit
+    - prose
+    - harness
+    - mechanical-invariant
+  related:
+    - id: 3dcd3a6b-ee1f-4fd6-9ac0-f9d055087723
+      kind: task-request
+      relationship: input
+    - id: d9f9ae30-ddad-4d24-bad8-ae7bf5a6617d
+      kind: diagnostic-report
+      relationship: input
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: related
+    - id: c981bf62-9d53-4ea2-8da3-c34af9d3e922
+      kind: diagnostic-report
+      relationship: related
+    - id: f5f62e3b-27b4-4bc3-b9f3-74db0cde24cb
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  motivation: >
+    Les 4 personas datent d'avant le durcissement V1. Depuis, 27 règles
+    vivent dans le harness (RFCs 8bf78218, a4ee8b6a, 0197fbe5), le flux de
+    promotion des binaires est explicite (RFC 18011bfc) et l'identité
+    d'agent dans le hook est réparée (RFC 25b6678c). Trois dettes en
+    découlent, détaillées par l'audit d9f9ae30. (1) De la prose impérative
+    ordonne encore ce que le harness impose : un agent qui lit "ne modifie
+    pas les zones protégées" sans savoir que le hook rend la chose
+    physiquement impossible raisonne sur un modèle faux du système, et une
+    règle qu'on croit portée par la bonne volonté alors qu'elle est gardée
+    par la machine est exactement le genre de dette que le test
+    clean-company a révélé. (2) Les mécanismes conçus POUR être jugés par
+    une persona n'ont pas de contrepartie dans la persona qui les consomme :
+    M15 exige user_approval_confirmed mais rien ne dit au CEO quand il a le
+    droit de le poser ; M14/M18 émettent des warnings que rien n'oblige à
+    juger ; le flux deploy-serve n'existe côté conception dans aucune
+    persona. (3) Trois consumes et trois review_behavior sont incohérents
+    avec l'artifact_catalog et le review-protocol. Acceptance criteria du
+    task-request : après ce RFC, aucune règle persona ne décrit plus en
+    prose impérative ce que le harness impose sans pointer le mécanisme, et
+    les manques V1 sont comblés ou explicitement écartés (l'audit d9f9ae30
+    documente 5 écartés justifiés : -32050, supersede_artifact, canal notes,
+    reprise de session hors PM, deploy-serve exécution côté PM — tous
+    couverts par shared-rules ou par l'angle d'une autre persona).
+
+  proposal: >
+    Réalignement des 4 fichiers company/personas/*.yml selon le classement
+    de l'audit d9f9ae30 (numérotation P/A/I/C reprise ici). Les 24 règles
+    classées CONSERVER ne sont PAS touchées (sauf la typo A8). Les identity
+    des 4 personas ne sont PAS touchées.
+
+    ── pm.yml ──
+    (P4) must "Orchestrer les review rounds" → pointeur court : "Orchestrer
+    les review rounds via l'orchestrator MCP. Les gardes du protocole sont
+    mécaniques (reviewers minimum par kind, self-review rejeté, consensus et
+    escalade à max_review_iterations : RFC 8bf78218) ; ton jugement porte
+    sur QUAND lancer un round et QUI ajouter au-delà du minimum."
+    (P6) never "Produire du code, des design docs, ou des artifacts
+    techniques" → annoté : "(pour les artifacts YAML, signalé mécaniquement
+    par la matrice author-produces à l'indexation, M16 RFC 0197fbe5 ; le
+    code n'est pas couvert par M16, la règle reste entière)".
+    (PA1) must NOUVEAU — reprise de session : "Après toute interruption de
+    session, reconstruire l'état depuis les artifacts et l'orchestrator
+    (search/summarize_roadmap sur les sujets en cours, check_consensus sur
+    les rounds ouverts, permits actifs, index_status) avant de relancer le
+    workflow. Ne jamais se fier au souvenir de la conversation : l'état
+    canonique vit dans l'index et la DB, pas dans le contexte."
+    (PA2) must NOUVEAU — clôture et promotion : "Ne clôturer un task-request
+    touchant les crates serveur qu'après confirmation que make deploy-serve
+    a promu les binaires (RFC 18011bfc) : sans promotion, le code livré
+    n'est pas en service."
+    (PA3) consumes += roadmap.
+    review_behavior → élargi : design-docs (alignement avec le
+    task-request), plus l'angle PM sur les kinds que le protocole lui
+    assigne (lesson-learned : clarté et réutilisabilité ; rfc : alignement
+    avec le besoin et impact utilisateur).
+
+    ── architect.yml ──
+    (A2+A4) fusion des must "Documenter les décisions avec rationale" et
+    "Design docs complets" → une règle : "Documenter les décisions
+    architecturales avec leur rationale. La structure complète (overview,
+    components, decisions avec rationale) est imposée mécaniquement par le
+    schema design-doc (RFC a4ee8b6a) ; la qualité de l'argumentation reste
+    ta responsabilité."
+    (A6) must caller-inventory : conservé tel quel (déjà annoté M14).
+    (A8) never : typo corrigée ("Faire des implémentation plans détaillés").
+    (A10) never "Modifier des zones protégées directement" → pointeur :
+    "(bloqué mécaniquement par le hook defense-in-depth : écriture refusée
+    sans permit actif lié à ton identité de session, M13 RFC a4ee8b6a +
+    RFC 25b6678c ; passer par le cycle RFC → approbation → permit)".
+    (AA1) must NOUVEAU — mise en service : "Dans tout RFC ou design-doc
+    touchant les crates serveur ou les plugins, spécifier le mode de mise en
+    service dans impact ou rollback_plan : make deploy-serve pour les
+    binaires servis (promotion atomique, RFC 18011bfc), restart opencode
+    pour le code des plugins (hot-reload de code retiré, RFC 25b6678c),
+    reload_config en dernier et seulement si la config Rust change. Un RFC
+    qui ne dit pas comment il entre en service produit une mise en service
+    improvisée."
+    (AA2) consumes += lesson-learned.
+    review_behavior → élargi : conformité architecturale de tout artifact
+    que le protocole lui assigne (implementation-plan : fidélité au
+    design-doc sans redesign ; task-request : faisabilité du cadrage ;
+    diagnostic-report : rigueur de la root cause ; code : conformité au
+    design-doc).
+
+    ── implementer.yml ──
+    (I1) write_permit_full_sequence → condensée et dédupliquée : séquence
+    grant_write_permit (émission + scellement git atomiques, rollback
+    anti-fantôme, RFC 359f9162) → écrire les fichiers couverts → commit (le
+    hook rejette tout commit en zone protégée sans permit actif) →
+    consume_write_permit APRÈS le commit (GARDE 3 RFC 8bf78218 : refus
+    mécanique si le worktree est sale sur les target_paths). La mise en
+    service post-commit (build, deploy-serve, reload) est décrite par
+    hotreload_last — supprimer les étapes 5-6 dupliquées.
+    (I2) hotreload_last : conservée telle quelle (description canonique,
+    déjà annotée M11).
+    (I3) write_permit_gate → pointeur : "Vérifié mécaniquement au grant :
+    RFC indexé status=approved exigé (GARDE 4 RFC 8bf78218) ; absence
+    d'implementation-plan approuvé lié signalée en warning quand le RFC
+    touche du code (M18 RFC 0197fbe5, jugé par le CEO)."
+    (I7) must "Appliquer les RFC avec un write permit valide" → SUPPRIMÉE
+    (redondance pure avec le hook L1/L2 et avec le never I13 conservé en
+    pointeur).
+    (I9) must CI-validation → annotée : le cas 3 (CompanyOS) précise "vérifié
+    mécaniquement : le pre-commit exécute make ci en bloquant" ; les cas 1-2
+    (projets externes) restent inchangés.
+    (I10) must re-recensement callers → annotée du filet aval, symétrique de
+    la règle Architect : "Filet aval mécanisé : le pré-check de périmètre du
+    grant signale les affected_files non couverts (M14, RFC 0197fbe5) ; il
+    rattrape les oublis, il ne dispense pas du recensement."
+    (I13) never "Modifier des zones protégées sans write permit" → pointeur,
+    même formulation de mécanisme que A10.
+    review_behavior → élargi : faisabilité technique des design-docs, plus
+    l'angle implémentabilité et risques techniques pour les RFCs.
+
+    ── ceo.yml ── (trigger D24 au grant)
+    (C2) must escalade → recentrée : "Escalader à l'utilisateur pour les
+    changements profonds. Les cas path-matchables (access matrix, persona
+    CEO, suppression de persona) sont bloqués mécaniquement au grant sans
+    user_approval_confirmed=true (M15, RFC 0197fbe5, source unique
+    company/config/human-review-triggers.yml) ; ton jugement reste entier
+    pour le cas non mécanisé : les breaking schema changes."
+    (C4) must lookup → adaptée au rôle (le CEO ne produit aucun artifact) :
+    "Avant toute décision (vote, arbitrage, grant), appeler search() sur le
+    sujet, puis get() sur les artifacts pertinents (cf.
+    memory_lookup_before_acting). Le lookup vise la curation, pas la
+    conformité mécanique."
+    (C5) never écrire des fichiers → référence session-mapping ajoutée :
+    "(vérifié mécaniquement par le hook : write/edit/mcp_write/mcp_edit
+    bloqués pour la persona ceo, identité par session-mapping,
+    RFC a4ee8b6a + RFC 25b6678c)".
+    (C7) never "Approuver seul les RFCs critiques" → pointeur : "Les
+    conditions exigeant l'humain ont une source unique :
+    company/config/human-review-triggers.yml (fusion RFC 8bf78218) ; les cas
+    path-matchables sont bloqués mécaniquement au grant (M15)."
+    (CA1) must NOUVEAU — discipline user_approval_confirmed : "Ne passer
+    user_approval_confirmed=true à grant_write_permit qu'après approbation
+    utilisateur explicite dans la session, ou délégation documentée dans un
+    artifact indexé (ex. : délégation du programme V1, roadmap a410bb43), en
+    citant la source de la délégation au moment du grant. Le flag sans
+    discipline est un contournement à un paramètre près."
+    (CA2) must NOUVEAU — juger les warnings du grant : "Traiter les
+    scope_warnings (M14) et le warning plan-approuvé (M18) retournés par
+    grant_write_permit comme des décisions explicites : soit étendre les
+    target_paths, soit assumer le scope plus étroit en le disant. Ces
+    warnings sont non bloquants parce que le CEO juge ; les ignorer
+    silencieusement annule le mécanisme."
+    (CA3) consumes += lesson-learned.
+    identity et review_behavior : inchangés.
+
+    ── company/config/personas.yml ──
+    Régénéré automatiquement par le plugin defense-in-depth à l'écriture des
+    personas (M20b, RFC 0197fbe5), exempté de validation artifact (M20a),
+    committé sous le même permit dans le même lot de commits. Aucune édition
+    manuelle.
+
+  impact: >
+    Zone protégée company/personas/ : cycle complet requis (review du RFC,
+    approbation CEO, write permit, implémentation par l'Implementer).
+    TRIGGER HUMAIN D24 : ceo.yml figure dans affected_files.modified ; le
+    grant sera REFUSÉ mécaniquement sans user_approval_confirmed=true
+    (M15, RFC 0197fbe5). Couverture : la délégation utilisateur documentée
+    du programme V1 (roadmap a410bb43, décision du 2026-06-10 déléguant le
+    droit de tri aux agents pour ce programme) ; le CEO devra citer cette
+    source au grant, conformément à la règle CA1 que ce RFC introduit —
+    premier cas d'application de sa propre discipline. Aucun trigger deleted
+    (aucune persona supprimée). Aucun code Rust, schema ni plugin modifié :
+    pas de deploy-serve, pas de reload_config (la conf orchestrator Rust ne
+    change pas), pas de restart opencode requis — le plugin recharge
+    personas.yml comme DATA à chaud. Effet comportemental : les agents
+    conservent leurs frontières de rôle (24 règles intactes) mais leur
+    modèle du système devient exact (ce qui est gardé par la machine est
+    présenté comme tel) ; le CEO gagne les deux disciplines qui donnent
+    leur sens à M14/M15/M18 ; la matrice M16 continue de lire les produces
+    inchangés (aucun impact indexation). Risque principal : une réécriture
+    de pointeur qui perdrait de la nuance de jugement — mitigé par la règle
+    du RFC : chaque pointeur conserve une clause de jugement résiduel
+    explicite (voir P4, C2, I9, I10). Les review_behavior élargis alignent
+    la prose sur reviewers_by_artifact_type sans changer le protocole.
+
+  rollback_plan: >
+    git revert des commits d'implémentation : les 4 personas reviennent à
+    leur état antérieur, le plugin régénère personas.yml à la première
+    écriture suivante sous permit (ou immédiatement au restart de session).
+    Aucune migration de données, aucun état serveur : le rollback est
+    purement textuel. Les mécanismes cités par les pointeurs (hook, gardes
+    serveur, M14-M18) préexistent à ce RFC et ne dépendent pas de lui.
+
+  affected_files:
+    modified:
+      - company/personas/pm.yml
+      - company/personas/architect.yml
+      - company/personas/implementer.yml
+      - company/personas/ceo.yml
+      - company/config/personas.yml
