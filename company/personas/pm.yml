@@ -27,6 +27,8 @@ artifacts:
     - task-request
     - lesson-learned
     - roadmap
+    - diagnostic-report
+    - review-report
   consumes:
     - design-doc
     - implementation-plan
