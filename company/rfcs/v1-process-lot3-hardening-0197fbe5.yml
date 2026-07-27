@@ -7,6 +7,21 @@ metadata:
   created_at: "2026-07-12"
   status: approved
   approved_at: "2026-07-11T23:26:11.541363121+00:00"
+  changelog:
+    - date: "2026-07-14"
+      author: architect
+      description: >
+        SCOPE AMENDMENT (RFC approved — aucune décision modifiée, uniquement
+        le recensement de périmètre) : ajout de crates/orchestrator/src/lib.rs
+        à affected_files.modified (17 → 18 paths). Le ré-export public de
+        ReindexOutcome (M21, reindex_all retourne {count, warnings}) figurait
+        au plan bca90818 mais le fichier lib.rs qui le porte avait été omis
+        de l'inventaire affected_files du RFC. Quatrième occurrence de la
+        classe 611fde3e (fichier hors périmètre du permit découvert à
+        l'exécution) — que le mécanisme M14 de ce même RFC (pré-check de
+        périmètre au grant) aurait attrapé une fois livré. Permit
+        complémentaire 62dddab7 émis sur demande utilisateur. Précédent :
+        amendement 021ef0f du lot 1 (RFC 8bf78218, même procédure).
   description: >
     Lot 3 et dernier du durcissement process (recensement c981bf62 items 14
     à 19 + frictions 20-21 du lot 2, task-request b9dbcff9, suite des lots
@@ -609,6 +624,7 @@ spec:
       - crates/orchestrator/src/db.rs
       - crates/orchestrator/src/error.rs
       - crates/orchestrator/src/types.rs
+      - crates/orchestrator/src/lib.rs
       - crates/orchestrator/tests/integration_search.rs
       - crates/mcp-servers/orchestrator/src/main.rs
       - crates/validation/src/validator.rs
