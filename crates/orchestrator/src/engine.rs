@@ -8,6 +8,33 @@ use uuid::Uuid;
 
 use crate::embedding::Embedder;
 
+/// Mechanism 16 (RFC 0197fbe5) — historical cutoff for the author↔produces
+/// matrix. Artifacts whose `metadata.created_at` is strictly BEFORE this date
+/// (the RFC date) are exempt from the produces check: the pre-existing corpus
+/// predates the rule. Strict lower bound: `created_at == cutoff` is NOT exempt.
+/// ISO-8601 date strings compare lexicographically the same as chronologically.
+pub const AUTHOR_PRODUCES_CUTOFF: &str = "2026-07-12";
+
+/// The three affected-files lists extracted from an RFC's
+/// `spec.affected_files` (mechanism 14/15, RFC 0197fbe5). FORME A (flat array)
+/// populates `modified`; FORME B (object) populates the three keys.
+#[derive(Debug, Clone, Default)]
+pub struct AffectedFiles {
+    pub modified: Vec<String>,
+    pub created: Vec<String>,
+    pub deleted: Vec<String>,
+}
+
+impl AffectedFiles {
+    /// The union modified + created + deleted (candidate target_paths).
+    pub fn union(&self) -> Vec<String> {
+        let mut v = self.modified.clone();
+        v.extend(self.created.iter().cloned());
+        v.extend(self.deleted.iter().cloned());
+        v
+    }
+}
+
 /// Result of an RFC status auto-update triggered by close_round.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RfcUpdateResult {
@@ -786,6 +813,430 @@ impl OrchestratorEngine {
         warnings
     }
 
+    /// Mechanism 17a (RFC 0197fbe5) — single-file dangling-related detection.
+    /// For each `related[].id` declared by `artifact`, verify the target is an
+    /// indexed artifact; a missing target yields a non-blocking warning.
+    /// Mirrors `supersession_warnings`: read the YAML, extract relations, look
+    /// each target up in the index. NON-BLOCKING (imposed by the task-request).
+    /// EDGE (RFC 17a): two brand-new artifacts referencing each other can
+    /// produce a transient false positive here depending on write order (it
+    /// disappears once the second is indexed); the bulk `reindex_all` pass does
+    /// not have this problem thanks to the global SQL query
+    /// ([`OrchestratorDb::dangling_related_links`]).
+    pub fn related_integrity_warnings(
+        &self,
+        root: &str,
+        artifact: &IndexedArtifact,
+    ) -> Vec<String> {
+        let full = format!("{root}/{}", artifact.file_path);
+        let Ok(content) = std::fs::read_to_string(&full) else {
+            return Vec::new();
+        };
+        let Ok(yaml) = serde_yaml::from_str::<serde_json::Value>(&content) else {
+            return Vec::new();
+        };
+        let mut warnings = Vec::new();
+        for rel in extract_relations(&yaml) {
+            match self.db.get_artifact(&rel.target_id) {
+                Ok(Some(_)) => {}
+                Ok(None) => warnings.push(format!(
+                    "related[].id {} introuvable dans l'index — lien pendant : id erroné \
+                     (typo ?) ou artifact supprimé/jamais créé",
+                    rel.target_id
+                )),
+                Err(_) => {}
+            }
+        }
+        warnings
+    }
+
+    /// Mechanism 16 (RFC 0197fbe5) — author↔produces matrix, WARNING not
+    /// rejection (a refused artifact would become invisible to `search()`,
+    /// worse than the signalled violation). The persona YAML files are the
+    /// SINGLE source of truth (no hard-coded "universal kinds" constant): read
+    /// `company/personas/<author>.yml` fresh and warn if `artifact.kind` is not
+    /// in `artifacts.produces`.
+    ///
+    /// Périmètre tranché (RFC 16c): system kinds are EXEMPT (governance, gated
+    /// by protected zones + RFC cycle); an unknown author (no persona YAML) is
+    /// skipped silently; a `created_at` strictly BEFORE
+    /// [`AUTHOR_PRODUCES_CUTOFF`] is exempt (historical corpus). The cutoff is a
+    /// strict lower bound: `created_at == cutoff` is NOT exempt.
+    pub fn author_produces_warnings(&self, root: &str, artifact: &IndexedArtifact) -> Vec<String> {
+        // System kinds are exempt (gouvernance).
+        const SYSTEM_KINDS: [&str; 5] = [
+            "persona",
+            "project-config",
+            "flow-control",
+            "review-protocol",
+            "human-review-triggers",
+        ];
+        if SYSTEM_KINDS.contains(&artifact.kind.as_str()) {
+            return Vec::new();
+        }
+
+        let full = format!("{root}/{}", artifact.file_path);
+        let Ok(content) = std::fs::read_to_string(&full) else {
+            return Vec::new();
+        };
+        let Ok(yaml) = serde_yaml::from_str::<serde_json::Value>(&content) else {
+            return Vec::new();
+        };
+
+        // Historical cutoff: exempt artifacts created strictly before the RFC.
+        let created_at = yaml
+            .pointer("/metadata/created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !created_at.is_empty() && created_at < AUTHOR_PRODUCES_CUTOFF {
+            return Vec::new();
+        }
+
+        let author = yaml
+            .pointer("/metadata/author")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if author.is_empty() {
+            return Vec::new();
+        }
+
+        // Read the author's persona YAML fresh. Unknown author => skip silently.
+        let persona_path = format!("{root}/company/personas/{author}.yml");
+        let Ok(persona_content) = std::fs::read_to_string(&persona_path) else {
+            return Vec::new();
+        };
+        let Ok(persona_yaml) = serde_yaml::from_str::<serde_json::Value>(&persona_content) else {
+            return Vec::new();
+        };
+        let produces: Vec<String> = persona_yaml
+            .pointer("/artifacts/produces")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if produces.iter().any(|k| k == &artifact.kind) {
+            Vec::new()
+        } else {
+            vec![format!(
+                "author '{author}' ne produit pas le kind '{}' selon sa persona \
+                 (artifacts.produces) — vérifier l'attribution ou amender la persona par RFC",
+                artifact.kind
+            )]
+        }
+    }
+
+    /// Mechanism 19c (RFC 0197fbe5) — capitalization reminders for a resolved
+    /// diagnostic-report with no linked lesson. Single-file surface only (the
+    /// reminder concerns the MOMENT of resolution; in bulk it would spam
+    /// history). NON-BLOCKING.
+    pub fn capitalization_reminders(&self, root: &str, artifact: &IndexedArtifact) -> Vec<String> {
+        if artifact.kind != "diagnostic-report" {
+            return Vec::new();
+        }
+        let full = format!("{root}/{}", artifact.file_path);
+        let Ok(content) = std::fs::read_to_string(&full) else {
+            return Vec::new();
+        };
+        let Ok(yaml) = serde_yaml::from_str::<serde_json::Value>(&content) else {
+            return Vec::new();
+        };
+        let status = yaml
+            .pointer("/spec/status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if status != "resolved" {
+            return Vec::new();
+        }
+        match self.db.has_linked_lesson(&artifact.id) {
+            Ok(true) => Vec::new(),
+            Ok(false) => vec![format!(
+                "diagnostic-report {} resolved sans lesson liée — la règle \
+                 lesson_after_every_artifact attend une capitalisation (context/insight/\
+                 recommendation) ; créer une lesson et la lier via metadata.related",
+                artifact.id
+            )],
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Mechanism 14d (RFC 0197fbe5) — single-file warnings aggregator. Union of
+    /// supersession asymmetry (10c), related-integrity dangling links (17a),
+    /// author↔produces (16), and capitalization reminders (19c). The three
+    /// server single-file call-sites (index_now, index_artifact, CLI --index)
+    /// switch to this so their existing `warnings` field enriches without a
+    /// shape change. `supersession_warnings` stays public and UNCHANGED.
+    pub fn artifact_warnings(&self, root: &str, artifact: &IndexedArtifact) -> Vec<String> {
+        let mut w = self.supersession_warnings(root, artifact);
+        w.extend(self.related_integrity_warnings(root, artifact));
+        w.extend(self.author_produces_warnings(root, artifact));
+        w.extend(self.capitalization_reminders(root, artifact));
+        w
+    }
+
+    /// Extract `spec.affected_files` from an RFC YAML value into three lists
+    /// (modified, created, deleted). Supports FORME A (flat array of strings,
+    /// counted as `modified`) and FORME B (object with optional modified /
+    /// created / deleted keys). Mechanism 14/15 (RFC 0197fbe5). Returns `None`
+    /// only when the `affected_files` key is entirely absent (distinct from an
+    /// empty declaration).
+    /// Read + parse a YAML artifact into a `serde_json::Value` (mechanism
+    /// 14/15/18, RFC 0197fbe5). Returns `None` on any read/parse failure. Keeps
+    /// serde_yaml an implementation detail of this crate (the server crate does
+    /// not depend on serde_yaml).
+    pub fn read_yaml_value(&self, root: &str, file_path: &str) -> Option<serde_json::Value> {
+        let full = if file_path.starts_with('/') {
+            file_path.to_string()
+        } else {
+            format!("{root}/{file_path}")
+        };
+        let content = std::fs::read_to_string(&full).ok()?;
+        serde_yaml::from_str(&content).ok()
+    }
+
+    pub fn extract_affected_files(rfc_yaml: &serde_json::Value) -> Option<AffectedFiles> {
+        let af = rfc_yaml.pointer("/spec/affected_files")?;
+        let mut out = AffectedFiles::default();
+        if let Some(arr) = af.as_array() {
+            // FORME A: flat list -> modified.
+            out.modified = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+        } else if let Some(obj) = af.as_object() {
+            let take = |key: &str| -> Vec<String> {
+                obj.get(key)
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            out.modified = take("modified");
+            out.created = take("created");
+            out.deleted = take("deleted");
+        } else {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// Mechanism 14 (RFC 0197fbe5) — pre-check the permit scope at grant time.
+    /// NON-BLOCKING: for each file in the RFC's affected_files union
+    /// (modified + created + deleted), verify at least one `target_path`
+    /// covers it (same [`crate::db::path_matches`] semantics as the permit
+    /// checker). Uncovered files, or an RFC declaring no affected_files, yield
+    /// a warning. The grant is NEVER refused for a scope gap (the CEO may scope
+    /// narrower on purpose; the algorithm signals, the LLM judges).
+    pub fn rfc_scope_warnings(
+        &self,
+        root: &str,
+        rfc_file_path: &str,
+        target_paths: &[PathPattern],
+    ) -> Vec<String> {
+        let full = if rfc_file_path.starts_with('/') {
+            rfc_file_path.to_string()
+        } else {
+            format!("{root}/{rfc_file_path}")
+        };
+        let Ok(content) = std::fs::read_to_string(&full) else {
+            return vec![format!(
+                "pré-check de périmètre impossible : le fichier RFC {rfc_file_path} est illisible"
+            )];
+        };
+        let Ok(yaml) = serde_yaml::from_str::<serde_json::Value>(&content) else {
+            return vec![format!(
+                "pré-check de périmètre impossible : le RFC {rfc_file_path} n'est pas un YAML valide"
+            )];
+        };
+        let Some(af) = Self::extract_affected_files(&yaml) else {
+            return vec![
+                "pré-check de périmètre impossible : le RFC ne déclare pas affected_files"
+                    .to_string(),
+            ];
+        };
+        let mut warnings = Vec::new();
+        for file in af.union() {
+            let covered = target_paths
+                .iter()
+                .any(|tp| crate::db::path_matches(tp, &file));
+            if !covered {
+                warnings.push(format!(
+                    "RFC affected_files: {file} n'est couvert par aucun target_path — si ce \
+                     fichier sera écrit pendant l'implémentation, le hook la bloquera ; étendre \
+                     target_paths ou assumer le scoping étroit"
+                ));
+            }
+        }
+        warnings
+    }
+
+    /// Mechanism 18 (RFC 0197fbe5) — write_permit_gate. NON-BLOCKING warning.
+    /// If the RFC's affected_files union touches code (`crates/**` or
+    /// `company/plugins/**`), look for a linked implementation-plan (either
+    /// relation direction) with at least one Closed round in consensus. Absence
+    /// of a plan, or a plan without such a round, yields a warning. `rfc_id` is
+    /// the RFC uuid; `rfc_yaml` is its parsed content (already read by M14).
+    pub fn write_permit_gate_warnings(
+        &self,
+        rfc_id: &str,
+        rfc_yaml: &serde_json::Value,
+    ) -> Vec<String> {
+        let Some(af) = Self::extract_affected_files(rfc_yaml) else {
+            return Vec::new();
+        };
+        let touches_code = af
+            .union()
+            .iter()
+            .any(|f| f.starts_with("crates/") || f.starts_with("company/plugins/"));
+        if !touches_code {
+            return Vec::new();
+        }
+
+        // Resolve linked implementation-plans (both directions).
+        let Ok(links) = self.db.get_relations(rfc_id) else {
+            return Vec::new();
+        };
+        let plan_ids: Vec<String> = links
+            .iter()
+            .filter(|l| l.kind.as_deref() == Some("implementation-plan"))
+            .map(|l| l.id.clone())
+            .collect();
+
+        if plan_ids.is_empty() {
+            return vec![format!(
+                "le RFC touche du code mais aucun implementation-plan lié n'existe dans l'index \
+                 (write_permit_gate) — lier un plan approuvé via metadata.related"
+            )];
+        }
+
+        let mut warnings = Vec::new();
+        for plan_id in plan_ids {
+            let Ok(Some(plan_art)) = self.db.get_artifact(&plan_id) else {
+                continue;
+            };
+            let rounds = self
+                .db
+                .list_rounds_by_artifact_path(&plan_art.file_path)
+                .unwrap_or_default();
+            let has_consensus = rounds.iter().any(|r| {
+                r.status == RoundStatus::Closed
+                    && compute_consensus(r) == ConsensusResult::ConsensusReached
+            });
+            if !has_consensus {
+                let short = &plan_id[..plan_id.len().min(8)];
+                warnings.push(format!(
+                    "plan {short} lié mais aucun review round fermé en consensus trouvé — NB : \
+                     rounds éphémères, faux positif attendu après autorepair (write_permit_gate)"
+                ));
+            }
+        }
+        warnings
+    }
+
+    /// Mechanism 15 (RFC 0197fbe5) — evaluate the path-matchable human-review
+    /// triggers against a grant. BLOCKING when a trigger matches and the caller
+    /// did not confirm user approval. Reads `human-review-triggers.yml` fresh.
+    /// FAIL-SAFE: an unreadable/invalid triggers file refuses the grant.
+    ///
+    /// Semantics of `on`:
+    /// - `any`: matched against the target_paths (a glob target that COVERS the
+    ///   trigger path fires, conservative) AND against the affected_files union
+    ///   (literal: a trigger path that covers an affected file fires).
+    /// - `deleted`: matched against affected_files.deleted only.
+    ///
+    /// Returns `Ok(())` when no trigger fires OR when `user_approval_confirmed`.
+    pub fn evaluate_human_review_triggers(
+        &self,
+        root: &str,
+        target_paths: &[PathPattern],
+        affected: &Option<AffectedFiles>,
+        user_approval_confirmed: bool,
+    ) -> Result<(), OrchestratorError> {
+        let triggers_path = format!("{root}/company/config/human-review-triggers.yml");
+        let content = std::fs::read_to_string(&triggers_path).map_err(|e| {
+            OrchestratorError::HumanReviewTriggersUnreadable {
+                reason: format!("read failed: {e}"),
+            }
+        })?;
+        let yaml: serde_json::Value = serde_yaml::from_str(&content).map_err(|e| {
+            OrchestratorError::HumanReviewTriggersUnreadable {
+                reason: format!("parse failed: {e}"),
+            }
+        })?;
+
+        let triggers = yaml
+            .pointer("/spec/triggers")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| OrchestratorError::HumanReviewTriggersUnreadable {
+                reason: "spec.triggers missing or not an array".to_string(),
+            })?;
+
+        let deleted: Vec<String> = affected
+            .as_ref()
+            .map(|a| a.deleted.clone())
+            .unwrap_or_default();
+        let union: Vec<String> = affected.as_ref().map(|a| a.union()).unwrap_or_default();
+
+        let mut matched: Vec<String> = Vec::new();
+        for t in triggers {
+            let Some(m) = t.get("match") else { continue };
+            let paths: Vec<String> = m
+                .get("paths")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let on = m.get("on").and_then(|v| v.as_str()).unwrap_or("any");
+            let condition = t
+                .get("condition")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unnamed trigger>");
+
+            let fired = match on {
+                "deleted" => paths.iter().any(|tp| {
+                    deleted
+                        .iter()
+                        .any(|f| crate::db::path_matches(&PathPattern(tp.clone()), f))
+                }),
+                _ => {
+                    // any: target_paths as patterns covering the trigger path,
+                    // OR trigger path covering an affected file (literal).
+                    let via_target = paths.iter().any(|tp| {
+                        target_paths
+                            .iter()
+                            .any(|target| crate::db::path_matches(target, tp))
+                    });
+                    let via_affected = paths.iter().any(|tp| {
+                        union
+                            .iter()
+                            .any(|f| crate::db::path_matches(&PathPattern(tp.clone()), f))
+                    });
+                    via_target || via_affected
+                }
+            };
+            if fired {
+                matched.push(format!("- {condition} (match.on={on}, paths={paths:?})"));
+            }
+        }
+
+        if !matched.is_empty() && !user_approval_confirmed {
+            return Err(OrchestratorError::HumanReviewTriggered {
+                count: matched.len(),
+                triggers: matched.join("\n"),
+            });
+        }
+        Ok(())
+    }
+
     pub fn start_revision(&self, round_id: Uuid) -> Result<ReviewRound, OrchestratorError> {
         let mut round = self
             .db
@@ -1540,7 +1991,7 @@ impl OrchestratorEngine {
         &mut self,
         root: &str,
         validator: &ArtifactValidator,
-    ) -> Result<usize, OrchestratorError> {
+    ) -> Result<ReindexOutcome, OrchestratorError> {
         self.db.delete_all_artifacts()?;
         // After delete_all, persist the current model_version so a future
         // boot can detect a mismatch and trigger a wipe + reindex.
@@ -1566,13 +2017,36 @@ impl OrchestratorEngine {
             });
         }
 
+        // Keep the successfully-indexed artifacts to run the per-artifact
+        // warning families (10c supersession, 16 author-produces) AFTER the
+        // whole corpus is indexed, so cross-artifact lookups see the full set.
+        let mut indexed: Vec<IndexedArtifact> = Vec::new();
         for rel in yaml_paths {
-            if self.index_artifact(root, &rel, validator).is_ok() {
+            if let Ok(artifact) = self.index_artifact(root, &rel, validator) {
                 count += 1;
+                indexed.push(artifact);
             }
         }
 
-        Ok(count)
+        // Mechanism 21 (RFC 0197fbe5): collect the non-blocking warnings.
+        // Bulk families only: supersession asymmetry (10c) and author↔produces
+        // (16) per artifact, plus dangling related links (17b) via one global
+        // SQL pass (order-insensitive). NOT the capitalization reminders (19c):
+        // those are single-file only (moment-of-resolution), spamming history
+        // in bulk.
+        let mut warnings = Vec::new();
+        for artifact in &indexed {
+            warnings.extend(self.supersession_warnings(root, artifact));
+            warnings.extend(self.author_produces_warnings(root, artifact));
+        }
+        for (source_id, target_id) in self.db.dangling_related_links()? {
+            warnings.push(format!(
+                "related[].id {target_id} introuvable dans l'index — lien pendant \
+                 (source {source_id}) : id erroné (typo ?) ou artifact supprimé/jamais créé"
+            ));
+        }
+
+        Ok(ReindexOutcome { count, warnings })
     }
 }
 
@@ -1832,10 +2306,12 @@ fn walk_yaml_files(dir: &Path, callback: &mut dyn FnMut(&Path)) {
 
 #[cfg(test)]
 mod tests {
+    use super::AUTHOR_PRODUCES_CUTOFF;
     use crate::error::OrchestratorError;
-    use crate::types::{PathPattern, ReviewRound, RoundStatus};
+    use crate::types::{ParsedRelation, PathPattern, ReviewRound, RoundStatus};
     use crate::{
-        ArtifactPath, ConsensusResult, Finding, OrchestratorDb, OrchestratorEngine, ReviewVerdict,
+        ArtifactPath, ConsensusResult, Finding, IndexedArtifact, OrchestratorDb,
+        OrchestratorEngine, ReviewVerdict,
     };
     use chrono::Utc;
     use companyos_config::{ArtifactKind, PersonaId};
@@ -3509,6 +3985,601 @@ mod tests {
         assert!(
             engine.list_active_permits().unwrap().is_empty(),
             "a consumed permit is not listed"
+        );
+    }
+
+    // ============================================================
+    // Mechanisms 16/17/19/21 (RFC 0197fbe5): warning families.
+    //
+    // These engine methods read the artifact YAML from disk + query the DB;
+    // they do NOT need the embedder. We therefore populate the index with
+    // `upsert_on_disk` (direct db upsert + fixture on disk) rather than
+    // `index_artifact` (which requires an embedder, absent in test mode).
+    // The `reindex_all` end-to-end wiring is exercised over the real corpus
+    // with a real embedder in tests/integration_search.rs.
+    // ============================================================
+
+    /// Upsert an artifact into the index AND write its YAML fixture to disk,
+    /// with relations and created_at, without needing an embedder.
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_on_disk(
+        engine: &mut OrchestratorEngine,
+        root: &RoadmapTestRoot,
+        id: &str,
+        kind: &str,
+        author: &str,
+        created_at: &str,
+        file_rel: &str,
+        content: &str,
+        relations: &[(&str, &str)],
+    ) -> IndexedArtifact {
+        root.write_raw(file_rel, content);
+        let artifact = crate::IndexedArtifact {
+            id: id.into(),
+            kind: kind.into(),
+            title: format!("title-{id}"),
+            description: String::new(),
+            tags: vec![],
+            file_path: file_rel.into(),
+            indexed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let rels: Vec<ParsedRelation> = relations
+            .iter()
+            .map(|(target, rel)| ParsedRelation {
+                target_id: (*target).into(),
+                relationship: (*rel).into(),
+            })
+            .collect();
+        engine
+            .db
+            .upsert_artifact_full(
+                &artifact,
+                content,
+                &test_dummy_embedding(),
+                &rels,
+                Some(author),
+                None,
+                Some(created_at),
+            )
+            .expect("upsert");
+        artifact
+    }
+
+    fn lesson_yaml(id: &str, author: &str, created_at: &str, related: Option<&str>) -> String {
+        let mut c = String::new();
+        c.push_str("api_version: companyos/v1\nkind: lesson-learned\nmetadata:\n");
+        c.push_str(&format!(
+            "  id: {id}\n  title: \"L {id}\"\n  author: {author}\n"
+        ));
+        c.push_str(&format!(
+            "  created_at: \"{created_at}\"\n  description: d\n"
+        ));
+        c.push_str("  tags:\n    - t\n");
+        if let Some(r) = related {
+            c.push_str(r);
+        }
+        c.push_str("spec:\n  context: c\n  insight: i\n  recommendation: r\n");
+        c
+    }
+
+    fn diag_yaml(
+        id: &str,
+        author: &str,
+        created_at: &str,
+        status: &str,
+        related: Option<&str>,
+    ) -> String {
+        let mut c = String::new();
+        c.push_str("api_version: companyos/v1\nkind: diagnostic-report\nmetadata:\n");
+        c.push_str(&format!(
+            "  id: {id}\n  title: \"D {id}\"\n  author: {author}\n"
+        ));
+        c.push_str(&format!(
+            "  created_at: \"{created_at}\"\n  description: d\n"
+        ));
+        c.push_str("  tags:\n    - t\n");
+        if let Some(r) = related {
+            c.push_str(r);
+        }
+        c.push_str(&format!("spec:\n  symptom: s\n  status: {status}\n"));
+        c
+    }
+
+    fn write_persona(root: &RoadmapTestRoot, id: &str, produces: &[&str]) {
+        std::fs::create_dir_all(root.path.join("company/personas")).ok();
+        let mut c = String::new();
+        c.push_str("api_version: companyos/v1\nkind: persona\nmetadata:\n");
+        c.push_str(&format!("  id: {id}\n  display_name: {id}\n"));
+        c.push_str("identity: >\n  x\nartifacts:\n  produces:");
+        if produces.is_empty() {
+            c.push_str(" []\n");
+        } else {
+            c.push('\n');
+            for p in produces {
+                c.push_str(&format!("    - {p}\n"));
+            }
+        }
+        c.push_str("  consumes:\n    - rfc\n");
+        root.write_raw(&format!("company/personas/{id}.yml"), &c);
+    }
+
+    // --- Mechanism 21: ReindexOutcome struct + bulk warning assembly ---
+
+    // EDGE: empty ReindexOutcome default is (0, []).
+    #[test]
+    fn test_reindex_outcome_default_empty() {
+        let o = crate::ReindexOutcome::default();
+        assert_eq!(o.count, 0);
+        assert!(o.warnings.is_empty());
+    }
+
+    // NOMINAL: dangling_related_links bulk pass surfaces exactly the pendant.
+    #[test]
+    fn test_dangling_related_links_nominal() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let a = "a0000000-0000-4000-8000-000000000001";
+        let dead = "dead0000-0000-4000-8000-000000000000";
+        upsert_on_disk(
+            &mut engine,
+            &root,
+            a,
+            "lesson-learned",
+            "implementer",
+            "2026-07-03",
+            &format!("company/lessons/{a}.yml"),
+            &lesson_yaml(a, "implementer", "2026-07-03", None),
+            &[(dead, "related")],
+        );
+        let pendants = engine.db.dangling_related_links().unwrap();
+        assert_eq!(pendants.len(), 1);
+        assert_eq!(pendants[0], (a.to_string(), dead.to_string()));
+    }
+
+    // NÉGATIF: all targets present -> no dangling link.
+    #[test]
+    fn test_dangling_related_links_clean() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let a = "a0000000-0000-4000-8000-000000000011";
+        let b = "a0000000-0000-4000-8000-000000000012";
+        upsert_on_disk(
+            &mut engine,
+            &root,
+            b,
+            "lesson-learned",
+            "implementer",
+            "2026-07-03",
+            &format!("company/lessons/{b}.yml"),
+            &lesson_yaml(b, "implementer", "2026-07-03", None),
+            &[],
+        );
+        upsert_on_disk(
+            &mut engine,
+            &root,
+            a,
+            "lesson-learned",
+            "implementer",
+            "2026-07-03",
+            &format!("company/lessons/{a}.yml"),
+            &lesson_yaml(a, "implementer", "2026-07-03", None),
+            &[(b, "related")],
+        );
+        assert!(engine.db.dangling_related_links().unwrap().is_empty());
+    }
+
+    // EDGE: bulk pass order-insensitive (target inserted AFTER source).
+    #[test]
+    fn test_dangling_related_links_order_insensitive() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let a = "a0000000-0000-4000-8000-000000000021";
+        let b = "a0000000-0000-4000-8000-000000000022";
+        // source first, pointing to b which does not exist yet.
+        upsert_on_disk(
+            &mut engine,
+            &root,
+            a,
+            "lesson-learned",
+            "implementer",
+            "2026-07-03",
+            &format!("company/lessons/{a}.yml"),
+            &lesson_yaml(a, "implementer", "2026-07-03", None),
+            &[(b, "related")],
+        );
+        assert_eq!(
+            engine.db.dangling_related_links().unwrap().len(),
+            1,
+            "b missing -> dangling"
+        );
+        // now b arrives -> no longer dangling.
+        upsert_on_disk(
+            &mut engine,
+            &root,
+            b,
+            "lesson-learned",
+            "implementer",
+            "2026-07-03",
+            &format!("company/lessons/{b}.yml"),
+            &lesson_yaml(b, "implementer", "2026-07-03", None),
+            &[],
+        );
+        assert!(
+            engine.db.dangling_related_links().unwrap().is_empty(),
+            "b present -> resolved"
+        );
+    }
+
+    // --- Mechanism 17: single-file related-integrity warnings ---
+
+    // NOMINAL: resolved related -> silent.
+    #[test]
+    fn test_related_integrity_resolved_silent() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let a = "c1000000-0000-4000-8000-000000000001";
+        let b = "c1000000-0000-4000-8000-000000000002";
+        upsert_on_disk(
+            &mut engine,
+            &root,
+            b,
+            "lesson-learned",
+            "implementer",
+            "2026-07-03",
+            &format!("company/lessons/{b}.yml"),
+            &lesson_yaml(b, "implementer", "2026-07-03", None),
+            &[],
+        );
+        let a_rel = format!("  related:\n    - id: {b}\n      relationship: related\n");
+        let a_art = upsert_on_disk(
+            &mut engine,
+            &root,
+            a,
+            "lesson-learned",
+            "implementer",
+            "2026-07-03",
+            &format!("company/lessons/{a}.yml"),
+            &lesson_yaml(a, "implementer", "2026-07-03", Some(&a_rel)),
+            &[(b, "related")],
+        );
+        assert!(
+            engine
+                .related_integrity_warnings(root.root_str(), &a_art)
+                .is_empty()
+        );
+    }
+
+    // NÉGATIF: dangling id warned; no-related silent.
+    #[test]
+    fn test_related_integrity_dangling_warned() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let a = "c1000000-0000-4000-8000-000000000011";
+        let dead = "dead1111-0000-4000-8000-000000000000";
+        let a_rel = format!("  related:\n    - id: {dead}\n      relationship: related\n");
+        let a_art = upsert_on_disk(
+            &mut engine,
+            &root,
+            a,
+            "lesson-learned",
+            "implementer",
+            "2026-07-03",
+            &format!("company/lessons/{a}.yml"),
+            &lesson_yaml(a, "implementer", "2026-07-03", Some(&a_rel)),
+            &[(dead, "related")],
+        );
+        let warns = engine.related_integrity_warnings(root.root_str(), &a_art);
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("dead1111"));
+
+        let n = "c1000000-0000-4000-8000-000000000012";
+        let n_art = upsert_on_disk(
+            &mut engine,
+            &root,
+            n,
+            "lesson-learned",
+            "implementer",
+            "2026-07-03",
+            &format!("company/lessons/{n}.yml"),
+            &lesson_yaml(n, "implementer", "2026-07-03", None),
+            &[],
+        );
+        assert!(
+            engine
+                .related_integrity_warnings(root.root_str(), &n_art)
+                .is_empty()
+        );
+    }
+
+    // EDGE: single-file surface on a fresh artifact whose target not yet
+    // indexed warns (documented transient false positive); the bulk SQL pass
+    // is the order-insensitive counterpart (tested above).
+    #[test]
+    fn test_related_integrity_single_file_transient() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let a = "c1000000-0000-4000-8000-000000000021";
+        let b = "c1000000-0000-4000-8000-000000000022";
+        let a_rel = format!("  related:\n    - id: {b}\n      relationship: related\n");
+        // b not yet indexed.
+        let a_art = upsert_on_disk(
+            &mut engine,
+            &root,
+            a,
+            "lesson-learned",
+            "implementer",
+            "2026-07-03",
+            &format!("company/lessons/{a}.yml"),
+            &lesson_yaml(a, "implementer", "2026-07-03", Some(&a_rel)),
+            &[(b, "related")],
+        );
+        assert_eq!(
+            engine
+                .related_integrity_warnings(root.root_str(), &a_art)
+                .len(),
+            1,
+            "transient single-file false positive documented"
+        );
+    }
+
+    // --- Mechanism 16: author-produces matrix ---
+
+    // NOMINAL: legitimate author-kind pairing -> silent.
+    #[test]
+    fn test_author_produces_legitimate_silent() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        write_persona(
+            &root,
+            "implementer",
+            &["lesson-learned", "diagnostic-report"],
+        );
+        let id = "d0000000-0000-4000-8000-000000000001";
+        let art = upsert_on_disk(
+            &mut engine,
+            &root,
+            id,
+            "lesson-learned",
+            "implementer",
+            "2026-07-20",
+            &format!("company/lessons/{id}.yml"),
+            &lesson_yaml(id, "implementer", "2026-07-20", None),
+            &[],
+        );
+        assert!(
+            engine
+                .author_produces_warnings(root.root_str(), &art)
+                .is_empty()
+        );
+    }
+
+    // NÉGATIF: kind not in produces warned; unknown author skipped silently.
+    #[test]
+    fn test_author_produces_violation_and_unknown_author() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        write_persona(&root, "pm", &["task-request"]);
+        let d = "d0000000-0000-4000-8000-000000000011";
+        let art = upsert_on_disk(
+            &mut engine,
+            &root,
+            d,
+            "diagnostic-report",
+            "pm",
+            "2026-07-20",
+            &format!("projects/x/diagnostic-reports/{d}.yml"),
+            &diag_yaml(d, "pm", "2026-07-20", "investigating", None),
+            &[],
+        );
+        let warns = engine.author_produces_warnings(root.root_str(), &art);
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("pm") && warns[0].contains("diagnostic-report"));
+
+        let d2 = "d0000000-0000-4000-8000-000000000012";
+        let art2 = upsert_on_disk(
+            &mut engine,
+            &root,
+            d2,
+            "diagnostic-report",
+            "ghost",
+            "2026-07-20",
+            &format!("projects/x/diagnostic-reports/{d2}.yml"),
+            &diag_yaml(d2, "ghost", "2026-07-20", "investigating", None),
+            &[],
+        );
+        assert!(
+            engine
+                .author_produces_warnings(root.root_str(), &art2)
+                .is_empty(),
+            "unknown author skipped"
+        );
+    }
+
+    // EDGE: system kind exempt; pre-cutoff exempt; == cutoff NOT exempt.
+    #[test]
+    fn test_author_produces_edge_exemptions() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        write_persona(&root, "pm", &["task-request"]);
+
+        // System kind (persona) -> exempt regardless of author/produces.
+        let pid = "arch";
+        write_persona(&root, pid, &["design-doc"]);
+        let persona_art = crate::IndexedArtifact {
+            id: pid.into(),
+            kind: "persona".into(),
+            title: "arch".into(),
+            description: String::new(),
+            tags: vec![],
+            file_path: format!("company/personas/{pid}.yml"),
+            indexed_at: chrono::Utc::now().to_rfc3339(),
+        };
+        assert!(
+            engine
+                .author_produces_warnings(root.root_str(), &persona_art)
+                .is_empty(),
+            "system kind persona exempt"
+        );
+
+        // Pre-cutoff diagnostic by pm (kind not produced) -> exempt.
+        let pre = "d0000000-0000-4000-8000-000000000021";
+        let art_pre = upsert_on_disk(
+            &mut engine,
+            &root,
+            pre,
+            "diagnostic-report",
+            "pm",
+            "2026-07-11",
+            &format!("projects/x/diagnostic-reports/{pre}.yml"),
+            &diag_yaml(pre, "pm", "2026-07-11", "investigating", None),
+            &[],
+        );
+        assert!(
+            engine
+                .author_produces_warnings(root.root_str(), &art_pre)
+                .is_empty(),
+            "pre-cutoff exempt"
+        );
+
+        // created_at == cutoff -> NOT exempt (strict bound).
+        let atc = "d0000000-0000-4000-8000-000000000022";
+        let art_atc = upsert_on_disk(
+            &mut engine,
+            &root,
+            atc,
+            "diagnostic-report",
+            "pm",
+            AUTHOR_PRODUCES_CUTOFF,
+            &format!("projects/x/diagnostic-reports/{atc}.yml"),
+            &diag_yaml(atc, "pm", AUTHOR_PRODUCES_CUTOFF, "investigating", None),
+            &[],
+        );
+        assert_eq!(
+            engine
+                .author_produces_warnings(root.root_str(), &art_atc)
+                .len(),
+            1,
+            "created_at == cutoff is NOT exempt"
+        );
+    }
+
+    // --- Mechanism 19: capitalization reminders + has_linked_lesson ---
+
+    // NOMINAL: resolved diagnostic WITH linked lesson -> silent.
+    #[test]
+    fn test_capitalization_resolved_with_lesson_silent() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let lesson = "e0000000-0000-4000-8000-000000000001";
+        let diag = "e0000000-0000-4000-8000-000000000002";
+        upsert_on_disk(
+            &mut engine,
+            &root,
+            lesson,
+            "lesson-learned",
+            "implementer",
+            "2026-07-20",
+            &format!("company/lessons/{lesson}.yml"),
+            &lesson_yaml(lesson, "implementer", "2026-07-20", None),
+            &[],
+        );
+        let d_rel = format!("  related:\n    - id: {lesson}\n      relationship: related\n");
+        let d_art = upsert_on_disk(
+            &mut engine,
+            &root,
+            diag,
+            "diagnostic-report",
+            "implementer",
+            "2026-07-20",
+            &format!("projects/x/diagnostic-reports/{diag}.yml"),
+            &diag_yaml(diag, "implementer", "2026-07-20", "resolved", Some(&d_rel)),
+            &[(lesson, "related")],
+        );
+        assert!(
+            engine
+                .capitalization_reminders(root.root_str(), &d_art)
+                .is_empty()
+        );
+    }
+
+    // NÉGATIF: resolved diagnostic WITHOUT lesson -> reminder.
+    #[test]
+    fn test_capitalization_resolved_without_lesson_reminded() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let diag = "e0000000-0000-4000-8000-000000000011";
+        let d_art = upsert_on_disk(
+            &mut engine,
+            &root,
+            diag,
+            "diagnostic-report",
+            "implementer",
+            "2026-07-20",
+            &format!("projects/x/diagnostic-reports/{diag}.yml"),
+            &diag_yaml(diag, "implementer", "2026-07-20", "resolved", None),
+            &[],
+        );
+        let rem = engine.capitalization_reminders(root.root_str(), &d_art);
+        assert_eq!(rem.len(), 1);
+        assert!(rem[0].contains("resolved sans lesson"));
+    }
+
+    // EDGE: has_linked_lesson detects BOTH directions; investigating silent.
+    #[test]
+    fn test_capitalization_edge_direction_and_status() {
+        let root = RoadmapTestRoot::new();
+        let mut engine = setup_engine();
+        let lesson = "e0000000-0000-4000-8000-000000000021";
+        let diag = "e0000000-0000-4000-8000-000000000022";
+        // diagnostic first (no relation of its own), then lesson references it.
+        let d_art = upsert_on_disk(
+            &mut engine,
+            &root,
+            diag,
+            "diagnostic-report",
+            "implementer",
+            "2026-07-20",
+            &format!("projects/x/diagnostic-reports/{diag}.yml"),
+            &diag_yaml(diag, "implementer", "2026-07-20", "resolved", None),
+            &[],
+        );
+        let l_rel = format!("  related:\n    - id: {diag}\n      relationship: related\n");
+        upsert_on_disk(
+            &mut engine,
+            &root,
+            lesson,
+            "lesson-learned",
+            "implementer",
+            "2026-07-20",
+            &format!("company/lessons/{lesson}.yml"),
+            &lesson_yaml(lesson, "implementer", "2026-07-20", Some(&l_rel)),
+            &[(diag, "related")],
+        );
+        assert!(
+            engine
+                .capitalization_reminders(root.root_str(), &d_art)
+                .is_empty(),
+            "linked lesson in the OTHER direction still counts (has_linked_lesson bidirectional)"
+        );
+
+        // investigating status -> silent even without lesson.
+        let diag2 = "e0000000-0000-4000-8000-000000000023";
+        let d2_art = upsert_on_disk(
+            &mut engine,
+            &root,
+            diag2,
+            "diagnostic-report",
+            "implementer",
+            "2026-07-20",
+            &format!("projects/x/diagnostic-reports/{diag2}.yml"),
+            &diag_yaml(diag2, "implementer", "2026-07-20", "investigating", None),
+            &[],
+        );
+        assert!(
+            engine
+                .capitalization_reminders(root.root_str(), &d2_art)
+                .is_empty(),
+            "investigating silent"
         );
     }
 }

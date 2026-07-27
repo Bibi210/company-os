@@ -127,6 +127,14 @@ struct GrantPermitParams {
         with = "Vec<String>"
     )]
     target_paths: Vec<PathPattern>,
+    /// Mechanism 15 (RFC 0197fbe5): affirm that the user approved a change that
+    /// a path-matchable human-review trigger flags (access matrix, ceo persona,
+    /// persona deletion). Absent/false + a matching trigger => grant refused.
+    #[serde(default)]
+    #[schemars(
+        description = "Set true ONLY after the user explicitly approved a change that a human-review trigger flags (mechanism 15). Ignored when no trigger matches."
+    )]
+    user_approval_confirmed: Option<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -459,12 +467,26 @@ fn check_worktree_clean(root: &str, target_paths: &[PathPattern]) -> WorktreeChe
 fn permit_response_json(
     permit: &companyos_orchestrator::WritePermit,
     sealed_commit: Option<&str>,
+    scope_warnings: &[String],
+    user_approval_confirmed: bool,
 ) -> String {
     let mut value = serde_json::to_value(permit).unwrap_or(serde_json::Value::Null);
-    if let (Some(hash), serde_json::Value::Object(map)) = (sealed_commit, &mut value) {
+    if let serde_json::Value::Object(map) = &mut value {
+        if let Some(hash) = sealed_commit {
+            map.insert(
+                "sealed_commit".to_string(),
+                serde_json::Value::String(hash.to_string()),
+            );
+        }
+        // Mechanism 14/18 (RFC 0197fbe5): non-blocking scope + gate warnings.
         map.insert(
-            "sealed_commit".to_string(),
-            serde_json::Value::String(hash.to_string()),
+            "scope_warnings".to_string(),
+            serde_json::json!(scope_warnings),
+        );
+        // Mechanism 15: echo the confirmation flag for the audit trail.
+        map.insert(
+            "user_approval_confirmed".to_string(),
+            serde_json::Value::Bool(user_approval_confirmed),
         );
     }
     serde_json::to_string_pretty(&value).unwrap_or_default()
@@ -919,10 +941,10 @@ impl OrchestratorServer {
         // a non-rfc artifact, or an unindexed id are all refused). Done BEFORE
         // the idempotence lookup so no permit is ever created for an
         // unapproved RFC.
-        match engine.get_artifact(&params.rfc_id.to_string()) {
+        let rfc_file_path: String = match engine.get_artifact(&params.rfc_id.to_string()) {
             Ok(Some(artifact)) if artifact.kind == "rfc" => {
                 match engine.read_artifact_status(&self.root_path, &artifact.file_path) {
-                    Ok(status) if status == "approved" => { /* proceed */ }
+                    Ok(status) if status == "approved" => artifact.file_path.clone(),
                     Ok(status) => {
                         return err(Diagnostic::error(C, "Write permit refused")
                             .with_context(format!("grant_write_permit(rfc_id={})", params.rfc_id))
@@ -971,6 +993,47 @@ impl OrchestratorServer {
                         .to_string(),
                 );
             }
+        };
+
+        // Mechanism 14/18 (RFC 0197fbe5): compute the non-blocking scope +
+        // gate warnings NOW — BEFORE the idempotence lookup — so they are
+        // present on BOTH the fresh-grant response AND the idempotent replay
+        // (which returns early below). Read the RFC YAML once for both M18 and
+        // the trigger evaluation.
+        let rfc_yaml: Option<serde_json::Value> =
+            engine.read_yaml_value(&self.root_path, &rfc_file_path);
+
+        let mut scope_warnings =
+            engine.rfc_scope_warnings(&self.root_path, &rfc_file_path, &params.target_paths);
+        if let Some(ref yaml) = rfc_yaml {
+            scope_warnings
+                .extend(engine.write_permit_gate_warnings(&params.rfc_id.to_string(), yaml));
+        }
+
+        // Mechanism 15 (RFC 0197fbe5): evaluate the path-matchable human-review
+        // triggers AFTER GARDE 4 and BEFORE idempotence. BLOCKING: a matching
+        // trigger without user_approval_confirmed refuses the grant; an
+        // unreadable/invalid triggers file also refuses (fail-safe).
+        let affected = rfc_yaml
+            .as_ref()
+            .and_then(companyos_orchestrator::OrchestratorEngine::extract_affected_files);
+        let confirmed = params.user_approval_confirmed.unwrap_or(false);
+        if let Err(e) = engine.evaluate_human_review_triggers(
+            &self.root_path,
+            &params.target_paths,
+            &affected,
+            confirmed,
+        ) {
+            return err(
+                Diagnostic::error(C, "Write permit refused: human review required")
+                    .with_context(format!("grant_write_permit(rfc_id={})", params.rfc_id))
+                    .with_reason(format!("{e}"))
+                    .with_fix(
+                        "Obtain the user's explicit approval, then retry with \
+                     user_approval_confirmed=true",
+                    )
+                    .to_string(),
+            );
         }
 
         // (a) IDEMPOTENCE (decision CEO 3): replaying the same grant key
@@ -982,9 +1045,21 @@ impl OrchestratorServer {
                 // it should already be in HEAD, so NothingToCommit is the
                 // expected success path here.
                 match self.seal_db_commit(existing.id, params.rfc_id) {
-                    Ok(hash) => return ok(permit_response_json(&existing, Some(&hash))),
+                    Ok(hash) => {
+                        return ok(permit_response_json(
+                            &existing,
+                            Some(&hash),
+                            &scope_warnings,
+                            confirmed,
+                        ));
+                    }
                     Err(SealError::NothingToCommit) => {
-                        return ok(permit_response_json(&existing, None));
+                        return ok(permit_response_json(
+                            &existing,
+                            None,
+                            &scope_warnings,
+                            confirmed,
+                        ));
                     }
                     Err(seal_err) => {
                         // Do NOT rollback — the existing permit predates
@@ -1045,7 +1120,12 @@ impl OrchestratorServer {
 
         // (d) SEAL: git add -f <db> + git commit.
         match self.seal_db_commit(permit.id, params.rfc_id) {
-            Ok(hash) => ok(permit_response_json(&permit, Some(&hash))),
+            Ok(hash) => ok(permit_response_json(
+                &permit,
+                Some(&hash),
+                &scope_warnings,
+                confirmed,
+            )),
             Err(seal_err) => {
                 // (d') A brand-new grant that yields NothingToCommit is an
                 //      anomaly: the insert did not materialize on disk.
@@ -1226,9 +1306,10 @@ impl OrchestratorServer {
         let validator = self.validator.read().await;
         match engine.index_artifact(&self.root_path, &params.path, &validator) {
             Ok(artifact) => {
-                // Mechanism 10c: warn when this artifact declares supersedes
-                // toward a target lacking the reciprocal superseded-by.
-                let warnings = engine.supersession_warnings(&self.root_path, &artifact);
+                // Mechanism 14d aggregator (RFC 0197fbe5): supersession (10c)
+                // + related-integrity (17a) + author-produces (16) +
+                // capitalization reminders (19c).
+                let warnings = engine.artifact_warnings(&self.root_path, &artifact);
                 let mut value = serde_json::to_value(&artifact).unwrap_or_default();
                 if let Some(obj) = value.as_object_mut() {
                     obj.insert("warnings".into(), serde_json::json!(warnings));
@@ -1463,7 +1544,7 @@ impl OrchestratorServer {
         let validator = self.validator.read().await;
         match engine.index_artifact(&self.root_path, &params.path, &validator) {
             Ok(artifact) => {
-                let warnings = engine.supersession_warnings(&self.root_path, &artifact);
+                let warnings = engine.artifact_warnings(&self.root_path, &artifact);
                 ok(serde_json::to_string_pretty(&serde_json::json!({
                     "indexed": true,
                     "id": artifact.id,
@@ -1489,9 +1570,10 @@ impl OrchestratorServer {
         let mut engine = self.engine.lock().await;
         let validator = self.validator.read().await;
         match engine.reindex_all(&self.root_path, &validator) {
-            Ok(count) => ok(serde_json::to_string_pretty(&serde_json::json!({
+            Ok(outcome) => ok(serde_json::to_string_pretty(&serde_json::json!({
                 "reindexed": true,
-                "count": count,
+                "count": outcome.count,
+                "warnings": outcome.warnings,
             }))
             .unwrap_or_default()),
             Err(e) => err(Diagnostic::error(C, "Failed to reindex")
@@ -1788,8 +1870,10 @@ fn run_index(file_path: &str) -> anyhow::Result<()> {
                 Diagnostic::info(C, format!("Indexed: {} ({})", artifact.id, artifact.kind))
                     .with_context(format!("index_artifact(path={file_path})"))
             );
-            // Mechanism 10c: surface supersession asymmetry warnings on stderr.
-            for w in engine.supersession_warnings(&root, &artifact) {
+            // Mechanism 14d aggregator (RFC 0197fbe5): surface all single-file
+            // warnings (supersession 10c, related-integrity 17a, author-produces
+            // 16, capitalization reminders 19c) on stderr.
+            for w in engine.artifact_warnings(&root, &artifact) {
                 eprintln!(
                     "{}",
                     Diagnostic::warning(C, w)
@@ -1906,7 +1990,8 @@ async fn run_server() -> anyhow::Result<()> {
             let validator_guard = validator.read().await;
             let count = new_engine
                 .reindex_all(&root, &validator_guard)
-                .map_err(|e| anyhow::anyhow!("rebuild reindex_all failed: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("rebuild reindex_all failed: {e}"))?
+                .count;
             drop(validator_guard);
             eprintln!(
                 "[companyos:{C}] Database rebuilt from YAML index — {count} artifacts re-indexed"
@@ -1928,7 +2013,8 @@ async fn run_server() -> anyhow::Result<()> {
         let validator_guard = validator.read().await;
         let count = e
             .reindex_all(&root, &validator_guard)
-            .map_err(|e| anyhow::anyhow!("post-migrate reindex_all failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("post-migrate reindex_all failed: {e}"))?
+            .count;
         drop(validator_guard);
         eprintln!(
             "[companyos:{C}] Post-migration reindex completed ({count} artifacts) — drift: fts={fts_drift} model={model_drift}"
@@ -1967,7 +2053,10 @@ async fn run_server() -> anyhow::Result<()> {
         async move {
             let mut engine = engine.lock().await;
             let validator = validator.read().await;
-            let count = engine.reindex_all(&root, &validator).unwrap_or(0);
+            let count = engine
+                .reindex_all(&root, &validator)
+                .map(|o| o.count)
+                .unwrap_or(0);
             if count > 0 {
                 tracing::info!("Indexed {count} artifact(s) on startup");
             }
@@ -2048,8 +2137,14 @@ async fn run_server() -> anyhow::Result<()> {
                                 let mut engine = engine.lock().await;
                                 let validator = validator.read().await;
                                 match engine.reindex_all(&root, &validator) {
-                                    Ok(count) => {
-                                        tracing::info!("Auto-reindexed {count} artifact(s)")
+                                    Ok(outcome) => {
+                                        tracing::info!(
+                                            "Auto-reindexed {} artifact(s)",
+                                            outcome.count
+                                        );
+                                        for w in &outcome.warnings {
+                                            tracing::warn!("reindex warning: {w}");
+                                        }
                                     }
                                     Err(e) => tracing::warn!("Auto-reindex failed: {e}"),
                                 }
@@ -2290,15 +2385,36 @@ mod tests {
     /// default APPROVED RFC fixture (so grant tests pass GARDE 4) and returns
     /// its id. Returns (server, ceo_token, approved_rfc_id).
     async fn setup_server(root: &Path) -> (OrchestratorServer, String, Uuid) {
+        setup_server_seeded(root, |_db, _root| {}).await
+    }
+
+    /// Like `setup_server` but runs `seed` against the db BEFORE the engine
+    /// takes ownership, so tests can inject custom RFC fixtures (mechanism
+    /// 14/15/18). Returns the same triple; the closure adds its own artifacts.
+    async fn setup_server_seeded<F>(root: &Path, seed: F) -> (OrchestratorServer, String, Uuid)
+    where
+        F: FnOnce(&mut OrchestratorDb, &Path),
+    {
         let db_dir = root.join(constants::DATA_DIR);
         std::fs::create_dir_all(&db_dir).unwrap();
         let db_path = db_dir.join(constants::DB_FILENAME);
         let mut db = OrchestratorDb::open(&db_path).unwrap();
         db.migrate().unwrap();
+        // Mechanism 15 (RFC 0197fbe5): the real root always ships a
+        // human-review-triggers.yml; the grant path fail-safe-refuses without
+        // it. Write a default one so pre-existing grant tests keep passing (a
+        // test wanting the fail-safe path overwrites/removes it explicitly).
+        if !root
+            .join("company/config/human-review-triggers.yml")
+            .exists()
+        {
+            write_triggers_file(root);
+        }
         // Seed a default approved RFC BEFORE the engine takes ownership of db
         // (GARDE 4: grant_write_permit now requires an indexed approved RFC).
         let approved_rfc = Uuid::new_v4();
         seed_artifact(&mut db, root, approved_rfc, "rfc", "approved");
+        seed(&mut db, root);
         let engine = OrchestratorEngine::new_without_embedder(db, 3);
         // Validator points at an empty schemas dir (never exercised by the
         // permit path).
@@ -2325,11 +2441,21 @@ mod tests {
     }
 
     fn grant_params(token: &str, rfc: Uuid, paths: Vec<&str>) -> Parameters<GrantPermitParams> {
+        grant_params_confirmed(token, rfc, paths, None)
+    }
+
+    fn grant_params_confirmed(
+        token: &str,
+        rfc: Uuid,
+        paths: Vec<&str>,
+        user_approval_confirmed: Option<bool>,
+    ) -> Parameters<GrantPermitParams> {
         Parameters(GrantPermitParams {
             token: token.to_string(),
             rfc_id: rfc,
             granted_to: PersonaId::Implementer,
             target_paths: paths.into_iter().map(|p| PathPattern(p.into())).collect(),
+            user_approval_confirmed,
         })
     }
 
@@ -2548,6 +2674,8 @@ mod tests {
         let tmp = LocalTempDir::new("grant-coexist");
         init_git_repo(tmp.path());
         let root = tmp.path();
+        // Mechanism 15: the grant path needs a triggers file (fail-safe).
+        write_triggers_file(root);
 
         // Two distinct approved RFCs (GARDE 4 requires each grant's rfc_id to
         // reference an indexed approved RFC). Seed both BEFORE the engine owns
@@ -3116,5 +3244,414 @@ mod tests {
             .unwrap();
         assert_eq!(res.is_error, Some(true));
         assert!(result_text(&res).contains("supersede"));
+    }
+
+    // =====================================================================
+    // Mechanisms 14 / 15 / 18 (RFC 0197fbe5): grant-time scope pre-check,
+    // human-review triggers, write_permit_gate.
+    // =====================================================================
+
+    /// Seed an approved RFC with a FORME-B affected_files block (modified /
+    /// created / deleted) and index it. Returns the rfc id.
+    fn seed_rfc_with_affected(
+        db: &mut OrchestratorDb,
+        root: &Path,
+        modified: &[&str],
+        created: &[&str],
+        deleted: &[&str],
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        let dir = "company/rfcs";
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+        let file_path = format!("{dir}/{id}.yml");
+        let mut y = String::new();
+        y.push_str("api_version: companyos/v1\nkind: rfc\nmetadata:\n");
+        y.push_str(&format!(
+            "  id: {id}\n  title: Fixture\n  author: architect\n"
+        ));
+        y.push_str("  created_at: \"2026-07-20\"\n  status: approved\n");
+        y.push_str("spec:\n  motivation: m\n  proposal: p\n  impact: i\n");
+        y.push_str("  affected_files:\n");
+        let list = |k: &str, v: &[&str]| -> String {
+            if v.is_empty() {
+                String::new()
+            } else {
+                let mut s = format!("    {k}:\n");
+                for f in v {
+                    s.push_str(&format!("      - {f}\n"));
+                }
+                s
+            }
+        };
+        y.push_str(&list("modified", modified));
+        y.push_str(&list("created", created));
+        y.push_str(&list("deleted", deleted));
+        std::fs::write(root.join(&file_path), y).unwrap();
+        let artifact = IndexedArtifact {
+            id: id.to_string(),
+            kind: "rfc".into(),
+            title: "Fixture".into(),
+            description: String::new(),
+            tags: vec![],
+            file_path,
+            indexed_at: "2026-07-20T00:00:00Z".into(),
+        };
+        db.upsert_artifact(&artifact, "", &vec![0.0f32; EMBEDDING_DIM], &[])
+            .expect("seed rfc");
+        id
+    }
+
+    /// Write a human-review-triggers.yml with the three path-matchable triggers.
+    fn write_triggers_file(root: &Path) {
+        let dir = root.join("company/config");
+        std::fs::create_dir_all(&dir).unwrap();
+        let content = r#"api_version: companyos/v1
+kind: human-review-triggers
+metadata:
+  id: c7ce9b0f-6d47-4ad6-bda1-493e1432321c
+  title: Human Review Triggers
+  author: ceo
+  created_at: "2026-03-14"
+spec:
+  triggers:
+    - condition: rfc modifies access matrix
+      action: escalate_user
+      description: x
+      match:
+        paths:
+          - company/config/protected-zones.json
+        on: any
+    - condition: rfc modifies ceo persona
+      action: escalate_user
+      description: x
+      match:
+        paths:
+          - company/personas/ceo.yml
+        on: any
+    - condition: rfc introduces breaking schema change
+      action: escalate_user
+      description: x
+    - condition: rfc deletes persona
+      action: escalate_user
+      description: x
+      match:
+        paths:
+          - company/personas/*
+        on: deleted
+"#;
+        std::fs::write(dir.join("human-review-triggers.yml"), content).unwrap();
+    }
+
+    fn json_of(res: &CallToolResult) -> serde_json::Value {
+        serde_json::from_str(&result_text(res)).unwrap()
+    }
+
+    /// Cell to capture the seeded RFC id from inside the seed closure.
+    fn rfc_cell() -> std::sync::Arc<std::sync::Mutex<Uuid>> {
+        std::sync::Arc::new(std::sync::Mutex::new(Uuid::nil()))
+    }
+
+    // M14 NOMINAL: covered affected_files -> no scope warning.
+    #[tokio::test]
+    async fn test_m14_scope_covered_no_warning() {
+        let tmp = LocalTempDir::new("m14-covered");
+        init_git_repo(tmp.path());
+        write_triggers_file(tmp.path());
+        let cell = rfc_cell();
+        let c2 = cell.clone();
+        let (server, token, _default) = setup_server_seeded(tmp.path(), move |db, root| {
+            *c2.lock().unwrap() =
+                seed_rfc_with_affected(db, root, &["crates/x/src/a.rs"], &[], &[]);
+        })
+        .await;
+        let rfc = *cell.lock().unwrap();
+        let res = server
+            .grant_write_permit(grant_params(&token, rfc, vec!["crates/x/src/a.rs"]))
+            .await
+            .unwrap();
+        assert_ne!(res.is_error, Some(true), "{}", result_text(&res));
+        let v = json_of(&res);
+        let sw = v.get("scope_warnings").unwrap().as_array().unwrap();
+        // M14 scope gap must be absent (a.rs is covered). A separate M18 gate
+        // warning may appear (code RFC without linked plan) — that is not a
+        // scope-coverage warning.
+        assert!(
+            !sw.iter().any(|w| w
+                .as_str()
+                .unwrap()
+                .contains("n'est couvert par aucun target_path")),
+            "no M14 coverage gap expected: {sw:?}"
+        );
+    }
+
+    // M14 NÉGATIF: uncovered affected_file -> scope warning; grant still ok.
+    #[tokio::test]
+    async fn test_m14_scope_gap_warns_not_refused() {
+        let tmp = LocalTempDir::new("m14-gap");
+        init_git_repo(tmp.path());
+        write_triggers_file(tmp.path());
+        let cell = rfc_cell();
+        let c2 = cell.clone();
+        let (server, token, _default) = setup_server_seeded(tmp.path(), move |db, root| {
+            *c2.lock().unwrap() = seed_rfc_with_affected(
+                db,
+                root,
+                &["crates/x/src/a.rs", "crates/x/src/b.rs"],
+                &[],
+                &[],
+            );
+        })
+        .await;
+        let rfc = *cell.lock().unwrap();
+        // permit covers only a.rs -> b.rs is a gap.
+        let res = server
+            .grant_write_permit(grant_params(&token, rfc, vec!["crates/x/src/a.rs"]))
+            .await
+            .unwrap();
+        assert_ne!(res.is_error, Some(true), "grant NEVER refused for a gap");
+        let v = json_of(&res);
+        let sw = v.get("scope_warnings").unwrap().as_array().unwrap();
+        assert!(
+            sw.iter().any(|w| w.as_str().unwrap().contains("b.rs")),
+            "gap on b.rs must be signalled: {sw:?}"
+        );
+    }
+
+    // M14 EDGE: idempotent replay ALSO carries scope_warnings; RFC without
+    // affected_files -> dedicated warning.
+    #[tokio::test]
+    async fn test_m14_idempotent_replay_and_no_affected() {
+        let tmp = LocalTempDir::new("m14-edge");
+        init_git_repo(tmp.path());
+        write_triggers_file(tmp.path());
+        let (server, token, default_rfc) = setup_server(tmp.path()).await;
+        // default_rfc has NO affected_files -> dedicated warning.
+        let res = server
+            .grant_write_permit(grant_params(&token, default_rfc, vec!["crates/x/src/a.rs"]))
+            .await
+            .unwrap();
+        let v = json_of(&res);
+        let sw = v.get("scope_warnings").unwrap().as_array().unwrap();
+        assert!(
+            sw.iter().any(|w| w
+                .as_str()
+                .unwrap()
+                .contains("ne déclare pas affected_files")),
+            "no-affected warning: {sw:?}"
+        );
+        // Replay the SAME grant key -> idempotent, still carries scope_warnings.
+        let res2 = server
+            .grant_write_permit(grant_params(&token, default_rfc, vec!["crates/x/src/a.rs"]))
+            .await
+            .unwrap();
+        let v2 = json_of(&res2);
+        assert!(
+            v2.get("scope_warnings").is_some(),
+            "idempotent replay must still carry scope_warnings"
+        );
+    }
+
+    // M15 NOMINAL: ordinary grant with no trigger match and no flag -> accepted;
+    // grant with user_approval_confirmed=true echoes the flag.
+    #[tokio::test]
+    async fn test_m15_ordinary_grant_and_confirmed_echo() {
+        let tmp = LocalTempDir::new("m15-ok");
+        init_git_repo(tmp.path());
+        write_triggers_file(tmp.path());
+        let cell = rfc_cell();
+        let c2 = cell.clone();
+        let (server, token, _d) = setup_server_seeded(tmp.path(), move |db, root| {
+            *c2.lock().unwrap() =
+                seed_rfc_with_affected(db, root, &["crates/x/src/a.rs"], &[], &[]);
+        })
+        .await;
+        let rfc = *cell.lock().unwrap();
+        let res = server
+            .grant_write_permit(grant_params_confirmed(
+                &token,
+                rfc,
+                vec!["crates/x/src/a.rs"],
+                Some(true),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(res.is_error, Some(true));
+        let v = json_of(&res);
+        assert_eq!(
+            v.get("user_approval_confirmed").unwrap(),
+            &serde_json::json!(true)
+        );
+    }
+
+    // M15 NÉGATIF: grant whose target_paths cover ceo.yml is refused without flag.
+    #[tokio::test]
+    async fn test_m15_ceo_persona_refused_without_flag() {
+        let tmp = LocalTempDir::new("m15-ceo");
+        init_git_repo(tmp.path());
+        write_triggers_file(tmp.path());
+        let cell = rfc_cell();
+        let c2 = cell.clone();
+        let (server, token, _d) = setup_server_seeded(tmp.path(), move |db, root| {
+            *c2.lock().unwrap() =
+                seed_rfc_with_affected(db, root, &["company/personas/ceo.yml"], &[], &[]);
+        })
+        .await;
+        let rfc = *cell.lock().unwrap();
+        let res = server
+            .grant_write_permit(grant_params(&token, rfc, vec!["company/personas/ceo.yml"]))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true), "must refuse without flag");
+        assert!(result_text(&res).contains("human review"));
+
+        // With the flag -> accepted.
+        let res2 = server
+            .grant_write_permit(grant_params_confirmed(
+                &token,
+                rfc,
+                vec!["company/personas/ceo.yml"],
+                Some(true),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(
+            res2.is_error,
+            Some(true),
+            "flag unblocks: {}",
+            result_text(&res2)
+        );
+    }
+
+    // M15 NÉGATIF: deleted persona (affected_files.deleted) refused without flag.
+    #[tokio::test]
+    async fn test_m15_deleted_persona_refused_without_flag() {
+        let tmp = LocalTempDir::new("m15-del");
+        init_git_repo(tmp.path());
+        write_triggers_file(tmp.path());
+        let cell = rfc_cell();
+        let c2 = cell.clone();
+        let (server, token, _d) = setup_server_seeded(tmp.path(), move |db, root| {
+            *c2.lock().unwrap() =
+                seed_rfc_with_affected(db, root, &[], &[], &["company/personas/architect.yml"]);
+        })
+        .await;
+        let rfc = *cell.lock().unwrap();
+        let res = server
+            .grant_write_permit(grant_params(&token, rfc, vec!["crates/x/src/a.rs"]))
+            .await
+            .unwrap();
+        assert_eq!(res.is_error, Some(true), "deleted persona must trigger");
+        assert!(result_text(&res).contains("human review"));
+    }
+
+    // M15 NÉGATIF: unreadable triggers file -> fail-safe refuse.
+    #[tokio::test]
+    async fn test_m15_triggers_unreadable_failsafe() {
+        let tmp = LocalTempDir::new("m15-failsafe");
+        init_git_repo(tmp.path());
+        let cell = rfc_cell();
+        let c2 = cell.clone();
+        let (server, token, _d) = setup_server_seeded(tmp.path(), move |db, root| {
+            *c2.lock().unwrap() =
+                seed_rfc_with_affected(db, root, &["crates/x/src/a.rs"], &[], &[]);
+        })
+        .await;
+        // Remove the default triggers file so the fail-safe path is exercised.
+        std::fs::remove_file(tmp.path().join("company/config/human-review-triggers.yml")).unwrap();
+        let rfc = *cell.lock().unwrap();
+        let res = server
+            .grant_write_permit(grant_params(&token, rfc, vec!["crates/x/src/a.rs"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.is_error,
+            Some(true),
+            "missing triggers file -> fail-safe refuse"
+        );
+        assert!(result_text(&res).contains("human review"));
+    }
+
+    // M15 EDGE: a glob target_path covering ceo.yml fires (conservative).
+    #[tokio::test]
+    async fn test_m15_glob_target_covers_ceo_fires() {
+        let tmp = LocalTempDir::new("m15-glob");
+        init_git_repo(tmp.path());
+        write_triggers_file(tmp.path());
+        let cell = rfc_cell();
+        let c2 = cell.clone();
+        let (server, token, _d) = setup_server_seeded(tmp.path(), move |db, root| {
+            *c2.lock().unwrap() =
+                seed_rfc_with_affected(db, root, &["crates/x/src/a.rs"], &[], &[]);
+        })
+        .await;
+        let rfc = *cell.lock().unwrap();
+        // target glob company/personas/* covers ceo.yml -> fires via_target.
+        let res = server
+            .grant_write_permit(grant_params(&token, rfc, vec!["company/personas/*"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.is_error,
+            Some(true),
+            "glob covering ceo.yml must fire (conservative)"
+        );
+    }
+
+    // M18 NÉGATIF: RFC touching code with NO linked plan -> gate warning.
+    #[tokio::test]
+    async fn test_m18_no_plan_warns() {
+        let tmp = LocalTempDir::new("m18-noplan");
+        init_git_repo(tmp.path());
+        write_triggers_file(tmp.path());
+        let cell = rfc_cell();
+        let c2 = cell.clone();
+        let (server, token, _d) = setup_server_seeded(tmp.path(), move |db, root| {
+            *c2.lock().unwrap() =
+                seed_rfc_with_affected(db, root, &["crates/x/src/a.rs"], &[], &[]);
+        })
+        .await;
+        let rfc = *cell.lock().unwrap();
+        let res = server
+            .grant_write_permit(grant_params(&token, rfc, vec!["crates/x/src/a.rs"]))
+            .await
+            .unwrap();
+        let v = json_of(&res);
+        let sw = v.get("scope_warnings").unwrap().as_array().unwrap();
+        assert!(
+            sw.iter()
+                .any(|w| w.as_str().unwrap().contains("write_permit_gate")),
+            "code RFC without plan -> gate warning: {sw:?}"
+        );
+    }
+
+    // M18 EDGE: RFC touching only YAML (not crates/plugins) -> gate NOT evaluated.
+    #[tokio::test]
+    async fn test_m18_pure_yaml_not_evaluated() {
+        let tmp = LocalTempDir::new("m18-yaml");
+        init_git_repo(tmp.path());
+        write_triggers_file(tmp.path());
+        let cell = rfc_cell();
+        let c2 = cell.clone();
+        let (server, token, _d) = setup_server_seeded(tmp.path(), move |db, root| {
+            *c2.lock().unwrap() =
+                seed_rfc_with_affected(db, root, &["company/config/flow-control.yml"], &[], &[]);
+        })
+        .await;
+        let rfc = *cell.lock().unwrap();
+        let res = server
+            .grant_write_permit(grant_params(
+                &token,
+                rfc,
+                vec!["company/config/flow-control.yml"],
+            ))
+            .await
+            .unwrap();
+        let v = json_of(&res);
+        let sw = v.get("scope_warnings").unwrap().as_array().unwrap();
+        assert!(
+            !sw.iter()
+                .any(|w| w.as_str().unwrap().contains("write_permit_gate")),
+            "pure-YAML RFC must not be gate-evaluated: {sw:?}"
+        );
     }
 }

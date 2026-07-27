@@ -213,7 +213,8 @@ fn quality_eval_real_corpus() {
     let started = std::time::Instant::now();
     let indexed = engine
         .reindex_all(&root, &validator)
-        .expect("reindex_all on real corpus");
+        .expect("reindex_all on real corpus")
+        .count;
     let reindex_ms = started.elapsed().as_millis();
     println!(
         "[bench] indexed {indexed} artifacts in {reindex_ms} ms (avg {} ms/artifact)",
@@ -393,7 +394,8 @@ fn bench_search_latency_10x_corpus() {
     // 1. Reindex the real corpus.
     let real_count = engine
         .reindex_all(&root, &validator)
-        .expect("reindex real corpus");
+        .expect("reindex real corpus")
+        .count;
     println!("[bench:10x] real corpus: {real_count} artifacts");
 
     // 2. Generate synthetic duplicates by reading the real YAMLs and

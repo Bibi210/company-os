@@ -1356,6 +1356,80 @@ impl OrchestratorDb {
         Ok(results)
     }
 
+    /// Mechanism 17b (RFC 0197fbe5) — bulk dangling-related detection.
+    /// One SQL pass over the fully-populated index: every relation whose
+    /// `target_id` is not itself an indexed artifact is a dangling link.
+    /// Order-insensitive by construction (the whole corpus is indexed before
+    /// this runs), unlike the single-file surface which can produce a
+    /// transient false positive for two mutually-referencing new artifacts.
+    /// Returns `(source_id, target_id)` pairs. Uses `idx_relations_target`.
+    pub fn dangling_related_links(&self) -> Result<Vec<(String, String)>, OrchestratorError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source_id, target_id FROM artifact_relations \
+             WHERE target_id NOT IN (SELECT id FROM artifacts)",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Mechanism 19a (RFC 0197fbe5) — does artifact `id` have any relation
+    /// (either direction) to an artifact of kind `lesson-learned`? Backs the
+    /// non-blocking capitalization reminders on `rfc_set_implemented` and on a
+    /// resolved diagnostic-report. Uses the bidirectional relation table with
+    /// a join on the artifacts kind.
+    pub fn has_linked_lesson(&self, id: &str) -> Result<bool, OrchestratorError> {
+        let found: bool = self.conn.query_row(
+            "SELECT EXISTS(\
+               SELECT 1 FROM artifact_relations r \
+               JOIN artifacts a \
+                 ON a.id = CASE WHEN r.source_id = ?1 THEN r.target_id ELSE r.source_id END \
+               WHERE (r.source_id = ?1 OR r.target_id = ?1) \
+                 AND a.kind = 'lesson-learned')",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(found)
+    }
+
+    /// Mechanism 18a (RFC 0197fbe5) — list every review round whose
+    /// `artifact_path` matches `path` (relative form, same shape as the index
+    /// `file_path`). Backs `write_permit_gate`: given an implementation-plan's
+    /// file_path, find its rounds to check for a Closed + consensus one.
+    pub fn list_rounds_by_artifact_path(
+        &self,
+        path: &str,
+    ) -> Result<Vec<ReviewRound>, OrchestratorError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, artifact_path, artifact_kind, author, required_reviewers, status, \
+             iteration, max_iterations, votes, created_at, updated_at \
+             FROM review_rounds WHERE artifact_path = ?1",
+        )?;
+        let rows = stmt.query_map(params![path], |row| {
+            Ok(RoundRow {
+                id: row.get(0)?,
+                artifact_path: row.get(1)?,
+                artifact_kind: row.get(2)?,
+                author: row.get(3)?,
+                required_reviewers: row.get(4)?,
+                status: row.get(5)?,
+                iteration: row.get(6)?,
+                max_iterations: row.get(7)?,
+                votes: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?.into_round()?);
+        }
+        Ok(out)
+    }
+
     /// Return the three table counts (`artifacts`, `artifacts_fts`,
     /// `artifacts_vec`) for [`crate::engine::IndexStatusGlobal`].
     pub fn index_table_counts(&self) -> Result<(usize, usize, usize), OrchestratorError> {
@@ -1468,7 +1542,13 @@ fn normalized_path_set(paths: &[PathPattern]) -> Vec<String> {
     set
 }
 
-fn path_matches(pattern: &PathPattern, path: &str) -> bool {
+/// Match a permit path pattern against a concrete path (exact, `dir/` prefix,
+/// or glob). Made `pub(crate)` (mechanism 14, RFC 0197fbe5) so the engine's
+/// `rfc_scope_warnings` and the trigger evaluation reuse the SAME semantics as
+/// the permit checker — NOT a 4th independent implementation (the full
+/// unification is reserved for v1-harness-refactor). Single internal caller
+/// besides these: `check_permit` (L778).
+pub(crate) fn path_matches(pattern: &PathPattern, path: &str) -> bool {
     let pat = &pattern.0;
     if pat == path {
         return true;

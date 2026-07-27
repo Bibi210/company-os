@@ -120,4 +120,19 @@ pub enum OrchestratorError {
 
     #[error("Anthropic API key required for {feature} (set ANTHROPIC_API_KEY)")]
     AnthropicKeyMissing { feature: String },
+
+    #[error(
+        "Write permit refused: {count} human-review trigger(s) matched and require explicit \
+         user approval:\n{triggers}\nFix: obtain the user's approval for this change, then call \
+         grant_write_permit again with user_approval_confirmed=true (mechanism 15, RFC 0197fbe5)."
+    )]
+    HumanReviewTriggered { count: usize, triggers: String },
+
+    #[error(
+        "Write permit refused: the human-review-triggers file could not be read or parsed \
+         ({reason}). A trigger guard that cannot be evaluated does not let the grant through \
+         (fail-safe, GARDE 3 philosophy). Fix: repair company/config/human-review-triggers.yml \
+         then retry."
+    )]
+    HumanReviewTriggersUnreadable { reason: String },
 }

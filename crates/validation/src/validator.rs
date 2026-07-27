@@ -16,6 +16,13 @@ pub struct ValidationReport {
     pub warnings: Vec<String>,
 }
 
+/// Mechanism 20a (RFC 0197fbe5): the exact generated file exempted from
+/// validation. `company/config/personas.yml` is auto-generated from the
+/// persona YAML files (see the defense-in-depth wrapper) and carries NO
+/// `api_version`, so `validate_yaml_str` would reject it with
+/// `InvalidApiVersion`. It is a generated artifact, not a CompanyOS artifact.
+const PERSONAS_YML_EXEMPTION: &str = "company/config/personas.yml";
+
 /// Main validation entry point.
 pub struct ArtifactValidator {
     registry: SchemaRegistry,
@@ -58,11 +65,48 @@ impl ArtifactValidator {
 
     /// Validate a YAML file. When a root is configured and `path` resolves
     /// under it, kind↔path placement is enforced as a blocking error.
+    ///
+    /// Mechanism 20a (RFC 0197fbe5): `company/config/personas.yml` is EXEMPT.
+    /// The check is placed EN TÊTE (before read_to_string / validate_yaml_str)
+    /// because the generated file has no `api_version` and would otherwise be
+    /// rejected with `InvalidApiVersion`. ROOT-GATED: the exemption resolves
+    /// the relative path via the same canonicalize + strip_prefix machinery as
+    /// the placement check, so it only applies when a root is configured. A
+    /// schema-only validator (no `with_root`, e.g. some integration tests) does
+    /// NOT apply the exemption and still returns `Err(InvalidApiVersion)` on
+    /// personas.yml — a documented, harmless behaviour (the shipped-artifacts
+    /// test already accepts both Ok-valid and Err-InvalidApiVersion).
     pub fn validate_file(&self, path: &Path) -> Result<ValidationReport, ValidationError> {
+        if self.is_personas_yml_exemption(path) {
+            return Ok(ValidationReport {
+                kind: ArtifactKind::Persona,
+                id: ArtifactId("company/config/personas.yml".to_string()),
+                is_valid: true,
+                errors: Vec::new(),
+                warnings: vec!["generated file, skipped (not an artifact)".to_string()],
+            });
+        }
         let content = std::fs::read_to_string(path)?;
         let mut report = self.validate_yaml_str(&content)?;
         self.check_placement(path, &mut report);
         Ok(report)
+    }
+
+    /// Mechanism 20a (RFC 0197fbe5): does `path` resolve EXACTLY onto
+    /// `company/config/personas.yml` under the configured root? Root-gated: a
+    /// validator without `with_root` returns false (no exemption). Uses the
+    /// same canonicalize + strip_prefix resolution as `check_placement`.
+    fn is_personas_yml_exemption(&self, path: &Path) -> bool {
+        let Some(root) = &self.root else {
+            return false;
+        };
+        let (Ok(root_c), Ok(path_c)) = (root.canonicalize(), path.canonicalize()) else {
+            return false;
+        };
+        let Ok(rel) = path_c.strip_prefix(&root_c) else {
+            return false;
+        };
+        rel.to_str() == Some(PERSONAS_YML_EXEMPTION)
     }
 
     /// Batch validate all YAML files under a directory (recursive).
@@ -438,5 +482,81 @@ spec:
         );
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&other).ok();
+    }
+
+    // --- Mechanism 20a: personas.yml exemption ---
+
+    // Content WITHOUT api_version (like the real generated personas.yml).
+    const PERSONAS_YML_CONTENT: &str =
+        "# Auto-generated — do not edit manually\narchitect:\n  role: x\n";
+
+    // NOMINAL: with root, company/config/personas.yml is exempted (valid report
+    // with the note), WITHOUT parsing the content.
+    #[test]
+    fn test_personas_yml_exemption_with_root() {
+        let tmp = std::env::temp_dir().join(format!("personas-exempt-{}", std::process::id()));
+        let dir = tmp.join("company/config");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("personas.yml");
+        std::fs::write(&file, PERSONAS_YML_CONTENT).unwrap();
+
+        let validator = setup_validator_with_root(&tmp);
+        let report = validator.validate_file(&file).unwrap();
+        assert!(report.is_valid, "personas.yml must be exempted (valid)");
+        assert!(
+            report.warnings.iter().any(|w| w.contains("generated file")),
+            "exemption note present: {:?}",
+            report.warnings
+        );
+        // validate_dir inherits the exemption (it calls validate_file).
+        let results = validator.validate_dir(&dir);
+        let personas = results
+            .iter()
+            .find(|(p, _)| p.file_name().and_then(|n| n.to_str()) == Some("personas.yml"))
+            .expect("personas.yml walked");
+        assert!(
+            personas.1.as_ref().unwrap().is_valid,
+            "dir path exempts too"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // NÉGATIF: a personas.yml at a DIFFERENT path is NOT exempted (fails on
+    // missing api_version like any non-artifact).
+    #[test]
+    fn test_personas_yml_elsewhere_not_exempted() {
+        let tmp = std::env::temp_dir().join(format!("personas-elsewhere-{}", std::process::id()));
+        // Wrong location: company/personas.yml (not company/config/).
+        let dir = tmp.join("company");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("personas.yml");
+        std::fs::write(&file, PERSONAS_YML_CONTENT).unwrap();
+
+        let validator = setup_validator_with_root(&tmp);
+        let result = validator.validate_file(&file);
+        assert!(
+            matches!(result, Err(ValidationError::InvalidApiVersion { .. })),
+            "personas.yml elsewhere must NOT be exempted, got {result:?}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // EDGE: schema-only validator (no root) does NOT apply the exemption —
+    // documented behaviour (returns InvalidApiVersion). Unchanged.
+    #[test]
+    fn test_personas_yml_no_root_not_exempted() {
+        let tmp = std::env::temp_dir().join(format!("personas-noroot-{}", std::process::id()));
+        let dir = tmp.join("company/config");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("personas.yml");
+        std::fs::write(&file, PERSONAS_YML_CONTENT).unwrap();
+
+        let validator = setup_validator(); // no with_root
+        let result = validator.validate_file(&file);
+        assert!(
+            matches!(result, Err(ValidationError::InvalidApiVersion { .. })),
+            "without root, the exemption does not trigger (documented), got {result:?}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

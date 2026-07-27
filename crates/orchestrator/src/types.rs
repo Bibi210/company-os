@@ -52,6 +52,19 @@ pub struct ParsedRelation {
     pub relationship: String,
 }
 
+/// Outcome of [`crate::engine::OrchestratorEngine::reindex_all`] (mechanism 21,
+/// RFC 0197fbe5). Carries the number of indexed artifacts AND the non-blocking
+/// warnings collected during the bulk pass (supersession asymmetry 10c,
+/// related-integrity dangling links 17b, author-produces violations 16). The
+/// data lives in the return value rather than a `tracing` channel because a lib
+/// crate must not impose its output channel on heterogeneous callers (JSON
+/// response, tracing, stderr).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReindexOutcome {
+    pub count: usize,
+    pub warnings: Vec<String>,
+}
+
 // --- Newtypes ---
 
 /// File path to an artifact being reviewed.
