@@ -1,0 +1,381 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: d9f9ae30-ddad-4d24-bad8-ae7bf5a6617d
+  title: "Audit V1 des 4 personas : 38 entrées classées (conserver 24, pointeur/réécrire 12, supprimer 2, ajouter 5) + 3 corrections produces/consumes"
+  author: architect
+  created_at: "2026-07-27"
+  project: company-os
+  description: >
+    Phase d'analyse du domaine v1-personas-audit (task-request 3dcd3a6b,
+    roadmap a410bb43). Passe cohérente persona par persona, règle par règle,
+    sur les 38 entrées actuelles des 4 personas (rules.must/never + règles
+    nommées) plus les champs identity, review_behavior, produces et consumes.
+    Chaque entrée est classée : CONSERVER (jugement pur, prose légitime),
+    RÉÉCRIRE EN POINTEUR (le harness impose désormais, la règle devient une
+    ligne courte citant le mécanisme), SUPPRIMER (redondance pure avec le
+    harness ou une autre règle), ou AJOUTER (manques observés pendant le
+    programme V1). Base : recensement c981bf62 section E, mis à jour des
+    mécanismes livrés par les lots 1 (RFC 8bf78218), 2 (RFC a4ee8b6a) et
+    3 (RFC 0197fbe5), du flux deploy-serve (RFC 18011bfc) et du hotfix
+    identité d'agent (RFC 25b6678c). Débouche sur le RFC de réalignement
+    098f35db.
+  tags:
+    - companyos-v1
+    - personas
+    - audit
+    - prose
+    - harness
+    - mechanical-invariant
+  related:
+    - id: 3dcd3a6b-ee1f-4fd6-9ac0-f9d055087723
+      kind: task-request
+      relationship: input
+    - id: c981bf62-9d53-4ea2-8da3-c34af9d3e922
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: related
+    - id: f5f62e3b-27b4-4bc3-b9f3-74db0cde24cb
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  status: resolved
+
+  symptom: >
+    Les 4 personas datent d'avant le durcissement process V1 (lots 1-3,
+    27 règles désormais dans le harness). Plusieurs de leurs règles ordonnent
+    encore en prose impérative ce que le harness impose mécaniquement (permit
+    sur zones protégées, grant exigeant un RFC approved, CEO no-write,
+    triggers humains path-matchables), d'autres dupliquent shared-rules, et
+    des manques observés en sessions réelles (flux deploy-serve côté
+    conception, discipline user_approval_confirmed, traitement des
+    scope_warnings, reprise après interruption de session) ne sont couverts
+    par aucune persona. Les produces ont été réconciliés au lot 3 (M16) mais
+    les consumes présentent trois incohérences documentaires.
+
+  root_cause: >
+    Croissance organique identique à celle diagnostiquée en c981bf62 pour les
+    règles système : chaque règle persona a été ajoutée au moment de
+    l'incident qui la motive, puis les lots 1-3 ont mécanisé une partie de ce
+    qu'elles ordonnent SANS passe de réalignement d'ensemble (seules des
+    annotations partielles ont été posées au fil des lots : E38, E45, E46,
+    E60b). Résultat : trois dettes. (1) De la prose impérative survit là où
+    le harness garantit déjà (un agent qui lit "ne modifie pas les zones
+    protégées" ne sait pas que c'est physiquement impossible sans permit).
+    (2) Les mécanismes récents à destination des personas (M14
+    scope_warnings, M15 user_approval_confirmed, M18 plan-approuvé, flux
+    deploy-serve) n'ont pas de contrepartie de jugement dans les personas qui
+    les consomment. (3) Les consumes n'ont jamais été re-vérifiés contre
+    l'artifact_catalog après l'introduction du lookup obligatoire et de
+    l'auto-sync roadmap.
+
+  resolution: >
+    CLASSEMENT COMPLET — 38 entrées rules + champs identity/review_behavior/
+    produces/consumes. Numérotation croisée avec le recensement c981bf62
+    section E. Verdicts : CONSERVER / POINTEUR (réécrire en pointeur court
+    vers le mécanisme) / SUPPRIMER / AJOUTER.
+
+    ════════════════════════════════════════════════════════════
+    PM — 8 entrées : conserver 6, pointeur 2, supprimer 0 ; +2 règles, +1 fix consumes
+    ════════════════════════════════════════════════════════════
+
+    P1 (E27) must "Être la seule interface avec l'utilisateur" — CONSERVER.
+    Organisationnel, non observable par le harness ; c'est le contrat
+    fondateur du PM.
+
+    P2 (E28) must "Confirmation user avant task-request" — CONSERVER.
+    Interaction humaine, aucun mécanisme ne peut vérifier qu'un intent a été
+    clarifié.
+
+    P3 (E29) must "Déléguer les décisions techniques à l'Architect" —
+    CONSERVER. Jugement de frontière de rôle.
+
+    P4 (E30) must "Orchestrer les review rounds via l'orchestrator MCP" —
+    POINTEUR. Les gardes du protocole sont désormais serveur : reviewers
+    minimum par kind (GARDE 5), self-review rejeté (GARDE 1), consensus et
+    escalade à max_review_iterations (RFC 8bf78218). La règle devient une
+    ligne courte : orchestrer via les tools, les gardes du protocole sont
+    mécaniques, le jugement du PM porte sur QUAND lancer un round et QUI
+    ajouter au-delà du minimum.
+
+    P5 (E31) must lookup mémoire — CONSERVER. Intrinsèquement prose (A10) ;
+    duplication VOLONTAIRE avec shared-rules pour saillance (documentée au
+    recensement E31). Texte inchangé, identique dans les 4 personas.
+
+    P6 (E32) never "Produire du code, des design docs, ou des artifacts
+    techniques" — POINTEUR. Pour les artifacts YAML, la matrice
+    author-produces signale mécaniquement la violation à l'indexation
+    (M16, RFC 0197fbe5, warning). Le code n'est pas couvert par M16 : la
+    règle survit, annotée du mécanisme.
+
+    P7 (E33) never "Exposer les noms internes des agents au user" —
+    CONSERVER. Non observable par le harness.
+
+    P8 (E34) never "Prendre des décisions d'architecture" — CONSERVER.
+
+    AJOUTS PM :
+    PA1 must (nouveau) — Protocole de reprise après interruption de session :
+    reconstruire l'état depuis les artifacts et l'orchestrator
+    (search/summarize_roadmap pour les sujets, check_consensus sur les rounds
+    ouverts, permits actifs, index_status), jamais depuis le souvenir de la
+    conversation. Manque observé pendant le programme V1 (sessions
+    interrompues mi-workflow, aucune persona ne dit comment reprendre). Porté
+    par le PM seul : il est l'orchestrateur et l'unique point d'entrée (P1) ;
+    c'est lui qui re-briefe les autres personas. Une règle par persona serait
+    de la duplication.
+    PA2 must (nouveau) — Ne clôturer un task-request touchant les crates
+    serveur qu'après confirmation que la promotion make deploy-serve a eu
+    lieu (RFC 18011bfc) : sans promotion, le code livré n'est PAS en service
+    et le done est illusoire.
+    PA3 consumes — AJOUTER roadmap : le PM est le producteur ET le lecteur
+    principal des roadmaps (artifact_catalog : "sert au PM à répondre à où en
+    sont mes sujets") ; l'absence de roadmap dans ses consumes est une
+    incohérence documentaire.
+
+    ════════════════════════════════════════════════════════════
+    Architect — 10 entrées : conserver 7, pointeur 2, supprimer 1 ; +1 règle, +1 fix consumes
+    ════════════════════════════════════════════════════════════
+
+    A1 (E35) design_doc_boundary — CONSERVER. Frontière de contenu, jugement
+    pur. La clause d'invalidation du plan si le design-doc change après
+    approbation reste prose (mécanisation par timestamps évaluée L au
+    recensement, hors V1).
+
+    A2 (E36) must "Documenter les décisions architecturales avec leur
+    rationale" — POINTEUR par FUSION avec A4 : la présence de components et
+    de decisions[].rationale est imposée par le schema design-doc
+    (RFC a4ee8b6a) ; la QUALITÉ du rationale reste du jugement. Les deux
+    règles deviennent une seule : "documenter les décisions avec leur
+    rationale — la structure complète (overview, components, decisions) est
+    imposée par le schema ; la qualité de l'argumentation reste ta
+    responsabilité".
+
+    A3 (E37) must "Vérifier que l'implémentation respecte le design doc lors
+    du code review" — CONSERVER. Jugement de conformité sémantique.
+
+    A4 (E38) must "Design docs complets (overview, components, decisions)" —
+    SUPPRIMER (fusion dans A2). Depuis le lot 2 le schema rejette
+    mécaniquement un design-doc incomplet à l'écriture ; la règle, déjà
+    réduite à une annotation, est une redondance pure une fois le pointeur
+    porté par A2.
+
+    A5 (E39) must lookup mémoire — CONSERVER (cf. P5).
+
+    A6 (E40) must caller-inventory avant signature d'API publique —
+    CONSERVER, déjà annotée (filet aval M14 mentionné depuis le lot 3). La
+    procédure de recensement (rg/get_references, jugement sur la trivialité
+    de la liste) est irremplaçable en amont ; 4 incidents de la classe
+    documentés (lessons ea6e9dd1, 611fde3e, 1bb07073, f5f62e3b) prouvent que
+    le filet mécanique aval ne dispense pas du travail amont.
+
+    A7 (E41) never "Implémenter du code" — CONSERVER.
+
+    A8 (E42) never "Faire des implentation plan détaillés" — CONSERVER,
+    correction de la typo ("implémentation plans") au passage.
+
+    A9 (E43) never "Prendre de décisions business" — CONSERVER.
+
+    A10 (E44) never "Modifier des zones protégées directement" — POINTEUR.
+    Bloqué physiquement par le hook defense-in-depth : permit actif requis,
+    lié au granted_to (M13, RFC a4ee8b6a, identité par session-mapping RFC
+    25b6678c). La règle devient une ligne courte citant le mécanisme — sa
+    valeur résiduelle est d'expliquer POURQUOI l'écriture échouerait.
+
+    AJOUTS Architect :
+    AA1 must (nouveau) — Tout RFC ou design-doc touchant les crates serveur
+    ou les plugins doit spécifier le mode de mise en service dans impact ou
+    rollback_plan : make deploy-serve pour les binaires servis (promotion
+    atomique, RFC 18011bfc), restart opencode pour le code des plugins (le
+    hot-reload de code a été retiré, RFC 25b6678c), reload_config EN DERNIER
+    et seulement si la config Rust change. Manque observé : le flux
+    deploy-serve n'existait dans aucune persona côté CONCEPTION, seul
+    l'Implementer (hotreload_last) le connaissait côté exécution ; un RFC qui
+    n'en parle pas produit des plans où la mise en service est improvisée.
+    AA2 consumes — AJOUTER lesson-learned : le lookup obligatoire (A5) impose
+    la lecture des lessons ; PM et Implementer les listent déjà, l'Architect
+    non. Incohérence documentaire.
+
+    ════════════════════════════════════════════════════════════
+    Implementer — 13 entrées : conserver 7, pointeur 5, supprimer 1 ; +0 règle
+    ════════════════════════════════════════════════════════════
+
+    I1 (E45) write_permit_full_sequence — POINTEUR (condensé et dédupliqué).
+    Les étapes critiques sont toutes gardées mécaniquement : grant atomique
+    avec scellement et rollback anti-fantôme (RFC 359f9162), commit sans
+    permit rejeté par le hook, consume refusé si le worktree est sale sur les
+    target_paths (GARDE 3, RFC 8bf78218). Les étapes 5-6 (build/test puis
+    reload en dernier) DUPLIQUENT hotreload_last qui est la description
+    canonique du flux post-commit. La règle devient : séquence courte
+    grant → écrire → commit → consume, chaque étape citant sa garde, puis
+    renvoi à hotreload_last pour la mise en service.
+
+    I2 (E46) hotreload_last — CONSERVER, déjà annotée (gate reload_config
+    M11 RFC a4ee8b6a, flux deploy-serve RFC 18011bfc). C'est la description
+    canonique du flux de promotion ; les autres règles pointent vers elle.
+
+    I3 (E47) write_permit_gate — POINTEUR. Le grant exige mécaniquement un
+    RFC indexé status=approved (GARDE 4, RFC 8bf78218) et signale l'absence
+    d'implementation-plan approuvé lié quand le RFC touche du code (M18,
+    RFC 0197fbe5, warning). La règle devient une ligne citant les deux
+    mécanismes ; le jugement résiduel (le CEO décide face au warning M18)
+    appartient au CEO, pas à l'Implementer.
+
+    I4 (E48) must "Tests pour chaque acceptance criterion" — CONSERVER.
+    Jugement de couverture.
+
+    I5 (E49) must "Suivre le design doc approuvé" — CONSERVER.
+
+    I6 (E50) must "Diagnostic report en cas d'échec" — CONSERVER.
+
+    I7 (E51) must "Appliquer les RFC avec un write permit valide" —
+    SUPPRIMER. Redondance pure : le hook L1/L2 rend l'écriture et le commit
+    impossibles sans permit, et le never I13 (conservé en pointeur) porte
+    déjà la même interdiction côté garde. Deux règles pour un même invariant
+    mécanisé, c'est une de trop.
+
+    I8 (E52) must lookup mémoire — CONSERVER (cf. P5).
+
+    I9 (E53) must CI-validation — POINTEUR partiel. Le cas 3 (CompanyOS) est
+    mécanique : le pre-commit exécute make ci en bloquant. Annoter ce cas et
+    conserver la prose pour les cas 1-2 (projets externes, où aucun harness
+    CompanyOS ne tourne). La substance de la règle (la CI est la source de
+    vérité du done) reste du jugement pour les projets externes.
+
+    I10 (E54) must re-recensement callers avant modif de signature —
+    POINTEUR partiel. Conserver la procédure (jugement), ajouter la mention
+    du filet aval M14 (scope_warnings au grant) pour symétrie avec la règle
+    jumelle de l'Architect (A6) qui l'a depuis le lot 3.
+
+    I11 (E55) never "Redesigner l'architecture" — CONSERVER.
+
+    I12 (E56) never "Merger du code" — CONSERVER.
+
+    I13 (E57) never "Modifier des zones protégées sans write permit" —
+    POINTEUR. Même mécanisme que A10 (hook, permit lié à granted_to,
+    M13 RFC a4ee8b6a + RFC 25b6678c). Devient la ligne courte unique de
+    l'Implementer sur ce sujet (I7 supprimée).
+
+    AJOUTS Implementer : AUCUN. Le flux deploy-serve est déjà porté par
+    hotreload_last ; l'erreur -32050 est couverte par
+    shared-rules.mcp_availability (globale).
+
+    ════════════════════════════════════════════════════════════
+    CEO — 7 entrées : conserver 4, pointeur/réécrire 3, supprimer 0 ; +2 règles, +1 fix consumes
+    ════════════════════════════════════════════════════════════
+
+    C1 (E58) must "Intervenir uniquement quand sollicité" — CONSERVER.
+    Posture, non observable par le harness.
+
+    C2 (E59) must "Escalader à l'utilisateur pour les changements profonds" —
+    POINTEUR partiel. Les trois cas path-matchables (access matrix, persona
+    CEO, suppression de persona) sont BLOQUÉS mécaniquement au grant sans
+    user_approval_confirmed=true (M15, RFC 0197fbe5, source unique
+    company/config/human-review-triggers.yml). Le breaking schema change
+    (D25) reste entièrement du jugement. La règle cite le mécanisme et
+    recentre la prose sur le cas non mécanisé.
+
+    C3 (E60a) must "Agir uniquement via MCP tools" — CONSERVER. C'est la
+    face positive du never C5 mécanisé ; elle dit au CEO ce qu'il PEUT faire
+    (votes, grants, arbitrages), pas seulement ce qui lui est interdit.
+
+    C4 must lookup mémoire — RÉÉCRIRE (adaptation, pas pointeur). Depuis le
+    RFC a4ee8b6a le CEO ne produit AUCUN artifact (produces []) : la
+    formulation "avant toute production d'artifact" est une règle MORTE pour
+    lui. La réécrire en "avant toute décision (vote, arbitrage, grant),
+    appeler search() puis get() parcimonieux" — le lookup avant jugement est
+    la vraie intention.
+
+    C5 (E60b) never "Écrire des fichiers directement" — CONSERVER tel quel :
+    déjà réécrite en pointeur au lot 2 (hook write/edit/mcp_write/mcp_edit
+    bloqués pour agent==ceo, RFC a4ee8b6a). Ajout de la référence au
+    session-mapping (RFC 25b6678c) pour exactitude.
+
+    C6 (E61) never "Intervenir proactivement" — CONSERVER.
+
+    C7 (E62) never "Approuver seul les RFCs critiques" — POINTEUR. Fusionnée
+    dans human-review-triggers.yml comme source unique (RFC 8bf78218) et
+    bloquée mécaniquement pour les cas path-matchables (M15). La règle
+    devient une ligne pointant la source unique et le mécanisme.
+
+    AJOUTS CEO :
+    CA1 must (nouveau) — Discipline user_approval_confirmed : ne passer
+    user_approval_confirmed=true à grant_write_permit qu'après approbation
+    utilisateur EXPLICITE ou délégation documentée dans un artifact indexé
+    (ex. : délégation du programme V1, roadmap a410bb43), en citant la
+    source. Manque critique : M15 exige le flag mais rien ne dit au CEO la
+    discipline pour le poser — le flag sans discipline est un contournement
+    à un paramètre près.
+    CA2 must (nouveau) — Juger explicitement les scope_warnings (M14) et le
+    warning plan-approuvé (M18) retournés par grant_write_permit : soit
+    étendre les target_paths, soit assumer le scope plus étroit en le disant.
+    Les warnings sont conçus non bloquants PARCE QUE le CEO juge ; les
+    ignorer silencieusement annule le mécanisme.
+    CA3 consumes — AJOUTER lesson-learned : le lookup avant décision (C4)
+    lit les lessons ; incohérence documentaire.
+
+    ════════════════════════════════════════════════════════════
+    Champs identity / review_behavior / produces / consumes
+    ════════════════════════════════════════════════════════════
+
+    identity x4 — CONSERVER (les 4 sont justes et denses ; c'est la valeur
+    de la persona, pas une cible de dégraissage).
+
+    review_behavior pm — RÉÉCRIRE légèrement : le protocole assigne aussi au
+    PM les lesson-learned et les RFCs (all) ; mentionner l'angle PM
+    (alignement besoin utilisateur) pour ces kinds.
+    review_behavior architect — RÉÉCRIRE : "review le code et les tests" ne
+    couvre pas ce que le protocole lui assigne réellement
+    (implementation-plan, task-request, diagnostic-report, rfc) ; élargir à
+    la conformité architecturale de tout artifact reviewé.
+    review_behavior implementer — RÉÉCRIRE légèrement : ajouter l'angle
+    implémentabilité pour les RFCs (all).
+    review_behavior ceo — CONSERVER.
+
+    produces x4 — CONSERVER : réconciliés au lot 3 (M16a), vérifiés
+    cohérents avec l'artifact_catalog et la matrice M16 (source unique =
+    persona YAML, lue fraîche par author_produces_warnings). ceo.produces []
+    est cohérent avec le hook CEO no-write.
+    consumes — 3 corrections (PA3, AA2, CA3 ci-dessus) ; implementer.consumes
+    CONSERVER (complet pour son rôle).
+
+    ════════════════════════════════════════════════════════════
+    Manques évalués et EXPLICITEMENT ÉCARTÉS (avec justification)
+    ════════════════════════════════════════════════════════════
+
+    - Erreur -32050 / escalade : couverte par shared-rules.mcp_availability,
+      globale à tous les personas. La dupliquer dans 4 fichiers irait contre
+      l'objectif de déduplication de ce même audit.
+    - Usage de supersede_artifact : couvert par shared-rules.lessons et
+      lesson_chaining (canal canonique documenté, RFC a4ee8b6a).
+    - Canal notes de submit_review_vote : couvert par
+      shared-rules.review_findings_honesty (paragraphe GARDE MÉCANIQUE,
+      RFC 8bf78218).
+    - Reprise de session pour Architect/Implementer/CEO : portée par le PM
+      seul (PA1), unique point d'entrée et re-brieffeur des autres.
+    - Flux deploy-serve pour le PM en exécution : opéré par l'Implementer
+      (hotreload_last), conçu par l'Architect (AA1), vérifié en clôture par
+      le PM (PA2). Chaque persona a exactement son angle, pas de règle
+      d'exécution côté PM.
+
+    ════════════════════════════════════════════════════════════
+    STATISTIQUES (38 entrées rules actuelles)
+    ════════════════════════════════════════════════════════════
+    - PM (8)          : conserver 6, pointeur 2, supprimer 0 | +2 règles, +1 consumes
+    - Architect (10)  : conserver 7, pointeur 2, supprimer 1 | +1 règle,  +1 consumes
+    - Implementer (13): conserver 7, pointeur 5, supprimer 1 | +0
+    - CEO (7)         : conserver 4, pointeur 3, supprimer 0 | +2 règles, +1 consumes
+    - TOTAL           : conserver 24, pointeur/réécrire 12, supprimer 2,
+                        ajouter 5 règles + 3 corrections consumes
+    - Champs : identity 4/4 conserver ; review_behavior 1 conserver,
+      3 réécritures légères ; produces 4/4 conserver ; consumes 1 conserver,
+      3 corrections.
+
+    Après réalignement, l'acceptance criterion central est satisfait :
+    aucune règle persona ne décrira plus en prose impérative ce que le
+    harness impose sans pointer le mécanisme (P4, P6, A10, I1, I3, I9, I13,
+    C2, C7 portent toutes leur pointeur ; A4/I7 disparaissent). Le
+    réalignement est porté par le RFC 098f35db (zone protégée
+    company/personas/ : cycle complet, trigger D24 au grant pour ceo.yml).
