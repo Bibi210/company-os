@@ -38,6 +38,24 @@ metadata:
       kind: lesson-learned
       relationship: input
   changelog:
+    - date: "2026-07-27"
+      author: pm
+      description: >
+        v1-process-hardening TERMINÉ : lot 3 livré (RFC 0197fbe5
+        implemented : pré-check de périmètre au grant, triggers humains
+        path-matchables avec user_approval_confirmed, matrice
+        author-produces, intégrité related, gate plan-approuvé, rappels de
+        capitalisation, personas.yml committable, ReindexOutcome).
+        27/62 garanties clean-company, les 16 règles mécanisables du
+        recensement c981bf62 sont toutes traitées. En chemin : hotfix
+        RFC 324e8a33 (hermeticité git/gpg, seals non signés sur décision
+        utilisateur) et hotfix RFC 25b6678c (identité d'agent par mapping
+        sessionID-persona : M13/M12a étaient morts-nés, input.agent
+        n'ayant jamais existé dans l'API opencode ; appliqué par
+        l'utilisateur via la parade c129453c). Le permit du lot 3 a dû
+        être complété (lib.rs oublié, 4e occurrence de la classe
+        611fde3e) : le M14 fraîchement livré ferme cette classe.
+        Lessons 59875703, e4e296d6, f5f62e3b.
     - date: "2026-07-03"
       author: pm
       description: >
@@ -235,8 +253,8 @@ spec:
         type: loose
         category: exploration
         label: "shared-rules, review-protocol, flow-control, human-review-triggers : prose -> mécanisme partout où c'est possible"
-      timeframe: present
-      status: in_progress
+      timeframe: past
+      status: done
       target_date: "2026-Q3"
       depends_on: [v1-memory-audit]
       rationale: >
