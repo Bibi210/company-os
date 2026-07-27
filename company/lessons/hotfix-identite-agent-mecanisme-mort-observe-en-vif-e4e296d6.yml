@@ -1,0 +1,106 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: e4e296d6-a70d-4347-a2a6-4f82f8d2117e
+  title: >
+    Un mécanisme validé seulement par des tests qui SIMULENT son input n'est pas
+    validé ; un hot-reload invérifiable masque un mécanisme mort pendant des jours
+  author: implementer
+  created_at: "2026-07-27"
+  description: >
+    Capitalisation de clôture du RFC 25b6678c (hotfix identité d'agent dans le hook
+    defense-in-depth), diagnostic 9ed7c07c, permit 3c4c35d9. Le mécanisme 13 (RFC
+    a4ee8b6a, hasActivePermit exige granted_to === input.agent) a bloqué TOUTES les
+    écritures en zone protégée avec "agent 'undefined'" parce que l'API plugin
+    opencode ne fournit AUCUN champ agent dans les hooks tool.execute.before/after :
+    M13 reposait sur un champ inexistant. Deux enseignements structurels. (1) Un
+    mécanisme dont les tests unitaires FABRIQUENT eux-mêmes l'input (ici, on passait
+    input.agent aux tests de hasActivePermit) est vert alors que le runtime réel ne
+    fournit jamais cet input : la couverture verte prouve la logique, pas le câblage
+    au runtime. Un mécanisme n'est validé que lorsqu'il a été observé EN VIF avec
+    l'input réel du runtime, pas avec un input simulé. Le fix ajoute resolveAgent
+    (mapping sessionID→persona observé sur authenticate) et surtout a été confirmé
+    par un test en vif : écriture réelle sans permit → blocage nominatif "granted to
+    agent 'implementer'" (plus jamais 'undefined'), fichier intact. (2) Le hot-reload
+    de code du wrapper (import "?t=mtime" non fiable sous Bun) a masqué le mécanisme
+    mort du 11 au 13 juillet : M13 est resté dormant dans le process opencode longue
+    durée, puis s'est armé silencieusement au reboot. Un hot-reload invérifiable rend
+    impossible de savoir quel code s'exécute réellement ; il a été retiré au profit
+    d'une promotion explicite (restart requis), pattern déjà établi par RFC 18011bfc.
+  tags:
+    - companyos-v1
+    - defense-in-depth
+    - write-permit
+    - mechanism-13
+    - agent-identity
+    - session-mapping
+    - hot-reload
+    - dead-guard
+    - test-vs-runtime
+    - opencode-plugin-api
+    - harness
+    - critical-infra
+    - lessons-from-implementation
+  related:
+    - id: 9ed7c07c-3c2d-45fa-a5ed-7ec9ac7667f7
+      relationship: derived-from
+    - id: 50409fb0-4f74-4825-a68d-84ce219506c4
+      relationship: related
+    - id: aa8c4d52-12b2-4d1f-b931-008951231a11
+      relationship: related
+
+spec:
+  context: >
+    Le lot 3 du durcissement process V1 (RFC 0197fbe5) était gelé à l'étape 1 :
+    l'Implementer, muni d'un permit valide et actif, était bloqué sur toute écriture
+    en zone protégée avec "No active permit granted to agent 'undefined'". Le
+    diagnostic 9ed7c07c a établi la root cause : le mécanisme 13 (RFC a4ee8b6a)
+    exigeait granted_to === input.agent, or les hooks tool.execute.before/after
+    d'opencode ne fournissent {tool, sessionID, callID(, args)} et n'ont JAMAIS
+    contenu de champ agent (binaires 1.15.13 → 1.17.18). M13 était armé sur un champ
+    inexistant, fail-closed sur agent falsy, donc bloquant universel. Il était resté
+    dormant du 11 au 13 juillet parce que le hot-reload du core n'avait pas pris
+    effet dans le process opencode longue durée, puis s'est armé au reboot suivant un
+    upgrade opencode. Le RFC 25b6678c a introduit resolveAgent (mapping
+    sessionID→persona construit en observant les appels authenticate, dernière
+    gagne), rebranché M13/M12a/garde cross-persona dessus, corrigé la détection du
+    nom de tool authenticate, et retiré le hot-reload de code non fiable. Le patch a
+    été appliqué par l'utilisateur (zone plugins protégée, parade échappatoire
+    humaine RFC c129453c), puis j'ai committé, consommé le permit, marqué le RFC
+    implemented, et testé en vif la réparation.
+  insight: >
+    Deux enseignements distincts mais liés par le même angle mort : "je crois que ce
+    code tourne et fait ce que je pense". (1) TEST-VS-RUNTIME. Les tests unitaires de
+    hasActivePermit passaient input.agent en argument : ils validaient la LOGIQUE de
+    matching granted_to/path, jamais le CÂBLAGE de la source d'identité. Un test qui
+    fabrique lui-même l'input du mécanisme ne peut structurellement pas révéler
+    qu'au runtime cet input est toujours undefined. La couverture triaxiale verte
+    était un faux positif de validation : verte sur une hypothèse d'input que le
+    monde réel viole. La seule preuve qui compte est l'observation EN VIF avec
+    l'input réel du runtime. Ici, le test en vif (Edit réel sur flow-control.yml sans
+    permit) a produit le message nominatif "granted to agent 'implementer'" et non
+    "undefined", et le fichier est resté intact : c'est CELA qui valide le fix, pas
+    les 81 tests verts. (2) HOT-RELOAD INVÉRIFIABLE. Un mécanisme de rechargement de
+    code qu'on ne peut pas confirmer (import "?t=mtime" sous Bun) crée une
+    incertitude fondamentale sur quel code s'exécute : M13 mort a pu vivre 2 jours
+    caché derrière un core non rechargé, et son armement au reboot a semblé surgir de
+    nulle part. Un hot-reload non observable est pire qu'un restart explicite : il
+    déplace le moment de la panne loin de sa cause et la rend non reproductible. La
+    promotion explicite (restart requis, RFC 18011bfc) rend déterministe la question
+    "quel code tourne ?".
+  recommendation: >
+    (1) Pour tout mécanisme dont l'input vient du runtime (payload de hook, variable
+    d'environnement, champ d'API tierce), ne jamais considérer les tests unitaires
+    qui fabriquent cet input comme une validation suffisante : ajouter une
+    observation EN VIF avec l'input réel avant de déclarer le mécanisme done, et
+    documenter le message/comportement exact observé. Corollaire : un test unitaire
+    d'un tel mécanisme doit au minimum couvrir explicitement le cas "input absent /
+    falsy" (ce que le fix a fait via resolveAgent → null fail-closed), car c'est
+    précisément le cas que le runtime peut imposer en permanence. (2) Bannir tout
+    hot-reload de code non vérifiable des chemins critiques : préférer une promotion
+    explicite avec restart, pour que "quel code s'exécute" soit toujours une réponse
+    déterministe. Si un hot-reload existe, il doit exposer une preuve observable de
+    ce qui est chargé (version, hash), sinon il masque les mécanismes morts. (3)
+    Quand un fail-closed strict bloque un flux entier, suspecter en priorité une
+    SOURCE D'IDENTITÉ/INPUT défaillante avant de suspecter la logique du garde : le
+    garde faisait exactement son travail, c'est son input qui était fantôme.
