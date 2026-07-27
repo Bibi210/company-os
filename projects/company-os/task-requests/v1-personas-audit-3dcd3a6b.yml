@@ -1,0 +1,63 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 3dcd3a6b-ee1f-4fd6-9ac0-f9d055087723
+  title: "V1 personas : audit des 4 personas (règles devenues mécaniques, manques, duplication)"
+  author: pm
+  created_at: "2026-07-27"
+  project: company-os
+  description: >
+    Domaine v1-personas-audit du programme companyos-v1 (roadmap a410bb43).
+    Le durcissement process est terminé : 27 règles vivent désormais dans
+    le harness. Les personas doivent être réalignées : retirer ou annoter
+    les règles de prose devenues mécaniques (plus besoin d'ordonner ce que
+    le harness impose), combler les manques observés en sessions réelles,
+    éliminer la duplication entre personas et shared-rules, et vérifier
+    que chaque règle restante est soit du jugement (légitime en prose),
+    soit un pointeur vers son mécanisme.
+  tags:
+    - companyos-v1
+    - personas
+    - audit
+    - prose
+    - harness
+  related:
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: input
+    - id: c981bf62-9d53-4ea2-8da3-c34af9d3e922
+      kind: diagnostic-report
+      relationship: input
+    - id: b9dbcff9-a168-46e7-803e-ce05924386f5
+      kind: task-request
+      relationship: related
+
+spec:
+  priority: high
+  status: in_progress
+
+  context: >
+    Le recensement c981bf62 avait classé les 36 entrées rules des personas ;
+    depuis, les lots 1-3 ont mécanisé une partie de ce qu'elles ordonnent
+    (self-review, approve+findings, séquence permit, caller-inventory
+    partiellement via M14, CEO no-write, etc.) et des annotations partielles
+    ont été posées au fil des lots. Il faut maintenant une passe cohérente :
+    persona par persona, règle par règle, décider si elle reste (jugement),
+    devient un pointeur court vers le mécanisme, ou disparaît (redondance
+    pure avec le harness ou avec shared-rules). Vérifier aussi la cohérence
+    produces/consumes avec l'artifact_catalog après la réconciliation M16,
+    et capitaliser les manques observés dans les sessions du programme V1
+    (ex. : les personas ne disent rien du flux deploy-serve pour
+    l'architect/pm, rien des erreurs -32050, rien du protocole de reprise
+    après interruption).
+
+  acceptance_criteria:
+    - "Un diagnostic-report classe chaque règle de chaque persona : conserver (jugement) / réécrire en pointeur vers le mécanisme / supprimer (redondance), avec justification"
+    - "Un RFC applique le réalignement des 4 personas (zone protégée : cycle complet)"
+    - "Aucune règle ne décrit plus en prose impérative ce que le harness impose mécaniquement sans pointer le mécanisme"
+    - "Les produces/consumes des 4 personas sont cohérents avec l'artifact_catalog et la matrice M16"
+    - "Les manques observés pendant le programme V1 sont comblés ou explicitement écartés"
+
+  constraints:
+    - "Modifier ceo.yml déclenche le trigger humain D24 : le grant exigera user_approval_confirmed, à couvrir par la délégation utilisateur documentée"
+    - "Pas de push : commits locaux uniquement"

@@ -1,0 +1,55 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: ceb26109-cfcf-4128-a447-d933e6ee4f48
+  title: "V1 schemas : audit des 14 schemas JSON (strictesse, champs morts, idées à moitié appliquées)"
+  author: pm
+  created_at: "2026-07-27"
+  project: company-os
+  description: >
+    Domaine v1-schemas-audit du programme companyos-v1 (roadmap a410bb43).
+    Les schemas sont le harness statique des artifacts. Les lots 1-3 ont
+    durci review-report, design-doc, rfc, flow-control, review-protocol et
+    human-review-triggers au fil des besoins ; il faut maintenant une passe
+    cohérente sur les 14 schemas : champs jamais utilisés, laxismes (strings
+    libres qui devraient être des enums, additionalProperties absents),
+    idées appliquées à un seul schema à généraliser ou à trancher
+    (verrous additionalProperties, changelog, FORME B), et cohérence
+    inter-schemas (_base vs spécialisations).
+  tags:
+    - companyos-v1
+    - schemas
+    - audit
+    - validation
+    - harness
+  related:
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: input
+    - id: 3dcd3a6b-ee1f-4fd6-9ac0-f9d055087723
+      kind: task-request
+      relationship: related
+
+spec:
+  priority: medium
+  status: backlog
+
+  context: >
+    14 schemas dans company/schemas/. Questions types : quels champs définis
+    ne sont jamais renseignés par aucun artifact du corpus (candidats au
+    retrait, pattern bd4650e2) ? Quels champs libres mériteraient un enum ou
+    un pattern ? Où manque additionalProperties: false (verrou posé sur
+    flow-control/review-protocol aux lots, absent ailleurs) ? metadata.changelog
+    est utilisé par les RFCs et roadmaps mais est-il défini dans _base ou
+    ad hoc ? La FORME B affected_files doit-elle être généralisée ? La passe
+    doit vérifier chaque durcissement contre le corpus réel (comme les lots :
+    strict quand le stock est conforme, migration explicite sinon).
+
+  acceptance_criteria:
+    - "Un diagnostic-report recense schema par schema : champs morts, laxismes, incohérences, verrous manquants, avec vérification contre le corpus réel"
+    - "Un RFC applique les durcissements retenus (zone protégée : cycle complet), rétro-compatibilité vérifiée fichier par fichier"
+    - "Le corpus entier reste valide après changements (make validate vert)"
+
+  constraints:
+    - "Strict sans anyOf uniquement quand le stock est vérifié conforme ; sinon migration explicite dans le même commit ou anyOf justifié"
+    - "Pas de push : commits locaux uniquement"
