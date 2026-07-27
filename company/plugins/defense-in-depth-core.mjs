@@ -113,6 +113,42 @@ function runSqliteWithTimeout(dbPath, sql, cwd) {
   );
 }
 
+// Agent identity (RFC 25b6678c). The opencode plugin API does NOT populate
+// input.agent in tool.execute.before/after (verified on binaries 1.15.13 →
+// 1.17.18: payload is {tool, sessionID, callID}(+args), no agent field). The
+// real identity source is a sessionID→persona mapping the hook builds by
+// observing successful authenticate calls (see recordAuthenticate + AUTH_TOOL_RE).
+// resolveAgent is the SINGLE resolution used by every guard:
+//   (1) input.agent if present and non-empty (priority to a future runtime
+//       that would provide it);
+//   (2) else sessions.get(sessionID)?.persona (the observed mapping);
+//   (3) else null → unknown identity → callers fail-closed on protected zones.
+function resolveAgent(input, sessions) {
+  if (input && typeof input.agent === "string" && input.agent) return input.agent;
+  const sid = input?.sessionID;
+  if (sid && sessions?.has(sid)) {
+    const persona = sessions.get(sid)?.persona;
+    if (persona) return persona;
+  }
+  return null;
+}
+
+// Tool-name detection for authenticate. The hook sees the orchestrator MCP tool
+// as "orchestrator_authenticate" (constaté dans opencode.db); the previous code
+// matched "mcp_orchestrator_authenticate" which never fired. Suffix match,
+// case-insensitive, covers the three observed/possible forms:
+//   "orchestrator_authenticate"      (real form seen by the hook)
+//   "mcp_orchestrator_authenticate"  (form tested by the old code, kept for
+//                                     robustness if an env prefixes this way)
+//   "mcp_Orchestrator_authenticate"  (MCP server-name casing)
+const AUTH_TOOL_RE = /(^|_)orchestrator_authenticate$/i;
+
+// Message shown when a write in a protected zone is attempted by a session with
+// no resolvable identity (no input.agent, no authenticate observed). Distinct
+// from a permit mismatch so the blocked agent knows immediately what to do.
+const UNAUTH_SESSION_MSG =
+  "session non authentifiée : appelez authenticate(persona=...) avant d'écrire en zone protégée";
+
 // Mechanism 13 (RFC a4ee8b6a): a permit only covers its BENEFICIARY. The
 // query selects granted_to alongside target_paths, and a permit matches only
 // when granted_to === agent IN ADDITION to the path match. The path-matching
@@ -371,6 +407,9 @@ export {
   buildBaseline,
   revertPermitTampering,
   hasActivePermit,
+  resolveAgent,
+  AUTH_TOOL_RE,
+  UNAUTH_SESSION_MSG,
 };
 
 export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
@@ -398,10 +437,15 @@ export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
       // Preventive block in `before` (unlike Layer 1's after+revert): the
       // guard does not depend on the written content, so there is nothing to
       // validate or revert — blocking before execution is strictly safer.
-      // input.agent is populated in production (the authenticate cross-persona
-      // guard below relies on it too).
+      // Identity comes from resolveAgent (RFC 25b6678c): input.agent is never
+      // populated by the opencode plugin API, so the CEO is recognised through
+      // the sessionID→persona mapping built on authenticate. Unknown identity
+      // (no authenticate observed) does NOT trigger this guard — a session that
+      // never authenticated is not the CEO; protected zones remain covered by
+      // M13, and a write outside protected zones by an unauthenticated session
+      // was already permitted before this RFC (scope unchanged).
       if (
-        input.agent === "ceo" &&
+        resolveAgent(input, sessions) === "ceo" &&
         (input.tool === "write" ||
           input.tool === "edit" ||
           input.tool === "mcp_write" ||
@@ -416,8 +460,18 @@ export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
         );
       }
 
-      // Block cross-persona authentication
-      if (input.tool === "mcp_orchestrator_authenticate") {
+      // Block cross-persona authentication (RFC 25b6678c: match the tool name
+      // by suffix — the hook sees "orchestrator_authenticate", not the
+      // "mcp_orchestrator_authenticate" form the old code required). This guard
+      // stays bound to input.agent ALONE (the future runtime source): the
+      // sessionID→persona mapping does NOT feed it, because the mapping is
+      // declarative and posterior to the authenticate itself — using it to
+      // block a re-authentication would contradict the last-wins semantics and
+      // the real use case (a multi-persona orchestrator session). While
+      // opencode does not provide input.agent, this guard is a documented
+      // fail-open (agent undefined → no check); it is no longer cited as proof
+      // of anything.
+      if (AUTH_TOOL_RE.test(input.tool ?? "")) {
         const persona = input.args?.persona;
         const agent = input.agent;
         if (agent && persona && agent !== persona) {
@@ -472,6 +526,20 @@ export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
     // Layer 1 + Layer 2 (after): Validate writes, guard bash
     // -----------------------------------------------------------------
     "tool.execute.after": async (input) => {
+      // -----------------------------------------------------------------
+      // Identity mapping (RFC 25b6678c): record sessionID→persona on every
+      // SUCCESSFUL authenticate. opencode does not fire tool.execute.after when
+      // a tool fails, so reaching this point means the authenticate succeeded.
+      // Last-wins: a session that authenticates several personas keeps the last
+      // one. An absent/empty args.persona is not recorded.
+      // -----------------------------------------------------------------
+      if (AUTH_TOOL_RE.test(input.tool ?? "")) {
+        const persona = input.args?.persona;
+        if (typeof persona === "string" && persona && input.sessionID) {
+          getState(input.sessionID).persona = persona;
+        }
+      }
+
       const filePath = input.args?.file_path || input.args?.filePath;
 
       // ---------------------------------------------------------------
@@ -502,14 +570,21 @@ export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
         }
 
         if (isInProtectedZone(rel)) {
-          if (!hasActivePermit(rootDir, filePath, input.agent)) {
+          const agent = resolveAgent(input, sessions);
+          if (!hasActivePermit(rootDir, filePath, agent)) {
             revertFile(rootDir, rel);
             throw new Error(
-              diag("ERROR", `Write blocked in protected zone: ${rel}`, {
-                context: `${input.tool}(file_path=${rel})`,
-                reason: `No active permit granted to agent '${input.agent}' covers ${rel}. Change reverted.`,
-                fix: `Request a write permit via grant_write_permit (CEO only, requires an approved RFC)`,
-              }),
+              agent
+                ? diag("ERROR", `Write blocked in protected zone: ${rel}`, {
+                    context: `${input.tool}(file_path=${rel})`,
+                    reason: `No active permit granted to agent '${agent}' covers ${rel}. Change reverted.`,
+                    fix: `Request a write permit via grant_write_permit (CEO only, requires an approved RFC)`,
+                  })
+                : diag("ERROR", `Write blocked in protected zone: ${rel}`, {
+                    context: `${input.tool}(file_path=${rel})`,
+                    reason: `${UNAUTH_SESSION_MSG}. Change reverted.`,
+                    fix: `Call authenticate(persona="<your id>") in this session, then retry the write under your active permit.`,
+                  }),
             );
           }
 
@@ -539,6 +614,8 @@ export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
       // ---------------------------------------------------------------
       if (input.tool === "bash") {
         const state = getState(input.sessionID);
+        // Identity for the two protected-zone permit checks below (RFC 25b6678c).
+        const bashAgent = resolveAgent(input, sessions);
 
         // Layer 3: detect DB tampering (self-granted permits)
         if (revertPermitTampering(rootDir, state.permitSnapshot)) {
@@ -565,15 +642,21 @@ export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
 
             if (
               isInProtectedZone(file) &&
-              !hasActivePermit(rootDir, file, input.agent)
+              !hasActivePermit(rootDir, file, bashAgent)
             ) {
               revertFile(rootDir, file);
               throw new Error(
-                diag("ERROR", `Bash modified protected zone: ${file}`, {
-                  context: `bash command aftermath check`,
-                  reason: `No active permit granted to agent '${input.agent}' covers ${file}. Change reverted.`,
-                  fix: `Request a write permit via grant_write_permit before modifying protected zones`,
-                }),
+                bashAgent
+                  ? diag("ERROR", `Bash modified protected zone: ${file}`, {
+                      context: `bash command aftermath check`,
+                      reason: `No active permit granted to agent '${bashAgent}' covers ${file}. Change reverted.`,
+                      fix: `Request a write permit via grant_write_permit before modifying protected zones`,
+                    })
+                  : diag("ERROR", `Bash modified protected zone: ${file}`, {
+                      context: `bash command aftermath check`,
+                      reason: `${UNAUTH_SESSION_MSG}. Change reverted.`,
+                      fix: `Call authenticate(persona="<your id>") in this session before modifying protected zones`,
+                    }),
               );
             }
           }
@@ -595,7 +678,7 @@ export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
                   !isSafeBashPath(f) &&
                   !isVolatile(f) &&
                   isInProtectedZone(f) &&
-                  !hasActivePermit(rootDir, f, input.agent),
+                  !hasActivePermit(rootDir, f, bashAgent),
               );
             if (unauthorized.length > 0) {
               run(`git reset --soft ${state.gitHead}`, rootDir);

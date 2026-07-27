@@ -5,7 +5,8 @@ metadata:
   title: "V1 process lot 3 : pré-check de périmètre au grant, triggers humains path-matchables, matrice author-produces, intégrité des related, gate plan-approuvé, rappels de capitalisation, personas.yml et warnings reindex_all"
   author: architect
   created_at: "2026-07-12"
-  status: draft
+  status: approved
+  approved_at: "2026-07-11T23:26:11.541363121+00:00"
   description: >
     Lot 3 et dernier du durcissement process (recensement c981bf62 items 14
     à 19 + frictions 20-21 du lot 2, task-request b9dbcff9, suite des lots

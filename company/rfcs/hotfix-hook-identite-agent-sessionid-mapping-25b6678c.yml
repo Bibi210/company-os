@@ -5,7 +5,8 @@ metadata:
   title: "Hotfix identité d'agent dans le hook : mapping sessionID→persona via authenticate, réparation M13/M12a/garde cross-persona, retrait du hot-reload de code non fiable"
   author: architect
   created_at: "2026-07-14"
-  status: draft
+  status: approved
+  approved_at: "2026-07-14T14:10:34.232737408+00:00"
   project: company-os
   description: >
     Hotfix de l'incident bloquant diagnostiqué en 9ed7c07c : le mécanisme 13

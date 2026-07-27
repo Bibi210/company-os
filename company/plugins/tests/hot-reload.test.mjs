@@ -1,11 +1,14 @@
-// Hot-reload tests — verifies the event-driven reload mechanism
+// Data-reload tests (RFC 25b6678c) — verifies the event-driven DATA reload.
+//
+// CODE hot-reload was REMOVED (RFC 25b6678c): plugin code changes now require an
+// opencode restart, so there is nothing to test for core invalidation. Only
+// DATA reloads (zones, personas.yml) fire without restart, via readFileSync.
 //
 // Tests that:
 // 1. Zones are loaded on init and reloaded when protected-zones.json changes
-// 2. Core is invalidated when a plugin file changes
-// 3. Personas.yml is regenerated when a persona file changes
-// 4. Protected zones config changes trigger full reload
-// 5. Rust protected_zones module reload works via CLI
+// 2. personas.yml is regenerated when a persona file changes
+// 3. protected zones config changes trigger a zones re-read (data only)
+// 4. defense-in-depth-core.mjs protected zones reload works
 
 import { describe, it, beforeEach } from "node:test";
 import { strict as assert } from "node:assert";
@@ -17,10 +20,8 @@ import "../defense-in-depth.mjs";
 const _test = globalThis.__defenseInDepthTest;
 const {
   loadZones,
-  invalidateCore,
   generatePersonasYml,
   onProtectedZoneWrite,
-  getCachedCreateHandlers,
   getZones,
 } = _test;
 
@@ -141,18 +142,11 @@ describe("loadZones", () => {
 });
 
 // ==========================================================================
-// Core invalidation
+// No code hot-reload (RFC 25b6678c)
 // ==========================================================================
 
-describe("core invalidation", () => {
-  it("invalidateCore clears the cached module", () => {
-    // We can't easily set cachedCreateHandlers from outside, but we can
-    // verify invalidateCore doesn't throw and the getter returns null after
-    invalidateCore();
-    assert.strictEqual(getCachedCreateHandlers(), null);
-  });
-
-  it("onProtectedZoneWrite invalidates core when plugin file changes", () => {
+describe("no code hot-reload", () => {
+  it("a plugin code change does NOT invalidate the cached core (restart required)", () => {
     const root = makeTmpRoot();
     writeZonesFile(root, {
       prefixes: ["company/plugins/"],
@@ -162,14 +156,14 @@ describe("core invalidation", () => {
     });
     loadZones(root);
 
-    // Invalidate first to have a clean state
-    invalidateCore();
-    assert.strictEqual(getCachedCreateHandlers(), null);
-
-    // The callback should invalidate core for plugin changes
-    // (we can't test that it WAS cached, but we can verify the path triggers invalidation)
-    onProtectedZoneWrite(root, "company/plugins/defense-in-depth-core.mjs");
-    assert.strictEqual(getCachedCreateHandlers(), null);
+    // A write to the plugin dir must NOT trigger any core invalidation: the
+    // callback only handles data (zones, personas). It must not throw and must
+    // be a no-op for code files.
+    assert.doesNotThrow(() =>
+      onProtectedZoneWrite(root, "company/plugins/defense-in-depth-core.mjs"),
+    );
+    // zones untouched by a plugin-code write
+    assert.deepStrictEqual(getZones().prefixes, ["company/plugins/"]);
   });
 });
 
@@ -315,7 +309,7 @@ describe("defense-in-depth-core zones reload", () => {
 // ==========================================================================
 
 describe("end-to-end reload cycle", () => {
-  it("zones change → core invalidated → personas regenerated", () => {
+  it("zones change → zones reloaded → personas regenerated (data only, no core reload)", () => {
     const root = makeTmpRoot();
     const personasDir = "company/personas";
     const personasOut = "company/config/personas.yml";
@@ -338,7 +332,7 @@ describe("end-to-end reload cycle", () => {
     const initial = readFileSync(join(root, personasOut), "utf-8");
     assert.ok(initial.includes("tester:"));
 
-    // Step 1: zones file changes → reload zones + invalidate core
+    // Step 1: zones file changes → reload zones (data only, no core reload)
     writeZonesFile(root, {
       prefixes: ["company/config/", "company/personas/", "company/plugins/", "new-zone/"],
       files: [],
@@ -348,7 +342,6 @@ describe("end-to-end reload cycle", () => {
     onProtectedZoneWrite(root, "company/config/protected-zones.json");
 
     assert.ok(getZones().prefixes.includes("new-zone/"), "zones should be reloaded");
-    assert.strictEqual(getCachedCreateHandlers(), null, "core should be invalidated");
 
     // Step 2: persona changes → personas.yml regenerated
     const newPersona = SAMPLE_PERSONA.replace("id: tester", "id: new-agent")

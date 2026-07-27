@@ -1,14 +1,18 @@
 // Defense in Depth — OpenCode plugin for Company OS
 //
-// Thin wrapper with event-driven hot-reload:
-// - Core logic is reimported when a plugin file is modified (via permit)
+// Thin wrapper with event-driven DATA reload (RFC 25b6678c):
 // - personas.yml is regenerated when a persona file is modified (via permit)
-// - protected-zones.json changes trigger core reload (zones are re-read on init)
-// No mtime polling — reload only fires when a write with permit hits a protected zone.
+// - protected-zones.json changes trigger a zones re-read (readFileSync)
+// CODE hot-reload was REMOVED (RFC 25b6678c): the import "?t=mtime" cache-bust
+// was not reliable under the Bun runtime opencode embeds and masked an incident
+// for three days by running stale code while appearing to reload. The core is
+// now imported ONCE per process. ANY plugin code change (core or wrapper)
+// requires an opencode RESTART (explicit promotion pattern, RFC 18011bfc).
+// Only DATA (zones, personas.yml) reloads without restart, via readFileSync.
 
 import { resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { readdirSync, readFileSync, writeFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CORE_PATH = resolve(__dirname, "defense-in-depth-core.mjs");
@@ -32,15 +36,12 @@ function loadZones(rootDir) {
 }
 
 async function loadCore() {
+  // RFC 25b6678c: import the core ONCE per process, no cache-busting query
+  // string. A plugin code change requires an opencode restart to take effect.
   if (cachedCreateHandlers) return cachedCreateHandlers;
-  const mtime = statSync(CORE_PATH).mtimeMs;
-  const mod = await import(pathToFileURL(CORE_PATH).href + `?t=${mtime}`);
+  const mod = await import(pathToFileURL(CORE_PATH).href);
   cachedCreateHandlers = mod.createHandlers;
   return cachedCreateHandlers;
-}
-
-function invalidateCore() {
-  cachedCreateHandlers = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -109,23 +110,18 @@ function generatePersonasYml(rootDir) {
 // Callback: a write with permit just succeeded on a protected zone file
 // ---------------------------------------------------------------------------
 function onProtectedZoneWrite(rootDir, relPath) {
-  // Check each prefix from the zones config to decide what to reload
+  // RFC 25b6678c: only DATA reloads here. Plugin CODE changes are NOT
+  // hot-reloaded any more — they require an opencode restart.
   for (const prefix of zones.prefixes) {
     if (!relPath.startsWith(prefix)) continue;
 
-    // The zones file itself changed → reload zones + invalidate core
+    // The zones file itself changed → reload zones (data, readFileSync).
     if (relPath === ZONES_FILE) {
       loadZones(rootDir);
-      invalidateCore();
       return;
     }
 
-    // Plugin dir → invalidate core so next call reimports
-    if (CORE_PATH.endsWith(relPath.split("/").pop())) {
-      invalidateCore();
-    }
-
-    // Personas dir → regenerate personas.yml
+    // Personas dir → regenerate personas.yml (data).
     if (relPath.startsWith(zones.personas_dir)) {
       generatePersonasYml(rootDir);
     }
@@ -140,7 +136,6 @@ const _test = {
   parsePersonaYaml,
   parseYamlList,
   loadZones,
-  invalidateCore,
   generatePersonasYml,
   onProtectedZoneWrite,
   getCachedCreateHandlers: () => cachedCreateHandlers,

@@ -12,6 +12,9 @@ import {
   revertPermitTampering,
   snapshotPermits,
   hasActivePermit,
+  resolveAgent,
+  AUTH_TOOL_RE,
+  UNAUTH_SESSION_MSG,
 } from "../defense-in-depth-core.mjs";
 import { writeFileSync, mkdirSync, rmSync, existsSync, readdirSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
@@ -512,5 +515,162 @@ describe("hasActivePermit (mechanism 13: granted_to == agent)", () => {
     } finally {
       rmSync(rootDir, { recursive: true, force: true });
     }
+  });
+});
+
+// =====================================================================
+// Agent identity (RFC 25b6678c): resolveAgent + AUTH_TOOL_RE
+// Triaxial: nominal (mapping resolves), négatif (fail-closed / no mapping),
+// edge (last-wins, input.agent priority, restart, 3 tool-name forms).
+// =====================================================================
+
+// Simulate the sessions Map with a per-session persona (as the hook records it
+// in tool.execute.after on a successful authenticate).
+function sessionsWith(entries) {
+  const m = new Map();
+  for (const [sid, persona] of entries) m.set(sid, { persona });
+  return m;
+}
+
+describe("resolveAgent (identity source)", () => {
+  it("nominal: mapping resolves the persona for the session", () => {
+    // authenticate(persona=implementer) observed in `after` → sessions has it.
+    const sessions = sessionsWith([["s1", "implementer"]]);
+    assert.equal(
+      resolveAgent({ sessionID: "s1" }, sessions),
+      "implementer",
+      "write in the same session resolves to the mapped persona",
+    );
+  });
+
+  it("négatif: session with no authenticate → null (fail-closed)", () => {
+    const sessions = sessionsWith([]); // nothing recorded
+    assert.equal(resolveAgent({ sessionID: "s1" }, sessions), null);
+  });
+
+  it("négatif: a different session's mapping does not leak", () => {
+    const sessions = sessionsWith([["s1", "implementer"]]);
+    assert.equal(resolveAgent({ sessionID: "s2" }, sessions), null);
+  });
+
+  it("négatif: empty persona in the mapping resolves to null", () => {
+    // An empty args.persona is never recorded, but guard against a falsy value.
+    const sessions = new Map([["s1", { persona: "" }]]);
+    assert.equal(resolveAgent({ sessionID: "s1" }, sessions), null);
+  });
+
+  it("edge: last-wins — authenticate pm then implementer → implementer", () => {
+    // The recording is last-wins; here we simulate the final state of the Map.
+    const sessions = sessionsWith([["s1", "pm"]]);
+    sessions.set("s1", { persona: "implementer" }); // second authenticate overwrote
+    assert.equal(resolveAgent({ sessionID: "s1" }, sessions), "implementer");
+  });
+
+  it("edge: input.agent (future runtime) takes priority over a divergent mapping", () => {
+    const sessions = sessionsWith([["s1", "pm"]]);
+    assert.equal(
+      resolveAgent({ sessionID: "s1", agent: "architect" }, sessions),
+      "architect",
+      "runtime-provided agent wins over the mapping",
+    );
+  });
+
+  it("edge: empty input.agent falls back to the mapping", () => {
+    const sessions = sessionsWith([["s1", "implementer"]]);
+    assert.equal(resolveAgent({ sessionID: "", agent: "" }, sessions), null);
+    assert.equal(
+      resolveAgent({ sessionID: "s1", agent: "" }, sessions),
+      "implementer",
+    );
+  });
+
+  it("edge: restart — empty sessions Map → null (mapping lost)", () => {
+    const sessions = new Map(); // fresh process after restart
+    assert.equal(resolveAgent({ sessionID: "s1" }, sessions), null);
+  });
+
+  it("edge: no sessionID and no agent → null", () => {
+    assert.equal(resolveAgent({}, new Map()), null);
+    assert.equal(resolveAgent(undefined, undefined), null);
+  });
+});
+
+describe("AUTH_TOOL_RE (authenticate tool-name detection)", () => {
+  it("edge: matches the three forms of the authenticate tool name", () => {
+    assert.ok(AUTH_TOOL_RE.test("orchestrator_authenticate"), "real form seen by the hook");
+    assert.ok(AUTH_TOOL_RE.test("mcp_orchestrator_authenticate"), "old code form");
+    assert.ok(AUTH_TOOL_RE.test("mcp_Orchestrator_authenticate"), "MCP server-name casing");
+  });
+
+  it("négatif: does not match unrelated tools", () => {
+    assert.ok(!AUTH_TOOL_RE.test("bash"));
+    assert.ok(!AUTH_TOOL_RE.test("write"));
+    assert.ok(!AUTH_TOOL_RE.test("orchestrator_search"));
+    assert.ok(!AUTH_TOOL_RE.test("authenticate_orchestrator"));
+    assert.ok(!AUTH_TOOL_RE.test(""));
+  });
+});
+
+// =====================================================================
+// End-to-end identity: hasActivePermit fed by resolveAgent (RFC 25b6678c)
+// mirrors the three call-sites, which now pass resolveAgent(input) instead of
+// input.agent brut.
+// =====================================================================
+describe("hasActivePermit fed by resolveAgent (call-site behaviour)", () => {
+  it("nominal: mapped persona + covering permit → write allowed", () => {
+    const { rootDir } = setupPermitRoot([
+      ["active", "implementer", ["company/plugins/"]],
+    ]);
+    try {
+      const sessions = sessionsWith([["s1", "implementer"]]);
+      const agent = resolveAgent({ sessionID: "s1" }, sessions);
+      assert.equal(
+        hasActivePermit(rootDir, "company/plugins/x.mjs", agent),
+        true,
+      );
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("négatif: unauthenticated session → resolveAgent null → no permit matches", () => {
+    const { rootDir } = setupPermitRoot([
+      ["active", "implementer", ["company/plugins/"]],
+    ]);
+    try {
+      const agent = resolveAgent({ sessionID: "s1" }, new Map());
+      assert.equal(agent, null);
+      assert.equal(
+        hasActivePermit(rootDir, "company/plugins/x.mjs", agent),
+        false,
+        "fail-closed: unknown identity never matches a permit",
+      );
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("négatif: authenticate pm then write under implementer's permit → mismatch blocks", () => {
+    const { rootDir } = setupPermitRoot([
+      ["active", "implementer", ["company/plugins/"]],
+    ]);
+    try {
+      const sessions = sessionsWith([["s1", "pm"]]);
+      const agent = resolveAgent({ sessionID: "s1" }, sessions);
+      assert.equal(agent, "pm");
+      assert.equal(
+        hasActivePermit(rootDir, "company/plugins/x.mjs", agent),
+        false,
+        "a permit granted to implementer does not cover pm",
+      );
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it("edge: the fail-closed message is the actionable authenticate hint", () => {
+    // The call-sites emit UNAUTH_SESSION_MSG when resolveAgent returns null.
+    assert.match(UNAUTH_SESSION_MSG, /authenticate\(persona=/);
+    assert.match(UNAUTH_SESSION_MSG, /zone protégée/);
   });
 });
