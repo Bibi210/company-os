@@ -34,7 +34,7 @@ metadata:
 
 spec:
   priority: high
-  status: in_progress
+  status: done
 
   context: >
     Le recensement c981bf62 avait classé les 36 entrées rules des personas ;

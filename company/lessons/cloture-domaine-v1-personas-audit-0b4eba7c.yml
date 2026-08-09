@@ -1,0 +1,130 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 0b4eba7c-8e66-44d2-8846-352e2d3f37c9
+  title: >
+    Clôture du domaine v1-personas-audit : après un durcissement mécanique, réaligner
+    la prose des personas sinon les agents raisonnent sur un modèle faux du système ;
+    et appliquer un RFC peut révéler un bug latent dans l'outillage qui le consomme
+  author: implementer
+  created_at: "2026-08-09"
+  description: >
+    Capitalisation de clôture du DOMAINE v1-personas-audit (task-request 3dcd3a6b,
+    diagnostic d9f9ae30, roadmap a410bb43, programme companyos-v1). Le domaine
+    v1-process-hardening avait mécanisé 27 des 62 règles de process dans le harness ;
+    ce domaine-ci en tire la conséquence sur les 4 personas. RFC 098f35db (approved
+    puis implemented) : 12 règles réécrites en pointeurs courts vers leur mécanisme,
+    2 supprimées (redondance mécanisée), 5 ajoutées (manques V1 : reprise de session
+    et vérif deploy-serve pour le PM, mode de mise en service dans les RFCs pour
+    l'Architect, discipline user_approval_confirmed et traitement des scope_warnings
+    pour le CEO), 3 consumes corrigés, 3 review_behavior élargis. 24 règles de
+    jugement conservées intactes. Deux enseignements : (1) un durcissement mécanique
+    laisse une dette de prose : tant que la persona ordonne en impératif ce que le
+    harness impose déjà, l'agent raisonne sur un modèle FAUX (il croit tenir une
+    règle par bonne volonté alors qu'elle est gardée par la machine) — il faut une
+    passe de réalignement qui transforme chaque règle mécanisée en pointeur vers son
+    mécanisme, en gardant la clause de jugement résiduel. (2) L'application d'un RFC
+    peut révéler un bug latent dans l'outillage qui le consomme : les review_behavior
+    élargis (première prose contenant ' : ') ont cassé le générateur personas.yml
+    qui concaténait des scalaires non quotés, forçant un revert + le hotfix bd416171
+    (JSON.stringify). Un artefact de test non représentatif cache un bug pendant des
+    mois ; c'est la donnée réelle nouvelle qui le déclenche.
+  tags:
+    - companyos-v1
+    - personas
+    - audit
+    - prose
+    - harness
+    - mechanical-invariant
+    - domain-closure
+    - latent-bug
+    - lessons-from-implementation
+  related:
+    - id: d9f9ae30-ddad-4d24-bad8-ae7bf5a6617d
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: 70ae1440-6def-4601-bfdb-38a7973904f9
+      kind: lesson-learned
+      relationship: related
+    - id: f5f62e3b-27b4-4bc3-b9f3-74db0cde24cb
+      kind: lesson-learned
+      relationship: related
+    - id: 098f35db-d3f8-402d-8528-bb71b2ef5dcd
+      kind: rfc
+      relationship: input
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: input
+
+spec:
+  context: >
+    Le domaine v1-personas-audit ouvre sur le diagnostic d9f9ae30, qui classe les
+    38 entrées rules des 4 personas plus leurs champs identity/review_behavior/
+    produces/consumes en quatre verdicts : CONSERVER (jugement, prose légitime),
+    RÉÉCRIRE EN POINTEUR (le harness impose désormais, la règle cite le mécanisme),
+    SUPPRIMER (redondance pure avec le harness ou shared-rules), AJOUTER (manque
+    observé en sessions V1). Le RFC 098f35db applique ce classement, itéré une fois
+    (round 1931fd02, request_changes de l'Implementer sur la séquence I1 qui
+    paraphrasait l'ancien ordre build-après-consume au lieu de l'ordre imposé par
+    la GARDE 3 : make ci avant commit, consume sur worktree propre). Le RFC cible
+    une zone protégée (company/personas/) : cycle complet, trigger humain D24 au
+    grant pour ceo.yml, couvert par la délégation V1 documentée dans la roadmap
+    a410bb43. Première tentative d'implémentation : les 4 personas éditées, puis
+    l'écriture régénère personas.yml (M20b) qui devient du YAML invalide → make ci
+    rouge (test_validate_all_shipped_artifacts) → revert. Le permit b90f10e3 et le
+    RFC 098f35db approved sont restés intacts. Le hotfix bd416171 corrige le
+    générateur (JSON.stringify), déployé par restart de session, puis
+    ré-application propre : personas.yml valide, make ci vert, commit, consume,
+    RFC implemented.
+  insight: >
+    Deux enseignements de domaine. (1) UN DURCISSEMENT MÉCANIQUE LAISSE UNE DETTE DE
+    PROSE, ET LA LAISSER EST DANGEREUX. Quand un invariant passe de la prose au
+    harness (lots 1-3, RFCs 8bf78218/a4ee8b6a/0197fbe5), la règle persona qui
+    l'ordonnait encore en impératif ne devient pas inoffensive : elle devient
+    TROMPEUSE. Un agent qui lit « ne modifie pas les zones protégées » sans savoir
+    que le hook rend la chose physiquement impossible sans permit raisonne sur un
+    modèle faux du système — il croit qu'une garantie mécanique repose sur sa bonne
+    volonté. La réponse n'est ni de supprimer la règle (on perd le POURQUOI l'action
+    échouerait) ni de la garder telle quelle (modèle faux), mais de la réécrire en
+    POINTEUR : une ligne courte qui cite le mécanisme (M13, GARDE 3, M14...) et
+    conserve la clause de jugement résiduel là où il en reste (P4 : QUAND lancer un
+    round ; C2 : le breaking schema change non mécanisé ; I9 : la CI des projets
+    externes). Le critère de tri est celui du diagnostic : CONSERVER si jugement pur,
+    POINTEUR si le harness impose mais qu'une nuance survit, SUPPRIMER si redondance
+    pure (A4 fusionnée dans A2, I7 doublon de I13). Corollaire : les manques
+    symétriques des mécanismes (M14/M15/M18 conçus POUR être jugés par une persona
+    mais sans contrepartie dans la persona qui juge) doivent être comblés en même
+    temps — un mécanisme sans sa discipline de jugement est un contournement à un
+    paramètre près (CA1 pour user_approval_confirmed). (2) APPLIQUER UN RFC EST UN
+    TEST D'INTÉGRATION DE L'OUTILLAGE QUI LE CONSOMME. Le générateur personas.yml
+    concaténait des scalaires non quotés (`role: ${identity}`) depuis des mois sans
+    incident : aucun review_behavior historique ne contenait ' : '. Les
+    review_behavior élargis de ce RFC en contiennent (« Pour les RFCs : ... ») → le
+    document régénéré devient un mapping imbriqué invalide → make ci rouge. Le bug
+    était latent parce que les données de test n'étaient pas représentatives de la
+    prose future ; c'est la donnée réelle nouvelle apportée par le RFC qui l'a
+    déclenché. Un RFC qui touche des données passées dans un générateur/validateur
+    est aussi un test de ce générateur : le hook M20b a fait exactement son travail
+    en refusant de committer un YAML cassé.
+  recommendation: >
+    (1) Après tout lot de mécanisation d'invariants (nouveau harness serveur, schema,
+    hook), planifier une passe de réalignement de la prose qui référence ces
+    invariants — personas ET shared-rules. Ne pas laisser survivre une règle qui
+    ordonne en impératif ce qui est désormais mécanique : la réécrire en pointeur
+    (cite le mécanisme + garde la nuance de jugement) ou la supprimer si redondance
+    pure. Le diagnostic préalable (classement règle par règle : CONSERVER / POINTEUR
+    / SUPPRIMER / AJOUTER, avec justification et croisement au recensement) est ce
+    qui rend la passe cohérente plutôt qu'improvisée. (2) Combler les manques
+    SYMÉTRIQUES en même temps : pour chaque mécanisme récent conçu pour être jugé par
+    une persona (scope_warnings, user_approval_confirmed, warning plan-approuvé),
+    vérifier que la persona qui le consomme a la règle de jugement correspondante.
+    (3) Quand un RFC modifie des données lues par un générateur ou un validateur
+    (personas.yml régénéré par M20b, schemas, matrices), traiter l'application comme
+    un test d'intégration de cet outillage : préparer le cas où la donnée nouvelle
+    déclenche un bug latent (revert propre possible parce que le permit et le RFC
+    approved survivent au revert du code, puis hotfix ciblé sur l'outil, puis
+    ré-application). Un générateur de format structuré (YAML/JSON/TOML) doit quoter
+    inconditionnellement ses scalaires (JSON.stringify) plutôt que concaténer, cf.
+    lesson 70ae1440 — mais au-delà du fix ponctuel, la leçon de processus est que
+    l'outillage doit être testé avec des données représentatives des artefacts
+    FUTURS, pas seulement du stock historique.
