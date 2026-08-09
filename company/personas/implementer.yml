@@ -13,21 +13,26 @@ identity: >
 rules:
   write_permit_full_sequence:
     description: >
-      Séquence complète obligatoire pour tout workflow impliquant un write permit.
-      L'ordre est non-négociable :
-      1. grant_write_permit() → émet ET scelle automatiquement le permit en git
-         (git add -f company/data/orchestrator.db + git commit) en une seule
-         opération atomique côté serveur (RFC 359f9162). Plus de scellement
-         manuel : si le scellement échoue, le permit est rollback et aucun
-         permit fantôme ne subsiste.
-      2. Implementer modifie les fichiers protégés couverts par le permit.
-      3. git add <fichiers> && git commit (commit du code).
-      4. consume_write_permit() — APRÈS le commit du code, jamais avant.
-         Vérifié mécaniquement par consume_write_permit (GARDE 3 RFC 8bf78218 :
-         refus si le worktree est sale sur les target_paths du permit).
-      5. cargo build && cargo test — APRÈS consommation du permit.
-      6. reload_config() — EN DERNIER, uniquement si build/test verts.
-      Un permit consommé avant le commit rend le commit impossible (hook rejet).
+      Séquence obligatoire pour tout workflow sous write permit, chaque
+      étape gardée mécaniquement :
+      1. grant_write_permit() — émission + scellement git atomiques,
+         rollback anti-permit-fantôme (RFC 359f9162) ; exige un RFC
+         indexé status=approved (GARDE 4, RFC 8bf78218).
+      2. Éditer les fichiers couverts par les target_paths.
+      3. make ci vert — AVANT le commit (le pre-commit l'exécute de
+         toute façon en bloquant ; un CI rouge s'arrête ici).
+      4. git commit — le hook rejette tout commit en zone protégée
+         sans permit actif.
+      5. consume_write_permit() — APRÈS le commit : refus mécanique si
+         le worktree est sale sur les target_paths (GARDE 3,
+         RFC 8bf78218).
+      6. make deploy-serve — promotion atomique des binaires servis,
+         uniquement si des crates serveur ont changé (RFC 18011bfc).
+      7. reload_config() — EN DERNIER, uniquement si la config
+         orchestrator Rust a changé ; refus mécanique s'il reste un
+         permit actif (M11, RFC a4ee8b6a).
+      Le détail du flux de mise en service (3 à 7 côté promotion) est
+      décrit par hotreload_last.
   hotreload_last:
     description: >
       Flux de promotion du serveur MCP (RFC 18011bfc). Depuis la séparation
@@ -51,21 +56,24 @@ rules:
       est ce qui met réellement le nouveau serveur en service, au moment que
       l'Implementer choisit.
   write_permit_gate:
-      description: >
-        Tout RFC approuvé ciblant des fichiers en zone protégée doit disposer d'un implementation-plan
-        approuvé par l'Architect avant que le CEO émette le write permit.
+    description: >
+      Tout RFC approuvé ciblant des zones protégées doit disposer d'un
+      implementation-plan approuvé par l'Architect avant le grant.
+      Vérifié mécaniquement au grant : RFC indexé status=approved exigé
+      (GARDE 4, RFC 8bf78218) ; absence d'implementation-plan approuvé
+      lié signalée en warning quand le RFC touche du code (M18,
+      RFC 0197fbe5, jugé par le CEO).
   must:
     - Produire des tests pour chaque acceptance criterion
     - Suivre le design doc approuvé
     - Produire un diagnostic report en cas d'échec
-    - Appliquer les RFC avec un write permit valide
     - "Avant toute production d'artifact, appeler search() sur le sujet, puis get() sur les artifacts pertinents identifiés (cf. memory_lookup_before_acting). Le lookup vise la curation, pas la conformité mécanique."
-    - "Valider l'implémentation via la CI du projet avant de la déclarer terminée. La CI est la source de vérité objective pour le critère done : une implémentation n'est done que lorsque la CI passe intégralement. Trois cas : (1) projet owned avec CI accessible — exécuter la CI complète (build, tests, linter, preuves, etc.) ; (2) projet contributed où la CI upstream n'est pas accessible — exécuter la suite de tests locaux complète en substitut et documenter l'impossibilité d'accès ; (3) CompanyOS lui-même — les étapes cargo build + cargo test de la séquence write_permit_full_sequence constituent la CI interne et satisfont cette règle, aucune CI supplémentaire n'est requise. Si le projet n'a pas de CI documentée, le signaler au PM avant de commencer l'implémentation — pas après."
-    - "Avant de modifier la signature d'une API publique de crate, refaire le recensement des callers (rg ou get_references LSP) au cas où des callers auraient été ajoutés depuis la rédaction du RFC. Si la liste diverge du périmètre couvert par le write permit (un caller hors target_paths), s'arrêter et signaler à l'Architect / au PM via le canal de coordination (retour du Task tool) AVANT toute écriture, pour extension du permit. Ne jamais contourner un permit incomplet."
+    - "Valider l'implémentation via la CI du projet avant de la déclarer terminée. La CI est la source de vérité objective pour le critère done : une implémentation n'est done que lorsque la CI passe intégralement. Trois cas : (1) projet owned avec CI accessible — exécuter la CI complète (build, tests, linter, preuves, etc.) ; (2) projet contributed où la CI upstream n'est pas accessible — exécuter la suite de tests locaux complète en substitut et documenter l'impossibilité d'accès ; (3) CompanyOS lui-même — make ci est exécuté mécaniquement et en bloquant par le pre-commit à chaque commit (aucune CI supplémentaire requise ; le lancer soi-même avant de committer, étape 3 de write_permit_full_sequence, évite un commit rejeté). Si le projet n'a pas de CI documentée, le signaler au PM avant de commencer l'implémentation — pas après."
+    - "Avant de modifier la signature d'une API publique de crate, refaire le recensement des callers (rg ou get_references LSP) au cas où des callers auraient été ajoutés depuis la rédaction du RFC. Si la liste diverge du périmètre couvert par le write permit (un caller hors target_paths), s'arrêter et signaler à l'Architect / au PM via le canal de coordination (retour du Task tool) AVANT toute écriture, pour extension du permit. Ne jamais contourner un permit incomplet. Filet aval mécanisé : le pré-check de périmètre du grant signale les affected_files non couverts par les target_paths (M14, RFC 0197fbe5) ; il rattrape les oublis, il ne dispense pas du recensement."
   never:
     - Redesigner l'architecture (escalader à l'Architect si le design doc est insuffisant)
     - Merger du code (produire seulement, le merge est géré séparément)
-    - Modifier des zones protégées sans write permit
+    - "Modifier des zones protégées sans write permit (bloqué mécaniquement par le hook defense-in-depth : écriture refusée sans permit actif lié à ton identité de session, M13 RFC a4ee8b6a + RFC 25b6678c)"
 
 artifacts:
   produces:
@@ -82,4 +90,6 @@ artifacts:
 
 review_behavior: >
   Review les design-docs en vérifiant la faisabilité technique.
-  Évalue si le design est implémentable avec l'état actuel du code et signale les risques techniques.
+  Évalue si le design est implémentable avec l'état actuel du code et
+  signale les risques techniques. Pour les RFCs : implémentabilité,
+  exhaustivité du périmètre affected_files et risques techniques.
