@@ -251,6 +251,110 @@ describe("personas hot-reload", () => {
     generatePersonasYml(root);
     assert.ok(!existsSync(join(root, "company/config/personas.yml")), "should not create file for empty dir");
   });
+
+  // RFC bd416171: the generator emits every scalar via JSON.stringify so any
+  // YAML-active content survives without corrupting the document. Regression
+  // guard for the latent bug that broke personas.yml under RFC 098f35db: a
+  // review_behavior containing " : " was parsed as a nested mapping. This test
+  // exercises the three axes on the emitted values (colon-space, quotes,
+  // backslash, unicode) with a lossless round-trip. Each emitted value is a
+  // JSON string, which is a valid YAML 1.2 double-quoted scalar; we round-trip
+  // via JSON.parse (dependency-free) to assert value === source.
+  it("generatePersonasYml quotes YAML-active scalars losslessly (RFC bd416171)", () => {
+    const root = makeTmpRoot();
+    const personasDir = "company/personas";
+    const personasOut = "company/config/personas.yml";
+
+    writeZonesFile(root, {
+      prefixes: ["company/personas/"],
+      files: [],
+      personas_dir: personasDir,
+      personas_out: personasOut,
+    });
+    loadZones(root);
+
+    // NEGATIVE + EDGE payloads, all on ONE line each (the generator collapses
+    // block scalars to a single line before emitting):
+    //  - identity: colon-space, backslash, unicode, hash
+    //  - review_behavior: colon-space AND both single and double quotes
+    const IDENTITY = `Concoit les systemes : autorite technique. Chemin C:\\\\x #1 — flux "resilient" — café ☕ 日本語`;
+    const REVIEW = `Verifie tout : implementation-plans (fidelite), "code" et 'tests' — sans redesign`;
+
+    const persona = `api_version: companyos/v1
+kind: persona
+metadata:
+  id: quoter
+  title: Quoter
+  author: ceo
+  created_at: "2026-07-27"
+  display_name: Quoter
+
+identity: >
+  ${IDENTITY}
+
+rules:
+  must:
+    - Do things
+  never:
+    - Break things
+
+artifacts:
+  produces:
+    - design-doc
+  consumes:
+    - task-request
+
+review_behavior: >
+  ${REVIEW}
+`;
+
+    writePersonaFile(root, personasDir, "quoter.yml", persona);
+    mkdirSync(join(root, "company/config"), { recursive: true });
+
+    generatePersonasYml(root);
+
+    const outPath = join(root, personasOut);
+    assert.ok(existsSync(outPath), "personas.yml should be generated");
+    const content = readFileSync(outPath, "utf-8");
+
+    // Helper: extract the raw text after "  <field>: " for the given field,
+    // assert it is a well-formed double-quoted (JSON) scalar, and return the
+    // parsed value for the round-trip check.
+    const parseField = (field) => {
+      const line = content
+        .split("\n")
+        .find((l) => l.startsWith(`  ${field}: `));
+      assert.ok(line, `personas.yml must contain a ${field} line`);
+      const raw = line.slice(`  ${field}: `.length);
+      // NOMINAL/EDGE: the emitted value MUST be a double-quoted scalar so
+      // colon-space is never interpreted as a mapping.
+      assert.ok(
+        raw.startsWith('"') && raw.endsWith('"'),
+        `${field} value must be a double-quoted scalar, got: ${raw}`,
+      );
+      // A JSON string is a valid YAML 1.2 double-quoted scalar; JSON.parse is a
+      // faithful decoder for it. Round-trip must be lossless.
+      return JSON.parse(raw);
+    };
+
+    assert.strictEqual(parseField("role"), IDENTITY, "role round-trip lossless");
+    assert.strictEqual(parseField("review"), REVIEW, "review round-trip lossless");
+
+    // Regression assertion: the whole document has no bare colon-space inside a
+    // value that could be re-read as a nested mapping. Every value line after a
+    // field key is a quoted scalar.
+    for (const field of ["role", "produces", "consumes", "review"]) {
+      const line = content
+        .split("\n")
+        .find((l) => l.startsWith(`  ${field}: `));
+      if (!line) continue;
+      const raw = line.slice(`  ${field}: `.length);
+      assert.ok(
+        raw.startsWith('"') && raw.endsWith('"'),
+        `${field} must be quoted (no bare scalar): ${raw}`,
+      );
+    }
+  });
 });
 
 // ==========================================================================

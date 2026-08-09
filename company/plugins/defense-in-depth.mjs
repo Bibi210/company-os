@@ -96,10 +96,10 @@ function generatePersonasYml(rootDir) {
 
   for (const { name, identity, produces, consumes, review } of entries) {
     lines.push(`${name.toLowerCase()}:`);
-    lines.push(`  role: ${identity}`);
-    if (produces.length) lines.push(`  produces: ${produces.join(", ")}`);
-    if (consumes.length) lines.push(`  consumes: ${consumes.join(", ")}`);
-    if (review) lines.push(`  review: ${review}`);
+    lines.push(`  role: ${JSON.stringify(identity)}`);
+    if (produces.length) lines.push(`  produces: ${JSON.stringify(produces.join(", "))}`);
+    if (consumes.length) lines.push(`  consumes: ${JSON.stringify(consumes.join(", "))}`);
+    if (review) lines.push(`  review: ${JSON.stringify(review)}`);
     lines.push("");
   }
 
