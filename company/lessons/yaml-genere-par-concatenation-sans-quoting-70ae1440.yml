@@ -1,0 +1,70 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 70ae1440-6def-4601-bfdb-38a7973904f9
+  title: "Générer du YAML/config par concaténation de strings sans quoting est une mine latente : quoter inconditionnellement (JSON.stringify)"
+  author: implementer
+  created_at: "2026-08-09"
+  description: >
+    Le générateur de company/config/personas.yml (generatePersonasYml dans
+    company/plugins/defense-in-depth.mjs) émettait role/produces/consumes/review
+    par concaténation de strings brutes non quotées (`role: ${identity}`). Un
+    scalaire YAML non quoté contenant ': ' (deux-points + espace) est réinterprété
+    comme un mapping imbriqué, rendant le document invalide. Le bug est resté
+    latent des mois : aucun review_behavior historique ne contenait ': '. Il s'est
+    déclenché à la première prose légitime avec deux-points (review_behavior
+    élargis du RFC 098f35db), cassant make ci (test_validate_all_shipped_artifacts)
+    et forçant un revert + un hotfix (RFC bd416171). Fix : quoter chaque valeur via
+    JSON.stringify (scalaire double-quoted, JSON étant un sous-ensemble de YAML 1.2),
+    robuste pour tout contenu.
+  tags:
+    - yaml
+    - code-generation
+    - quoting
+    - latent-bug
+    - plugins
+    - defense-in-depth
+    - robustness
+  related:
+    - id: bd416171-8e94-4c88-91af-cfee9e581faf
+      kind: rfc
+      relationship: derived-from
+    - id: f3fc4a5d-e9e6-43ef-86e9-49441fa84eaa
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Un générateur produit un fichier structuré (YAML, JSON, TOML, CSV) en
+    interpolant des valeurs dynamiques dans un template texte, sans échapper ni
+    quoter ces valeurs. Tant que les valeurs restent « sages » (pas de caractère
+    actif du format), la sortie est valide et le bug dort. Il se réveille dès
+    qu'une valeur parfaitement légitime contient un caractère structurel du
+    format cible : pour YAML, ': ' (deux-points + espace), un dièse en tête, une
+    quote, un chevron, un tiret initial. Ici, un review_behavior de persona
+    contenant « lui assigne : implementation-plans » a suffi.
+  insight: >
+    La robustesse d'un émetteur de format ne se juge pas sur le contenu observé
+    aujourd'hui mais sur TOUT contenu que le champ peut légitimement recevoir. La
+    concaténation de strings brutes reporte la charge d'échappement sur l'auteur
+    du contenu (la prose des personas), ce qui est fragile et invisible : rien ne
+    signale que la prose est contrainte par la grammaire d'un générateur en aval.
+    Deux propriétés valent mieux qu'une heuristique « quoter si nécessaire » :
+    (1) quoting INCONDITIONNEL et uniforme, sans cas particulier à oublier ;
+    (2) réutiliser un encodeur déjà correct pour un sur-ensemble syntaxique.
+    JSON.stringify coche les deux : une string JSON est un scalaire YAML 1.2
+    double-quoted valide, et son échappement gère nativement deux-points, quotes
+    simples et doubles, backslashes, dièse et unicode. Le filet mécanique existant
+    (make ci qui parse les artifacts livrés) a rattrapé le bug, mais un filet
+    n'est pas une excuse pour émettre du format non robuste en amont.
+  recommendation: >
+    Ne jamais émettre un format structuré par concaténation de valeurs brutes.
+    Émettre via un sérialiseur du format, ou à défaut quoter/échapper
+    INCONDITIONNELLEMENT chaque valeur avec un encodeur correct pour un
+    sur-ensemble du format cible (pour YAML : JSON.stringify, JSON ⊂ YAML 1.2).
+    Proscrire les heuristiques « quoter si le contenu semble dangereux » : elles
+    oublient toujours un cas. Couvrir le point par un test triaxial qui injecte du
+    contenu YAML-actif (deux-points + espace, quotes simples ET doubles, backslash,
+    unicode) et vérifie un round-trip sans perte, pas seulement la présence du
+    champ. Enfin, garder au moins un test qui parse le fichier généré réel
+    (fail-safe global) : c'est lui qui a révélé cette mine.
