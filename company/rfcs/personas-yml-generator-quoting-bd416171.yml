@@ -1,0 +1,130 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: bd416171-8e94-4c88-91af-cfee9e581faf
+  title: "Hotfix : quoter les scalaires émis par le générateur de personas.yml (JSON.stringify), débloque le RFC 098f35db"
+  author: architect
+  created_at: "2026-07-27"
+  status: draft
+  description: >
+    Le générateur de company/config/personas.yml dans
+    company/plugins/defense-in-depth.mjs (generatePersonasYml, L99-102) émet
+    les scalaires role/produces/consumes/review SANS quoting. Bug latent
+    préexistant, jamais déclenché : aucun review_behavior historique ne
+    contenait " : ". Les review_behavior élargis du RFC 098f35db
+    (réalignement personas, approved) en contiennent → le personas.yml
+    régénéré devient du YAML invalide → make ci rouge
+    (test_validate_all_shipped_artifacts) → implémentation revertée par
+    l'Implementer (permit b90f10e3 toujours actif, RFC 098f35db toujours
+    approved). Fix minimal : émettre chaque valeur via JSON.stringify
+    (double-quoted scalar, JSON étant un sous-ensemble de YAML), robuste
+    pour tout contenu : deux-points, quotes, backslashes, unicode. Un test
+    JS couvre un review contenant " : " et des quotes. Code plugin :
+    restart opencode requis après merge (RFC 25b6678c a retiré le
+    hot-reload de code) ; l'ordre de reprise du RFC 098f35db est documenté
+    dans l'impact.
+  tags:
+    - companyos-v1
+    - hotfix
+    - personas
+    - plugins
+    - yaml
+    - defense-in-depth
+    - quoting
+  related:
+    - id: 098f35db-d3f8-402d-8528-bb71b2ef5dcd
+      kind: rfc
+      relationship: input
+    - id: 25b6678c-5c47-4f3c-9f61-804d98fc78b2
+      kind: rfc
+      relationship: related
+    - id: d9f9ae30-ddad-4d24-bad8-ae7bf5a6617d
+      kind: diagnostic-report
+      relationship: related
+
+spec:
+  motivation: >
+    L'implémentation du RFC 098f35db est BLOQUÉE. Le générateur construit
+    personas.yml par concaténation de strings brutes : `role: ${identity}`,
+    `produces: ${produces.join(", ")}`, `consumes: ...`, `review: ${review}`
+    (defense-in-depth.mjs L99-102). Un scalaire YAML non quoté contenant
+    ": " (deux-points + espace) change la structure du document ou le rend
+    invalide. Les review_behavior élargis par le RFC 098f35db contiennent
+    précisément " : " (ex. "Pour les RFCs : implémentabilité..."), donc la
+    régénération M20b produit un personas.yml invalide et make ci passe au
+    rouge. Le bug est préexistant et latent : il n'attendait qu'un contenu
+    légitime pour se déclencher — n'importe quelle future identity ou
+    review_behavior avec deux-points, quote ou dièse l'aurait déclenché
+    aussi. Corriger le générateur (rendre l'émission robuste à TOUT
+    contenu) est la seule réponse durable ; contourner en réécrivant les
+    review_behavior sans deux-points serait laisser la mine en place et
+    contraindre la prose des personas à la fragilité d'un générateur.
+
+  proposal: >
+    Deux changements, tous deux dans company/plugins/.
+
+    1. generatePersonasYml (company/plugins/defense-in-depth.mjs, L99-102) :
+    quoter SYSTÉMATIQUEMENT chaque valeur émise via JSON.stringify.
+    Verbatim cible :
+      lines.push(`  role: ${JSON.stringify(identity)}`);
+      if (produces.length) lines.push(`  produces: ${JSON.stringify(produces.join(", "))}`);
+      if (consumes.length) lines.push(`  consumes: ${JSON.stringify(consumes.join(", "))}`);
+      if (review) lines.push(`  review: ${JSON.stringify(review)}`);
+    Rationale du choix JSON.stringify : une string JSON est un scalaire
+    YAML double-quoted valide (JSON est un sous-ensemble de YAML 1.2) ;
+    l'échappement gère nativement deux-points, quotes simples et doubles,
+    backslashes, dièses et unicode. Aucune heuristique "quoter si
+    nécessaire" : quoting inconditionnel, uniforme, sans cas particulier.
+    Les clés émises (`${name.toLowerCase()}:`) proviennent de display_name
+    contrôlé par les personas existantes (pm/architect/implementer/ceo,
+    identifiants simples) et restent hors périmètre du fix.
+
+    2. Test JS (company/plugins/tests/hot-reload.test.mjs, qui couvre déjà
+    la génération de personas.yml) : ajouter un cas où une persona a un
+    review_behavior contenant " : " ET des quotes (simples et doubles),
+    vérifier (a) que le personas.yml généré est parsé sans erreur par un
+    parser YAML (ou à défaut que chaque ligne value est un scalaire
+    double-quoted bien formé), (b) que la valeur relue est identique à la
+    source (round-trip sans perte). Axes négatif/edge du même test :
+    backslash et unicode dans identity.
+
+    Périmètre STRICT : aucun autre fichier. Le format de personas.yml
+    change marginalement (valeurs désormais double-quotées) ; ses deux
+    consommateurs sont insensibles à ce changement : l'injection
+    instructions d'opencode (texte lu par les LLMs) et l'exemption M20a du
+    validator (qui ne parse pas le contenu). Le pre-commit ne valide pas
+    personas.yml comme artifact (exemption M20a, RFC 0197fbe5).
+
+  impact: >
+    Zone protégée company/plugins/ : cycle complet requis (review, CEO,
+    permit, implémentation). Aucun trigger humain path-matchable (M15 :
+    protected-zones.json, ceo.yml, suppression de persona — aucun des
+    trois). Aucun binaire Rust touché : pas de deploy-serve ni de
+    reload_config. CODE PLUGIN MODIFIÉ → RESTART OPENCODE REQUIS après
+    merge pour que la régénération corrigée soit active (le hot-reload de
+    code a été retiré par le RFC 25b6678c ; règle AA1 du RFC 098f35db,
+    appliquée ici). ORDRE DE REPRISE du RFC 098f35db, bloqué par ce bug :
+    (1) merger ce hotfix via son propre cycle (permit dédié sur
+    company/plugins/) ; (2) restart opencode — le plugin corrigé est en
+    service ; (3) l'Implementer réapplique les verbatims du RFC 098f35db
+    sous le permit b90f10e3 TOUJOURS ACTIF (aucun nouveau grant, donc pas
+    de nouveau passage du trigger D24 : le grant initial couvert par la
+    délégation V1 reste valable) ; (4) la régénération M20b produit un
+    personas.yml valide, make ci vert ; (5) commit, consume b90f10e3,
+    clôture du RFC 098f35db. Risque résiduel : un restart opencode oublié
+    entre (1) et (3) ferait régénérer personas.yml par l'ANCIEN générateur
+    encore chargé et reproduirait le YAML invalide — le make ci rouge de
+    l'étape (4) le rattraperait mécaniquement (fail-safe existant, celui-là
+    même qui a révélé le bug).
+
+  rollback_plan: >
+    Trivial : git revert du commit du hotfix + restart opencode. Le
+    générateur revient à l'émission non quotée ; personas.yml reste valide
+    tant qu'aucune persona ne contient de caractère YAML-actif — état
+    exactement identique à la situation antérieure au RFC 098f35db. Aucune
+    donnée, aucun état serveur.
+
+  affected_files:
+    modified:
+      - company/plugins/defense-in-depth.mjs
+      - company/plugins/tests/hot-reload.test.mjs
