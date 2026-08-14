@@ -47,6 +47,13 @@ spec:
     auto-généré ne contient que role/produces/consumes/review, pas les
     rules.must, donc il n'est pas affecté par cet ajout.
 
+    Criteres d'acceptation du plan (champ replie par l'audit v1-schemas) :
+    - architect.yml contient une règle rules.must imposant l'inventaire des callers avant de figer une signature d'API publique dans un design-doc/RFC.
+    - implementer.yml contient une règle rules.must imposant le ré-inventaire des callers avant de modifier une signature, avec signalement par agent-message si divergence du permit.
+    - Les deux fichiers restent conformes au schema persona (validate_file vert).
+    - Aucun fichier hors des deux target_paths du permit n'est modifié.
+    - cargo build + cargo test verts (CI interne CompanyOS).
+
   steps:
     - step: 1
       description: >
@@ -87,13 +94,6 @@ spec:
         reload_config() en dernier si build/test verts.
       file: "(workflow, pas de fichier)"
       validation: cargo build && cargo test verts, permit consumed
-
-  acceptance_criteria:
-    - "architect.yml contient une règle rules.must imposant l'inventaire des callers avant de figer une signature d'API publique dans un design-doc/RFC."
-    - "implementer.yml contient une règle rules.must imposant le ré-inventaire des callers avant de modifier une signature, avec signalement par agent-message si divergence du permit."
-    - "Les deux fichiers restent conformes au schema persona (validate_file vert)."
-    - "Aucun fichier hors des deux target_paths du permit n'est modifié."
-    - "cargo build + cargo test verts (CI interne CompanyOS)."
 
   risks:
     - "Risque résiduel assumé par le RFC lui-même (section RISQUE RÉSIDUEL) : une discipline déléguée à un agent reste faillible. Hors scope du plan : le RFC documente que c'est le coût explicite de la décision utilisateur de ne pas mécaniser."

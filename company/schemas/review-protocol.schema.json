@@ -1,11 +1,24 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://companyos.dev/schemas/review-protocol.schema.json",
+  "unevaluatedProperties": false,
   "allOf": [
-    { "$ref": "_base.schema.json" },
+    {
+      "$ref": "_base.schema.json"
+    },
     {
       "properties": {
-        "kind": { "const": "review-protocol" },
+        "kind": {
+          "const": "review-protocol"
+        },
+        "metadata": {
+          "allOf": [
+            {
+              "$ref": "_base.schema.json#/$defs/metadata"
+            }
+          ],
+          "unevaluatedProperties": false
+        },
         "spec": {
           "type": "object",
           "properties": {
@@ -13,25 +26,43 @@
               "type": "object",
               "additionalProperties": {
                 "type": "array",
-                "items": { "type": "string" }
+                "items": {
+                  "type": "string"
+                }
               }
             },
             "self_review_forbidden": {
               "type": "object",
-              "properties": { "description": { "type": "string" } },
-              "required": ["description"]
+              "properties": {
+                "description": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "description"
+              ]
             },
             "review_analysis_framework": {
               "type": "object",
-              "properties": { "description": { "type": "string" } },
-              "required": ["description"]
+              "properties": {
+                "description": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "description"
+              ]
             }
           },
-          "required": ["reviewers_by_artifact_type"],
+          "required": [
+            "reviewers_by_artifact_type"
+          ],
           "additionalProperties": false
         }
       },
-      "required": ["spec"]
+      "required": [
+        "spec"
+      ]
     }
   ]
 }

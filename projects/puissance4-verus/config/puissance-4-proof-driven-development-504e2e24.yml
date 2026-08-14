@@ -17,7 +17,6 @@ metadata:
     - connect-four
 
 spec:
-  project_name: puissance4-verus
   ownership: owned
   repo_url: https://github.com/Bibi210/puissance4-verus
   contribution_rules:

@@ -1,31 +1,73 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://companyos.dev/schemas/rfc.schema.json",
+  "unevaluatedProperties": false,
   "allOf": [
-    { "$ref": "_base.schema.json" },
+    {
+      "$ref": "_base.schema.json"
+    },
     {
       "properties": {
-        "kind": { "const": "rfc" },
+        "kind": {
+          "const": "rfc"
+        },
         "metadata": {
+          "allOf": [
+            {
+              "$ref": "_base.schema.json#/$defs/metadata"
+            }
+          ],
+          "unevaluatedProperties": false,
           "properties": {
             "status": {
               "type": "string",
-              "enum": ["draft", "review", "approved", "rejected", "implemented"]
+              "enum": [
+                "draft",
+                "review",
+                "approved",
+                "rejected",
+                "implemented"
+              ]
+            },
+            "approved_at": {
+              "$ref": "_base.schema.json#/$defs/timestamp",
+              "description": "Server-stamped when the review round closes in consensus (close_review_round)."
+            },
+            "implemented_at": {
+              "$ref": "_base.schema.json#/$defs/timestamp",
+              "description": "Server-stamped by rfc_set_implemented."
             }
-          }
+          },
+          "required": [
+            "status"
+          ]
         },
         "spec": {
           "type": "object",
           "properties": {
-            "motivation": { "type": "string" },
-            "proposal": { "type": "string" },
-            "impact": { "type": "string" },
-            "rollback_plan": { "type": "string" },
+            "motivation": {
+              "type": "string"
+            },
+            "proposal": {
+              "type": "string"
+            },
+            "impact": {
+              "type": "string"
+            },
+            "rollback_plan": {
+              "type": "string"
+            },
+            "cleanup_workaround": {
+              "type": "string",
+              "description": "Optional: which prose workaround this RFC retires, and where it lived."
+            },
             "affected_files": {
               "anyOf": [
                 {
                   "type": "array",
-                  "items": { "type": "string" },
+                  "items": {
+                    "type": "string"
+                  },
                   "description": "Legacy flat form: a single list of file paths (modified or created indistinctly). Kept for backward compatibility."
                 },
                 {
@@ -33,17 +75,23 @@
                   "properties": {
                     "modified": {
                       "type": "array",
-                      "items": { "type": "string" },
+                      "items": {
+                        "type": "string"
+                      },
                       "description": "Files that already exist in HEAD and will be edited."
                     },
                     "created": {
                       "type": "array",
-                      "items": { "type": "string" },
+                      "items": {
+                        "type": "string"
+                      },
                       "description": "New files that do not yet exist and will be created."
                     },
                     "deleted": {
                       "type": "array",
-                      "items": { "type": "string" },
+                      "items": {
+                        "type": "string"
+                      },
                       "description": "Files that exist in HEAD and will be deleted. Evaluated by the path-matchable human-review triggers (mechanism 15, RFC 0197fbe5)."
                     }
                   },
@@ -53,10 +101,18 @@
               ]
             }
           },
-          "required": ["motivation", "proposal", "impact"]
+          "required": [
+            "motivation",
+            "proposal",
+            "impact",
+            "affected_files"
+          ],
+          "additionalProperties": false
         }
       },
-      "required": ["spec"]
+      "required": [
+        "spec"
+      ]
     }
   ]
 }

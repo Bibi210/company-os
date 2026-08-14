@@ -1,38 +1,72 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://companyos.dev/schemas/implementation-plan.schema.json",
+  "unevaluatedProperties": false,
   "allOf": [
-    { "$ref": "_base.schema.json" },
+    {
+      "$ref": "_base.schema.json"
+    },
     {
       "properties": {
-        "kind": { "const": "implementation-plan" },
+        "kind": {
+          "const": "implementation-plan"
+        },
+        "metadata": {
+          "allOf": [
+            {
+              "$ref": "_base.schema.json#/$defs/metadata"
+            }
+          ],
+          "unevaluatedProperties": false
+        },
         "spec": {
           "type": "object",
           "properties": {
+            "overview": {
+              "type": "string"
+            },
             "steps": {
               "type": "array",
               "items": {
                 "type": "object",
                 "properties": {
-                  "description": { "type": "string" },
-                  "files": { "type": "array", "items": { "type": "string" } }
+                  "description": {
+                    "type": "string"
+                  },
+                  "files": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
                 },
-                "required": ["description"]
+                "required": [
+                  "description"
+                ]
               }
             },
             "dependencies": {
               "type": "array",
-              "items": { "type": "string" }
+              "items": {
+                "type": "string"
+              }
             },
             "risks": {
               "type": "array",
-              "items": { "type": "string" }
+              "items": {
+                "type": "string"
+              }
             }
           },
-          "required": ["steps"]
+          "required": [
+            "steps"
+          ],
+          "additionalProperties": false
         }
       },
-      "required": ["spec"]
+      "required": [
+        "spec"
+      ]
     }
   ]
 }

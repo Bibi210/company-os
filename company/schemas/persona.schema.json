@@ -1,38 +1,107 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://companyos.dev/schemas/persona.schema.json",
+  "unevaluatedProperties": false,
   "allOf": [
-    { "$ref": "_base.schema.json" },
+    {
+      "$ref": "_base.schema.json"
+    },
     {
       "properties": {
-        "kind": { "const": "persona" },
-        "metadata": {
-          "properties": {
-            "id": { "type": "string" },
-            "display_name": { "type": "string" }
-          },
-          "required": ["id", "display_name"]
+        "kind": {
+          "const": "persona"
         },
-        "identity": { "type": "string" },
+        "metadata": {
+          "allOf": [
+            {
+              "$ref": "_base.schema.json#/$defs/metadata"
+            }
+          ],
+          "unevaluatedProperties": false,
+          "properties": {
+            "display_name": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "display_name"
+          ]
+        },
+        "identity": {
+          "type": "string",
+          "minLength": 1
+        },
         "rules": {
           "type": "object",
           "properties": {
-            "must": { "type": "array", "items": { "type": "string" } },
-            "never": { "type": "array", "items": { "type": "string" } }
+            "must": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "never": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
           },
-          "required": ["must", "never"]
+          "required": [
+            "must",
+            "never"
+          ],
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "description": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "description"
+            ],
+            "additionalProperties": false,
+            "description": "Named judgement rule: an object with a single description field."
+          }
         },
         "artifacts": {
           "type": "object",
           "properties": {
-            "produces": { "type": "array", "items": { "type": "string" } },
-            "consumes": { "type": "array", "items": { "type": "string" } }
+            "produces": {
+              "type": "array",
+              "items": {
+                "$ref": "_base.schema.json#/$defs/artifact_kind"
+              }
+            },
+            "consumes": {
+              "type": "array",
+              "items": {
+                "$ref": "_base.schema.json#/$defs/artifact_kind"
+              }
+            }
           },
-          "required": ["produces", "consumes"]
+          "required": [
+            "produces",
+            "consumes"
+          ],
+          "additionalProperties": false
         },
-        "review_behavior": { "type": "string" }
+        "review_behavior": {
+          "type": "string",
+          "minLength": 1
+        }
       },
-      "required": ["identity", "rules", "artifacts", "review_behavior"]
+      "required": [
+        "identity",
+        "rules",
+        "artifacts",
+        "review_behavior"
+      ]
     }
   ]
 }

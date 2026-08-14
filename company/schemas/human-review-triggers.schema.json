@@ -1,11 +1,24 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://companyos.dev/schemas/human-review-triggers.schema.json",
+  "unevaluatedProperties": false,
   "allOf": [
-    { "$ref": "_base.schema.json" },
+    {
+      "$ref": "_base.schema.json"
+    },
     {
       "properties": {
-        "kind": { "const": "human-review-triggers" },
+        "kind": {
+          "const": "human-review-triggers"
+        },
+        "metadata": {
+          "allOf": [
+            {
+              "$ref": "_base.schema.json#/$defs/metadata"
+            }
+          ],
+          "unevaluatedProperties": false
+        },
         "spec": {
           "type": "object",
           "properties": {
@@ -14,36 +27,58 @@
               "items": {
                 "type": "object",
                 "properties": {
-                  "condition": { "type": "string" },
-                  "action": { "type": "string" },
-                  "description": { "type": "string" },
+                  "condition": {
+                    "type": "string"
+                  },
+                  "action": {
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  },
                   "match": {
                     "type": "object",
                     "properties": {
                       "paths": {
                         "type": "array",
-                        "items": { "type": "string" },
+                        "items": {
+                          "type": "string"
+                        },
                         "minItems": 1
                       },
                       "on": {
                         "type": "string",
-                        "enum": ["any", "deleted"]
+                        "enum": [
+                          "any",
+                          "deleted"
+                        ]
                       }
                     },
-                    "required": ["paths", "on"],
+                    "required": [
+                      "paths",
+                      "on"
+                    ],
                     "additionalProperties": false
                   }
                 },
-                "required": ["condition", "action", "description"],
+                "required": [
+                  "condition",
+                  "action",
+                  "description"
+                ],
                 "additionalProperties": false
               }
             }
           },
-          "required": ["triggers"],
+          "required": [
+            "triggers"
+          ],
           "additionalProperties": false
         }
       },
-      "required": ["spec"]
+      "required": [
+        "spec"
+      ]
     }
   ]
 }

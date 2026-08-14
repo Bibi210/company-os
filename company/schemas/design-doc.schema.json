@@ -1,25 +1,47 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://companyos.dev/schemas/design-doc.schema.json",
+  "unevaluatedProperties": false,
   "allOf": [
-    { "$ref": "_base.schema.json" },
+    {
+      "$ref": "_base.schema.json"
+    },
     {
       "properties": {
-        "kind": { "const": "design-doc" },
+        "kind": {
+          "const": "design-doc"
+        },
+        "metadata": {
+          "allOf": [
+            {
+              "$ref": "_base.schema.json#/$defs/metadata"
+            }
+          ],
+          "unevaluatedProperties": false
+        },
         "spec": {
           "type": "object",
           "properties": {
-            "overview": { "type": "string" },
+            "overview": {
+              "type": "string"
+            },
             "components": {
               "type": "array",
               "minItems": 1,
               "items": {
                 "type": "object",
                 "properties": {
-                  "name": { "type": "string" },
-                  "description": { "type": "string" }
+                  "name": {
+                    "type": "string"
+                  },
+                  "description": {
+                    "type": "string"
+                  }
                 },
-                "required": ["name", "description"]
+                "required": [
+                  "name",
+                  "description"
+                ]
               }
             },
             "decisions": {
@@ -28,21 +50,37 @@
               "items": {
                 "type": "object",
                 "properties": {
-                  "decision": { "type": "string" },
-                  "rationale": { "type": "string" }
+                  "decision": {
+                    "type": "string"
+                  },
+                  "rationale": {
+                    "type": "string"
+                  }
                 },
-                "required": ["decision", "rationale"]
+                "required": [
+                  "decision",
+                  "rationale"
+                ]
               }
             },
             "open_questions": {
               "type": "array",
-              "items": { "type": "string" }
+              "items": {
+                "type": "string"
+              }
             }
           },
-          "required": ["overview", "components", "decisions"]
+          "required": [
+            "overview",
+            "components",
+            "decisions"
+          ],
+          "additionalProperties": false
         }
       },
-      "required": ["spec"]
+      "required": [
+        "spec"
+      ]
     }
   ]
 }

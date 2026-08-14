@@ -1,16 +1,31 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://companyos.dev/schemas/project-config.schema.json",
+  "unevaluatedProperties": false,
   "allOf": [
-    { "$ref": "_base.schema.json" },
+    {
+      "$ref": "_base.schema.json"
+    },
     {
       "properties": {
-        "kind": { "const": "project-config" },
+        "kind": {
+          "const": "project-config"
+        },
         "metadata": {
+          "allOf": [
+            {
+              "$ref": "_base.schema.json#/$defs/metadata"
+            }
+          ],
+          "unevaluatedProperties": false,
           "properties": {
-            "project_name": { "type": "string" }
+            "project_name": {
+              "$ref": "_base.schema.json#/$defs/slug"
+            }
           },
-          "required": ["project_name"]
+          "required": [
+            "project_name"
+          ]
         },
         "spec": {
           "type": "object",
@@ -22,7 +37,10 @@
             "ownership": {
               "type": "string",
               "description": "Type de relation au dépôt git. 'owned' = on crée et gère le dépôt, on définit la CI et les règles de contribution, on est maître des décisions. 'contributed' = le dépôt appartient à un tiers (open source, client, partenaire), on est contributeur individuel soumis à ses règles.",
-              "enum": ["owned", "contributed"]
+              "enum": [
+                "owned",
+                "contributed"
+              ]
             },
             "contribution_rules": {
               "type": "object",
@@ -44,10 +62,15 @@
               "additionalProperties": false
             }
           },
-          "required": ["ownership", "repo_url"]
+          "required": [
+            "ownership",
+            "repo_url"
+          ]
         }
       },
-      "required": ["spec"]
+      "required": [
+        "spec"
+      ]
     }
   ]
 }

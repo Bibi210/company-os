@@ -388,43 +388,8 @@ spec:
       filet. Acceptable (cf. périmètre : robustesse boot, pas zéro-incident
       sur DB trafiquées).
 
-  cleanup_workaround: >
-    INVENTAIRE DU CONTOURNEMENT À RETIRER (application de la lesson
-    be16dc46 : la solution générale retire le hotfix ponctuel qu'elle
-    remplace, dans la même unité de travail).
+    TESTING (champ spec.testing replie ici par l'audit v1-schemas) :
 
-    (a) QUEL contournement. Le hotfix 57019e7 ("create artifacts
-        filter-column indexes AFTER ALTER TABLE") a sorti trois CREATE
-        INDEX (idx_artifacts_author, idx_artifacts_project,
-        idx_artifacts_created_at) de SCHEMA_SQL pour les replacer dans un
-        "Step 2bis" ad-hoc exécuté manuellement après la boucle ALTER
-        TABLE. C'est un réordonnancement ponctuel : il corrige LE symptôme
-        (cet ordre-là) sans encoder la RÈGLE d'ordre.
-
-    (b) OÙ il vit. crates/orchestrator/src/db.rs, lignes 382-393 (le bloc
-        execute_batch "Step 2bis" + son commentaire). Le matching fragile
-        "duplicate column" du Step 2 (db.rs:371-379) est le contournement
-        d'idempotence associé, du même registre de dette.
-
-    (c) ACTION DE RETRAIT. Le Step 2bis cesse d'exister comme step séparé.
-        Les trois CREATE INDEX sont intégrés DANS la même migration
-        numérotée que les ALTER TABLE ADD COLUMN author/project/created_at,
-        positionnés après les ALTER À L'INTÉRIEUR de cette migration. Le
-        matching "duplicate column" est remplacé par un test PRAGMA
-        table_info (recommandé) ou conservé encapsulé dans la migration si
-        l'implementation-plan le préfère. Résultat : il n'y a plus de "Step
-        2bis" ni de contournement textuel ; l'ordre CREATE-INDEX-après-ALTER
-        est garanti par l'appartenance à une seule migration ordonnée.
-        Aucune duplication : le hotfix devient une propriété du registre,
-        pas un patch coexistant.
-
-    (d) TEST À PRÉSERVER. Le test test_migrate_legacy_db_without_filter_columns_succeeds
-        (db.rs:1706) qui couvre exactement le scénario du hotfix DOIT être
-        conservé (éventuellement adapté à la nouvelle API de migrate()), car
-        il vérifie structurellement que la classe de bug reste fermée. Il
-        rejoint la suite de tests de transition décrite ci-dessous.
-
-  testing: >
     EXIGENCE D'ENTÉRINEMENT EN BASE (application de la lesson b04f8838 et
     de l'acceptance criterion 4 : les cas triaxiaux sont des tests
     automatisés versionnés, PAS une validation manuelle de session).
@@ -464,6 +429,42 @@ spec:
     - COHÉRENCE registre : un test asserte que SCHEMA_VERSION_TARGET est
       égal au nombre de migrations enregistrées (garde-fou contre l'oubli
       d'incrément lors de l'ajout d'une migration future).
+
+  cleanup_workaround: >
+    INVENTAIRE DU CONTOURNEMENT À RETIRER (application de la lesson
+    be16dc46 : la solution générale retire le hotfix ponctuel qu'elle
+    remplace, dans la même unité de travail).
+
+    (a) QUEL contournement. Le hotfix 57019e7 ("create artifacts
+        filter-column indexes AFTER ALTER TABLE") a sorti trois CREATE
+        INDEX (idx_artifacts_author, idx_artifacts_project,
+        idx_artifacts_created_at) de SCHEMA_SQL pour les replacer dans un
+        "Step 2bis" ad-hoc exécuté manuellement après la boucle ALTER
+        TABLE. C'est un réordonnancement ponctuel : il corrige LE symptôme
+        (cet ordre-là) sans encoder la RÈGLE d'ordre.
+
+    (b) OÙ il vit. crates/orchestrator/src/db.rs, lignes 382-393 (le bloc
+        execute_batch "Step 2bis" + son commentaire). Le matching fragile
+        "duplicate column" du Step 2 (db.rs:371-379) est le contournement
+        d'idempotence associé, du même registre de dette.
+
+    (c) ACTION DE RETRAIT. Le Step 2bis cesse d'exister comme step séparé.
+        Les trois CREATE INDEX sont intégrés DANS la même migration
+        numérotée que les ALTER TABLE ADD COLUMN author/project/created_at,
+        positionnés après les ALTER À L'INTÉRIEUR de cette migration. Le
+        matching "duplicate column" est remplacé par un test PRAGMA
+        table_info (recommandé) ou conservé encapsulé dans la migration si
+        l'implementation-plan le préfère. Résultat : il n'y a plus de "Step
+        2bis" ni de contournement textuel ; l'ordre CREATE-INDEX-après-ALTER
+        est garanti par l'appartenance à une seule migration ordonnée.
+        Aucune duplication : le hotfix devient une propriété du registre,
+        pas un patch coexistant.
+
+    (d) TEST À PRÉSERVER. Le test test_migrate_legacy_db_without_filter_columns_succeeds
+        (db.rs:1706) qui couvre exactement le scénario du hotfix DOIT être
+        conservé (éventuellement adapté à la nouvelle API de migrate()), car
+        il vérifie structurellement que la classe de bug reste fermée. Il
+        rejoint la suite de tests de transition décrite ci-dessous.
 
   rollback_plan: >
     Le rollback est simple et sans perte de données (la DB est un index

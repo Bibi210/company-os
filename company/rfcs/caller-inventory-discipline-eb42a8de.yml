@@ -49,35 +49,37 @@ metadata:
     - id: a4eb3ee7-45c1-4422-a43a-fbbc07d686f0
       kind: rfc
       relationship: related
+  changelog:
+    - date: "2026-06-05"
+      author: architect
+      description: >
+        ITERATION 2 (2026-06-05) — RÉDUCTION DE SCOPE sur décision
+        utilisateur. L'iteration 1 proposait l'option (d) combinaison :
+        un tool MCP `list_callers` côté orchestrator, une section
+        `spec.caller_inventory` ajoutée au schema implementation-plan, et
+        une règle dédiée dans shared-rules. L'utilisateur a jugé le tool
+        MCP « overkill » et a tranché pour une instrumentation des seules
+        personas Architect et Implementer, en s'appuyant sur les outils
+        (rg / get_references LSP) que les agents possèdent déjà.
+
+        Cette décision applique directement la lesson 4e5c109b (préférence
+        utilisateur formalisée le 2026-06-04) : un tool intermédiaire qui
+        n'apporte qu'une garantie PARTIELLE (invoquer rg) en laissant à
+        l'agent le travail de jugement (quels callers sont impactés,
+        lesquels listés dans affected_files) introduit de la surface de
+        maintenance sans garantie de bout en bout. Puisque l'agent doit de
+        toute façon raisonner derrière, instrumenter la persona suffit.
+        Principe : automatiser COMPLÈTEMENT ou PAS DU TOUT, ne pas
+        mi-automatiser.
+
+        SUPPRIMÉ par rapport à l'iteration 1 :
+        - le tool MCP list_callers (crates/mcp-servers/orchestrator/src/main.rs) ;
+        - la propriété spec.caller_inventory du schema implementation-plan ;
+        - la règle caller_inventory_before_signature_change de shared-rules.
+        CONSERVÉ et désormais unique scope : la mise à jour des personas
+        Architect et Implementer.
 
 spec:
-  changelog: >
-    ITERATION 2 (2026-06-05) — RÉDUCTION DE SCOPE sur décision
-    utilisateur. L'iteration 1 proposait l'option (d) combinaison :
-    un tool MCP `list_callers` côté orchestrator, une section
-    `spec.caller_inventory` ajoutée au schema implementation-plan, et
-    une règle dédiée dans shared-rules. L'utilisateur a jugé le tool
-    MCP « overkill » et a tranché pour une instrumentation des seules
-    personas Architect et Implementer, en s'appuyant sur les outils
-    (rg / get_references LSP) que les agents possèdent déjà.
-
-    Cette décision applique directement la lesson 4e5c109b (préférence
-    utilisateur formalisée le 2026-06-04) : un tool intermédiaire qui
-    n'apporte qu'une garantie PARTIELLE (invoquer rg) en laissant à
-    l'agent le travail de jugement (quels callers sont impactés,
-    lesquels listés dans affected_files) introduit de la surface de
-    maintenance sans garantie de bout en bout. Puisque l'agent doit de
-    toute façon raisonner derrière, instrumenter la persona suffit.
-    Principe : automatiser COMPLÈTEMENT ou PAS DU TOUT, ne pas
-    mi-automatiser.
-
-    SUPPRIMÉ par rapport à l'iteration 1 :
-    - le tool MCP list_callers (crates/mcp-servers/orchestrator/src/main.rs) ;
-    - la propriété spec.caller_inventory du schema implementation-plan ;
-    - la règle caller_inventory_before_signature_change de shared-rules.
-    CONSERVÉ et désormais unique scope : la mise à jour des personas
-    Architect et Implementer.
-
   motivation: >
     Le diagnostic 56513173 recense deux RFCs récents qui ont omis un
     caller d'une API publique de crate dans leur scope, chacun

@@ -47,12 +47,14 @@ metadata:
   title: "Build user dashboard"
   author: pm
   created_at: "2026-01-01"
+  project: company-os
 spec:
   description: "Build a real-time user dashboard"
   acceptance_criteria:
     - "Shows live metrics"
     - "Responsive design"
   priority: high
+  status: backlog
 "#;
     let report = validator
         .validate_yaml_str(task_yaml)
@@ -284,11 +286,14 @@ metadata:
   title: "Increase max review iterations"
   author: architect
   created_at: "2026-01-01"
+  status: draft
 spec:
   motivation: "Current limit of 3 is too restrictive for complex reviews"
   proposal: "Increase max_review_iterations from 3 to 5"
   impact: "Affects flow-control.yml configuration"
   rollback_plan: "Revert flow-control.yml to previous value"
+  affected_files:
+    - "company/config/flow-control.yml"
 "#;
     let report = validator.validate_yaml_str(rfc_yaml).expect("validate rfc");
     assert!(report.is_valid, "rfc should be valid: {:?}", report.errors);
@@ -433,11 +438,13 @@ metadata:
   title: "Valid task request"
   author: pm
   created_at: "2026-01-01"
+  project: company-os
 spec:
   acceptance_criteria:
     - "Criterion A"
     - "Criterion B"
   priority: high
+  status: backlog
 "#;
     let report = validator.validate_yaml_str(yaml).expect("validate");
     assert!(

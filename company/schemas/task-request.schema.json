@@ -1,36 +1,94 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://companyos.dev/schemas/task-request.schema.json",
+  "unevaluatedProperties": false,
   "allOf": [
-    { "$ref": "_base.schema.json" },
+    {
+      "$ref": "_base.schema.json"
+    },
     {
       "properties": {
-        "kind": { "const": "task-request" },
+        "kind": {
+          "const": "task-request"
+        },
         "metadata": {
-          "properties": {
-            "project": { "type": "string" }
-          }
+          "allOf": [
+            {
+              "$ref": "_base.schema.json#/$defs/metadata"
+            }
+          ],
+          "unevaluatedProperties": false,
+          "required": [
+            "project"
+          ]
         },
         "spec": {
           "type": "object",
           "properties": {
             "acceptance_criteria": {
               "type": "array",
-              "items": { "type": "string" }
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
             },
             "priority": {
               "type": "string",
-              "enum": ["low", "medium", "high", "critical"]
+              "enum": [
+                "low",
+                "medium",
+                "high",
+                "critical"
+              ]
             },
             "status": {
               "type": "string",
-              "enum": ["backlog", "in_progress", "done", "cancelled"]
+              "enum": [
+                "backlog",
+                "in_progress",
+                "done",
+                "cancelled"
+              ]
+            },
+            "context": {
+              "type": "string"
+            },
+            "constraints": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "out_of_scope": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              ]
+            },
+            "investigation_hints": {
+              "type": "string"
             }
           },
-          "required": ["acceptance_criteria"]
+          "required": [
+            "acceptance_criteria",
+            "priority",
+            "status"
+          ]
         }
       },
-      "required": ["spec"]
+      "required": [
+        "spec"
+      ]
     }
   ]
 }

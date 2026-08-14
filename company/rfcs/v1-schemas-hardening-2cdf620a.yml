@@ -5,7 +5,8 @@ metadata:
   title: "V1 schemas : durcissement des 14 schemas JSON (verrous unevaluatedProperties racine+metadata, $defs partages dans _base, champs serveur declares, required stock-conformes, 6 migrations de corpus)"
   author: architect
   created_at: "2026-08-14"
-  status: draft
+  status: approved
+  approved_at: "2026-08-14T17:04:55.181337509+00:00"
   description: >
     Applique les verdicts de l'audit v1-schemas-audit (diagnostic c2a64134,
     task-request ceb26109, roadmap a410bb43). Recrit les 14 schemas de

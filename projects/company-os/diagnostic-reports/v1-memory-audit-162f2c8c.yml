@@ -154,7 +154,7 @@ spec:
     du churn au problème qu'on corrige. Le doublon b8cb709d est supersedé
     in-place via 42ef0378. Zéro lesson consolidée créée.
 
-  notes: >
+    NOTES (champ spec.notes replie ici par l'audit v1-schemas) :
     Cas difficiles et décisions d'arbitrage :
     (1) 13fdf5bc (og-memory, author ceo) contredisait la règle canonique :
     corrigée par mention + chaînage plutôt que réécriture, le contenu

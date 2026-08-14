@@ -1,26 +1,56 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://companyos.dev/schemas/diagnostic-report.schema.json",
+  "unevaluatedProperties": false,
   "allOf": [
-    { "$ref": "_base.schema.json" },
+    {
+      "$ref": "_base.schema.json"
+    },
     {
       "properties": {
-        "kind": { "const": "diagnostic-report" },
+        "kind": {
+          "const": "diagnostic-report"
+        },
+        "metadata": {
+          "allOf": [
+            {
+              "$ref": "_base.schema.json#/$defs/metadata"
+            }
+          ],
+          "unevaluatedProperties": false
+        },
         "spec": {
           "type": "object",
           "properties": {
-            "symptom": { "type": "string" },
-            "root_cause": { "type": "string" },
-            "resolution": { "type": "string" },
+            "symptom": {
+              "type": "string",
+              "minLength": 1
+            },
+            "root_cause": {
+              "type": "string"
+            },
+            "resolution": {
+              "type": "string"
+            },
             "status": {
               "type": "string",
-              "enum": ["investigating", "resolved", "wont_fix"]
+              "enum": [
+                "investigating",
+                "resolved",
+                "wont_fix"
+              ]
             }
           },
-          "required": ["symptom"]
+          "required": [
+            "symptom",
+            "status"
+          ],
+          "additionalProperties": false
         }
       },
-      "required": ["spec"]
+      "required": [
+        "spec"
+      ]
     }
   ]
 }

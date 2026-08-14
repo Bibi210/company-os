@@ -1,25 +1,55 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://companyos.dev/schemas/lesson-learned.schema.json",
+  "unevaluatedProperties": false,
   "allOf": [
-    { "$ref": "_base.schema.json" },
+    {
+      "$ref": "_base.schema.json"
+    },
     {
       "properties": {
-        "kind": { "const": "lesson-learned" },
+        "kind": {
+          "const": "lesson-learned"
+        },
         "metadata": {
-          "required": ["tags", "description"]
+          "allOf": [
+            {
+              "$ref": "_base.schema.json#/$defs/metadata"
+            }
+          ],
+          "unevaluatedProperties": false,
+          "required": [
+            "tags",
+            "description"
+          ]
         },
         "spec": {
           "type": "object",
           "properties": {
-            "context": { "type": "string" },
-            "insight": { "type": "string" },
-            "recommendation": { "type": "string" }
+            "context": {
+              "type": "string",
+              "minLength": 1
+            },
+            "insight": {
+              "type": "string",
+              "minLength": 1
+            },
+            "recommendation": {
+              "type": "string",
+              "minLength": 1
+            }
           },
-          "required": ["context", "insight", "recommendation"]
+          "required": [
+            "context",
+            "insight",
+            "recommendation"
+          ],
+          "additionalProperties": false
         }
       },
-      "required": ["spec"]
+      "required": [
+        "spec"
+      ]
     }
   ]
 }

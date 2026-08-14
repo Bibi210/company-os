@@ -276,10 +276,13 @@ metadata:
   title: "Test Task"
   author: "pm"
   created_at: "2025-01-01"
+  project: "company-os"
 spec:
   acceptance_criteria:
     - "criterion one"
     - "criterion two"
+  priority: high
+  status: backlog
 "#;
         let report = validator.validate_yaml_str(yaml).unwrap();
         assert!(
@@ -393,6 +396,8 @@ spec:
   motivation: "m"
   proposal: "p"
   impact: "i"
+  affected_files:
+    - "company/config/x.yml"
 "#;
 
     fn setup_validator_with_root(root: &std::path::Path) -> ArtifactValidator {

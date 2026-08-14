@@ -1,21 +1,41 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://companyos.dev/schemas/flow-control.schema.json",
+  "unevaluatedProperties": false,
   "allOf": [
-    { "$ref": "_base.schema.json" },
+    {
+      "$ref": "_base.schema.json"
+    },
     {
       "properties": {
-        "kind": { "const": "flow-control" },
+        "kind": {
+          "const": "flow-control"
+        },
+        "metadata": {
+          "allOf": [
+            {
+              "$ref": "_base.schema.json#/$defs/metadata"
+            }
+          ],
+          "unevaluatedProperties": false
+        },
         "spec": {
           "type": "object",
           "properties": {
-            "max_review_iterations": { "type": "integer", "minimum": 1 }
+            "max_review_iterations": {
+              "type": "integer",
+              "minimum": 1
+            }
           },
-          "required": ["max_review_iterations"],
+          "required": [
+            "max_review_iterations"
+          ],
           "additionalProperties": false
         }
       },
-      "required": ["spec"]
+      "required": [
+        "spec"
+      ]
     }
   ]
 }

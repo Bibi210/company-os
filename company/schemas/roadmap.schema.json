@@ -1,28 +1,45 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://companyos.dev/schemas/roadmap.schema.json",
+  "unevaluatedProperties": false,
   "allOf": [
-    { "$ref": "_base.schema.json" },
+    {
+      "$ref": "_base.schema.json"
+    },
     {
       "properties": {
-        "kind": { "const": "roadmap" },
+        "kind": {
+          "const": "roadmap"
+        },
         "metadata": {
-          "properties": {
-            "description": { "type": "string" },
-            "tags": { "type": "array", "items": { "type": "string" } }
-          },
-          "required": ["description", "tags"]
+          "allOf": [
+            {
+              "$ref": "_base.schema.json#/$defs/metadata"
+            }
+          ],
+          "unevaluatedProperties": false,
+          "required": [
+            "description",
+            "tags"
+          ]
         },
         "spec": {
           "type": "object",
           "properties": {
             "domain": {
-              "type": "string",
+              "allOf": [
+                {
+                  "$ref": "_base.schema.json#/$defs/slug"
+                }
+              ],
               "description": "Domaine couvert par la roadmap (ex: 'companyos-system', 'puissance4-verus', 'product-discovery'). Identifiant kebab-case, libre. Plusieurs roadmaps peuvent partager un domaine si elles couvrent des sous-thèmes distincts, mais c'est rare — privilégier une roadmap par domaine."
             },
             "status": {
               "type": "string",
-              "enum": ["active", "archived"],
+              "enum": [
+                "active",
+                "archived"
+              ],
               "description": "active = roadmap vivante, mise à jour au fur et à mesure. archived = roadmap historique, plus mise à jour (ex: roadmap d'un trimestre passé que l'on garde pour mémoire)."
             },
             "narrative": {
@@ -49,18 +66,25 @@
                     "oneOf": [
                       {
                         "properties": {
-                          "type": { "const": "project" },
+                          "type": {
+                            "const": "project"
+                          },
                           "project_slug": {
                             "type": "string",
                             "description": "Slug kebab-case du projet (correspond au dossier projects/<slug>/ et au project_name du project-config)."
                           }
                         },
-                        "required": ["type", "project_slug"],
+                        "required": [
+                          "type",
+                          "project_slug"
+                        ],
                         "additionalProperties": false
                       },
                       {
                         "properties": {
-                          "type": { "const": "rfc" },
+                          "type": {
+                            "const": "rfc"
+                          },
                           "id": {
                             "type": "string",
                             "format": "uuid",
@@ -68,15 +92,26 @@
                             "description": "metadata.id du RFC référencé."
                           }
                         },
-                        "required": ["type", "id"],
+                        "required": [
+                          "type",
+                          "id"
+                        ],
                         "additionalProperties": false
                       },
                       {
                         "properties": {
-                          "type": { "const": "loose" },
+                          "type": {
+                            "const": "loose"
+                          },
                           "category": {
                             "type": "string",
-                            "enum": ["idea", "exploration", "hotfix", "observation", "dependency"],
+                            "enum": [
+                              "idea",
+                              "exploration",
+                              "hotfix",
+                              "observation",
+                              "dependency"
+                            ],
                             "description": "Nature du sujet tracé sans artifact formel. idea = en réflexion ; exploration = creusé activement sans engagement de livraison ; hotfix = action ponctuelle hors RFC ; observation = constat à garder en mémoire ; dependency = dépendance externe non maîtrisée."
                           },
                           "label": {
@@ -85,19 +120,33 @@
                             "description": "Description courte et lisible du sujet loose."
                           }
                         },
-                        "required": ["type", "category", "label"],
+                        "required": [
+                          "type",
+                          "category",
+                          "label"
+                        ],
                         "additionalProperties": false
                       }
                     ]
                   },
                   "timeframe": {
                     "type": "string",
-                    "enum": ["past", "present", "future"],
+                    "enum": [
+                      "past",
+                      "present",
+                      "future"
+                    ],
                     "description": "Position temporelle grossière de l'item. past = livré, present = en cours, future = planifié. Cette information est redondante avec status mais sert au regroupement visuel (un PM veut séparer 'ce qui est fait' de 'ce qui est devant nous')."
                   },
                   "status": {
                     "type": "string",
-                    "enum": ["planned", "in_progress", "done", "blocked", "cancelled"],
+                    "enum": [
+                      "planned",
+                      "in_progress",
+                      "done",
+                      "blocked",
+                      "cancelled"
+                    ],
                     "description": "État de l'item. AUTO-SYNCHRONISÉ : pour les items à ref project ou rfc, ce champ est ÉCRASÉ à la lecture par le status calculé depuis l'artifact source (cf. RFC a5f25718). La SEULE valeur que le PM peut écrire et qui sera respectée pour ces items est `blocked` (droit absolu du PM, court-circuite l'auto-sync). Pour les items à ref loose (pas d'artifact source), le status est manuel et respecté tel quel."
                   },
                   "target_date": {
@@ -106,7 +155,9 @@
                   },
                   "depends_on": {
                     "type": "array",
-                    "items": { "type": "string" },
+                    "items": {
+                      "type": "string"
+                    },
                     "description": "Liste de `key` d'autres items de la même roadmap dont celui-ci dépend. Permet de tracer la causalité (ne pas démarrer X tant que Y n'est pas done). Optionnel."
                   },
                   "rationale": {
@@ -114,15 +165,29 @@
                     "description": "Pourquoi cet item est dans la roadmap, ou pourquoi à cette position. Complète narrative au niveau global avec une justification par item. Optionnel."
                   }
                 },
-                "required": ["key", "title", "ref", "timeframe", "status"],
+                "required": [
+                  "key",
+                  "title",
+                  "ref",
+                  "timeframe",
+                  "status"
+                ],
                 "additionalProperties": false
               }
             }
           },
-          "required": ["domain", "status", "narrative", "items"]
+          "required": [
+            "domain",
+            "status",
+            "narrative",
+            "items"
+          ],
+          "additionalProperties": false
         }
       },
-      "required": ["spec"]
+      "required": [
+        "spec"
+      ]
     }
   ]
 }

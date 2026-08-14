@@ -73,12 +73,12 @@ spec:
       * best_move : légalité du coup retourné ✓
     - Le jeu fonctionne correctement en pratique : cargo build --release OK, jeu jouable
 
-  status: "resolved"
-
-  escalation: >
+    ESCALADE (champ spec.escalation replie ici par l'audit v1-schemas) :
     Escalade à l'Architect pour amélioration future : la preuve complète de
     lemma_ab_equals_pure_spec nécessite soit (a) une reformulation du lemme qui évite
     la récursion mutuelle, soit (b) l'utilisation de l'interface calc! de Verus pour guider
     Z3 pas-à-pas dans le raisonnement max/max, soit (c) une version simplifiée de
     minimax_ab_spec où la gestion alpha-beta est encodée différemment pour rendre la
     preuve d'équivalence plus directe.
+
+  status: "resolved"

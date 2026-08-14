@@ -7,67 +7,136 @@
       "properties": {
         "verdict": {
           "type": "string",
-          "enum": ["approve", "request_changes"]
+          "enum": [
+            "approve",
+            "request_changes"
+          ]
         },
-        "notes": { "type": "string" }
+        "notes": {
+          "type": "string"
+        }
       },
-      "required": ["verdict"],
+      "required": [
+        "verdict"
+      ],
       "additionalProperties": false
     }
   },
+  "unevaluatedProperties": false,
   "allOf": [
-    { "$ref": "_base.schema.json" },
+    {
+      "$ref": "_base.schema.json"
+    },
     {
       "properties": {
-        "kind": { "const": "review-report" },
+        "kind": {
+          "const": "review-report"
+        },
         "metadata": {
+          "allOf": [
+            {
+              "$ref": "_base.schema.json#/$defs/metadata"
+            }
+          ],
+          "unevaluatedProperties": false,
           "properties": {
-            "round_id": { "type": "string" },
-            "reviewer": { "type": "string" }
+            "round_id": {
+              "$ref": "_base.schema.json#/$defs/uuid",
+              "description": "UUID of the review round this report belongs to."
+            },
+            "reviewer": {
+              "$ref": "_base.schema.json#/$defs/persona_id"
+            }
           },
-          "required": ["round_id", "reviewer"]
+          "required": [
+            "round_id",
+            "reviewer"
+          ]
         },
         "spec": {
           "type": "object",
           "properties": {
             "verdict": {
               "type": "string",
-              "enum": ["approve", "request_changes"]
+              "enum": [
+                "approve",
+                "request_changes"
+              ]
             },
             "findings": {
               "type": "array",
-              "items": { "type": "string" }
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
             },
             "axes": {
               "type": "object",
               "properties": {
-                "nominal": { "$ref": "#/$defs/axis" },
-                "negative": { "$ref": "#/$defs/axis" },
-                "edge": { "$ref": "#/$defs/axis" }
+                "nominal": {
+                  "$ref": "#/$defs/axis"
+                },
+                "negative": {
+                  "$ref": "#/$defs/axis"
+                },
+                "edge": {
+                  "$ref": "#/$defs/axis"
+                }
               },
-              "required": ["nominal", "negative", "edge"],
+              "required": [
+                "nominal",
+                "negative",
+                "edge"
+              ],
               "additionalProperties": false
             },
-            "notes": { "type": "string" },
-            "summary": { "type": "string" }
+            "notes": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            }
           },
-          "required": ["verdict", "findings", "axes"],
+          "required": [
+            "verdict",
+            "findings",
+            "axes"
+          ],
+          "additionalProperties": false,
           "if": {
-            "properties": { "verdict": { "const": "approve" } }
+            "properties": {
+              "verdict": {
+                "const": "approve"
+              }
+            }
           },
           "then": {
             "properties": {
-              "findings": { "maxItems": 0 },
+              "findings": {
+                "maxItems": 0
+              },
               "axes": {
                 "properties": {
                   "nominal": {
-                    "properties": { "verdict": { "const": "approve" } }
+                    "properties": {
+                      "verdict": {
+                        "const": "approve"
+                      }
+                    }
                   },
                   "negative": {
-                    "properties": { "verdict": { "const": "approve" } }
+                    "properties": {
+                      "verdict": {
+                        "const": "approve"
+                      }
+                    }
                   },
                   "edge": {
-                    "properties": { "verdict": { "const": "approve" } }
+                    "properties": {
+                      "verdict": {
+                        "const": "approve"
+                      }
+                    }
                   }
                 }
               }
@@ -75,7 +144,9 @@
           }
         }
       },
-      "required": ["spec"]
+      "required": [
+        "spec"
+      ]
     }
   ]
 }
