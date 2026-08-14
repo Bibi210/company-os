@@ -1,0 +1,178 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 6aa2daed-e87c-4649-99e6-6f9c09f3528a
+  title: "Clôture du domaine v1-schemas-audit : durcir les 14 schemas d'un coup exige la pré-validation du corpus ET la migration dans le MÊME commit ; le hook per-file impose de retirer un champ mort avant de le replier ailleurs"
+  author: implementer
+  created_at: "2026-08-14"
+  description: >
+    Capitalisation de clôture du DOMAINE v1-schemas-audit (task-request
+    ceb26109, diagnostic c2a64134, roadmap a410bb43, programme companyos-v1).
+    RFC 2cdf620a (approved puis implemented) : les 14 schemas de
+    company/schemas/ réécrits en un seul commit atomique (verrous
+    unevaluatedProperties racine + metadata, _base restructuré en $defs
+    partagés, champs serveur approved_at/implemented_at enfin déclarés,
+    required stock-conformes, enums/patterns, champs morts retirés), + 6
+    migrations de corpus + 2 fixtures Rust. make ci vert, zéro extension de
+    permit. Trois enseignements : (1) durcir un harness statique large exige
+    de PROUVER contre le stock avant d'écrire — la pré-validation du corpus
+    entier avec le crate réel (204 artifacts, 6 échecs = exactement les 6
+    migrations prévues) a transformé un changement à risque en changement
+    déterministe, et le résultat s'est reproduit à l'octet près à
+    l'implémentation ; (2) l'atomicité schema+corpus n'est pas qu'une
+    intention : le hook defense-in-depth valide CHAQUE écriture contre le
+    NOUVEAU schema, donc chaque edit intermédiaire doit déjà être valide, ce
+    qui IMPOSE l'ordre « retirer le champ mort d'abord, le replier ensuite »
+    pour toute migration de repli ; (3) unevaluatedProperties de jsonschema
+    0.29.1 fonctionne à travers allOf + $ref externe (_base en Resource) mais
+    produit une cascade d'erreur racine après l'erreur réelle : bruit connu,
+    premier message toujours précis, vérifié en vif.
+  tags:
+    - companyos-v1
+    - schemas
+    - audit
+    - validation
+    - harness
+    - mechanical-invariant
+    - unevaluated-properties
+    - json-schema
+    - domain-closure
+    - atomic-commit
+    - companyos-internals
+    - critical-infra
+    - lessons-from-implementation
+  related:
+    - id: c2a64134-a9b4-488c-bc4a-3123ac3dd491
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: 2cdf620a-7071-49cf-a995-a96208625961
+      kind: rfc
+      relationship: derived-from
+    - id: bd4650e2-ab42-4b4e-9c10-cca638ded48c
+      kind: lesson-learned
+      relationship: related
+    - id: 0b4eba7c-8e66-44d2-8846-352e2d3f37c9
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Le domaine v1-schemas-audit ferme le programme companyos-v1 côté harness
+    STATIQUE des artifacts. Les lots 1-3 du domaine v1-process-hardening
+    avaient durci 6 schemas au fil des besoins (review-report, design-doc,
+    rfc, flow-control, review-protocol, human-review-triggers) ; les 8 autres
+    et _base restaient laxistes. L'audit c2a64134 a mesuré le laxisme contre
+    le corpus réel (204 artifacts) : des champs posés par le SERVEUR depuis le
+    premier jour (rfc approved_at / implemented_at) n'étaient déclarés dans
+    aucun schema et ne passaient que parce que metadata était un objet ouvert ;
+    8 champs spec hors-schema s'étaient accumulés dans 6 fichiers sans qu'aucun
+    mécanisme ne les signale.
+
+    Le RFC 2cdf620a a tranché 15 décisions de durcissement, toutes vérifiées
+    contre le stock : strict sans anyOf là où le stock est conforme à 100 %
+    (task-request priority+status+project 31/31, rfc status+affected_files
+    38/38, diagnostic-report status 22/22), migration explicite dans le même
+    commit sinon (6 fichiers : 2 RFCs historiques, 1 design-doc, 1 impl-plan,
+    2 diagnostics), anyOf conservé uniquement là où il est justifié
+    (affected_files FORME A/B rétro-compat RFC a4eb3ee7, out_of_scope
+    string|array). Specs volontairement ouverts pour task-request et
+    project-config (entrées libres). Zone protégée company/schemas/ + crates/ :
+    cycle complet approbation CEO + write permit f266fa36 (23 target_paths).
+
+    L'implémentation a copié les 14 schemas candidats (déjà pré-validés en
+    review), appliqué les 6 migrations et les 2 fixtures Rust, passé make ci
+    (build + 291 tests + lint + validate + naming, EXIT 0), committé le tout
+    en un commit (a215a75), consommé le permit, marqué le RFC implemented.
+    Aucun make deploy-serve (aucun binaire servi ne change, seuls des
+    fixtures cfg(test)), aucun reload_config (aucune config orchestrator Rust
+    modifiée) : les .schema.json hot-reloadent via les watchers
+    (ConfigChangeKind::Schemas).
+
+  insight: >
+    TROIS ENSEIGNEMENTS.
+
+    ENSEIGNEMENT 1 — DURCIR UN HARNESS LARGE EXIGE DE PROUVER CONTRE LE STOCK
+    AVANT D'ÉCRIRE, ET LA PREUVE SE REJOUE À L'IDENTIQUE.
+
+    Le risque d'un durcissement de 14 schemas d'un coup n'est pas la
+    correction d'un schema donné, c'est la CASSE COLLATÉRALE : un required
+    ajouté qui invalide silencieusement un artifact existant ailleurs. La
+    parade a été de rejouer la validation du corpus ENTIER avec le crate réel
+    companyos-validation (jsonschema 0.29.1, _base enregistré comme Resource,
+    exactement la structure du validator de production) AVANT tout write :
+    207 yml scannés, 1 personas.yml exempt, 6 SCHEMA-INVALID = EXACTEMENT les
+    6 migrations prévues, zéro casse ailleurs. Ce chiffre (6 = 6) est le
+    critère done objectif : il prouve que le périmètre de casse est
+    exactement le périmètre migré, ni plus ni moins. Fait remarquable : le
+    résultat s'est reproduit à l'octet près entre la review (empirique) et
+    l'implémentation, parce que le harness de validation EST le validator de
+    production. Quand la preuve utilise le vrai crate, elle n'est pas une
+    approximation, c'est le résultat.
+
+    ENSEIGNEMENT 2 — L'ATOMICITÉ SCHEMA+CORPUS EST IMPOSÉE PAR LE HOOK, PAS
+    SEULEMENT VOULUE, ET ELLE DICTE L'ORDRE DES EDITS.
+
+    « schemas + migrations dans le même commit » sonne comme une bonne
+    pratique optionnelle. Ce n'en est pas une : le hook defense-in-depth
+    valide CHAQUE écriture de fichier contre le schema EN VIGUEUR, qui est
+    déjà le nouveau (les schemas sont copiés en premier). Conséquence
+    opérationnelle non évidente : pour toute migration de repli (déplacer un
+    champ spec hors-schema vers un champ déclaré), on ne peut PAS ajouter le
+    contenu à sa nouvelle place d'abord — le fichier porterait alors DEUX
+    fois l'information et resterait invalide sur additionalProperties tant
+    que l'ancien champ existe. L'ordre CORRECT est : retirer le champ mort
+    d'abord (le fichier redevient valide), replier son contenu ensuite. J'ai
+    heurté ce mur sur la migration B2 (spec.testing replié dans spec.impact)
+    où mon premier edit, qui n'ajoutait qu'à impact, a été REJETÉ et reverti
+    par le hook parce que spec.testing subsistait ; la reprise a fusionné
+    retrait+repli en un seul edit contigu couvrant les deux régions. Le hook
+    per-file est ce qui rend l'atomicité RÉELLE : impossible de laisser le
+    corpus transitoirement invalide face aux schemas en vigueur.
+
+    ENSEIGNEMENT 3 — unevaluatedProperties MARCHE À TRAVERS allOf + $ref
+    EXTERNE, AVEC UNE CASCADE D'ERREUR ATTENDUE, PROUVÉ EN VIF.
+
+    Le verrou de fermeture (unevaluatedProperties:false à la racine ET sur
+    metadata de chaque kind) est ce qui donne au durcissement sa valeur : il
+    voit les annotations des deux branches allOf (_base ET la spécialisation),
+    donc rejette tout champ non déclaré. jsonschema 0.29.1 le supporte
+    correctement à condition que _base soit chargé comme Resource sur son URI
+    canonique (BASE_SCHEMA_URI), ce que fait déjà le validator. Effet de bord
+    documenté et jugé acceptable : quand une branche allOf échoue,
+    unevaluatedProperties racine ajoute une erreur en cascade (« 'api_version',
+    'kind', 'metadata', 'spec' were unexpected ») APRÈS l'erreur réelle ; le
+    PREMIER message reste toujours précis. Vérifié en vif après hot-reload :
+    un task-request avec un champ metadata parasite est rejeté par
+    « Unevaluated properties are not allowed ('bogus_parasite_field' was
+    unexpected) at /metadata ». Le mécanisme est vivant, sans redémarrage.
+
+  recommendation: >
+    TROIS RECOMMANDATIONS ACTIONNABLES.
+
+    RECOMMANDATION 1 — POUR TOUT DURCISSEMENT DE SCHEMA QUI TOUCHE UN CORPUS
+    EXISTANT. Rejouer la validation du corpus entier avec le crate RÉEL (pas
+    un validator jouet, pas une lib JS tierce) AVANT d'écrire quoi que ce soit,
+    et exiger l'égalité stricte « nombre d'échecs == nombre de migrations
+    prévues ». Si le compte diverge, il y a une casse collatérale non anticipée
+    ou une migration oubliée : ne pas committer tant que les deux nombres ne
+    coïncident pas. C'est le seul critère done objectif d'un durcissement de
+    masse. La pré-validation en amont vaut dix relectures de schema.
+
+    RECOMMANDATION 2 — POUR TOUTE MIGRATION DE REPLI SOUS SCHEMA DURCI DANS LE
+    MÊME COMMIT. Retirer le champ non déclaré AVANT de replier son contenu
+    ailleurs, jamais l'inverse ; si le retrait et le repli portent sur des
+    régions non contiguës du fichier séparées par d'autres clés, les fusionner
+    en un seul edit contigu couvrant toute la plage, sinon le hook rejette
+    l'état intermédiaire. Anticiper que chaque write est validé contre le
+    schema déjà durci : copier les schemas en premier fait de tout le reste du
+    commit un corpus soumis aux nouveaux verrous dès la première écriture.
+
+    RECOMMANDATION 3 — POUR TOUT VERROU unevaluatedProperties SUR UN SCHEMA
+    EN allOf + $ref EXTERNE. Vérifier que la _base référencée est bien chargée
+    comme Resource sur son URI canonique côté validator (sinon le $ref ne
+    résout pas et le verrou ne voit pas les annotations de la branche _base).
+    Documenter dans le RFC le bruit de cascade racine comme comportement
+    attendu, pas comme régression, pour épargner au prochain reviewer une
+    fausse alerte. Et confirmer en vif après hot-reload plutôt que de supposer :
+    un test validate_yaml sur un champ parasite prouve que le nouveau schema
+    est réellement en service, sans redémarrage ni reload_config.
