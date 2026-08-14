@@ -38,6 +38,20 @@ metadata:
       kind: lesson-learned
       relationship: input
   changelog:
+    - date: "2026-08-14"
+      author: pm
+      description: >
+        v1-schemas-audit TERMINÉ : RFC 2cdf620a implemented (14 schemas
+        durcis : $defs partagés, verrous unevaluatedProperties racine et
+        metadata partout, champs serveur déclarés, required
+        stock-conformes, enums/patterns, 6 migrations de corpus + 2
+        fixtures dans le même commit). Preuve empirique double : corpus
+        pré-validé avec le crate réel puis rejoué indépendamment par
+        l'Implementer (6 échecs = exactement les 6 migrations). Trigger
+        D25 (breaking schema change) acté par le CEO sous la délégation
+        utilisateur citée. Verrou metadata vérifié en vif à chaud.
+        Lesson 6aa2daed. v1-automation passe en in_progress (dernier
+        domaine avant les audits code).
     - date: "2026-08-09"
       author: pm
       description: >
@@ -285,8 +299,8 @@ spec:
         type: loose
         category: exploration
         label: "Recenser chaque étape manuelle de cycle de vie et l'automatiser sans LLM quand c'est possible"
-      timeframe: future
-      status: planned
+      timeframe: present
+      status: in_progress
       target_date: "2026-Q3"
       depends_on: [v1-hygiene]
       rationale: >
@@ -304,8 +318,8 @@ spec:
         type: loose
         category: exploration
         label: "pm, architect, implementer, ceo : règles mortes, manques, duplication avec shared-rules"
-      timeframe: future
-      status: planned
+      timeframe: past
+      status: done
       target_date: "2026-Q3"
       depends_on: [v1-process-hardening]
       rationale: >
@@ -322,8 +336,8 @@ spec:
         type: loose
         category: exploration
         label: "Cohérence inter-schemas, champs morts, validations manquantes, généralisation FORME B"
-      timeframe: future
-      status: planned
+      timeframe: past
+      status: done
       target_date: "2026-Q3"
       depends_on: [v1-process-hardening]
       rationale: >
