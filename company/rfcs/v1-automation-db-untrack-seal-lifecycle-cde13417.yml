@@ -26,10 +26,18 @@ metadata:
     auto-committées en pathspec (plus d'écritures serveur orphelines dans
     le worktree entre sessions). A3 : rfc_set_implemented rappelle
     (famille M19, non bloquant) les task-requests liés encore non clos ;
-    la clôture reste une décision LLM. Touche les zones protégées
-    crates/, company/plugins/ et company/config/protected-zones.json
-    (trigger humain access-matrix : user_approval_confirmed requis au
-    grant).
+    la clôture reste une décision LLM. ITÉRATION 2 (round 454760e6) :
+    tous les commits SERVEUR headless (seal du grant, seal du consume,
+    lifecycle) passent en --no-verify, décision consignée avec son
+    rationale de sûreté (contenu machine-généré, pathspec-scopé, la CI
+    n'y apporte rien — précédent gpgsign=false RFC 324e8a33) ; séquence
+    et idempotence du seal-au-consume figées (export APRÈS la transition
+    DB, ré-export après unconsume) ; reseed PILIER D borné aux branches
+    rebuild/DB-absente (jamais un boot normal) ; orchestrator.db retiré
+    de affected_files.deleted (untrack, pas suppression). Touche les
+    zones protégées crates/, company/plugins/ et
+    company/config/protected-zones.json (trigger humain access-matrix :
+    user_approval_confirmed requis au grant).
   tags:
     - companyos-v1
     - automation
@@ -42,6 +50,7 @@ metadata:
     - rfc-lifecycle
     - harness
     - critical-infra
+    - revised
   related:
     - id: 3779b2a7-483d-444c-ac57-abfecf2d6ca1
       kind: task-request
@@ -152,11 +161,38 @@ spec:
 
     A1.4 crates/mcp-servers/orchestrator/src/main.rs — le seal change
     d'objet, pas de sémantique :
+
+      CONVENTION COMMITS SERVEUR (--no-verify), décision itération 2 :
+      TOUS les commits émis par le processus serveur headless (seal du
+      grant, seal du consume A1.4c, lifecycle A2) passent en
+      `git commit --no-verify`. Motif : le pre-commit lance make ci
+      (fmt + clippy + tests + validation YAML) inconditionnellement ;
+      le faire tourner sous l'engine lock à chaque grant/consume/
+      transition serait un coût par appel de plusieurs minutes pour une
+      vérification qui n'apporte RIEN à ces commits : leur contenu est
+      MACHINE-GÉNÉRÉ (export JSON de la table write_permits ; YAML de
+      RFC déjà valide dont le serveur ne touche que le champ status via
+      update_rfc_status_in_file, transition bornée par enum) et
+      PATHSPEC-SCOPÉ à un unique fichier non-code — aucun code n'entre
+      dans ces commits, la CI n'a pas d'objet. C'est le précédent exact
+      de la décision B du RFC 324e8a33 (gpgsign=false pour le seal :
+      disponibilité et atomicité du canal machine priment sur un check
+      qu'aucun consommateur n'exploite). Ce --no-verify s'applique AUSSI
+      au seal EXISTANT du grant (cohérence : seal_permits_commit
+      remplace seal_db_commit, qui subit aujourd'hui le make ci complet
+      du pre-commit en tenant l'engine lock — coût jusqu'ici non
+      consigné). PORTÉE STRICTE : cette convention est réservée au canal
+      serveur headless ; les règles persona interdisant --no-verify aux
+      AGENTS restent entières (un agent qui committe passe le pre-commit,
+      sans exception). Le guard hook seal_path (A1.7) et le caractère
+      machine-généré du contenu bornent ce que ces commits peuvent
+      contenir.
+
       - seal_db_commit devient seal_permits_commit : (i)
         engine.write_permits_seal(), (ii) `git add -- company/data/
         permits-seal.json` (le -f devient inutile : le JSON ne matche pas
         *.db*), (iii) commit PATHSPEC `git -c commit.gpgsign=false commit
-        -m "chore: seal write permit <id> for RFC <rfc>" --
+        --no-verify -m "chore: seal write permit <id> for RFC <rfc>" --
         company/data/permits-seal.json`. LC_ALL=C/LANG=C conservés
         (lesson d5c9c933), enum SealError et sa taxonomie conservés à
         l'identique (GitNotFound, GitFailed, IndexLocked,
@@ -170,28 +206,64 @@ spec:
         committé contienne le permit fraîchement inséré ; l'export JSON
         lit la connexion vivante et n'en a pas besoin. (checkpoint_truncate
         reste utilisé par le graceful shutdown, PILIER C intact.)
-      - consume_write_permit : après engine.consume_permit, le serveur
-        réécrit le seal et committe en pathspec (message "chore: seal
-        consume of write permit <id>"). Si le seal échoue :
-        engine.unconsume_permit (retour à active) + erreur MCP explicite,
-        symétrique du rollback du grant. Motif : le reseed au boot (A1.5)
-        lit HEAD ; sans commit au consume, un permit consumed
-        ressusciterait active après un autorepair, ce qui serait une
-        régression de sécurité.
-      - NothingToCommit au consume et au rejeu idempotent du grant reste
-        un succès (état déjà scellé).
+      - A1.4c consume_write_permit — séquence EXACTE (itération 2), les
+        étapes 3-4 ne précèdent JAMAIS la 2 pour que le JSON reflète
+        consumed AVANT le commit (un NothingToCommit signifie alors
+        toujours "HEAD scelle déjà exactement cet état", jamais un seal
+        obsolète masqué) :
+          (1) lookup du permit. S'il est DÉJÀ consumed (rejeu) : chemin
+              idempotent — ré-export du seal + add + commit pathspec ;
+              NothingToCommit => succès idempotent (miroir du re-seal
+              idempotent du grant) ; commit créé => succès avec hash
+              (rattrape un rejeu après échec de seal antérieur).
+          (2) engine.consume_permit : transition DB active -> consumed.
+          (3) engine.write_permits_seal : l'export lit la DB APRÈS (2),
+              le JSON reflète donc consumed.
+          (4) `git add` + commit pathspec --no-verify, message
+              "chore: seal consume of write permit <id>".
+          (5) Si (3) ou (4) échoue : engine.unconsume_permit (consumed
+              -> active), puis RÉ-EXPORT du seal (le JSON disque
+              redevient cohérent avec la DB ; best effort, warning
+              loggé si ce ré-export échoue), puis erreur MCP explicite.
+              Le rejeu après correction retrouve un permit active et
+              repasse par (2) comme un premier appel : idempotence
+              garantie par l'état, pas par mémoire.
+        Motif du commit au consume : le reseed au boot (A1.5) lit HEAD ;
+        sans lui, un permit consumed ressusciterait active après un
+        autorepair — régression de sécurité. NON-INTERFÉRENCE avec les
+        gardes existantes : le commit de seal est émis par le serveur
+        (pas un bash d'agent), il n'est intercepté ni par le hook ni par
+        la vérification layer-2 côté agent ; l'invariant consume-en-
+        dernier (lesson 8fd49300) est intact — les commits de code de
+        l'agent précèdent le consume, le commit de seal machine le suit.
+      - NothingToCommit au rejeu idempotent du grant reste un succès
+        (état déjà scellé), comme aujourd'hui.
 
-    A1.5 Extension du PILIER D (boot, main.rs) : après open/migrate (et
-    dans la branche rebuild de l'autorepair), si la table write_permits
-    est VIDE et que `git cat-file -e HEAD:company/data/permits-seal.json`
-    réussit, le serveur reseed la table depuis `git show HEAD:<seal>`
-    (Command git, LC_ALL=C). Échec git ou JSON invalide : warning loggé,
-    boot non fatal (comportement actuel : table vide). Le reseed lit
-    EXCLUSIVEMENT HEAD (ancre de confiance tamper-evident), jamais le
-    fichier disque. Garde "table vide" : le reseed n'écrase jamais un
-    état vivant. Conséquence : write_permits, dernier état non couvert
-    par le PILIER D, devient reconstructible ; make clean-company ne
-    perd plus les permits scellés (test spirituel du programme V1).
+    A1.5 Extension du PILIER D (boot, main.rs). Le reseed est branché
+    EXCLUSIVEMENT sur les deux chemins où la table write_permits est
+    vide PARCE QUE le store vient d'être recréé (itération 2, fenêtre
+    précisée) :
+      (a) la branche rebuild de l'autorepair — le new_engine construit
+          après into_db_for_rebuild + reindex_all (corruption détectée
+          par integrity_check) ;
+      (b) la création d'un fichier DB ABSENT avant open (post make
+          clean / clean-company) — détectée par un flag db_existed
+          capturé AVANT OrchestratorDb::open (qui crée le fichier).
+    Un boot NORMAL (DB existante et saine) ne reseed JAMAIS, même si la
+    table est vide : une table vide sur une DB saine est un état
+    légitime et délibéré (ex. revert de tampering par le hook, rollback
+    de grant) qu'un reseed écraserait en ressuscitant des permits
+    volontairement supprimés. Mécanique du reseed : si
+    `git cat-file -e HEAD:company/data/permits-seal.json` réussit,
+    reseed depuis `git show HEAD:<seal>` (Command git, LC_ALL=C). Échec
+    git ou JSON invalide : warning loggé, boot non fatal (comportement
+    actuel : table vide). Le reseed lit EXCLUSIVEMENT HEAD (ancre de
+    confiance tamper-evident), jamais le fichier disque. Double garde :
+    branche (a)/(b) uniquement ET table vide (reseed_permits_from_seal
+    REFUSE une table non vide, A1.3). Conséquence : write_permits,
+    dernier état non couvert par le PILIER D, devient reconstructible ;
+    make clean-company ne perd plus les permits scellés (test spirituel
+    du programme V1).
 
     A1.6 company/config/protected-zones.json : nouvelle clé
     `"seal_path": "company/data/permits-seal.json"` (même modèle que
@@ -249,8 +321,10 @@ spec:
     ── A2 — AUTO-COMMIT DES TRANSITIONS LIFECYCLE SERVEUR ──
 
     main.rs : helper privé lifecycle_commit(rel_path, msg) : `git add --
-    <rel_path>` + commit pathspec `git -c commit.gpgsign=false commit -m
-    <msg> -- <rel_path>`, LC_ALL=C, NothingToCommit toléré (idempotence).
+    <rel_path>` + commit pathspec `git -c commit.gpgsign=false commit
+    --no-verify -m <msg> -- <rel_path>` (convention commits serveur
+    A1.4, même rationale), LC_ALL=C, NothingToCommit toléré
+    (idempotence).
     Branché sur les DEUX écritures serveur de cycle de vie RFC :
       - close_review_round quand rfc_auto_updated=true : message
         "chore(rfc): <id8> approved (close_review_round)" ;
@@ -284,6 +358,32 @@ spec:
     couvrir plusieurs RFCs et le jugement des acceptance criteria est
     sémantique).
 
+    ── CHANGELOG ──
+
+    ITÉRATION 2 (review round 454760e6, request_changes Implementer,
+    4 findings) :
+    (1) Couplage commits serveur × make ci du pre-commit TRANCHÉ :
+    convention --no-verify pour TOUS les commits serveur headless (seal
+    grant, seal consume, lifecycle), consignée en A1.4 avec son
+    rationale de sûreté (contenu machine-généré, pathspec-scopé, la CI
+    n'a pas d'objet ; précédent gpgsign=false RFC 324e8a33) ; appliquée
+    aussi au seal EXISTANT du grant, dont le coût make-ci-sous-engine-
+    lock n'avait jamais été consigné. Les règles persona interdisant
+    --no-verify aux AGENTS restent entières.
+    (2) Séquence exacte du seal-au-consume figée en A1.4c : export du
+    JSON APRÈS la transition DB (NothingToCommit ne peut plus masquer un
+    seal obsolète), rejeu idempotent par l'état (permit déjà consumed =>
+    re-seal idempotent ; unconsume => rejeu comme premier appel),
+    ré-export du seal après unconsume pour cohérence disque/DB.
+    (3) Fenêtre du reseed PILIER D bornée en A1.5 : branche rebuild de
+    l'autorepair (new_engine) et création de DB absente (clean-company)
+    UNIQUEMENT ; jamais un boot normal, même table vide (état légitime
+    post-revert qu'un reseed écraserait).
+    (4) affected_files : company/data/orchestrator.db RETIRÉ de deleted —
+    c'est un UNTRACK (git rm --cached, A1.8-iii), le fichier reste sur
+    disque ; aucune suppression de fichier dans ce RFC (annotation
+    explicite pour M14/M15 dans impact).
+
   impact: >
     SÉCURITÉ (invariant central) : "tout permit injecté hors canal MCP,
     absent de baseline = union(snapshot Source A, HEAD Source B), est
@@ -293,10 +393,14 @@ spec:
     d'attaque examinées : forge du seal disque par un agent -> bloquée
     par le nouveau guard hook sur tous les canaux agent (bash/write/edit) ;
     le reseed boot ne lit que HEAD, jamais le disque ; forge en HEAD ->
-    exigerait un commit passant les hooks, même exposition qu'aujourd'hui
+    exigerait d'ÉCRIRE d'abord le fichier, ce que le guard hook bloque
+    sur tous les canaux agent en amont de tout commit (la défense ne
+    repose PAS sur le pre-commit, que la convention --no-verify A1.4
+    contourne côté serveur uniquement), même exposition qu'aujourd'hui
     avec le .db. Résurrection de permit consumed -> fermée par le commit
-    de seal au consume (A1.4). Cas négatifs : seal en échec au grant ->
-    rollback permit (inchangé) ; au consume -> unconsume + erreur ;
+    de seal au consume (A1.4c). Cas négatifs : seal en échec au grant ->
+    rollback permit (inchangé) ; au consume -> unconsume + ré-export +
+    erreur, rejeu idempotent par l'état (A1.4c) ;
     index.lock -> SealError::IndexLocked (inchangé). Edge : JSON HEAD
     corrompu -> Source B null -> fallback legacy -> union avec Source A ;
     reseed sur table non vide -> refusé ; dépôt sans git (tests) ->
@@ -313,8 +417,20 @@ spec:
     0197fbe5). Le grant du permit exigera user_approval_confirmed=true :
     l'approbation explicite de l'utilisateur est requise AVANT le grant.
 
-    COMPATIBILITÉ : pre-commit inchangé (il lit la DB VIVANTE pour le
-    check de permit, pas HEAD ; vérifié .githooks/pre-commit L77-110).
+    PÉRIMÈTRE M14/M15 (itération 2) : affected_files ne contient AUCUN
+    deleted — orchestrator.db n'est PAS supprimé, il est UNTRACKÉ
+    (git rm --cached au commit de migration humain A1.8-iii, le fichier
+    reste sur disque et vivant pour le serveur). Le champ deleted est
+    réservé aux vraies suppressions de fichiers (sémantique M15) ; le
+    pré-check M14 calcule ses target_paths candidats sur
+    modified+created ci-dessous, qui sont exhaustifs.
+
+    COMPATIBILITÉ : pre-commit inchangé côté fichier (il lit la DB
+    VIVANTE pour le check de permit, pas HEAD ; vérifié
+    .githooks/pre-commit L77-110) ; il n'est simplement PLUS EXÉCUTÉ sur
+    les commits serveur (--no-verify, convention A1.4), ce qui supprime
+    au passage le make ci que chaque grant payait sous l'engine lock.
+    Les commits d'AGENTS continuent de le déclencher sans exception.
     .gitignore inchangé (*.db* couvre déjà ; permits-seal.json n'y est
     pas et reste versionné). Makefile inchangé (make clean supprime déjà
     les .db ; le reseed A1.5 restaure les permits au boot suivant).
@@ -386,5 +502,3 @@ spec:
       - company/config/protected-zones.json
     created:
       - company/data/permits-seal.json
-    deleted:
-      - company/data/orchestrator.db
