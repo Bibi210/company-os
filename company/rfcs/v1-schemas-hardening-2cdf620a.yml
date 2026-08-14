@@ -1,0 +1,1767 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 2cdf620a-7071-49cf-a995-a96208625961
+  title: "V1 schemas : durcissement des 14 schemas JSON (verrous unevaluatedProperties racine+metadata, $defs partages dans _base, champs serveur declares, required stock-conformes, 6 migrations de corpus)"
+  author: architect
+  created_at: "2026-08-14"
+  status: draft
+  description: >
+    Applique les verdicts de l'audit v1-schemas-audit (diagnostic c2a64134,
+    task-request ceb26109, roadmap a410bb43). Recrit les 14 schemas de
+    company/schemas/ : _base restructure autour de $defs partages (uuid,
+    date, timestamp, slug, persona_id, artifact_kind, metadata) ; chaque
+    kind schema gagne unevaluatedProperties:false a la racine ET sur
+    metadata (support jsonschema 0.29.1 prouve empiriquement) ; les champs
+    poses par le serveur (rfc approved_at / implemented_at) sont enfin
+    declares au schema ; required ajoutes uniquement la ou le stock est
+    conforme a 100% (task-request priority+status+project 31/31, rfc
+    status+affected_files 38/38, diagnostic-report status 22/22) ; enums et
+    patterns sur created_at, author, changelog, related[].kind, slugs ;
+    champs morts retires (override persona metadata.id no-op,
+    spec.project_name duplique) ; champs recurrents declares (rfc
+    cleanup_workaround, impl-plan overview, task-request context/
+    constraints/out_of_scope/investigation_hints) ; specs verrouilles sauf
+    task-request et project-config (ouverts, tranches). Six migrations de
+    corpus mecaniques dans le meme commit (2 RFCs historiques, 1 design-doc,
+    1 impl-plan, 2 diagnostics) et 2 fichiers de fixtures Rust. Corpus
+    entier pre-valide avec les schemas candidats : 204 artifacts, 6 echecs
+    = exactement les 6 migrations, zero casse ailleurs. FORME B non
+    generalisee hors RFC (tranche). Zone protegee : cycle complet
+    approbation CEO + write permit.
+  tags:
+    - companyos-v1
+    - schemas
+    - audit
+    - validation
+    - harness
+    - mechanical-invariant
+    - unevaluated-properties
+    - json-schema
+    - companyos-internals
+    - critical-infra
+  related:
+    - id: ceb26109-cfcf-4128-a447-d933e6ee4f48
+      kind: task-request
+      relationship: input
+    - id: c2a64134-a9b4-488c-bc4a-3123ac3dd491
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: related
+    - id: a4eb3ee7-45c1-4422-a43a-fbbc07d686f0
+      kind: rfc
+      relationship: related
+    - id: 8bf78218-e1f3-4bc5-864c-2abf618a990d
+      kind: rfc
+      relationship: related
+    - id: a4ee8b6a-ebcd-4a76-96eb-7e31785c8ae6
+      kind: rfc
+      relationship: related
+    - id: 0197fbe5-949e-4917-a4d8-2eb63e028ce6
+      kind: rfc
+      relationship: related
+    - id: bd4650e2-ab42-4b4e-9c10-cca638ded48c
+      kind: lesson-learned
+      relationship: input
+
+spec:
+  motivation: >
+    Les schemas sont le harness statique des artifacts : ce qu'ils ne
+    verrouillent pas, seule la prose le tient, et le programme V1 a prouve
+    trois fois que la prose ne tient pas (lessons 1bb07073, f5f62e3b). Les
+    lots 1-3 du process-hardening ont durci 6 schemas au fil des besoins ;
+    les 8 autres et _base sont restes laxistes. L'audit c2a64134 a mesure
+    le laxisme contre le corpus reel (204 artifacts) : des champs poses par
+    le SERVEUR depuis le premier jour (rfc approved_at / implemented_at)
+    ne sont declares dans aucun schema et ne passent que parce que metadata
+    est un objet ouvert -- un typo de champ metadata, un status invalide sur
+    un rfc, une date malformee, un related.kind vers un kind retire, un
+    champ spec parasite passent tous silencieusement aujourd'hui. Huit
+    champs spec hors-schema se sont accumules dans 6 fichiers du corpus
+    sans qu'aucun mecanisme ne les signale. Le pattern est connu
+    (bd4650e2) : on ne corrige pas un laxisme par une regle de non-usage,
+    on le retire mecaniquement. Chaque durcissement propose ici a ete
+    verifie contre le stock : strict sans anyOf quand le stock est conforme
+    (c'est le cas de tous les required et patterns ajoutes), migration
+    explicite dans le meme commit sinon (6 fichiers), anyOf conserve
+    uniquement la ou il est justifie (affected_files FORME A/B,
+    retro-compatibilite RFC a4eb3ee7 ; out_of_scope string|array, seule
+    heterogeneite de type du corpus).
+
+  proposal: |
+    Quatorze schemas recrits (contenus integraux verbatim ci-dessous, deja
+    VALIDES : corpus entier revalide avec ces schemas exacts via le crate
+    companyos-validation, jsonschema 0.29.1 Draft 2020-12 -> 204 artifacts,
+    6 echecs = exactement les 6 migrations du point B, zero casse ailleurs ;
+    batterie negative 6/6 rejets corrects ; support unevaluatedProperties
+    de jsonschema 0.29.1 prouve empiriquement a travers allOf + $ref externe
+    avec _base enregistre comme Resource, la structure exacte du validator).
+
+    A. LES QUINZE DECISIONS DE DURCISSEMENT.
+
+    A1. _base restructure autour de $defs partages : uuid, date
+    (^\d{4}-\d{2}-\d{2}$), timestamp (date pure OU RFC3339, pour les champs
+    poses par le serveur), slug (kebab-case), persona_id (kebab-case,
+    deliberement PAS un enum : la source de verite est company/personas/ et
+    la matrice author-produces est mecanisee a l'indexation, M16 RFC
+    0197fbe5), artifact_kind (enum des 13 kinds), et metadata (l'objet
+    metadata complet, referencable par les kind schemas). Le comportement de
+    _base seul est inchange pour tout artifact conforme.
+
+    A2. Verrou racine : chaque kind schema porte unevaluatedProperties:false
+    au niveau racine (voit les annotations des deux branches allOf : les
+    proprietes de _base ET celles de la specialisation). Toute cle top-level
+    parasite est rejetee. Corpus conforme (0 migration).
+
+    A3. Verrou metadata : chaque kind schema redefinit metadata comme
+    { allOf: [$ref _base#/$defs/metadata], properties: <champs propres>,
+    unevaluatedProperties: false }. Tout champ metadata non declare est
+    rejete. C'est ce verrou qui a revele l'incoherence A6. Corpus conforme
+    (0 migration).
+
+    A4. Patterns _base : created_at et changelog[].date en pattern date ;
+    author et changelog[].author en pattern persona_id ; title minLength 1 ;
+    tags items minLength 1 ; metadata.project declare dans _base (pattern
+    slug) : il etait utilise par 5 kinds (task-request 31/31, design-doc
+    10/12, diagnostic-report 18/22, implementation-plan 11/27, 2 RFCs
+    historiques) mais declare uniquement par task-request. Corpus conforme.
+
+    A5. related et changelog verrouilles : items additionalProperties:false,
+    related[].kind passe de string libre a enum artifact_kind (aurait
+    attrape un lien vers le kind retire agent-message). Corpus conforme
+    (0 cle parasite, 42 entrees changelog conformes, 7 valeurs de
+    related.kind toutes valides).
+
+    A6. Champs serveur declares au schema rfc : approved_at (pose par
+    close_review_round au consensus) et implemented_at (pose par
+    rfc_set_implemented) n'ont JAMAIS ete declares -- ils ne passaient que
+    parce que metadata etait ouvert. Declares en pattern timestamp tolerant
+    la date plate (2 implemented_at historiques sont des dates pures : zero
+    migration). approved_at reste optionnel (le RFC implemented cc4d9f8a,
+    hotfix, n'en a pas). metadata.status devient REQUIS (38/38 conformes).
+
+    A7. rfc spec verrouille : affected_files devient REQUIS (38/38, consomme
+    par le pre-check M14 et les triggers M15) ; l'anyOf FORME A / FORME B
+    est conserve tel quel (retro-compatibilite RFC a4eb3ee7) ;
+    cleanup_workaround DECLARE (5 occurrences reelles, pattern documente par
+    la regle affected_files_categorization) ; additionalProperties:false
+    (2 migrations, point B).
+
+    A8. task-request durci : priority, status et metadata.project deviennent
+    REQUIS (31/31 conformes, l'artifact_catalog les decrit deja comme
+    portes) ; acceptance_criteria minItems 1 ; les 4 champs libres
+    RECURRENTS sont declares types (context string, constraints array,
+    investigation_hints string, out_of_scope anyOf string|array -- seule
+    heterogeneite de type du corpus : 7 string, 4 list). spec reste OUVERT
+    (tranche : entree libre du PM ; les champs projet-specifiques observes
+    -- what_to_build, formal_verification_scope, installation_constraints,
+    triage_note -- restent legitimes sans etre canonises).
+
+    A9. diagnostic-report durci : status devient REQUIS (22/22) ;
+    root_cause et resolution restent optionnels (workflow investigating :
+    symptom d'abord) ; spec verrouille (2 migrations singletons, point B).
+
+    A10. review-report durci (ZERO YAML dans le corpus, durcissement
+    libre) : metadata.round_id pattern uuid REQUIS, metadata.reviewer
+    pattern persona_id REQUIS, spec additionalProperties:false (absent
+    jusqu'ici alors que axes/axis etaient deja verrouilles), garde
+    approve+findings inchangee (RFC 8bf78218).
+
+    A11. lesson-learned verrouille : spec additionalProperties:false,
+    context/insight/recommendation minLength 1 (63/63 conformes).
+
+    A12. implementation-plan : overview DECLARE (5 occurrences) ; spec
+    verrouille top-level (1 migration, point B) ; steps[] items PAS
+    verrouilles (tranche : deux formes historiques coexistent --
+    {description, files} pour 248/289 steps, {id, title, action, file,
+    depends_on, validation} pour 5 plans de 2026-03 -- migration
+    disproportionnee ; description reste le seul required).
+
+    A13. persona : retrait du CHAMP MORT metadata.id "type: string" --
+    un no-op pur, allOf est une intersection donc le pattern uuid de _base
+    s'appliquait de toute facon (les 4 personas ont des UUIDs) ; les regles
+    nommees hors must/never (4 observees, toutes de forme {description})
+    sont typees via rules.additionalProperties = objet {description}
+    requis ; artifacts.produces/consumes passent en enum artifact_kind ;
+    display_name minLength 1 ; verrous racine + metadata + artifacts.
+
+    A14. project-config : metadata.project_name pattern slug ; verrous
+    racine + metadata ; spec reste OUVERT (tranche : shared-rules.yml est
+    un project-config porteur de la config systeme libre --
+    companyos_is_a_project, artifact_catalog, rules -- le fermer imposerait
+    de schematiser toute la prose systeme). Le spec.project_name duplique
+    du config puissance4 est retire (hygiene, lu par aucun code, verifie).
+
+    A15. roadmap, flow-control, review-protocol, human-review-triggers :
+    verrous racine + metadata ; roadmap gagne le verrou spec top-level et
+    le pattern slug sur domain (items et refs etaient deja verrouilles) ;
+    target_date reste libre PAR DESIGN (date, trimestre ou label). Les
+    specs de flow-control/review-protocol/human-review-triggers etaient
+    deja verrouilles (lots 1 et 3), inchanges.
+
+    TRANCHES NEGATIFS (pour memoire) : FORME B affected_files PAS
+    generalisee hors RFC (seul le RFC pilote des permits ; impl-plan a deja
+    steps[].files) ; enum author REJETE (doublonnerait la source personas,
+    M16) ; pattern sur tags REJETE (10 tags accentues francais legitimes) ;
+    changelog RESTE dans _base (consomme par 5 kinds, 42 entrees conformes :
+    c'est une definition partagee coherente, pas un ad hoc).
+
+    B. LES SIX MIGRATIONS DE CORPUS (meme commit que les schemas, toutes
+    mecaniques et preservant le contenu ; entree metadata.changelog ajoutee
+    a chaque fichier migre datee du jour du commit, author implementer).
+
+    B1. company/rfcs/caller-inventory-discipline-eb42a8de.yml :
+    spec.changelog (block scalar narratif d'iteration 2, mal place dans
+    spec) -> deplace VERBATIM vers metadata.changelog en entree
+    {date: "2026-06-05", author: architect, description: <texte integral>}.
+
+    B2. company/rfcs/sql-schema-migration-discipline-973a5569.yml :
+    spec.testing -> replie VERBATIM en fin de spec.impact, precede de la
+    ligne "TESTING (champ spec.testing replie ici par l'audit v1-schemas) :".
+
+    B3. projects/company-os/design-docs/recherche-hybride-architecture-f433fefc.yml :
+    spec.triaxial_analysis retire (artefact pre-M7 : l'analyse triaxiale
+    embarquee dans le design-doc est exactement ce que le schema
+    review-report a mecanise depuis, RFC a4ee8b6a ; contenu preserve par
+    git et trace par l'entree changelog).
+
+    B4. projects/company-os/implementation-plans/caller-inventory-personas-1c590771.yml :
+    spec.acceptance_criteria (duplication du role du task-request, unique
+    occurrence du corpus) -> replie VERBATIM en fin de spec.overview,
+    precede de "Criteres d'acceptation du plan (champ replie par l'audit
+    v1-schemas) :" avec les 5 items en tirets.
+
+    B5. projects/company-os/diagnostic-reports/v1-memory-audit-162f2c8c.yml :
+    spec.notes -> replie VERBATIM en fin de spec.resolution, precede de
+    "NOTES (champ spec.notes replie ici par l'audit v1-schemas) :".
+
+    B6. projects/puissance4-verus/diagnostic-reports/lemma-ab-equals-pure-proof-difficulty-0838b79a.yml :
+    spec.escalation -> replie VERBATIM en fin de spec.resolution, precede de
+    "ESCALADE (champ spec.escalation replie ici par l'audit v1-schemas) :".
+
+    B7 (hygiene, hors validation) : projects/puissance4-verus/config/
+    puissance-4-proof-driven-development-504e2e24.yml : cle spec.project_name
+    retiree (duplique metadata.project_name ; spec de project-config reste
+    ouvert donc ce n'est pas une exigence de validite, c'est un retrait de
+    champ mort).
+
+    C. LES DEUX FICHIERS DE FIXTURES RUST (caller-inventory conduit sur le
+    workspace ENTIER : les surfaces validant contre les schemas reels sont
+    crates/validation/src/validator.rs, tests/integration/user_stories.rs,
+    tests/integration/edge_cases.rs, crates/orchestrator/src/engine.rs,
+    crates/orchestrator/tests/integration_search.rs ; seules les deux
+    premieres portent des fixtures POSITIVES cassantes -- verifie fixture
+    par fixture avec les schemas candidats).
+
+    C1. crates/validation/src/validator.rs : test_validate_valid_yaml
+    (task-request : ajouter metadata.project, spec.priority, spec.status) ;
+    RFC_YAML (fixture des tests placement, assert is_valid : ajouter
+    spec.affected_files, par ex. la FORME A ["company/config/x.yml"] ;
+    metadata.status draft deja present).
+
+    C2. tests/integration/user_stories.rs : story1 task-request (ajouter
+    metadata.project + spec.status ; spec.description y est un champ libre,
+    legal car spec de task-request reste ouvert) ; story3 rfc (ajouter
+    metadata.status + spec.affected_files) ; test_valid_task_request_passes
+    (ajouter metadata.project + spec.status). Les fixtures NEGATIVES des
+    deux fichiers restent invalides et leurs assertions tiennent
+    (test_task_request_missing_required_spec_field asserte que l'erreur
+    mentionne acceptance_criteria : toujours vrai, les erreurs
+    supplementaires status/priority s'y ajoutent sans l'evincer ;
+    test_rfc_missing_required_spec_field n'asserte que !is_valid).
+    edge_cases test_shipped_artifacts et integration_search
+    quality_eval_real_corpus valident le CORPUS REEL : verts apres les
+    migrations B. Les fixtures engine.rs (write_lesson : conformes,
+    verifie ; write_rfc : non schema-validee) et les registries no-schemas
+    de mcp-servers/orchestrator/main.rs : intacts.
+
+    D. CONTENUS INTEGRAUX DES QUATORZE SCHEMAS (verbatim, deja valides
+    contre le corpus ; l'implementeur les copie tels quels).
+
+    ===== company/schemas/_base.schema.json (contenu integral apres changement) =====
+
+    {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://companyos.dev/schemas/_base.schema.json",
+      "type": "object",
+      "$defs": {
+        "uuid": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        },
+        "date": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+          "description": "ISO 8601 calendar date (YYYY-MM-DD)"
+        },
+        "timestamp": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}(T\\d{2}:\\d{2}:\\d{2}(\\.\\d+)?([+-]\\d{2}:\\d{2}|Z))?$",
+          "description": "ISO 8601 date, optionally with RFC 3339 time (server-stamped fields use the full form)"
+        },
+        "slug": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+          "description": "kebab-case identifier"
+        },
+        "persona_id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "description": "Persona identifier (kebab-case). Deliberately NOT an enum: the source of truth is company/personas/ and the author-produces matrix is enforced at indexing (mechanism 16, RFC 0197fbe5)."
+        },
+        "artifact_kind": {
+          "type": "string",
+          "enum": [
+            "task-request",
+            "design-doc",
+            "implementation-plan",
+            "rfc",
+            "review-report",
+            "lesson-learned",
+            "diagnostic-report",
+            "persona",
+            "project-config",
+            "flow-control",
+            "review-protocol",
+            "human-review-triggers",
+            "roadmap"
+          ]
+        },
+        "metadata": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/uuid"
+            },
+            "title": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": {
+              "type": "string"
+            },
+            "tags": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "created_at": {
+              "$ref": "#/$defs/date"
+            },
+            "author": {
+              "$ref": "#/$defs/persona_id"
+            },
+            "project": {
+              "$ref": "#/$defs/slug",
+              "description": "Project slug (kebab-case). Mandatory semantics for project kinds (enforced per-kind), informative annotation elsewhere."
+            },
+            "changelog": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "date": {
+                    "$ref": "#/$defs/date",
+                    "description": "ISO 8601 date of the change"
+                  },
+                  "author": {
+                    "$ref": "#/$defs/persona_id",
+                    "description": "Persona who made the change"
+                  },
+                  "description": {
+                    "type": "string",
+                    "description": "What changed and why"
+                  }
+                },
+                "required": [
+                  "date",
+                  "author",
+                  "description"
+                ],
+                "additionalProperties": false
+              },
+              "description": "History of modifications to this artifact, most recent first"
+            },
+            "related": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "$ref": "#/$defs/uuid",
+                    "description": "metadata.id of the referenced artifact (UUID)"
+                  },
+                  "kind": {
+                    "$ref": "#/$defs/artifact_kind",
+                    "description": "Kind of the referenced artifact"
+                  },
+                  "relationship": {
+                    "type": "string",
+                    "enum": [
+                      "input",
+                      "derived-from",
+                      "supersedes",
+                      "superseded-by",
+                      "related"
+                    ],
+                    "description": "How this artifact relates to the referenced one"
+                  }
+                },
+                "required": [
+                  "id",
+                  "relationship"
+                ],
+                "additionalProperties": false
+              },
+              "description": "References to other artifacts used or consulted during creation"
+            }
+          },
+          "required": [
+            "id",
+            "title",
+            "author",
+            "created_at"
+          ]
+        }
+      },
+      "properties": {
+        "api_version": {
+          "type": "string",
+          "const": "companyos/v1"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/metadata"
+        }
+      },
+      "required": [
+        "api_version",
+        "kind",
+        "metadata"
+      ]
+    }
+
+    ===== company/schemas/task-request.schema.json (contenu integral apres changement) =====
+
+    {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://companyos.dev/schemas/task-request.schema.json",
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "_base.schema.json"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "task-request"
+            },
+            "metadata": {
+              "allOf": [
+                {
+                  "$ref": "_base.schema.json#/$defs/metadata"
+                }
+              ],
+              "unevaluatedProperties": false,
+              "required": [
+                "project"
+              ]
+            },
+            "spec": {
+              "type": "object",
+              "properties": {
+                "acceptance_criteria": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "priority": {
+                  "type": "string",
+                  "enum": [
+                    "low",
+                    "medium",
+                    "high",
+                    "critical"
+                  ]
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "backlog",
+                    "in_progress",
+                    "done",
+                    "cancelled"
+                  ]
+                },
+                "context": {
+                  "type": "string"
+                },
+                "constraints": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "out_of_scope": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    }
+                  ]
+                },
+                "investigation_hints": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "acceptance_criteria",
+                "priority",
+                "status"
+              ]
+            }
+          },
+          "required": [
+            "spec"
+          ]
+        }
+      ]
+    }
+
+    ===== company/schemas/design-doc.schema.json (contenu integral apres changement) =====
+
+    {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://companyos.dev/schemas/design-doc.schema.json",
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "_base.schema.json"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "design-doc"
+            },
+            "metadata": {
+              "allOf": [
+                {
+                  "$ref": "_base.schema.json#/$defs/metadata"
+                }
+              ],
+              "unevaluatedProperties": false
+            },
+            "spec": {
+              "type": "object",
+              "properties": {
+                "overview": {
+                  "type": "string"
+                },
+                "components": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "name": {
+                        "type": "string"
+                      },
+                      "description": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name",
+                      "description"
+                    ]
+                  }
+                },
+                "decisions": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "decision": {
+                        "type": "string"
+                      },
+                      "rationale": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "decision",
+                      "rationale"
+                    ]
+                  }
+                },
+                "open_questions": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "overview",
+                "components",
+                "decisions"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "spec"
+          ]
+        }
+      ]
+    }
+
+    ===== company/schemas/implementation-plan.schema.json (contenu integral apres changement) =====
+
+    {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://companyos.dev/schemas/implementation-plan.schema.json",
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "_base.schema.json"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "implementation-plan"
+            },
+            "metadata": {
+              "allOf": [
+                {
+                  "$ref": "_base.schema.json#/$defs/metadata"
+                }
+              ],
+              "unevaluatedProperties": false
+            },
+            "spec": {
+              "type": "object",
+              "properties": {
+                "overview": {
+                  "type": "string"
+                },
+                "steps": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "description": {
+                        "type": "string"
+                      },
+                      "files": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "required": [
+                      "description"
+                    ]
+                  }
+                },
+                "dependencies": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "risks": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "steps"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "spec"
+          ]
+        }
+      ]
+    }
+
+    ===== company/schemas/rfc.schema.json (contenu integral apres changement) =====
+
+    {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://companyos.dev/schemas/rfc.schema.json",
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "_base.schema.json"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "rfc"
+            },
+            "metadata": {
+              "allOf": [
+                {
+                  "$ref": "_base.schema.json#/$defs/metadata"
+                }
+              ],
+              "unevaluatedProperties": false,
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "draft",
+                    "review",
+                    "approved",
+                    "rejected",
+                    "implemented"
+                  ]
+                },
+                "approved_at": {
+                  "$ref": "_base.schema.json#/$defs/timestamp",
+                  "description": "Server-stamped when the review round closes in consensus (close_review_round)."
+                },
+                "implemented_at": {
+                  "$ref": "_base.schema.json#/$defs/timestamp",
+                  "description": "Server-stamped by rfc_set_implemented."
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "spec": {
+              "type": "object",
+              "properties": {
+                "motivation": {
+                  "type": "string"
+                },
+                "proposal": {
+                  "type": "string"
+                },
+                "impact": {
+                  "type": "string"
+                },
+                "rollback_plan": {
+                  "type": "string"
+                },
+                "cleanup_workaround": {
+                  "type": "string",
+                  "description": "Optional: which prose workaround this RFC retires, and where it lived."
+                },
+                "affected_files": {
+                  "anyOf": [
+                    {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Legacy flat form: a single list of file paths (modified or created indistinctly). Kept for backward compatibility."
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "modified": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          },
+                          "description": "Files that already exist in HEAD and will be edited."
+                        },
+                        "created": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          },
+                          "description": "New files that do not yet exist and will be created."
+                        },
+                        "deleted": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          },
+                          "description": "Files that exist in HEAD and will be deleted. Evaluated by the path-matchable human-review triggers (mechanism 15, RFC 0197fbe5)."
+                        }
+                      },
+                      "additionalProperties": false,
+                      "description": "Structured form distinguishing files to modify, create, and delete. All three keys optional; any may be empty or absent."
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "motivation",
+                "proposal",
+                "impact",
+                "affected_files"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "spec"
+          ]
+        }
+      ]
+    }
+
+    ===== company/schemas/review-report.schema.json (contenu integral apres changement) =====
+
+    {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://companyos.dev/schemas/review-report.schema.json",
+      "$defs": {
+        "axis": {
+          "type": "object",
+          "properties": {
+            "verdict": {
+              "type": "string",
+              "enum": [
+                "approve",
+                "request_changes"
+              ]
+            },
+            "notes": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "verdict"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "_base.schema.json"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "review-report"
+            },
+            "metadata": {
+              "allOf": [
+                {
+                  "$ref": "_base.schema.json#/$defs/metadata"
+                }
+              ],
+              "unevaluatedProperties": false,
+              "properties": {
+                "round_id": {
+                  "$ref": "_base.schema.json#/$defs/uuid",
+                  "description": "UUID of the review round this report belongs to."
+                },
+                "reviewer": {
+                  "$ref": "_base.schema.json#/$defs/persona_id"
+                }
+              },
+              "required": [
+                "round_id",
+                "reviewer"
+              ]
+            },
+            "spec": {
+              "type": "object",
+              "properties": {
+                "verdict": {
+                  "type": "string",
+                  "enum": [
+                    "approve",
+                    "request_changes"
+                  ]
+                },
+                "findings": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "axes": {
+                  "type": "object",
+                  "properties": {
+                    "nominal": {
+                      "$ref": "#/$defs/axis"
+                    },
+                    "negative": {
+                      "$ref": "#/$defs/axis"
+                    },
+                    "edge": {
+                      "$ref": "#/$defs/axis"
+                    }
+                  },
+                  "required": [
+                    "nominal",
+                    "negative",
+                    "edge"
+                  ],
+                  "additionalProperties": false
+                },
+                "notes": {
+                  "type": "string"
+                },
+                "summary": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "verdict",
+                "findings",
+                "axes"
+              ],
+              "additionalProperties": false,
+              "if": {
+                "properties": {
+                  "verdict": {
+                    "const": "approve"
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "findings": {
+                    "maxItems": 0
+                  },
+                  "axes": {
+                    "properties": {
+                      "nominal": {
+                        "properties": {
+                          "verdict": {
+                            "const": "approve"
+                          }
+                        }
+                      },
+                      "negative": {
+                        "properties": {
+                          "verdict": {
+                            "const": "approve"
+                          }
+                        }
+                      },
+                      "edge": {
+                        "properties": {
+                          "verdict": {
+                            "const": "approve"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "required": [
+            "spec"
+          ]
+        }
+      ]
+    }
+
+    ===== company/schemas/lesson-learned.schema.json (contenu integral apres changement) =====
+
+    {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://companyos.dev/schemas/lesson-learned.schema.json",
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "_base.schema.json"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "lesson-learned"
+            },
+            "metadata": {
+              "allOf": [
+                {
+                  "$ref": "_base.schema.json#/$defs/metadata"
+                }
+              ],
+              "unevaluatedProperties": false,
+              "required": [
+                "tags",
+                "description"
+              ]
+            },
+            "spec": {
+              "type": "object",
+              "properties": {
+                "context": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "insight": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "recommendation": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "context",
+                "insight",
+                "recommendation"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "spec"
+          ]
+        }
+      ]
+    }
+
+    ===== company/schemas/diagnostic-report.schema.json (contenu integral apres changement) =====
+
+    {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://companyos.dev/schemas/diagnostic-report.schema.json",
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "_base.schema.json"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "diagnostic-report"
+            },
+            "metadata": {
+              "allOf": [
+                {
+                  "$ref": "_base.schema.json#/$defs/metadata"
+                }
+              ],
+              "unevaluatedProperties": false
+            },
+            "spec": {
+              "type": "object",
+              "properties": {
+                "symptom": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "root_cause": {
+                  "type": "string"
+                },
+                "resolution": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "investigating",
+                    "resolved",
+                    "wont_fix"
+                  ]
+                }
+              },
+              "required": [
+                "symptom",
+                "status"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "spec"
+          ]
+        }
+      ]
+    }
+
+    ===== company/schemas/persona.schema.json (contenu integral apres changement) =====
+
+    {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://companyos.dev/schemas/persona.schema.json",
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "_base.schema.json"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "persona"
+            },
+            "metadata": {
+              "allOf": [
+                {
+                  "$ref": "_base.schema.json#/$defs/metadata"
+                }
+              ],
+              "unevaluatedProperties": false,
+              "properties": {
+                "display_name": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "display_name"
+              ]
+            },
+            "identity": {
+              "type": "string",
+              "minLength": 1
+            },
+            "rules": {
+              "type": "object",
+              "properties": {
+                "must": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "never": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              },
+              "required": [
+                "must",
+                "never"
+              ],
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "description": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "description"
+                ],
+                "additionalProperties": false,
+                "description": "Named judgement rule: an object with a single description field."
+              }
+            },
+            "artifacts": {
+              "type": "object",
+              "properties": {
+                "produces": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "_base.schema.json#/$defs/artifact_kind"
+                  }
+                },
+                "consumes": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "_base.schema.json#/$defs/artifact_kind"
+                  }
+                }
+              },
+              "required": [
+                "produces",
+                "consumes"
+              ],
+              "additionalProperties": false
+            },
+            "review_behavior": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "identity",
+            "rules",
+            "artifacts",
+            "review_behavior"
+          ]
+        }
+      ]
+    }
+
+    ===== company/schemas/project-config.schema.json (contenu integral apres changement) =====
+
+    {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://companyos.dev/schemas/project-config.schema.json",
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "_base.schema.json"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "project-config"
+            },
+            "metadata": {
+              "allOf": [
+                {
+                  "$ref": "_base.schema.json#/$defs/metadata"
+                }
+              ],
+              "unevaluatedProperties": false,
+              "properties": {
+                "project_name": {
+                  "$ref": "_base.schema.json#/$defs/slug"
+                }
+              },
+              "required": [
+                "project_name"
+              ]
+            },
+            "spec": {
+              "type": "object",
+              "properties": {
+                "repo_url": {
+                  "type": "string",
+                  "description": "URL du dépôt git associé au projet. Pour owned : URL du dépôt que l'on gère (peut être un nom prévu si le dépôt n'est pas encore créé, ex: github.com/org/project-name). Pour contributed : URL du dépôt upstream tiers."
+                },
+                "ownership": {
+                  "type": "string",
+                  "description": "Type de relation au dépôt git. 'owned' = on crée et gère le dépôt, on définit la CI et les règles de contribution, on est maître des décisions. 'contributed' = le dépôt appartient à un tiers (open source, client, partenaire), on est contributeur individuel soumis à ses règles.",
+                  "enum": [
+                    "owned",
+                    "contributed"
+                  ]
+                },
+                "contribution_rules": {
+                  "type": "object",
+                  "description": "Règles de contribution spécifiques au projet. Principalement utile pour les projets owned où l'on définit soi-même ces règles.",
+                  "properties": {
+                    "branch_strategy": {
+                      "type": "string",
+                      "description": "Stratégie de branches du projet (ex: 'main + feature branches', 'trunk-based development', 'gitflow')."
+                    },
+                    "ci_command": {
+                      "type": "string",
+                      "description": "Commande à exécuter pour valider le projet en CI (ex: 'make ci', 'cargo test', 'npm test && npm run lint')."
+                    },
+                    "review_policy": {
+                      "type": "string",
+                      "description": "Politique de review des pull/merge requests (ex: '1 approval required', '2 approvals for main, 1 for feature branches')."
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "required": [
+                "ownership",
+                "repo_url"
+              ]
+            }
+          },
+          "required": [
+            "spec"
+          ]
+        }
+      ]
+    }
+
+    ===== company/schemas/flow-control.schema.json (contenu integral apres changement) =====
+
+    {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://companyos.dev/schemas/flow-control.schema.json",
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "_base.schema.json"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "flow-control"
+            },
+            "metadata": {
+              "allOf": [
+                {
+                  "$ref": "_base.schema.json#/$defs/metadata"
+                }
+              ],
+              "unevaluatedProperties": false
+            },
+            "spec": {
+              "type": "object",
+              "properties": {
+                "max_review_iterations": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "max_review_iterations"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "spec"
+          ]
+        }
+      ]
+    }
+
+    ===== company/schemas/review-protocol.schema.json (contenu integral apres changement) =====
+
+    {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://companyos.dev/schemas/review-protocol.schema.json",
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "_base.schema.json"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "review-protocol"
+            },
+            "metadata": {
+              "allOf": [
+                {
+                  "$ref": "_base.schema.json#/$defs/metadata"
+                }
+              ],
+              "unevaluatedProperties": false
+            },
+            "spec": {
+              "type": "object",
+              "properties": {
+                "reviewers_by_artifact_type": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "self_review_forbidden": {
+                  "type": "object",
+                  "properties": {
+                    "description": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "description"
+                  ]
+                },
+                "review_analysis_framework": {
+                  "type": "object",
+                  "properties": {
+                    "description": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "description"
+                  ]
+                }
+              },
+              "required": [
+                "reviewers_by_artifact_type"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "spec"
+          ]
+        }
+      ]
+    }
+
+    ===== company/schemas/human-review-triggers.schema.json (contenu integral apres changement) =====
+
+    {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://companyos.dev/schemas/human-review-triggers.schema.json",
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "_base.schema.json"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "human-review-triggers"
+            },
+            "metadata": {
+              "allOf": [
+                {
+                  "$ref": "_base.schema.json#/$defs/metadata"
+                }
+              ],
+              "unevaluatedProperties": false
+            },
+            "spec": {
+              "type": "object",
+              "properties": {
+                "triggers": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "condition": {
+                        "type": "string"
+                      },
+                      "action": {
+                        "type": "string"
+                      },
+                      "description": {
+                        "type": "string"
+                      },
+                      "match": {
+                        "type": "object",
+                        "properties": {
+                          "paths": {
+                            "type": "array",
+                            "items": {
+                              "type": "string"
+                            },
+                            "minItems": 1
+                          },
+                          "on": {
+                            "type": "string",
+                            "enum": [
+                              "any",
+                              "deleted"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "paths",
+                          "on"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "required": [
+                      "condition",
+                      "action",
+                      "description"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "triggers"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "spec"
+          ]
+        }
+      ]
+    }
+
+    ===== company/schemas/roadmap.schema.json (contenu integral apres changement) =====
+
+    {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://companyos.dev/schemas/roadmap.schema.json",
+      "unevaluatedProperties": false,
+      "allOf": [
+        {
+          "$ref": "_base.schema.json"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "roadmap"
+            },
+            "metadata": {
+              "allOf": [
+                {
+                  "$ref": "_base.schema.json#/$defs/metadata"
+                }
+              ],
+              "unevaluatedProperties": false,
+              "required": [
+                "description",
+                "tags"
+              ]
+            },
+            "spec": {
+              "type": "object",
+              "properties": {
+                "domain": {
+                  "allOf": [
+                    {
+                      "$ref": "_base.schema.json#/$defs/slug"
+                    }
+                  ],
+                  "description": "Domaine couvert par la roadmap (ex: 'companyos-system', 'puissance4-verus', 'product-discovery'). Identifiant kebab-case, libre. Plusieurs roadmaps peuvent partager un domaine si elles couvrent des sous-thèmes distincts, mais c'est rare — privilégier une roadmap par domaine."
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "active",
+                    "archived"
+                  ],
+                  "description": "active = roadmap vivante, mise à jour au fur et à mesure. archived = roadmap historique, plus mise à jour (ex: roadmap d'un trimestre passé que l'on garde pour mémoire)."
+                },
+                "narrative": {
+                  "type": "string",
+                  "description": "Récit stratégique de la roadmap : pourquoi ces sujets, pourquoi cet ordre, quel est le fil conducteur. C'est ce qu'on raconte à quelqu'un qui découvre le domaine. Champ libre, plusieurs paragraphes attendus."
+                },
+                "items": {
+                  "type": "array",
+                  "description": "Éléments tracés par la roadmap. Chaque item référence un artifact (projet, RFC) ou un sujet en exploration, et porte ses dimensions temporelle, causale, narrative.",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "key": {
+                        "type": "string",
+                        "description": "Identifiant local de l'item dans la roadmap (kebab-case, unique au sein de spec.items). Sert de cible pour les dépendances (depends_on). Ne pas confondre avec metadata.id — c'est juste un handle local."
+                      },
+                      "title": {
+                        "type": "string",
+                        "description": "Titre lisible de l'item (ex: 'Migrer le schéma project-config', 'Lancer le projet puissance4-verus')."
+                      },
+                      "ref": {
+                        "type": "object",
+                        "description": "Référence vers l'artifact ou le sujet tracé. Trois types supportés : project, rfc, loose. Le type discrimine le contenu attendu.",
+                        "oneOf": [
+                          {
+                            "properties": {
+                              "type": {
+                                "const": "project"
+                              },
+                              "project_slug": {
+                                "type": "string",
+                                "description": "Slug kebab-case du projet (correspond au dossier projects/<slug>/ et au project_name du project-config)."
+                              }
+                            },
+                            "required": [
+                              "type",
+                              "project_slug"
+                            ],
+                            "additionalProperties": false
+                          },
+                          {
+                            "properties": {
+                              "type": {
+                                "const": "rfc"
+                              },
+                              "id": {
+                                "type": "string",
+                                "format": "uuid",
+                                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                                "description": "metadata.id du RFC référencé."
+                              }
+                            },
+                            "required": [
+                              "type",
+                              "id"
+                            ],
+                            "additionalProperties": false
+                          },
+                          {
+                            "properties": {
+                              "type": {
+                                "const": "loose"
+                              },
+                              "category": {
+                                "type": "string",
+                                "enum": [
+                                  "idea",
+                                  "exploration",
+                                  "hotfix",
+                                  "observation",
+                                  "dependency"
+                                ],
+                                "description": "Nature du sujet tracé sans artifact formel. idea = en réflexion ; exploration = creusé activement sans engagement de livraison ; hotfix = action ponctuelle hors RFC ; observation = constat à garder en mémoire ; dependency = dépendance externe non maîtrisée."
+                              },
+                              "label": {
+                                "type": "string",
+                                "maxLength": 200,
+                                "description": "Description courte et lisible du sujet loose."
+                              }
+                            },
+                            "required": [
+                              "type",
+                              "category",
+                              "label"
+                            ],
+                            "additionalProperties": false
+                          }
+                        ]
+                      },
+                      "timeframe": {
+                        "type": "string",
+                        "enum": [
+                          "past",
+                          "present",
+                          "future"
+                        ],
+                        "description": "Position temporelle grossière de l'item. past = livré, present = en cours, future = planifié. Cette information est redondante avec status mais sert au regroupement visuel (un PM veut séparer 'ce qui est fait' de 'ce qui est devant nous')."
+                      },
+                      "status": {
+                        "type": "string",
+                        "enum": [
+                          "planned",
+                          "in_progress",
+                          "done",
+                          "blocked",
+                          "cancelled"
+                        ],
+                        "description": "État de l'item. AUTO-SYNCHRONISÉ : pour les items à ref project ou rfc, ce champ est ÉCRASÉ à la lecture par le status calculé depuis l'artifact source (cf. RFC a5f25718). La SEULE valeur que le PM peut écrire et qui sera respectée pour ces items est `blocked` (droit absolu du PM, court-circuite l'auto-sync). Pour les items à ref loose (pas d'artifact source), le status est manuel et respecté tel quel."
+                      },
+                      "target_date": {
+                        "type": "string",
+                        "description": "Cible temporelle libre : date ISO 8601 (2026-09-15), trimestre (2026-Q3), ou label (\"bientôt\", \"post-launch\"). Optionnel. Format libre pour ne pas forcer une rigueur prématurée."
+                      },
+                      "depends_on": {
+                        "type": "array",
+                        "items": {
+                          "type": "string"
+                        },
+                        "description": "Liste de `key` d'autres items de la même roadmap dont celui-ci dépend. Permet de tracer la causalité (ne pas démarrer X tant que Y n'est pas done). Optionnel."
+                      },
+                      "rationale": {
+                        "type": "string",
+                        "description": "Pourquoi cet item est dans la roadmap, ou pourquoi à cette position. Complète narrative au niveau global avec une justification par item. Optionnel."
+                      }
+                    },
+                    "required": [
+                      "key",
+                      "title",
+                      "ref",
+                      "timeframe",
+                      "status"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": [
+                "domain",
+                "status",
+                "narrative",
+                "items"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "spec"
+          ]
+        }
+      ]
+    }
+
+  impact: >
+    PORTEE. Zone protegee company/schemas/ (14 fichiers recrits) +
+    company/rfcs/ (2 migrations) + corpus projets (4 migrations + 1 hygiene)
+    + 2 fichiers de tests Rust. Aucun code runtime modifie : aucune ligne
+    de src hors bloc cfg(test) ne change.
+
+    POUR LES AUTEURS FUTURS. Tout nouvel artifact est soumis aux verrous a
+    l'ecriture (hook), au commit (pre-commit) et a make validate : un
+    task-request sans priority/status/metadata.project, un rfc sans status/
+    affected_files, un diagnostic sans status, un champ metadata non
+    declare, une date malformee ou un related.kind inconnu sont REJETES.
+    Les pratiques reelles observees satisfont deja toutes ces exigences
+    (c'est le critere de selection des required). Les specs de task-request
+    et project-config restent ouverts : les champs libres projet-specifiques
+    y restent legaux.
+
+    BRUIT DES ERREURS. Quand une branche allOf echoue, unevaluatedProperties
+    racine ajoute une erreur en cascade ("'api_version', 'kind', ... were
+    unexpected") apres l'erreur reelle. Le premier message reste toujours
+    l'erreur precise ; bruit constate et juge acceptable pendant la
+    pre-validation (l'alternative, abandonner le verrou racine, laisse
+    passer les cles top-level parasites).
+
+    TRIGGER HUMAIN D25. "Breaking schema change" est un trigger humain en
+    prose (non path-matchable, RFC 0197fbe5). Ce RFC est un durcissement
+    avec stock migre (aucun artifact valide ne devient invalide apres les
+    migrations B), mais il restreint ce que les FUTURS artifacts peuvent
+    contenir : le CEO doit considerer le trigger D25 et remonter a
+    l'utilisateur avant grant.
+
+    MISE EN SERVICE. Aucun make deploy-serve : aucun binaire ne change
+    (seuls des fixtures de tests Rust sont touchees, rebuild au prochain
+    make ci). Les deux serveurs MCP (orchestrator et yaml-validator)
+    hot-reloadent les .schema.json via leur watcher
+    (ConfigChangeKind::Schemas) : les nouveaux schemas prennent effet des
+    l'ecriture des fichiers, sans redemarrage. Pas de reload_config (aucune
+    config orchestrator Rust modifiee). Ordre impose : schemas + migrations
+    B + fixtures C dans le MEME commit (atomicite : a aucun moment le
+    corpus n'est invalide face aux schemas en vigueur), make ci vert exige
+    avant consume du permit.
+
+  rollback_plan: >
+    git revert du commit unique (schemas + migrations + fixtures) : les
+    watchers rechargent les anciens schemas immediatement, les artifacts
+    migres reviennent a leur forme anterieure par le meme revert, aucune
+    donnee DB touchee (les schemas ne sont lus qu'a la validation). Aucun
+    deploy-serve ni reload_config au rollback non plus. Si un seul
+    durcissement se revele trop strict a l'usage (ex. un required
+    conteste), le rollback partiel est un patch de schema isole via un
+    nouveau RFC, pas un revert global.
+
+  affected_files:
+    modified:
+      - company/schemas/_base.schema.json
+      - company/schemas/task-request.schema.json
+      - company/schemas/design-doc.schema.json
+      - company/schemas/implementation-plan.schema.json
+      - company/schemas/rfc.schema.json
+      - company/schemas/review-report.schema.json
+      - company/schemas/lesson-learned.schema.json
+      - company/schemas/diagnostic-report.schema.json
+      - company/schemas/persona.schema.json
+      - company/schemas/project-config.schema.json
+      - company/schemas/flow-control.schema.json
+      - company/schemas/review-protocol.schema.json
+      - company/schemas/human-review-triggers.schema.json
+      - company/schemas/roadmap.schema.json
+      - company/rfcs/caller-inventory-discipline-eb42a8de.yml
+      - company/rfcs/sql-schema-migration-discipline-973a5569.yml
+      - projects/company-os/design-docs/recherche-hybride-architecture-f433fefc.yml
+      - projects/company-os/implementation-plans/caller-inventory-personas-1c590771.yml
+      - projects/company-os/diagnostic-reports/v1-memory-audit-162f2c8c.yml
+      - projects/puissance4-verus/diagnostic-reports/lemma-ab-equals-pure-proof-difficulty-0838b79a.yml
+      - projects/puissance4-verus/config/puissance-4-proof-driven-development-504e2e24.yml
+      - crates/validation/src/validator.rs
+      - tests/integration/user_stories.rs
