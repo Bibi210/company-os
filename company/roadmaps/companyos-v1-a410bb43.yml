@@ -38,6 +38,19 @@ metadata:
       kind: lesson-learned
       relationship: input
   changelog:
+    - date: "2026-08-09"
+      author: pm
+      description: >
+        v1-personas-audit TERMINÉ : RFC 098f35db implemented (24 règles de
+        jugement conservées, 12 réécrites en pointeurs vers leurs
+        mécanismes, 2 supprimées, 5 ajoutées dont les disciplines CEO
+        CA1/CA2, consumes et review_behavior réconciliés). En chemin :
+        hotfix RFC bd416171 (générateur personas.yml quotait pas ses
+        scalaires, bug latent révélé par les verbatims ; JSON.stringify).
+        Premier cycle complet où M14/M15/M18 ont fonctionné en production
+        (scope exhaustif, flag user_approval_confirmed adossé à la
+        délégation citée, warning plan-manquant jugé et écarté par le CEO).
+        Lessons 70ae1440, 0b4eba7c. v1-schemas-audit passe en in_progress.
     - date: "2026-07-27"
       author: pm
       description: >

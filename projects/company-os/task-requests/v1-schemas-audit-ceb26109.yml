@@ -32,7 +32,7 @@ metadata:
 
 spec:
   priority: medium
-  status: backlog
+  status: in_progress
 
   context: >
     14 schemas dans company/schemas/. Questions types : quels champs définis
