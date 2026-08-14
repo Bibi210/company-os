@@ -1,0 +1,248 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: c2a64134-a9b4-488c-bc4a-3123ac3dd491
+  title: "Audit V1 des 14 schemas JSON : recensement schema par schema (champs morts, laxismes, verrous manquants, incohérences _base), vérifié contre les 204 artifacts du corpus"
+  author: architect
+  created_at: "2026-08-14"
+  project: company-os
+  description: >
+    Phase d'analyse du domaine v1-schemas-audit (task-request ceb26109,
+    roadmap a410bb43, programme companyos-v1). Passe cohérente sur les
+    14 schemas de company/schemas/ (_base + 13 kinds), chaque durcissement
+    candidat VÉRIFIÉ contre le corpus réel (204 artifacts YAML validés via
+    le crate companyos-validation, parité exacte avec le validator de
+    production, jsonschema 0.29.1 Draft 2020-12). Résultats : le support
+    de unevaluatedProperties par jsonschema 0.29.1 est prouvé empiriquement
+    (à travers allOf + $ref externe, la structure exacte du validator),
+    ce qui permet de fermer metadata et la racine de chaque kind schema ;
+    _base est restructuré autour de $defs partagés (date, timestamp, slug,
+    persona_id, artifact_kind, uuid, metadata) ; les champs serveur
+    approved_at / implemented_at des RFCs, posés par close_review_round et
+    rfc_set_implemented depuis le début, n'ont JAMAIS été déclarés au
+    schema rfc (incohérence _base/spécialisation résolue) ; 6 fichiers du
+    corpus portent des champs spec hors-schema à migrer (verbatims dans le
+    RFC associé) ; le stock est conforme à tous les autres durcissements
+    (patterns de dates, slugs, enums, required priority/status/project/
+    affected_files), donc strict sans anyOf partout sauf affected_files
+    (anyOf FORME A/B conservé). Tranchés : FORME B non généralisée hors
+    RFC, author sans enum (source unique personas, M16), tags sans pattern
+    (accents français légitimes), steps[] d'implementation-plan non
+    verrouillés (5 plans historiques hétérogènes), spec de task-request et
+    project-config volontairement ouverts. Débouche sur le RFC de
+    durcissement des schemas.
+  tags:
+    - companyos-v1
+    - schemas
+    - audit
+    - validation
+    - harness
+    - mechanical-invariant
+    - unevaluated-properties
+  related:
+    - id: ceb26109-cfcf-4128-a447-d933e6ee4f48
+      kind: task-request
+      relationship: input
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: related
+    - id: 8bf78218-e1f3-4bc5-864c-2abf618a990d
+      kind: rfc
+      relationship: input
+    - id: a4ee8b6a-ebcd-4a76-96eb-7e31785c8ae6
+      kind: rfc
+      relationship: input
+    - id: 0197fbe5-949e-4917-a4d8-2eb63e028ce6
+      kind: rfc
+      relationship: input
+    - id: bd4650e2-ab42-4b4e-9c10-cca638ded48c
+      kind: lesson-learned
+      relationship: input
+    - id: d9f9ae30-ddad-4d24-bad8-ae7bf5a6617d
+      kind: diagnostic-report
+      relationship: related
+
+spec:
+  symptom: >
+    Les 14 schemas JSON de company/schemas/ ont été durcis au fil des besoins
+    (lots 1-3 du process-hardening : review-report, design-doc, rfc,
+    flow-control, review-protocol, human-review-triggers) mais jamais audités
+    en passe cohérente. Questions ouvertes du task-request ceb26109 : champs
+    définis jamais renseignés (candidats retrait, pattern bd4650e2), strings
+    libres qui devraient être des enums/patterns, additionalProperties
+    absents (verrou posé sur 2 schemas seulement), incohérences _base vs
+    spécialisations (changelog défini où ? approved_at/implemented_at posés
+    par le serveur mais déclarés nulle part ?), FORME B affected_files à
+    généraliser ou trancher.
+
+  root_cause: >
+    MÉTHODE. Corpus profilé par script (204 artifacts : 63 lessons, 38 rfcs,
+    31 task-requests, 27 implementation-plans, 22 diagnostic-reports,
+    12 design-docs, 4 personas, 2 project-configs, 2 roadmaps, 1 flow-control,
+    1 review-protocol, 1 human-review-triggers ; 0 review-report YAML sur
+    disque, le kind ne vit qu'via submit_review_vote). Chaque durcissement
+    candidat validé contre le corpus ENTIER avec le vrai crate
+    companyos-validation pointé sur des schemas candidats (/tmp), plus une
+    batterie négative (verrous prouvés mordants) et un test de faisabilité
+    unevaluatedProperties sur jsonschema 0.29.1 (vert : la structure
+    metadata-allOf-$ref + racine voit bien les annotations à travers le
+    $ref externe _base enregistré comme Resource).
+
+    RECENSEMENT SCHEMA PAR SCHEMA.
+
+    (1) _base : created_at string libre (204/204 conformes YYYY-MM-DD →
+    pattern date) ; author string libre (4 valeurs : pm 60, architect 67,
+    implementer 64, ceo 13 → pattern kebab ; enum REJETÉ : la source de
+    vérité est company/personas/ et la matrice author-produces est déjà
+    mécanisée à l'indexation, M16 RFC 0197fbe5) ; metadata.project utilisé
+    par 5 kinds (task-request 31/31, design-doc 10/12, diagnostic 18/22,
+    impl-plan 11/27, et 2 RFCs historiques) mais déclaré UNIQUEMENT par
+    task-request → à déclarer dans _base (slug pattern, 5 valeurs toutes
+    conformes) ; related[].kind string libre (7 valeurs, toutes des kinds
+    valides → enum des 13 kinds ; aurait attrapé un related vers le kind
+    retiré agent-message) ; related[] et changelog[] sans
+    additionalProperties:false (0 clé parasite dans le corpus → verrou
+    gratuit) ; changelog défini dans _base et consommé par 5 kinds
+    (rfc 6, impl-plan 7, lesson 2, design-doc 2, roadmap 2 ; 42 entrées
+    toutes conformes date/author/description) : cohérent, pas ad hoc —
+    verdict conserver dans _base et durcir les entrées ; metadata OUVERT
+    partout (aucun verrou possible avant restructuration : les
+    spécialisations ajoutent des champs, additionalProperties:false dans
+    _base casserait tout ; la solution prouvée est $defs/metadata dans
+    _base + allOf-$ref + unevaluatedProperties:false par kind).
+
+    (2) task-request : priority et status déjà enums mais OPTIONNELS alors
+    que 31/31 les renseignent et que l'artifact_catalog les décrit comme
+    portés → required ; metadata.project 31/31 et catalog dit « rattachée
+    à un projet via metadata.project » → required ; spec porte 8 champs
+    hors-schema : context (14, string), out_of_scope (11, 7 string +
+    4 list !), constraints (10, list), investigation_hints (8, string)
+    récurrents et génériques → déclarés typés (out_of_scope en anyOf
+    string|array, seule hétérogénéité de type du corpus) ; what_to_build
+    (4), formal_verification_scope (4, dict), installation_constraints (3),
+    triage_note (1) projet-spécifiques → spec NON verrouillé (tranché :
+    entrée libre du PM, le catalog ne fixe pas de forme fermée).
+
+    (3) design-doc : conforme au durcissement lot 2 (components/decisions
+    minItems) ; 1 champ spec hors-schema dans le corpus : triaxial_analysis
+    (f433fefc, artefact pré-M7 qui embarquait l'analyse triaxiale dans le
+    design-doc, exactement ce que le schema review-report a mécanisé
+    depuis) → migration : retrait + entrée changelog (contenu préservé
+    par git). Verrou spec ensuite gratuit.
+
+    (4) implementation-plan : dependencies 26/27 et risks 23/27 vivants →
+    conservés ; overview 5/27 récurrent → déclaré ; acceptance_criteria
+    1/27 (1c590771, duplication du rôle du task-request) → migration
+    (replié dans overview) ; steps[] : DEUX formes historiques
+    ({description, files} pour 248/289 steps ; {id, title, action, file,
+    depends_on, validation} pour 5 plans de 2026-03) → items NON verrouillés
+    (migration disproportionnée de 5 plans historiques), description reste
+    le seul required. Verrou spec top-level après migration.
+
+    (5) rfc : metadata.status 38/38 mais optionnel → required ;
+    approved_at (37/38, RFC3339) et implemented_at (32/38, 30 RFC3339 +
+    2 dates plates) posés par le SERVEUR (close_review_round,
+    rfc_set_implemented) mais JAMAIS déclarés au schema — c'est
+    l'incohérence _base/spécialisation la plus nette de l'audit : les
+    champs n'existaient que parce que metadata était ouvert. Déclarés avec
+    pattern timestamp acceptant date pure OU RFC3339 (zéro migration ; un
+    RFC implemented sans approved_at existe, cc4d9f8a hotfix → approved_at
+    reste optionnel) ; affected_files 38/38 (consommé par M14 pré-check et
+    M15 triggers) → required ; anyOf FORME A (23) / FORME B (15) conservé
+    (rétro-compatibilité, RFC a4eb3ee7) ; spec porte 3 champs hors-schema :
+    cleanup_workaround (5×, pattern réel documenté par
+    affected_files_categorization) → DÉCLARÉ ; spec.changelog (1×,
+    eb42a8de : changelog d'itération placé dans spec au lieu de metadata)
+    → migré vers metadata.changelog ; spec.testing (1×, 973a5569) → replié
+    dans spec.impact. Verrou spec ensuite.
+
+    (6) review-report : ZÉRO YAML dans le corpus → durcissement libre :
+    round_id pattern uuid + reviewer pattern persona (requis), spec
+    additionalProperties:false (absent jusqu'ici alors que axes/axis
+    étaient verrouillés), garde approve+findings conservée.
+
+    (7) lesson-learned : corpus 63/63 strictement conforme → verrou spec
+    gratuit, required tags/description conservés.
+
+    (8) diagnostic-report : status 22/22 → required (root_cause/resolution
+    restent optionnels : le workflow investigating écrit symptom d'abord) ;
+    2 champs spec hors-schema singletons : notes (162f2c8c) et escalation
+    (0838b79a) → repliés dans resolution. Verrou spec ensuite.
+
+    (9) persona : CHAMP MORT AVÉRÉ — l'override metadata.id
+    « type: string » est un NO-OP : allOf est une intersection, le pattern
+    uuid de _base s'applique quand même (les 4 personas ont d'ailleurs des
+    UUIDs) → retiré (pattern bd4650e2) ; rules porte 4 règles nommées
+    hors must/never (design_doc_boundary, write_permit_full_sequence,
+    hotreload_last, write_permit_gate), toutes de forme {description} →
+    typées via additionalProperties:{object requis description} ;
+    artifacts.produces/consumes strings libres → enum des 13 kinds
+    (corpus conforme, source consommée par M16) ; verrous racine + metadata.
+
+    (10) project-config : spec.project_name dupliqué dans le config
+    puissance4 (dup de metadata.project_name, lu par AUCUN code, vérifié
+    rg) → retiré (hygiène) ; spec reste OUVERT (tranché : shared-rules.yml
+    est un project-config porteur de la config système libre —
+    companyos_is_a_project, artifact_catalog, rules — le fermer imposerait
+    de schématiser toute la prose système) ; metadata.project_name pattern
+    slug + verrou metadata.
+
+    (11) roadmap : déjà le schema le plus strict (items et refs verrouillés)
+    ; manquait le verrou spec top-level (4 propriétés, corpus conforme) et
+    le pattern slug sur domain (2 valeurs conformes) ; target_date reste
+    libre PAR DESIGN (date, trimestre ou label, documenté au schema).
+
+    (12) flow-control, (13) review-protocol, (14) human-review-triggers :
+    specs déjà verrouillés aux lots 1 et 3 ; il ne manquait que les verrous
+    metadata et racine (fichiers uniques conformes).
+
+    GÉNÉRALISATIONS TRANCHÉES. FORME B affected_files : NON généralisée —
+    seul le RFC pilote des permits (M14/M15) ; l'implementation-plan a déjà
+    steps[].files pour son périmètre ; aucun autre kind ne déclare de
+    fichiers. Verrou additionalProperties : généralisé à TOUS les schemas
+    (7 specs nouvellement verrouillés + 13 metadata + 13 racines via
+    unevaluatedProperties), SAUF spec de task-request et de project-config
+    (ouverts, tranchés ci-dessus) et items de steps[] (historique
+    hétérogène). Enum author : NON (doublonnerait la source personas déjà
+    mécanisée M16). Pattern tags : NON (10 tags accentués français
+    légitimes dans les artifacts puissance4 ; un pattern ASCII les
+    casserait pour un gain nul).
+
+  resolution: >
+    VERDICTS APPLIQUÉS DANS LE RFC DE DURCISSEMENT (même domaine) :
+    (a) _base restructuré : $defs partagés uuid/date/timestamp/slug/
+    persona_id/artifact_kind/metadata, patterns sur created_at, author,
+    tags items, title minLength, changelog et related verrouillés,
+    related[].kind enum, metadata.project déclaré ;
+    (b) 13 kind schemas : racine unevaluatedProperties:false + metadata
+    fermé (allOf-$ref vers _base#/$defs/metadata + unevaluatedProperties:
+    false) ;
+    (c) required ajoutés vérifiés stock-conformes : task-request
+    priority+status+metadata.project (31/31), rfc metadata.status (38/38)
+    + spec.affected_files (38/38), diagnostic-report status (22/22) ;
+    (d) champs serveur déclarés : rfc approved_at/implemented_at (pattern
+    timestamp tolérant date plate, zéro migration) ;
+    (e) champs déclarés car récurrents : rfc cleanup_workaround (5×),
+    impl-plan overview (5×), task-request context/constraints/out_of_scope/
+    investigation_hints (8-14×) ;
+    (f) champs morts retirés : override persona metadata.id (no-op),
+    spec.project_name dupliqué du config puissance4 ;
+    (g) 6 migrations de corpus dans le même commit que les schemas
+    (2 RFCs historiques, 1 design-doc, 1 impl-plan, 2 diagnostics), toutes
+    mécaniques et préservant le contenu (repli verbatim ou changelog) ;
+    (h) 2 fichiers de fixtures Rust à mettre à jour (caller-inventory
+    workspace entier : crates/validation/src/validator.rs et
+    tests/integration/user_stories.rs, seules fixtures POSITIVES
+    task-request/rfc cassantes ; les fixtures négatives restent invalides
+    et leurs assertions tiennent ; edge_cases test_shipped_artifacts et
+    integration_search quality_eval valident le corpus réel donc verts
+    après migrations ; les fixtures engine.rs write_lesson/write_rfc :
+    lessons conformes vérifiées, write_rfc non schema-validé).
+    PREUVE : corpus entier revalidé avec les schemas candidats via le crate
+    companyos-validation → 204 artifacts, 6 échecs = exactement les
+    6 migrations prévues, zéro casse ailleurs ; batterie négative → 6/6
+    rejets corrects (date malformée, champ metadata parasite, status/
+    affected_files manquants sur rfc, enums violés priority/status/
+    related.kind). make validate restera vert après le commit
+    schemas+migrations.
+  status: resolved
