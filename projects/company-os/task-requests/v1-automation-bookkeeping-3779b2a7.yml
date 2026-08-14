@@ -1,0 +1,58 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 3779b2a7-483d-444c-ac57-abfecf2d6ca1
+  title: "V1 automation : recenser et automatiser le bookkeeping manuel restant"
+  author: pm
+  created_at: "2026-08-14"
+  project: company-os
+  description: >
+    Domaine v1-automation du programme companyos-v1 (roadmap a410bb43).
+    Principe directeur n°2 : le LLM décide, l'algorithme tient les
+    registres. Une grande partie du domaine a été absorbée par les lots
+    du hardening (rfc_set_implemented, supersede_artifact, auto-sync
+    roadmap, scellement atomique, rappels de capitalisation M19,
+    pré-check M14). Ce task-request solde le domaine : recenser ce qui
+    RESTE de bookkeeping manuel dans les workflows observés (18 RFCs de
+    programme V1 exécutés = corpus d'observation riche), trancher ce qui
+    est automatisable à bon rapport coût/valeur, et l'implémenter.
+  tags:
+    - companyos-v1
+    - automation
+    - bookkeeping
+    - harness
+  related:
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: input
+
+spec:
+  priority: medium
+  status: in_progress
+
+  context: >
+    Candidats observés pendant le programme (à vérifier et compléter par
+    le recensement) : (a) la clôture des task-requests reste manuelle
+    (édition status par le PM/Implementer) alors que le lien
+    task-request→RFC→implemented est traçable ; (b) les commits de
+    lifecycle (RFC approved/implemented stampés par le serveur) restent à
+    committer manuellement et traînent dans le worktree entre sessions ;
+    (c) le churn permanent d'orchestrator.db pollue chaque commit (déjà
+    capturé en lesson, jamais résolu structurellement : faut-il le sortir
+    de git et le reconstruire par reindex_all, PILIER D ?) ; (d) la mise à
+    jour des items de roadmap loose reste manuelle (l'auto-sync ne couvre
+    que rfc/project) ; (e) les tokens authenticate expirent à chaque
+    restart serveur et chaque persona doit se ré-authentifier (friction
+    observée à chaque session). Le recensement doit s'appuyer sur les
+    frictions RÉELLEMENT observées dans les 18 cycles du programme V1,
+    pas sur de la spéculation.
+
+  acceptance_criteria:
+    - "Un diagnostic-report recense les étapes de bookkeeping manuel restantes, chacune avec fréquence observée (citations des sessions/lessons), coût, et automatisation proposée ou rejet justifié"
+    - "Les automatisations retenues sont implémentées via le cycle complet (RFC si zones protégées)"
+    - "Le sort d'orchestrator.db dans git est tranché structurellement (candidat : sortir du versionnement, source de vérité YAML + reindex_all, en préservant le scellement des permits qui repose sur le commit de la DB : analyser la compatibilité)"
+    - "Aucune automatisation ne retire un point de décision LLM légitime (le LLM décide, l'algorithme tient les registres)"
+
+  constraints:
+    - "Rapport coût/valeur explicite par item : ce domaine est opportuniste, un rejet justifié vaut mieux qu'un mécanisme de complaisance"
+    - "Pas de push : commits locaux uniquement"

@@ -1,0 +1,221 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: 672a141a-54c8-4851-b3c5-dfc32864b0f5
+  title: "V1 automation : recensement du bookkeeping manuel restant et triage retenu/rejeté"
+  author: architect
+  created_at: "2026-08-14"
+  project: company-os
+  description: >
+    Recensement cadré par le task-request 3779b2a7 (domaine v1-automation,
+    roadmap a410bb43). Examine les 5 candidats du task-request plus les
+    frictions remontées par les lessons du programme V1 (18 cycles RFC
+    observés). Pour chaque item : fréquence réellement observée (citations),
+    coût, et décision retenu/rejeté avec rapport coût/valeur explicite.
+    Tranche structurellement le sort d'orchestrator.db dans git : SORTIE du
+    versionnement, avec remplacement du scellement des permits (commit de la
+    DB entière, RFC 359f9162) par un fichier de seal dédié minimal
+    (company/data/permits-seal.json) qui préserve exactement l'invariant de
+    baseline du revert sélectif (RFC bde023e2) et rend en prime la table
+    write_permits reconstructible au boot (extension du PILIER D cdbfee72).
+    Chiffres clés mesurés : 94 blobs de DB dans l'historique git pour
+    696 MiB non compressés, .git à 310 MiB, DB working tree en état M
+    permanent, 29 commits de seal. Les automatisations retenues font
+    l'objet du RFC cde13417.
+  tags:
+    - companyos-v1
+    - automation
+    - bookkeeping
+    - recensement
+    - triage
+    - write-permit
+    - git
+    - harness
+  related:
+    - id: 3779b2a7-483d-444c-ac57-abfecf2d6ca1
+      kind: task-request
+      relationship: input
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: related
+    - id: cde13417-5014-4bf5-9daa-edc3f6d257a6
+      kind: rfc
+      relationship: derived-from
+    - id: a1601839-9c40-4425-9d13-a2291b1c58b3
+      kind: lesson-learned
+      relationship: input
+    - id: bd4650e2-ab42-4b4e-9c10-cca638ded48c
+      kind: lesson-learned
+      relationship: input
+    - id: 359f9162-18f2-4b72-85b0-7d0e44608959
+      kind: rfc
+      relationship: related
+    - id: bde023e2-8633-42c9-911a-80dcd5157c62
+      kind: rfc
+      relationship: related
+    - id: cdbfee72-59b9-449c-9e22-2666d8e591e0
+      kind: rfc
+      relationship: related
+
+spec:
+  status: resolved
+
+  symptom: >
+    Après l'absorption d'une grande partie du domaine v1-automation par les
+    lots de hardening (rfc_set_implemented RFC 1c0f2570, supersede_artifact
+    et M13 RFC a4ee8b6a, auto-sync roadmap RFC a5f25718, scellement atomique
+    RFC 359f9162, M14/M19 RFC 0197fbe5), du bookkeeping manuel subsiste dans
+    les workflows observés sur les 18 cycles RFC du programme V1. Symptômes
+    concrets, chacun avec ses occurrences :
+
+    (a) CLÔTURE DES TASK-REQUESTS MANUELLE. Le passage status in_progress ->
+    done reste une édition YAML faite (ou oubliée) par le PM/Implementer.
+    Occurrences : le triage v1-hygiene (diagnostic af11b99e, lesson a1601839)
+    a trouvé 8 task-requests livrés restés en backlog ; l'historique git
+    récent montre des commits de clôture manuelle dédiés (5d51078
+    "chore(task): mark v1-schemas-audit ceb26109 done"). Fréquence : à
+    chaque fin de cycle, soit ~18 fois sur le programme.
+
+    (b) COMMITS DE LIFECYCLE QUI TRAÎNENT. close_review_round (auto-approve)
+    et rfc_set_implemented écrivent le YAML du RFC côté serveur, mais ne
+    committent pas : la modification reste dans le worktree jusqu'à ce
+    qu'un agent la ramasse dans un commit fourre-tout d'une session
+    ultérieure (ex. 9b8ea7c "docs(lessons): close v1-schemas-audit domain +
+    mark RFC 2cdf620a implemented" : la transition serveur du RFC voyage
+    dans un commit de lessons). Fréquence : 2 écritures serveur par cycle
+    RFC, ~18 cycles.
+
+    (c) CHURN PERMANENT D'ORCHESTRATOR.DB DANS GIT. La DB (11.5 MiB,
+    embeddings inclus) est force-trackée (git add -f au seal) alors que
+    .gitignore contient *.db*. Chaque écriture YAML la réindexe : git
+    status affiche un M permanent (vérifié à l'instant du recensement),
+    chaque agent doit éviter git add -A, et chaque grant committe un
+    nouveau blob binaire. Mesures : 94 blobs de DB dans l'historique pour
+    696 MiB non compressés, .git à 310 MiB, 29 commits "chore: seal write
+    permit". Capturé en lesson (bd4650e2 friction B) mais jamais résolu
+    structurellement. La DB en git a aussi aggravé l'incident corruption
+    (git checkout HEAD -- orchestrator.db pendant que le serveur tourne
+    re-corrompt la DB, diagnostic 378c387c).
+
+    (d) ITEMS DE ROADMAP LOOSE À STATUT MANUEL. L'auto-sync (RFC a5f25718)
+    ne couvre que les refs rfc/project ; les items loose gardent un statut
+    écrit à la main par le PM (ex. 8324427 "docs(roadmap): schemas +
+    personas domains done"). Fréquence : à chaque clôture de domaine
+    (les 12 items de la roadmap a410bb43 sont tous loose).
+
+    (e) TOKENS AUTHENTICATE PERDUS AU RESTART SERVEUR. Le TokenStore est
+    en mémoire ; chaque restart (autrefois tout cargo build, aujourd'hui
+    make deploy-serve uniquement, RFC 18011bfc) invalide les tokens et
+    force une ré-authentification en cours de session (lesson bd4650e2
+    friction A).
+
+  root_cause: >
+    Cause commune aux items (a) et (b) : la fin de cycle de vie d'un
+    artifact n'est adossée à aucun mécanisme du harness — le registre est
+    tenu par le LLM, qui l'oublie sous charge (root cause déjà établie par
+    la lesson a1601839, confirmée par la récidive post-hygiene sur (a)).
+
+    Cause de (c), structurelle et distincte : orchestrator.db conflate DEUX
+    natures de données dans un même fichier versionné. D'une part un CACHE
+    DÉRIVÉ (tables artifacts, artifacts_fts, vecteurs d'embeddings,
+    artifact_relations, index_metadata) intégralement reconstructible
+    depuis les YAML par reindex_all (PILIER D du RFC cdbfee72, embeddings
+    déterministes par construction, RFC bdee1af4) — ce cache n'a rien à
+    faire dans git et cause tout le churn. D'autre part un petit ÉTAT
+    AUTORITATIF non reconstructible (table write_permits, ~quelques
+    lignes) dont le modèle de sécurité a besoin d'une trace scellée en
+    HEAD : le seal du grant (RFC 359f9162) committe la DB ENTIÈRE pour
+    sceller quelques UUIDs, et la Source B du revert sélectif (RFC
+    bde023e2, defense-in-depth-core.mjs permitIdsFromHeadDb) matérialise
+    le blob HEAD de 11.5 MiB dans /tmp pour en extraire ces mêmes UUIDs
+    via sqlite3. Le versionnement de la DB n'est donc pas un besoin : il
+    est l'implémentation historiquement commode du scellement des permits,
+    dont le grain réel est minuscule. (Les review_rounds, également en DB,
+    sont éphémères : l'autorepair PILIER D les perd déjà aujourd'hui et
+    c'est un comportement accepté, cf. engine.rs "rounds éphémères, faux
+    positif attendu après autorepair".)
+
+    Cause de (d) : par définition un item loose n'a pas d'artifact source ;
+    son statut EST un jugement.
+
+    Cause de (e) : décision de sécurité délibérée ("Tokens are generated on
+    first authenticate call and never written to disk", main.rs L28), pas
+    un oubli d'automatisation.
+
+  resolution: >
+    Triage retenu/rejeté, matérialisé par le RFC cde13417 pour les items
+    retenus.
+
+    RETENU — A1 (item c, décision structurelle majeure du domaine) : SORTIR
+    orchestrator.db de git et remplacer le scellement par un fichier dédié
+    minimal company/data/permits-seal.json, écrit par le serveur et commité
+    aux transitions de permits (grant, consume). ANALYSE DE COMPATIBILITÉ
+    avec le scellement (acceptance criterion 3 du task-request) :
+    l'invariant de sécurité de bde023e2 est "tout permit absent de
+    baseline = union(Source A snapshot, Source B HEAD) est supprimé ;
+    nucléaire seulement si les deux sources sont indisponibles". La Source
+    B ne consomme que les ids de write_permits en HEAD : un export JSON
+    canonique de la table (id, rfc_id, granted_to, target_paths, status,
+    timestamps) commité au même moment que l'était la DB fournit
+    exactement la même information, en texte lisible, sans matérialisation
+    /tmp ni sqlite3 sur blob. La sémantique null (inexploitable) vs Set
+    vide (exploitable, 0 permit) est conservée à l'identique. Le
+    pre-commit n'est pas affecté (il lit la DB VIVANTE, pas HEAD). Le seal
+    atomique 359f9162 est conservé : seul l'objet commité change (JSON de
+    quelques centaines d'octets au lieu d'un blob de 11.5 MiB). Bénéfice
+    additionnel : write_permits devient RECONSTRUCTIBLE au boot depuis le
+    seal HEAD (extension du PILIER D au dernier état non couvert), à
+    condition de committer le seal aussi au consume (sinon un permit
+    consumed ressusciterait active au reseed — d'où le commit au consume,
+    intégré au RFC). Alternatives écartées : YAML signé (la signature
+    n'ajoute rien, le commit HEAD est déjà l'ancre de confiance, personne
+    ne vérifie de signatures — même rationale que la décision B du RFC
+    324e8a33) ; statu quo (696 MiB de blobs morts et un M permanent pour
+    sceller quelques UUIDs, coût/valeur indéfendable).
+
+    RETENU — A2 (item b) : auto-commit des transitions lifecycle écrites
+    par le serveur (close_review_round auto-approve, rfc_set_implemented),
+    en commit pathspec (git commit -- <fichier RFC>) qui n'absorbe PAS
+    l'index stagé (ferme au passage la bizarrerie documentée par la lesson
+    595b2d8d pour ces commits-là), gpgsign=false et LC_ALL=C comme
+    seal_db_commit. Coût faible (réutilisation du pattern seal existant),
+    valeur : plus aucune écriture serveur orpheline dans le worktree.
+
+    RETENU — A3 (item a) : rappel non bloquant dans la réponse de
+    rfc_set_implemented listant les task-requests liés (metadata.related,
+    les deux sens) encore non clos (status ni done ni cancelled, lu du
+    YAML à la volée, pattern a5f25718). Extension de la famille M19.
+    L'auto-clôture est explicitement REJETÉE : juger les acceptance
+    criteria satisfaits est une décision LLM (un task-request peut couvrir
+    plusieurs RFCs) ; l'algorithme rappelle, le LLM décide — conformité
+    à l'acceptance criterion 4 du task-request.
+
+    REJETÉ — item d (auto-sync des items loose) : pas d'artifact source,
+    donc pas de vérité mécanique à synchroniser. Automatiser serait
+    inventer le statut par heuristique, c'est-à-dire retirer un point de
+    décision légitime (PM). Le geste correct existe déjà : convertir
+    l'item loose en ref rfc/project dès qu'un artifact apparaît, et
+    l'auto-sync prend le relais. Hygiène PM, pas mécanisme.
+
+    REJETÉ — item e (persistance des tokens authenticate) : contredirait
+    l'invariant de sécurité délibéré "token jamais écrit sur disque" ;
+    tant que la DB reste committée au seal, des tokens en DB fuiteraient
+    même dans l'historique git. Coût de la friction résiduelle quasi nul :
+    authenticate est idempotent par persona (un appel, même token), et la
+    fréquence des restarts a structurellement chuté depuis la promotion
+    atomique (RFC 18011bfc : restart = deploy-serve explicite, plus jamais
+    un cargo build). Rapport coût/valeur inversé : on affaiblirait la
+    sécurité pour économiser un appel d'outil.
+
+    REJETÉ — tool dédié de clôture task-request (variante de a) : les
+    task-requests vivent hors zone protégée, l'édition YAML est déjà
+    triviale ; le problème n'est pas le coût du geste mais l'OUBLI, que A3
+    traite au bon moment (la clôture du RFC est l'instant où la question
+    "le task-request est-il soldé ?" se pose).
+
+    Recensement complémentaire vérifié sans reliquat : génération
+    personas.yml (déjà mécanisée, M20), détection des RFCs approved jamais
+    implemented (M19 + write_permit_gate M18 + hygiene done), rappels de
+    capitalisation (M19), supersession (supersede_artifact M10), pré-check
+    de périmètre (M14). Aucune automatisation retenue ne retire de point
+    de décision LLM : A1 et A2 tiennent des registres, A3 rappelle.
