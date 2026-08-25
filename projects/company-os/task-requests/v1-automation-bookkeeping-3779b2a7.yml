@@ -28,7 +28,7 @@ metadata:
 
 spec:
   priority: medium
-  status: in_progress
+  status: done
 
   context: >
     Candidats observés pendant le programme (à vérifier et compléter par

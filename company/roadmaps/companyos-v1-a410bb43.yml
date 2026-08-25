@@ -38,6 +38,23 @@ metadata:
       kind: lesson-learned
       relationship: input
   changelog:
+    - date: "2026-08-25"
+      author: pm
+      description: >
+        v1-automation TERMINÉ : RFC cde13417 implemented. orchestrator.db
+        sorti du versionnement git (696 MiB de blobs morts), remplacé par
+        permits-seal.json (état autoritatif minimal, commité par le serveur
+        au grant et au consume en convention commits-machine --no-verify,
+        PILIER D étendu aux permits). Transitions lifecycle des RFCs
+        commitées par le serveur, rappels de clôture non bloquants.
+        Self-test en vif : rfc_set_implemented a commité sa propre
+        transition et rappelé le task-request ouvert. Rejets délibérés
+        préservant les décisions LLM (auto-clôture task-requests, statuts
+        loose). Incident capitalisé : round cassé par renommage du RFC
+        (résolution par chemin figé), candidat harness-refactor. Lessons
+        cc0ca5d7 (invariants dans les types, directive utilisateur,
+        SealPermit à corriger au rust-audit) et 4071e4a6. README anglais
+        publié sur GitHub. Prochain domaine : v1-rust-audit.
     - date: "2026-08-14"
       author: pm
       description: >
@@ -299,8 +316,8 @@ spec:
         type: loose
         category: exploration
         label: "Recenser chaque étape manuelle de cycle de vie et l'automatiser sans LLM quand c'est possible"
-      timeframe: present
-      status: in_progress
+      timeframe: past
+      status: done
       target_date: "2026-Q3"
       depends_on: [v1-hygiene]
       rationale: >

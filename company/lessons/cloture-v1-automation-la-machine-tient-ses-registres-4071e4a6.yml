@@ -1,0 +1,94 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 4071e4a6-e439-4307-935c-7f9f4e491130
+  title: "Clôture du domaine v1-automation : séparer l'état autoritatif minuscule du cache volumineux, et laisser la machine committer ses propres transitions"
+  author: pm
+  created_at: "2026-08-25"
+  description: >
+    Capitalisation de clôture du domaine v1-automation (RFC cde13417
+    implemented). Trois enseignements : (a) quand un fichier versionné
+    conflate un cache dérivé reconstructible (l'index SQLite, 696 MiB de
+    blobs morts en historique) et un état autoritatif minuscule (les write
+    permits), la bonne coupe est d'extraire l'état autoritatif dans un
+    fichier de seal dédié minimal et de sortir le cache du versionnement ;
+    (b) les commits machine (seals, transitions lifecycle) doivent porter
+    leur propre convention (--no-verify, pathspec-scopé, contenu
+    machine-généré) distincte des commits d'agents, sinon chaque garde
+    ajoutée pour les humains devient un point de gel pour la machine ;
+    (c) le self-test ultime d'un mécanisme de bookkeeping est de le voir
+    travailler pour sa propre clôture : rfc_set_implemented a commité sa
+    transition et rappelé le task-request ouvert lors de la clôture du RFC
+    qui l'introduisait.
+  tags:
+    - automation
+    - bookkeeping
+    - git
+    - sqlite
+    - write-permit
+    - seal
+    - lifecycle
+    - companyos-internals
+    - lessons-from-implementation
+  related:
+    - id: cde13417-5014-4bf5-9daa-edc3f6d257a6
+      kind: rfc
+      relationship: derived-from
+    - id: 672a141a-54c8-4851-b3c5-dfc32864b0f5
+      kind: diagnostic-report
+      relationship: derived-from
+    - id: d5c9c933-f9a1-4a4a-9a0f-3fca1c8e8d54
+      kind: lesson-learned
+      relationship: related
+    - id: a1601839-9c40-4425-9d13-a2291b1c58b3
+      kind: lesson-learned
+      relationship: related
+    - id: bd4650e2-ab42-4b4e-9c10-cca638ded48c
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Domaine v1-automation du programme V1 (roadmap a410bb43) : recensement
+    des étapes de bookkeeping manuel restantes après les 3 lots de
+    process-hardening, puis implémentation (RFC cde13417). Décisions :
+    orchestrator.db sorti du versionnement git (94 blobs, 696 MiB
+    d'historique) au profit de company/data/permits-seal.json (export JSON
+    canonique de write_permits, seule donnée autoritative de la DB), seals
+    commités automatiquement au grant ET au consume, transitions lifecycle
+    des RFCs commitées par le serveur, rappels non bloquants de clôture.
+    Deux rejets délibérés : auto-clôture des task-requests et statuts des
+    items loose de roadmap (points de décision LLM), persistance des
+    tokens (sécurité). Le cycle a aussi essuyé un incident de bookkeeping
+    instructif : le renommage du fichier RFC après ouverture du round a
+    cassé l'auto-transition approved (résolution par chemin figé), forçant
+    une réémission de round.
+
+  insight: >
+    (a) Le critère de coupe cache/autorité est la reconstructibilité : tout
+    ce qui se recalcule depuis une source de vérité (index FTS, embeddings
+    déterministes) n'a rien à faire dans git ; tout ce qui fait autorité
+    (les permits) doit y être scellé sous la forme la plus petite et la
+    plus lisible possible. (b) Les gardes conçues pour les agents (make ci
+    au pre-commit, signature gpg) s'appliquaient par défaut aux commits du
+    serveur et créaient des modes de gel : la convention "commits machine"
+    (--no-verify + pathspec + contenu machine-généré) est le pendant git de
+    la décision seals-non-signés (324e8a33). La frontière n'est pas
+    humain/machine par confort : elle tient parce que le contenu machine
+    est généré, borné et scellé par le hook en amont. (c) Un point de
+    friction observé vaut mieux qu'un mécanisme spéculatif : les deux
+    rejets du recensement (auto-clôture, statuts loose) protègent des
+    décisions que la machine ne sait pas prendre. (d) Résoudre les
+    artifacts par chemin figé casse au premier renommage : toute référence
+    durable doit résoudre par metadata.id via l'index (candidat harness
+    remonté pour close_review_round).
+
+  recommendation: >
+    Appliquer le critère de reconstructibilité à tout nouveau fichier
+    versionné volumineux ou churné. Toute nouvelle garde au commit doit
+    déclarer explicitement si elle s'applique au canal machine et pourquoi.
+    Corriger close_review_round pour résoudre le RFC par metadata.id
+    plutôt que par artifact_path figé (candidat v1-harness-refactor,
+    incident du 2026-08-25 en preuve). Vérifier au premier usage réel
+    chaque nouveau mécanisme de bookkeeping sur sa propre chaîne (le
+    self-test de clôture est gratuit et probant).
