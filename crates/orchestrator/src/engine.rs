@@ -35,6 +35,90 @@ impl AffectedFiles {
     }
 }
 
+/// Canonical on-disk seal of the `write_permits` table (RFC cde13417 A1.1).
+/// Serialized deterministically by
+/// [`OrchestratorEngine::write_permits_seal`]: `version` is fixed, permits
+/// are pre-sorted by id, and field order is the declaration order below.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SealFile {
+    version: u32,
+    permits: Vec<SealPermit>,
+}
+
+/// One permit entry in the canonical seal. Strings are used for timestamps
+/// (RFC 3339) and ids so the JSON is stable and human-diffable. Field order
+/// here IS the emitted key order (serde_json preserves struct field order).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SealPermit {
+    id: String,
+    rfc_id: String,
+    granted_to: String,
+    target_paths: Vec<String>,
+    status: String,
+    granted_by: String,
+    granted_at: String,
+    consumed_at: Option<String>,
+}
+
+impl From<&WritePermit> for SealPermit {
+    fn from(p: &WritePermit) -> Self {
+        SealPermit {
+            id: p.id.to_string(),
+            rfc_id: p.rfc_id.to_string(),
+            granted_to: p.granted_to.as_str().to_string(),
+            target_paths: p.target_paths.iter().map(|t| t.0.clone()).collect(),
+            status: p.status.to_string(),
+            granted_by: p.granted_by.as_str().to_string(),
+            granted_at: p.granted_at.to_rfc3339(),
+            consumed_at: p.consumed_at.map(|t| t.to_rfc3339()),
+        }
+    }
+}
+
+impl SealPermit {
+    /// Rebuild a [`WritePermit`] from a seal entry. Parses ids, personas,
+    /// path patterns, status and timestamps back into their typed form.
+    fn to_permit(&self) -> Result<WritePermit, OrchestratorError> {
+        use std::str::FromStr;
+        let parse_uuid = |s: &str| {
+            Uuid::parse_str(s).map_err(|e| OrchestratorError::IntegrityFailure {
+                details: format!("invalid uuid in permit seal: '{s}' ({e})"),
+            })
+        };
+        let parse_ts = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| OrchestratorError::IntegrityFailure {
+                    details: format!("invalid timestamp in permit seal: '{s}' ({e})"),
+                })
+        };
+        let granted_to = PersonaId::from_str(&self.granted_to)
+            .map_err(|e| OrchestratorError::InvalidEnumValue(format!("granted_to: {e}")))?;
+        let granted_by = PersonaId::from_str(&self.granted_by)
+            .map_err(|e| OrchestratorError::InvalidEnumValue(format!("granted_by: {e}")))?;
+        let status = crate::types::PermitStatus::from_str(&self.status)
+            .map_err(OrchestratorError::InvalidEnumValue)?;
+        let consumed_at = match &self.consumed_at {
+            Some(s) => Some(parse_ts(s)?),
+            None => None,
+        };
+        Ok(WritePermit {
+            id: parse_uuid(&self.id)?,
+            rfc_id: parse_uuid(&self.rfc_id)?,
+            granted_to,
+            target_paths: self
+                .target_paths
+                .iter()
+                .map(|s| crate::types::PathPattern(s.clone()))
+                .collect(),
+            status,
+            granted_by,
+            granted_at: parse_ts(&self.granted_at)?,
+            consumed_at,
+        })
+    }
+}
+
 /// Result of an RFC status auto-update triggered by close_round.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RfcUpdateResult {
@@ -1393,6 +1477,99 @@ impl OrchestratorEngine {
         self.db.checkpoint_truncate()
     }
 
+    /// List every permit (all statuses), ordered by id. Passthrough to
+    /// [`OrchestratorDb::list_all_permits`] (RFC cde13417 A1.3). Backs the
+    /// canonical seal export.
+    pub fn list_all_permits(&self) -> Result<Vec<WritePermit>, OrchestratorError> {
+        self.db.list_all_permits()
+    }
+
+    /// Insert a permit row verbatim. Passthrough to
+    /// [`OrchestratorDb::insert_permit_row`] (RFC cde13417 A1.3). Used by
+    /// [`Self::reseed_permits_from_seal`].
+    pub fn insert_permit_row(&self, permit: &WritePermit) -> Result<(), OrchestratorError> {
+        self.db.insert_permit_row(permit)
+    }
+
+    /// Revert a consumed permit back to `active`. Passthrough to
+    /// [`OrchestratorDb::unconsume_permit`] (RFC cde13417 A1.3). Rollback of
+    /// a consume whose seal commit failed (symmetric to the grant rollback).
+    pub fn unconsume_permit(&self, id: Uuid) -> Result<(), OrchestratorError> {
+        self.db.unconsume_permit(id)
+    }
+
+    /// Export the `write_permits` table as a canonical, deterministic JSON
+    /// seal (RFC cde13417 A1.1) and write it atomically to
+    /// `<root>/company/data/permits-seal.json`. Returns the path relative to
+    /// `root`.
+    ///
+    /// Canonical form: `version` is fixed at 1; `permits` are sorted by id
+    /// ascending (via [`OrchestratorDb::list_all_permits`]); each permit's
+    /// keys are emitted in a fixed declaration order. Two identical table
+    /// states therefore produce byte-identical JSON, so a re-seal with no
+    /// change yields `NothingToCommit` at the git layer.
+    ///
+    /// Atomicity: the JSON is written to a sibling temp file then
+    /// `std::fs::rename`d over the target, so a reader never observes a
+    /// partial file.
+    pub fn write_permits_seal(&self, root: &str) -> Result<String, OrchestratorError> {
+        let permits = self.db.list_all_permits()?;
+        let seal = SealFile {
+            version: 1,
+            permits: permits.iter().map(SealPermit::from).collect(),
+        };
+        // Pretty JSON with a trailing newline: stable, human-diffable in
+        // git history, and byte-identical for identical table states.
+        let mut json = serde_json::to_string_pretty(&seal)?;
+        json.push('\n');
+
+        let rel_path = format!("{}/{}", constants::DATA_DIR, constants::SEAL_FILENAME);
+        let dir = format!("{root}/{}", constants::DATA_DIR);
+        std::fs::create_dir_all(&dir)?;
+        let final_path = format!("{root}/{rel_path}");
+        // Unique temp sibling in the SAME directory (rename must be atomic,
+        // i.e. same filesystem). PID + nanos avoid collisions across
+        // concurrent boots/grants.
+        let tmp_path = format!(
+            "{dir}/.{}.tmp.{}.{}",
+            constants::SEAL_FILENAME,
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        std::fs::write(&tmp_path, json.as_bytes())?;
+        std::fs::rename(&tmp_path, &final_path)?;
+        Ok(rel_path)
+    }
+
+    /// Reconstruct the `write_permits` table from a canonical seal JSON
+    /// (RFC cde13417 A1.5, PILIER D extension). REFUSES when the table is
+    /// not empty: reseed only ever reconstructs an empty store; a non-empty
+    /// table is a live state (post-revert, post-rollback) that must never be
+    /// overwritten. Returns the number of permits inserted.
+    ///
+    /// Caller contract: the JSON MUST come from HEAD (the tamper-evident
+    /// anchor), never from the on-disk file. An invalid JSON surfaces a
+    /// parse error the boot treats as a non-fatal warning.
+    pub fn reseed_permits_from_seal(&self, seal_json: &str) -> Result<usize, OrchestratorError> {
+        let existing = self.db.list_all_permits()?;
+        if !existing.is_empty() {
+            return Err(OrchestratorError::IntegrityFailure {
+                details: format!(
+                    "permit seal reseed refused: write_permits is not empty ({} row(s)); reseed only reconstructs an empty table (RFC cde13417 A1.5)",
+                    existing.len()
+                ),
+            });
+        }
+        let seal: SealFile = serde_json::from_str(seal_json)?;
+        let mut count = 0usize;
+        for sp in &seal.permits {
+            let permit = sp.to_permit()?;
+            self.db.insert_permit_row(&permit)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Tear down the engine and return ownership of the inner DB
     /// connection. Used by the boot autorepair (PILIER D) when
     /// integrity_check fails: the caller drops the DB, removes the files,
@@ -1694,6 +1871,66 @@ impl OrchestratorEngine {
     /// Get all relations for an artifact (bidirectional).
     pub fn related(&self, id: &str) -> Result<Vec<RelationLink>, OrchestratorError> {
         self.db.get_relations(id)
+    }
+
+    /// Reminders for related task-requests that are still open at the moment
+    /// an RFC is marked implemented (RFC cde13417 A3, family M19). Resolves
+    /// the RFC's relations in BOTH directions, keeps `kind == task-request`,
+    /// reads each one's `spec.status` from its YAML source at read time
+    /// (calcul-à-la-lecture, RFC a5f25718 — the artifacts table has no status
+    /// column), and emits a reminder for any status outside {done, cancelled}.
+    /// NON blocking by construction: the caller merely surfaces the strings;
+    /// the LLM decides. Never fails on a single unreadable task-request YAML
+    /// (that entry is silently skipped), so one orphan can't suppress the rest.
+    pub fn open_task_request_reminders(&self, root: &str, rfc_id: Uuid) -> Vec<String> {
+        let links = match self.db.get_relations(&rfc_id.to_string()) {
+            Ok(l) => l,
+            Err(_) => return Vec::new(),
+        };
+        let mut seen: Vec<String> = Vec::new();
+        let mut out: Vec<String> = Vec::new();
+        for link in links {
+            if link.kind.as_deref() != Some("task-request") {
+                continue;
+            }
+            if seen.contains(&link.id) {
+                continue;
+            }
+            seen.push(link.id.clone());
+
+            // Resolve the file path and read spec.status from the YAML.
+            let artifact = match self.db.get_artifact(&link.id) {
+                Ok(Some(a)) => a,
+                _ => continue,
+            };
+            let full_path = format!("{root}/{}", artifact.file_path);
+            let content = match std::fs::read_to_string(&full_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let parsed: serde_yaml::Value = match serde_yaml::from_str(&content) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let status = parsed
+                .get("spec")
+                .and_then(|s| s.get("status"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("backlog")
+                .to_string();
+            if status == "done" || status == "cancelled" {
+                continue;
+            }
+            let id8: String = link.id.chars().take(8).collect();
+            let title = link
+                .title
+                .clone()
+                .unwrap_or_else(|| "(untitled)".to_string());
+            out.push(format!(
+                "Related task-request {id8} '{title}' is still '{status}' — if this RFC completes it, set it to done (or cancelled); if other work remains, leave it open."
+            ));
+        }
+        out
     }
 
     // --- Roadmap tools ---
@@ -2308,7 +2545,7 @@ fn walk_yaml_files(dir: &Path, callback: &mut dyn FnMut(&Path)) {
 mod tests {
     use super::AUTHOR_PRODUCES_CUTOFF;
     use crate::error::OrchestratorError;
-    use crate::types::{ParsedRelation, PathPattern, ReviewRound, RoundStatus};
+    use crate::types::{ParsedRelation, PathPattern, PermitStatus, ReviewRound, RoundStatus};
     use crate::{
         ArtifactPath, ConsensusResult, Finding, IndexedArtifact, OrchestratorDb,
         OrchestratorEngine, ReviewVerdict,
@@ -2322,6 +2559,230 @@ mod tests {
         let db = OrchestratorDb::open_in_memory().expect("open in-memory db");
         db.migrate().expect("migrate");
         OrchestratorEngine::new_without_embedder(db, 3)
+    }
+
+    // --- Permit seal / reseed tests (RFC cde13417 A1.1 + A1.5) ---
+
+    struct SealTempRoot {
+        path: std::path::PathBuf,
+    }
+    impl SealTempRoot {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("seal-eng-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+        fn root(&self) -> &str {
+            self.path.to_str().unwrap()
+        }
+    }
+    impl Drop for SealTempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    // NOMINAL: write_permits_seal exports a canonical JSON reflecting the
+    // table (one active + one consumed), sorted by id, with a version field.
+    #[test]
+    fn test_write_permits_seal_canonical() {
+        let tmp = SealTempRoot::new();
+        let engine = setup_engine();
+        let p1 = engine
+            .grant_permit(
+                Uuid::new_v4(),
+                PersonaId::Implementer,
+                vec![PathPattern("a".into())],
+            )
+            .unwrap();
+        let _p2 = engine
+            .grant_permit(
+                Uuid::new_v4(),
+                PersonaId::Implementer,
+                vec![PathPattern("b".into())],
+            )
+            .unwrap();
+        engine.consume_permit(p1.id).unwrap();
+
+        let rel = engine.write_permits_seal(tmp.root()).unwrap();
+        assert_eq!(rel, "company/data/permits-seal.json");
+        let content = std::fs::read_to_string(format!("{}/{rel}", tmp.root())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["version"], 1);
+        let permits = v["permits"].as_array().unwrap();
+        assert_eq!(permits.len(), 2);
+        // Sorted by id ascending → byte-stable.
+        let ids: Vec<&str> = permits.iter().map(|p| p["id"].as_str().unwrap()).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted, "permits must be sorted by id");
+    }
+
+    // EDGE: an empty table exports {"version":1,"permits":[]}.
+    #[test]
+    fn test_write_permits_seal_empty() {
+        let tmp = SealTempRoot::new();
+        let engine = setup_engine();
+        let rel = engine.write_permits_seal(tmp.root()).unwrap();
+        let content = std::fs::read_to_string(format!("{}/{rel}", tmp.root())).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["version"], 1);
+        assert!(v["permits"].as_array().unwrap().is_empty());
+    }
+
+    // NOMINAL: reseed reconstructs an empty table from a seal JSON,
+    // preserving status and timestamps; count matches.
+    #[test]
+    fn test_reseed_permits_from_seal_nominal() {
+        let tmp = SealTempRoot::new();
+        let src = setup_engine();
+        let p = src
+            .grant_permit(
+                Uuid::new_v4(),
+                PersonaId::Implementer,
+                vec![PathPattern("x".into())],
+            )
+            .unwrap();
+        src.consume_permit(p.id).unwrap();
+        let rel = src.write_permits_seal(tmp.root()).unwrap();
+        let json = std::fs::read_to_string(format!("{}/{rel}", tmp.root())).unwrap();
+
+        // Fresh (empty) engine reseeds from the JSON.
+        let dst = setup_engine();
+        let n = dst.reseed_permits_from_seal(&json).unwrap();
+        assert_eq!(n, 1);
+        let fetched = dst.get_permit(p.id).unwrap().unwrap();
+        assert_eq!(fetched.status, PermitStatus::Consumed);
+    }
+
+    // NÉGATIF: reseed refuses a non-empty table (never clobbers live state).
+    #[test]
+    fn test_reseed_refuses_non_empty_table() {
+        let engine = setup_engine();
+        engine
+            .grant_permit(
+                Uuid::new_v4(),
+                PersonaId::Implementer,
+                vec![PathPattern("x".into())],
+            )
+            .unwrap();
+        let json = r#"{"version":1,"permits":[]}"#;
+        let res = engine.reseed_permits_from_seal(json);
+        assert!(
+            matches!(res, Err(OrchestratorError::IntegrityFailure { .. })),
+            "reseed on a non-empty table must be refused"
+        );
+    }
+
+    // NÉGATIF: invalid JSON surfaces a parse error (boot treats as warning).
+    #[test]
+    fn test_reseed_invalid_json_errors() {
+        let engine = setup_engine();
+        let res = engine.reseed_permits_from_seal("not json");
+        assert!(res.is_err());
+    }
+
+    // EDGE: reseed an empty seal on an empty table inserts nothing, Ok(0).
+    #[test]
+    fn test_reseed_empty_seal_ok_zero() {
+        let engine = setup_engine();
+        let n = engine
+            .reseed_permits_from_seal(r#"{"version":1,"permits":[]}"#)
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    // --- open_task_request_reminders tests (RFC cde13417 A3) ---
+
+    // Seed an RFC that relates to a task-request, index the task-request with
+    // the given status written to its YAML on disk. Returns the rfc id.
+    fn seed_rfc_with_task_request(
+        engine: &mut OrchestratorEngine,
+        root: &str,
+        tr_status: &str,
+    ) -> Uuid {
+        let rfc_id = Uuid::new_v4();
+        let tr_id = Uuid::new_v4();
+        // task-request YAML on disk with spec.status.
+        let tr_rel = format!("projects/company-os/task-requests/{tr_id}.yml");
+        let tr_abs = format!("{root}/{tr_rel}");
+        std::fs::create_dir_all(format!("{root}/projects/company-os/task-requests")).unwrap();
+        let tr_yaml = format!(
+            "api_version: companyos/v1\nkind: task-request\nmetadata:\n  id: {tr_id}\n  title: TR fixture\n  author: pm\n  created_at: \"2026-08-25\"\nspec:\n  status: {tr_status}\n"
+        );
+        std::fs::write(&tr_abs, tr_yaml).unwrap();
+
+        // Index the task-request (kind + file_path resolvable by the reminder).
+        let tr_art = crate::IndexedArtifact {
+            id: tr_id.to_string(),
+            kind: "task-request".into(),
+            title: "TR fixture".into(),
+            description: String::new(),
+            tags: vec![],
+            file_path: tr_rel,
+            indexed_at: Utc::now().to_rfc3339(),
+        };
+        engine
+            .db
+            .upsert_artifact(&tr_art, "", &test_dummy_embedding(), &[])
+            .unwrap();
+
+        // Index the RFC with an outgoing relation to the task-request.
+        let rfc_art = crate::IndexedArtifact {
+            id: rfc_id.to_string(),
+            kind: "rfc".into(),
+            title: "RFC fixture".into(),
+            description: String::new(),
+            tags: vec![],
+            file_path: format!("company/rfcs/{rfc_id}.yml"),
+            indexed_at: Utc::now().to_rfc3339(),
+        };
+        engine
+            .db
+            .upsert_artifact(
+                &rfc_art,
+                "",
+                &test_dummy_embedding(),
+                &[ParsedRelation {
+                    target_id: tr_id.to_string(),
+                    relationship: "input".into(),
+                }],
+            )
+            .unwrap();
+        rfc_id
+    }
+
+    // NOMINAL: a related task-request still in backlog yields one reminder.
+    #[test]
+    fn test_reminders_open_task_request() {
+        let tmp = SealTempRoot::new();
+        let mut engine = setup_engine();
+        let rfc_id = seed_rfc_with_task_request(&mut engine, tmp.root(), "backlog");
+        let reminders = engine.open_task_request_reminders(tmp.root(), rfc_id);
+        assert_eq!(reminders.len(), 1, "backlog TR must produce a reminder");
+        assert!(reminders[0].contains("still 'backlog'"));
+    }
+
+    // NÉGATIF: a done/cancelled task-request produces no reminder.
+    #[test]
+    fn test_reminders_done_task_request_silent() {
+        let tmp = SealTempRoot::new();
+        let mut engine = setup_engine();
+        let rfc_id = seed_rfc_with_task_request(&mut engine, tmp.root(), "done");
+        assert!(
+            engine
+                .open_task_request_reminders(tmp.root(), rfc_id)
+                .is_empty()
+        );
+    }
+
+    // EDGE: an RFC with no related task-request yields an empty vec.
+    #[test]
+    fn test_reminders_no_related_empty() {
+        let tmp = SealTempRoot::new();
+        let engine = setup_engine();
+        let reminders = engine.open_task_request_reminders(tmp.root(), Uuid::new_v4());
+        assert!(reminders.is_empty());
     }
 
     // --- Consensus tests ---

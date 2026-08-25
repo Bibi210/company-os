@@ -8,6 +8,7 @@ import {
   loadProtectedZones,
   parsePermitIds,
   permitIdsFromHeadDb,
+  permitIdsFromHeadSeal,
   buildBaseline,
   revertPermitTampering,
   snapshotPermits,
@@ -15,6 +16,7 @@ import {
   resolveAgent,
   AUTH_TOOL_RE,
   UNAUTH_SESSION_MSG,
+  createHandlers,
 } from "../defense-in-depth-core.mjs";
 import { writeFileSync, mkdirSync, rmSync, existsSync, readdirSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
@@ -230,6 +232,150 @@ describe("buildBaseline (union Source A + Source B)", () => {
     try {
       const baseline = buildBaseline(rootDir, `1|${UUID_A}:active`);
       assert.deepEqual([...baseline], [UUID_A]); // B null, baseline = A
+    } finally {
+      cleanup(rootDir);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// permitIdsFromHeadSeal (Source B JSON, RFC cde13417 A1.7) + fallback legacy
+// ---------------------------------------------------------------------------
+const SEAL_REL = "company/data/permits-seal.json";
+
+// Root avec seal_path déclaré. Si sealPermits != null, écrit permits-seal.json
+// (format canonique) ; si commit, l'ajoute en HEAD. Si dbPermits != null, crée
+// AUSSI la DB legacy (pour tester le fallback). git=true init un repo.
+function setupRootSeal({ sealPermits = null, dbPermits = null, commit = false }) {
+  const rootDir = mkdtempSync(join(tmpdir(), "did-seal-"));
+  const cfgDir = join(rootDir, "company", "config");
+  mkdirSync(cfgDir, { recursive: true });
+  writeFileSync(
+    join(cfgDir, "protected-zones.json"),
+    JSON.stringify({
+      prefixes: ["company/plugins/"],
+      files: [],
+      db_path: DB_REL,
+      seal_path: SEAL_REL,
+    }),
+  );
+  loadProtectedZones(rootDir);
+  mkdirSync(join(rootDir, "company", "data"), { recursive: true });
+
+  if (dbPermits !== null) {
+    const dbAbs = join(rootDir, DB_REL);
+    sql(rootDir, dbAbs, "CREATE TABLE write_permits (id TEXT PRIMARY KEY, status TEXT)");
+    for (const [id, status] of dbPermits) {
+      sql(rootDir, dbAbs, `INSERT INTO write_permits (id, status) VALUES ('${id}', '${status}')`);
+    }
+  }
+  if (sealPermits !== null) {
+    const seal = {
+      version: 1,
+      permits: sealPermits.map(([id, status]) => ({ id, status })),
+    };
+    writeFileSync(join(rootDir, SEAL_REL), JSON.stringify(seal, null, 2) + "\n");
+  }
+  const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+  if (commit) {
+    execSync("git init -q", { cwd: rootDir, env });
+    execSync("git config user.email t@t.t && git config user.name t", { cwd: rootDir, env });
+    execSync("git config commit.gpgsign false", { cwd: rootDir, env });
+    if (sealPermits !== null) execSync(`git add "${SEAL_REL}"`, { cwd: rootDir, env });
+    if (dbPermits !== null) execSync(`git add -f "${DB_REL}"`, { cwd: rootDir, env });
+    execSync("git commit -q -m seal", { cwd: rootDir, env });
+  }
+  return { rootDir };
+}
+
+describe("permitIdsFromHeadSeal (Source B JSON, RFC cde13417)", () => {
+  it("NOMINAL: seal JSON valide en HEAD -> Set des ids", () => {
+    const { rootDir } = setupRootSeal({
+      sealPermits: [[UUID_A, "active"], [UUID_B, "consumed"]],
+      commit: true,
+    });
+    try {
+      const set = permitIdsFromHeadSeal(rootDir);
+      assert.deepEqual([...set].sort(), [UUID_A, UUID_B].sort());
+    } finally {
+      cleanup(rootDir);
+    }
+  });
+
+  it("EDGE: seal JSON vide en HEAD -> Set VIDE exploitable (pas null)", () => {
+    const { rootDir } = setupRootSeal({ sealPermits: [], commit: true });
+    try {
+      const set = permitIdsFromHeadSeal(rootDir);
+      assert.ok(set instanceof Set);
+      assert.equal(set.size, 0);
+    } finally {
+      cleanup(rootDir);
+    }
+  });
+
+  it("NÉGATIF: seal absent de HEAD -> fallback legacy DB HEAD", () => {
+    // Pas de seal committé, mais une DB legacy committée -> fallback l'utilise.
+    const { rootDir } = setupRootSeal({
+      dbPermits: [[UUID_C, "active"]],
+      commit: true,
+    });
+    try {
+      const set = permitIdsFromHeadSeal(rootDir);
+      assert.deepEqual([...set], [UUID_C], "fallback legacy doit remonter la DB HEAD");
+    } finally {
+      cleanup(rootDir);
+    }
+  });
+
+  it("EDGE: seal JSON corrompu -> fallback legacy; sans DB -> null", () => {
+    const { rootDir } = setupRootSeal({ commit: false });
+    try {
+      // Écrit un seal corrompu et le commite en HEAD.
+      writeFileSync(join(rootDir, SEAL_REL), "{ not json");
+      const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+      execSync("git init -q", { cwd: rootDir, env });
+      execSync("git config user.email t@t.t && git config user.name t", { cwd: rootDir, env });
+      execSync("git config commit.gpgsign false", { cwd: rootDir, env });
+      execSync(`git add "${SEAL_REL}"`, { cwd: rootDir, env });
+      execSync("git commit -q -m corrupt", { cwd: rootDir, env });
+      // Ni DB ni seal exploitable -> null.
+      assert.equal(permitIdsFromHeadSeal(rootDir), null);
+    } finally {
+      cleanup(rootDir);
+    }
+  });
+});
+
+describe("buildBaseline avec Source B JSON (RFC cde13417)", () => {
+  it("NOMINAL: union Source A snapshot + Source B seal JSON", () => {
+    const { rootDir } = setupRootSeal({
+      sealPermits: [[UUID_B, "active"], [UUID_C, "active"]],
+      commit: true,
+    });
+    try {
+      const before = `2|${UUID_A}:active,${UUID_B}:active`; // Source A = {a,b}
+      const baseline = buildBaseline(rootDir, before);
+      assert.deepEqual([...baseline].sort(), [UUID_A, UUID_B, UUID_C].sort());
+    } finally {
+      cleanup(rootDir);
+    }
+  });
+
+  it("NÉGATIF: A null ET seal null ET legacy null -> baseline null (nucléaire borné)", () => {
+    const { rootDir } = setupRootSeal({ commit: false }); // pas de git, pas de seal, pas de DB
+    try {
+      assert.equal(buildBaseline(rootDir, null), null);
+    } finally {
+      cleanup(rootDir);
+    }
+  });
+
+  it("EDGE: A '0|' + seal vide -> baseline Set vide déterminable (DELETE sur tout)", () => {
+    const { rootDir } = setupRootSeal({ sealPermits: [], commit: true });
+    try {
+      const baseline = buildBaseline(rootDir, "0|");
+      assert.ok(baseline instanceof Set);
+      assert.equal(baseline.size, 0);
     } finally {
       cleanup(rootDir);
     }
@@ -672,5 +818,85 @@ describe("hasActivePermit fed by resolveAgent (call-site behaviour)", () => {
     // The call-sites emit UNAUTH_SESSION_MSG when resolveAgent returns null.
     assert.match(UNAUTH_SESSION_MSG, /authenticate\(persona=/);
     assert.match(UNAUTH_SESSION_MSG, /zone protégée/);
+  });
+});
+
+// =====================================================================
+// Guard seal_path (RFC cde13417 A1.7) — bash + write/edit d'agent.
+// =====================================================================
+describe("guard seal_path (RFC cde13417)", () => {
+  // Root minimal avec seal_path déclaré (pas de git nécessaire).
+  function guardRoot() {
+    const rootDir = mkdtempSync(join(tmpdir(), "did-guard-seal-"));
+    const cfgDir = join(rootDir, "company", "config");
+    mkdirSync(cfgDir, { recursive: true });
+    writeFileSync(
+      join(cfgDir, "protected-zones.json"),
+      JSON.stringify({
+        prefixes: ["company/plugins/"],
+        files: [],
+        db_path: DB_REL,
+        seal_path: SEAL_REL,
+      }),
+    );
+    mkdirSync(join(rootDir, "company", "data"), { recursive: true });
+    return rootDir;
+  }
+
+  it("NÉGATIF: bash référençant le seal_path est refusé", async () => {
+    const rootDir = guardRoot();
+    try {
+      const handlers = createHandlers(rootDir, new Map(), () => {});
+      await assert.rejects(
+        () =>
+          handlers["tool.execute.before"]({
+            tool: "bash",
+            args: { command: `git rm --cached ${SEAL_REL}` },
+            sessionID: "s1",
+          }),
+        /Permits seal access blocked/,
+      );
+    } finally {
+      cleanup(rootDir);
+    }
+  });
+
+  it("NOMINAL: write/edit d'agent sur le seal_path est refusé et reverté", async () => {
+    const rootDir = guardRoot();
+    try {
+      // Écrit le fichier pour que revertFile ait quelque chose à annuler.
+      writeFileSync(join(rootDir, SEAL_REL), "{}");
+      const handlers = createHandlers(rootDir, new Map(), () => {});
+      await assert.rejects(
+        () =>
+          handlers["tool.execute.after"]({
+            tool: "write",
+            args: { file_path: SEAL_REL },
+            sessionID: "s1",
+          }),
+        /permits seal is machine-owned/,
+      );
+    } finally {
+      cleanup(rootDir);
+    }
+  });
+
+  it("EDGE: write sur un AUTRE .json de company/data/ n'est PAS bloqué par ce guard", async () => {
+    const rootDir = guardRoot();
+    try {
+      const otherRel = "company/data/other.json";
+      writeFileSync(join(rootDir, otherRel), "{}");
+      const handlers = createHandlers(rootDir, new Map(), () => {});
+      // Ne doit PAS rejeter avec le message du guard seal (le fichier n'est ni
+      // le seal ni en zone protégée company/data n'étant pas un prefix).
+      await handlers["tool.execute.after"]({
+        tool: "write",
+        args: { file_path: otherRel },
+        sessionID: "s1",
+      });
+      assert.ok(existsSync(join(rootDir, otherRel)), "other.json ne doit pas être reverté");
+    } finally {
+      cleanup(rootDir);
+    }
   });
 });

@@ -36,6 +36,11 @@ pub const ENV_COMPANYOS_ROOT: &str = "COMPANYOS_ROOT";
 // --- Data directory ---
 pub const DATA_DIR: &str = "company/data";
 pub const DB_FILENAME: &str = "orchestrator.db";
+/// Dedicated write-permit seal file (RFC cde13417 A1.1). Canonical JSON
+/// export of the `write_permits` table, committed in pathspec by the
+/// server. Replaces the whole-DB blob previously committed for sealing
+/// (RFC 359f9162). Lives under [`DATA_DIR`].
+pub const SEAL_FILENAME: &str = "permits-seal.json";
 
 // --- File extensions ---
 pub const EXT_YML: &str = "yml";

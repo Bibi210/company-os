@@ -624,6 +624,69 @@ impl OrchestratorDb {
         Ok(())
     }
 
+    /// List every permit in the table, ordered by id ascending, whatever
+    /// its status (RFC cde13417 A1.3). Deterministic order so the canonical
+    /// JSON seal exported by [`crate::engine::OrchestratorEngine::write_permits_seal`]
+    /// is byte-stable for identical table states. Unlike
+    /// [`Self::list_active_permits`], consumed and revoked permits are
+    /// included: the seal is a full mirror of the authoritative state.
+    pub fn list_all_permits(&self) -> Result<Vec<WritePermit>, OrchestratorError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, rfc_id, granted_to, target_paths, status, granted_by, granted_at, consumed_at \
+             FROM write_permits ORDER BY id ASC",
+        )?;
+
+        let rows: Vec<PermitRow> = stmt
+            .query_map([], |row| {
+                Ok(PermitRow {
+                    id: row.get(0)?,
+                    rfc_id: row.get(1)?,
+                    granted_to: row.get(2)?,
+                    target_paths: row.get(3)?,
+                    status: row.get(4)?,
+                    granted_by: row.get(5)?,
+                    granted_at: row.get(6)?,
+                    consumed_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.into_iter().map(|r| r.into_permit()).collect()
+    }
+
+    /// Insert a permit row verbatim, preserving its status and timestamps
+    /// (RFC cde13417 A1.3). Used by the boot reseed
+    /// ([`crate::engine::OrchestratorEngine::reseed_permits_from_seal`]) to
+    /// reconstruct the table from the HEAD seal. Distinct from
+    /// [`Self::create_permit`] only in intent (reconstruction vs fresh
+    /// grant); both perform the same full-column INSERT so status,
+    /// `granted_at` and `consumed_at` are taken from the row as-is (no new
+    /// timestamp is generated).
+    pub fn insert_permit_row(&self, permit: &WritePermit) -> Result<(), OrchestratorError> {
+        self.create_permit(permit)
+    }
+
+    /// Revert a consumed permit back to `active`, clearing `consumed_at`
+    /// (RFC cde13417 A1.3). Rollback of a consume whose seal commit failed,
+    /// symmetric to the grant rollback (`delete_permit`). Only a row that is
+    /// currently `consumed` matches; returns `PermitNotFound` otherwise so a
+    /// caller never silently believes a non-consumed permit was reverted.
+    pub fn unconsume_permit(&self, id: Uuid) -> Result<(), OrchestratorError> {
+        let updated = self.conn.execute(
+            "UPDATE write_permits SET status = ?1, consumed_at = NULL WHERE id = ?2 AND status = ?3",
+            params![
+                PermitStatus::Active.to_string(),
+                id.to_string(),
+                PermitStatus::Consumed.to_string(),
+            ],
+        )?;
+
+        if updated == 0 {
+            return Err(OrchestratorError::PermitNotFound { id });
+        }
+        Ok(())
+    }
+
     /// Delete a single permit by id. Used for the targeted rollback of a
     /// freshly-inserted permit when the atomic seal (checkpoint + git
     /// commit) fails in `grant_write_permit` (RFC 359f9162). Only ever
@@ -2480,6 +2543,96 @@ mod tests {
             .unwrap();
         assert!(found.is_some(), "dedup-normalized set should match");
         assert_eq!(found.unwrap().id, id);
+    }
+
+    // --- list_all_permits / insert_permit_row / unconsume_permit
+    //     (RFC cde13417 A1.3) ---
+
+    // NOMINAL: list_all_permits returns every status, ordered by id asc.
+    #[test]
+    fn test_list_all_permits_ordered_all_statuses() {
+        let db = setup_db();
+        let id_b = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let id_a = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        db.create_permit(&make_permit_full(
+            id_b,
+            Uuid::new_v4(),
+            PermitStatus::Active,
+            vec!["b"],
+        ))
+        .unwrap();
+        db.create_permit(&make_permit_full(
+            id_a,
+            Uuid::new_v4(),
+            PermitStatus::Active,
+            vec!["a"],
+        ))
+        .unwrap();
+        db.consume_permit(id_a).unwrap(); // one consumed, must still be listed
+        let all = db.list_all_permits().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id, id_a, "ordered by id asc");
+        assert_eq!(all[0].status, PermitStatus::Consumed);
+        assert_eq!(all[1].id, id_b);
+    }
+
+    // EDGE: list_all_permits on an empty table is an empty vec (not an error).
+    #[test]
+    fn test_list_all_permits_empty() {
+        let db = setup_db();
+        assert!(db.list_all_permits().unwrap().is_empty());
+    }
+
+    // NOMINAL: insert_permit_row preserves status and timestamps verbatim
+    // (reseed reconstruction, no new timestamp generated).
+    #[test]
+    fn test_insert_permit_row_preserves_state() {
+        let db = setup_db();
+        let id = Uuid::new_v4();
+        let mut permit = make_permit_full(id, Uuid::new_v4(), PermitStatus::Consumed, vec!["x"]);
+        let consumed_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        permit.consumed_at = Some(consumed_at);
+        db.insert_permit_row(&permit).unwrap();
+        let fetched = db.get_permit(id).unwrap().unwrap();
+        assert_eq!(fetched.status, PermitStatus::Consumed);
+        assert_eq!(fetched.consumed_at, Some(consumed_at));
+    }
+
+    // NOMINAL: unconsume_permit reverts consumed -> active and clears consumed_at.
+    #[test]
+    fn test_unconsume_permit_reverts() {
+        let db = setup_db();
+        let id = Uuid::new_v4();
+        db.create_permit(&make_permit_full(
+            id,
+            Uuid::new_v4(),
+            PermitStatus::Active,
+            vec!["x"],
+        ))
+        .unwrap();
+        db.consume_permit(id).unwrap();
+        db.unconsume_permit(id).unwrap();
+        let fetched = db.get_permit(id).unwrap().unwrap();
+        assert_eq!(fetched.status, PermitStatus::Active);
+        assert!(fetched.consumed_at.is_none());
+    }
+
+    // NÉGATIF: unconsume on a non-consumed (active) permit is PermitNotFound.
+    #[test]
+    fn test_unconsume_permit_not_consumed_errors() {
+        let db = setup_db();
+        let id = Uuid::new_v4();
+        db.create_permit(&make_permit_full(
+            id,
+            Uuid::new_v4(),
+            PermitStatus::Active,
+            vec!["x"],
+        ))
+        .unwrap();
+        let res = db.unconsume_permit(id);
+        assert!(matches!(res, Err(OrchestratorError::PermitNotFound { .. })));
     }
 
     // --- Snapshot / Restore permits (backing the defense-in-depth hook

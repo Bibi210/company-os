@@ -8,8 +8,8 @@ use companyos_config::{
     ArtifactKind, CompanyConfig, Diagnostic, PersonaId, ReviewProtocol, constants,
 };
 use companyos_orchestrator::{
-    ArtifactPath, Finding, OrchestratorDb, OrchestratorEngine, PathPattern, ReviewVerdict,
-    RfcUpdateResult, RoadmapSelector,
+    ArtifactPath, Finding, OrchestratorDb, OrchestratorEngine, PathPattern, PermitStatus,
+    ReviewVerdict, RfcUpdateResult, RoadmapSelector,
 };
 use companyos_validation::{ArtifactValidator, SchemaRegistry};
 use rmcp::{
@@ -278,10 +278,11 @@ struct SummarizeRoadmapParams {
     domain: Option<String>,
 }
 
-/// Failure causes for the atomic DB seal performed by
-/// [`OrchestratorServer::seal_db_commit`] (RFC 359f9162, decision CEO 1).
-/// Each variant maps to a distinct MCP diagnostic reason so the CEO can
-/// tell *why* a grant could not be materialized on disk.
+/// Failure causes for the atomic permit seal performed by
+/// [`OrchestratorServer::git_commit_pathspec`] (RFC 359f9162 for the seal,
+/// RFC cde13417 for the JSON pathspec form). Each variant maps to a distinct
+/// MCP diagnostic reason so the CEO can tell *why* a grant could not be
+/// materialized on disk.
 #[derive(Debug)]
 enum SealError {
     /// The `git` binary could not be spawned (absent from PATH, etc.).
@@ -506,6 +507,21 @@ fn rollback_permit(engine: &OrchestratorEngine, permit_id: Uuid, context: &str) 
 /// Build the JSON response for `rfc_set_implemented` (RFC 1c0f2570 §1).
 /// Pure function — extracted for direct unit testing of the response shape
 /// (RFC §7.b) without going through rmcp.
+/// Extract a short RFC identifier from an artifact file path for lifecycle
+/// commit messages (RFC cde13417 A2). Artifact files follow the
+/// `<slug>-<8hex>.yml` naming convention (RFC 2492822c), so the 8-char id is
+/// the last dash-separated token of the stem. Falls back to the whole stem
+/// when the convention does not hold (still produces a readable message).
+fn rfc_id8_from_path(path: &str) -> String {
+    let stem = path
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .trim_end_matches(".yml")
+        .trim_end_matches(".yaml");
+    stem.rsplit('-').next().unwrap_or(stem).to_string()
+}
+
 fn build_set_implemented_response(
     outcome: &companyos_orchestrator::engine::SetImplementedOutcome,
 ) -> serde_json::Value {
@@ -539,26 +555,30 @@ fn err(msg: String) -> Result<CallToolResult, McpError> {
 }
 
 impl OrchestratorServer {
-    /// Atomically seal the orchestrator DB into git after a permit
-    /// insert (RFC 359f9162). Runs `git add -f` strictly scoped to the
-    /// single `.db` file (NEVER `git add -A`, which would leave the
-    /// VOLATILE class of the defense-in-depth hook), then `git commit`,
-    /// and returns the resulting commit hash on success. Distinguishes
-    /// failure causes via [`SealError`] so the caller can rollback and
-    /// surface a precise diagnostic.
-    fn seal_db_commit(&self, permit_id: Uuid, rfc_id: Uuid) -> Result<String, SealError> {
+    /// Commit a SINGLE pathspec target as a machine commit emitted by the
+    /// headless MCP server (RFC cde13417 A1.4 — CONVENTION COMMITS SERVEUR).
+    ///
+    /// Sequence: `git add -- <rel_path>`, then
+    /// `git -c commit.gpgsign=false commit --no-verify -m <msg> -- <rel_path>`,
+    /// then `git rev-parse HEAD` for the resulting hash.
+    ///
+    /// - `--no-verify`: the pre-commit runs `make ci` unconditionally; this
+    ///   content is machine-generated (canonical JSON / an enum-bounded RFC
+    ///   status field) and pathspec-scoped to one non-code file, so the CI
+    ///   has no object here, and the defense does NOT rely on the pre-commit
+    ///   (the hook reads HEAD/live DB, not signatures). Reserved to the
+    ///   SERVER channel; agents never use `--no-verify`.
+    /// - `commit.gpgsign=false`: decision B of RFC 324e8a33 (a blocking
+    ///   pinentry would freeze the engine lock).
+    /// - `LC_ALL=C`/`LANG=C`: stable English markers for NothingToCommit /
+    ///   index.lock detection (lesson d5c9c933).
+    ///
+    /// The pathspec-scoped commit only ever includes `<rel_path>`, never any
+    /// already-staged file (closes the bizarrerie of lesson 595b2d8d for
+    /// machine commits).
+    fn git_commit_pathspec(&self, rel_path: &str, msg: &str) -> Result<String, SealError> {
         use std::process::Command;
 
-        // Path of the DB *relative to the repo root* — the literal,
-        // strictly-scoped target. constants::DATA_DIR already includes
-        // the "company/data" prefix.
-        let db_rel_path = format!("{}/{}", constants::DATA_DIR, constants::DB_FILENAME);
-
-        // Force the C locale on every git invocation so the stdout/stderr
-        // markers we match on ("nothing to commit", "index.lock", …) are
-        // stable English regardless of the server's configured locale
-        // (the environment here defaults to French, which silently broke
-        // the NothingToCommit detection).
         let git = || {
             let mut c = Command::new("git");
             c.current_dir(&self.root_path)
@@ -567,8 +587,9 @@ impl OrchestratorServer {
             c
         };
 
-        // (1) git add -f <db>
-        let add = git().args(["add", "-f", &db_rel_path]).output();
+        // (1) git add -- <rel_path>. No -f: the seal JSON is a tracked,
+        //     non-ignored path (unlike the *.db* blob the old seal forced).
+        let add = git().args(["add", "--", rel_path]).output();
         let add = match add {
             Ok(o) => o,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -588,16 +609,18 @@ impl OrchestratorServer {
             return Err(SealError::GitFailed { stderr });
         }
 
-        // (2) git -c commit.gpgsign=false commit -m "chore: seal write permit <id> for RFC <rfc>"
-        // DECISION B (RFC 324e8a33): the seal is a machine commit emitted by the
-        // headless MCP server. It is NEVER verified by signature (the
-        // defense-in-depth hook reads the DB CONTENT at HEAD, not signatures),
-        // and a blocking pinentry during a grant would freeze the engine lock
-        // then fail the grant in a commit.gpgsign=true environment. Disable
-        // signing explicitly so availability/atomicity of the grant prevails.
-        let msg = format!("chore: seal write permit {permit_id} for RFC {rfc_id}");
+        // (2) commit --no-verify, pathspec-scoped.
         let commit = git()
-            .args(["-c", "commit.gpgsign=false", "commit", "-m", &msg])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--no-verify",
+                "-m",
+                msg,
+                "--",
+                rel_path,
+            ])
             .output();
         let commit = match commit {
             Ok(o) => o,
@@ -616,10 +639,6 @@ impl OrchestratorServer {
             if is_index_locked(&stderr) {
                 return Err(SealError::IndexLocked);
             }
-            // git emits one of several locale-C phrasings when there is
-            // nothing staged: "nothing to commit" (clean tree),
-            // "no changes added to commit" / "nothing added to commit"
-            // (untracked files present — e.g. the -wal/-shm sidecars).
             if is_nothing_to_commit(&stdout) || is_nothing_to_commit(&stderr) {
                 return Err(SealError::NothingToCommit);
             }
@@ -645,6 +664,50 @@ impl OrchestratorServer {
             });
         }
         Ok(String::from_utf8_lossy(&rev.stdout).trim().to_string())
+    }
+
+    /// Commit an already-exported permits seal (RFC cde13417 A1.1 + A1.4).
+    /// The caller exports the JSON via `engine.write_permits_seal()` WHILE it
+    /// holds the engine lock, then passes the resulting `rel_path` here for
+    /// the git layer (which takes no engine lock). Replaces the old whole-DB
+    /// `seal_db_commit` (RFC 359f9162): the object sealed changes (a small
+    /// JSON export instead of an 11.5 MiB SQLite blob), the semantics do not.
+    fn seal_permits_commit(
+        &self,
+        rel_path: &str,
+        permit_id: Uuid,
+        rfc_id: Uuid,
+    ) -> Result<String, SealError> {
+        let msg = format!("chore: seal write permit {permit_id} for RFC {rfc_id}");
+        self.git_commit_pathspec(rel_path, &msg)
+    }
+
+    /// Commit an already-exported seal at consume time (RFC cde13417 A1.4c).
+    /// Same machine-commit convention as [`Self::seal_permits_commit`], only
+    /// the message differs. The caller has exported the JSON under the engine
+    /// lock and passes the `rel_path`.
+    fn seal_consume_commit(&self, rel_path: &str, permit_id: Uuid) -> Result<String, SealError> {
+        let msg = format!("chore: seal consume of write permit {permit_id}");
+        self.git_commit_pathspec(rel_path, &msg)
+    }
+
+    /// Auto-commit a server lifecycle transition (RFC cde13417 A2) in
+    /// pathspec, using the machine-commit convention. Returns the hash on
+    /// success, `None` when there was nothing to commit (idempotent replay).
+    /// Unlike the seal, a lifecycle commit failure is NON fatal: the caller
+    /// surfaces it as a warning, never a rollback.
+    fn lifecycle_commit(&self, rel_path: &str, msg: &str) -> Option<String> {
+        match self.git_commit_pathspec(rel_path, msg) {
+            Ok(hash) => Some(hash),
+            Err(SealError::NothingToCommit) => None,
+            Err(e) => {
+                eprintln!(
+                    "[orchestrator] WARN: lifecycle commit failed for {rel_path}: {}",
+                    e.diagnostic_reason()
+                );
+                None
+            }
+        }
     }
 }
 
@@ -827,11 +890,32 @@ impl OrchestratorServer {
                     }),
                 };
 
+                // A2 (RFC cde13417) — auto-commit the RFC status transition
+                // when close_round actually updated it. NON fatal: the
+                // transition is already effective on disk; a commit failure
+                // is surfaced as a warning, never a rollback.
+                let mut lifecycle_commit_hash: Option<String> = None;
+                if matches!(rfc_update, RfcUpdateResult::Updated { .. }) {
+                    let rel = round.artifact_path.0.clone();
+                    let id8 = rfc_id8_from_path(&rel);
+                    let msg = format!("chore(rfc): {id8} approved (close_review_round)");
+                    lifecycle_commit_hash = self.lifecycle_commit(&rel, &msg);
+                }
+
                 let mut response = serde_json::to_value(&round).unwrap_or_default();
                 if let serde_json::Value::Object(ref mut map) = response
                     && let serde_json::Value::Object(rfc_map) = rfc_info
                 {
                     map.extend(rfc_map);
+                }
+                if let serde_json::Value::Object(ref mut map) = response {
+                    map.insert(
+                        "lifecycle_commit".to_string(),
+                        match lifecycle_commit_hash {
+                            Some(h) => serde_json::Value::String(h),
+                            None => serde_json::Value::Null,
+                        },
+                    );
                 }
                 ok(serde_json::to_string_pretty(&response).unwrap_or_default())
             }
@@ -857,8 +941,34 @@ impl OrchestratorServer {
         let engine = self.engine.lock().await;
         match engine.set_rfc_implemented(params.id, &self.root_path) {
             Ok(outcome) => {
-                ok(serde_json::to_string_pretty(&build_set_implemented_response(&outcome))
-                    .unwrap_or_default())
+                // A3 (RFC cde13417) — reminders for related task-requests
+                // still open. NON blocking: the algorithm reminds, the LLM
+                // decides.
+                let reminders = engine.open_task_request_reminders(&self.root_path, params.id);
+
+                // A2 (RFC cde13417) — auto-commit the implemented transition.
+                // NON fatal: the transition is already effective on disk.
+                let id8 = rfc_id8_from_path(&outcome.file_path);
+                let msg = format!("chore(rfc): {id8} implemented (rfc_set_implemented)");
+                let lifecycle_commit_hash = self.lifecycle_commit(&outcome.file_path, &msg);
+
+                let mut response = build_set_implemented_response(&outcome);
+                if let serde_json::Value::Object(ref mut map) = response {
+                    map.insert(
+                        "lifecycle_reminders".to_string(),
+                        serde_json::Value::Array(
+                            reminders.into_iter().map(serde_json::Value::String).collect(),
+                        ),
+                    );
+                    map.insert(
+                        "lifecycle_commit".to_string(),
+                        match lifecycle_commit_hash {
+                            Some(h) => serde_json::Value::String(h),
+                            None => serde_json::Value::Null,
+                        },
+                    );
+                }
+                ok(serde_json::to_string_pretty(&response).unwrap_or_default())
             }
             Err(e) => err(Diagnostic::error(C, "Failed to mark RFC as implemented")
                 .with_context(format!("rfc_set_implemented(id={})", params.id))
@@ -1043,8 +1153,25 @@ impl OrchestratorServer {
             Ok(Some(existing)) => {
                 // Permit already exists and is active. Re-seal defensively:
                 // it should already be in HEAD, so NothingToCommit is the
-                // expected success path here.
-                match self.seal_db_commit(existing.id, params.rfc_id) {
+                // expected success path here. Export the JSON under the held
+                // engine lock, then commit in pathspec (RFC cde13417 A1.4).
+                let seal_rel = match engine.write_permits_seal(&self.root_path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return err(Diagnostic::error(
+                            C,
+                            "Existing permit found but seal export failed",
+                        )
+                        .with_context(format!(
+                            "grant_write_permit(rfc_id={}) [idempotent replay]",
+                            params.rfc_id
+                        ))
+                        .with_reason(format!("{e}"))
+                        .with_fix("Resolve the disk/DB issue then retry. No duplicate was created.")
+                        .to_string());
+                    }
+                };
+                match self.seal_permits_commit(&seal_rel, existing.id, params.rfc_id) {
                     Ok(hash) => {
                         return ok(permit_response_json(
                             &existing,
@@ -1106,20 +1233,28 @@ impl OrchestratorServer {
                 }
             };
 
-        // (c) CHECKPOINT WAL (edge h): flush the WAL into the .db on disk
-        //     BEFORE git add, so the committed file actually contains the
-        //     freshly-inserted permit. On failure: rollback + error.
-        if let Err(e) = engine.checkpoint_truncate() {
-            rollback_permit(&engine, permit.id, "checkpoint failed");
-            return err(Diagnostic::error(C, "WAL checkpoint failed before seal")
-                .with_context(format!("grant_write_permit(rfc_id={})", params.rfc_id))
-                .with_reason(format!("{e}"))
-                .with_fix("Check DB integrity; the permit was rolled back, retry the grant")
-                .to_string());
-        }
+        // (c) SEAL EXPORT: RFC cde13417 A1.4 removes the WAL checkpoint that
+        //     RFC 359f9162 needed only so the committed .db contained the
+        //     fresh permit — the JSON export reads the live connection and
+        //     has no such need (checkpoint_truncate stays in graceful
+        //     shutdown, PILIER C). Export the seal under the held engine
+        //     lock; on failure, rollback + error (symmetric to a seal fail).
+        let seal_rel = match engine.write_permits_seal(&self.root_path) {
+            Ok(p) => p,
+            Err(e) => {
+                rollback_permit(&engine, permit.id, "seal export failed");
+                return err(Diagnostic::error(C, "Permit seal export failed")
+                    .with_context(format!("grant_write_permit(rfc_id={})", params.rfc_id))
+                    .with_reason(format!("{e}"))
+                    .with_fix(
+                        "Check disk/DB integrity; the permit was rolled back, retry the grant",
+                    )
+                    .to_string());
+            }
+        };
 
-        // (d) SEAL: git add -f <db> + git commit.
-        match self.seal_db_commit(permit.id, params.rfc_id) {
+        // (d) SEAL: git add -- <seal> + git commit --no-verify (pathspec).
+        match self.seal_permits_commit(&seal_rel, permit.id, params.rfc_id) {
             Ok(hash) => ok(permit_response_json(
                 &permit,
                 Some(&hash),
@@ -1196,35 +1331,31 @@ impl OrchestratorServer {
         }
         let engine = self.engine.lock().await;
 
-        // GARDE 3 (RFC 8bf78218, commit-puis-consume): before consuming the
-        // permit, verify the worktree is clean on its target paths. A permit
-        // consumed before the code is committed would make the commit
-        // impossible (defense-in-depth Layer 2 rejects commits whose permit is
-        // already consumed). Order: token (above) -> permit lookup -> worktree
-        // check -> engine.consume_permit.
-        match engine.get_permit(params.permit_id) {
-            Ok(Some(permit)) => {
-                match check_worktree_clean(&self.root_path, &permit.target_paths) {
-                    WorktreeCheck::Clean => { /* fall through to consume */ }
-                    WorktreeCheck::Dirty(files) => {
-                        return err(Diagnostic::error(C, "Permit consumption refused: uncommitted changes")
-                            .with_context(format!("consume_write_permit(permit_id={})", params.permit_id))
-                            .with_reason(format!("uncommitted changes on target paths:\n{files}"))
-                            .with_fix("Commit your code FIRST (git add && git commit), then consume the permit (write_permit_full_sequence step 4)")
-                            .to_string());
-                    }
-                    WorktreeCheck::GitUnavailable(cause) => {
-                        return err(Diagnostic::error(C, "Permit consumption refused: cannot verify worktree")
-                            .with_context(format!("consume_write_permit(permit_id={})", params.permit_id))
-                            .with_reason(format!("git unavailable, cannot verify worktree cleanliness: {cause}"))
-                            .with_fix("git is a hard prerequisite (RFC 359f9162). Ensure git is installed and the repo is accessible, then retry")
-                            .to_string());
-                    }
-                }
-            }
+        // A1.4c (RFC cde13417) — seal-at-consume, EXACT sequence. The seal
+        // export (3) NEVER precedes the DB transition (2), so the committed
+        // JSON always reflects `consumed` and a NothingToCommit can only mean
+        // "HEAD already seals exactly this state", never a stale seal.
+        //
+        // (1) lookup. Already-consumed permit => idempotent replay: re-seal +
+        //     commit; NothingToCommit is success (state already sealed), a new
+        //     commit is success too (catches a replay after an earlier seal
+        //     failure). Otherwise: GARDE 3 (worktree clean on target paths).
+        let permit = match engine.get_permit(params.permit_id) {
+            Ok(Some(p)) => p,
             Ok(None) => {
-                // Permit not found: defer to engine.consume_permit so the
-                // existing PermitNotFound error/message is produced unchanged.
+                // Defer to engine.consume_permit so the existing PermitNotFound
+                // error/message is produced unchanged.
+                return match engine.consume_permit(params.permit_id) {
+                    Ok(()) => ok(r#"{"consumed": true}"#.to_string()),
+                    Err(e) => err(Diagnostic::error(C, "Failed to consume write permit")
+                        .with_context(format!(
+                            "consume_write_permit(permit_id={})",
+                            params.permit_id
+                        ))
+                        .with_reason(format!("{e}"))
+                        .with_fix("Verify the permit_id is valid and has not already been consumed")
+                        .to_string()),
+                };
             }
             Err(e) => {
                 return err(Diagnostic::error(C, "Failed to look up write permit")
@@ -1236,18 +1367,127 @@ impl OrchestratorServer {
                     .with_fix("Check database connectivity and DB integrity")
                     .to_string());
             }
+        };
+
+        if permit.status == PermitStatus::Consumed {
+            // (1-idempotent) Already consumed: re-seal + commit, no re-consume.
+            let seal_rel = match engine.write_permits_seal(&self.root_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    return err(Diagnostic::error(
+                        C,
+                        "Seal export failed (idempotent consume replay)",
+                    )
+                    .with_context(format!(
+                        "consume_write_permit(permit_id={})",
+                        params.permit_id
+                    ))
+                    .with_reason(format!("{e}"))
+                    .with_fix("Resolve the disk/DB issue then retry")
+                    .to_string());
+                }
+            };
+            return match self.seal_consume_commit(&seal_rel, params.permit_id) {
+                Ok(hash) => ok(format!(
+                    r#"{{"consumed": true, "sealed_commit": "{hash}"}}"#
+                )),
+                Err(SealError::NothingToCommit) => ok(r#"{"consumed": true}"#.to_string()),
+                Err(seal_err) => err(Diagnostic::error(
+                    C,
+                    "Consume seal commit failed (idempotent replay)",
+                )
+                .with_context(format!(
+                    "consume_write_permit(permit_id={})",
+                    params.permit_id
+                ))
+                .with_reason(seal_err.diagnostic_reason())
+                .with_fix("Resolve the git issue then retry; the permit is already consumed")
+                .to_string()),
+            };
         }
 
-        match engine.consume_permit(params.permit_id) {
-            Ok(()) => ok(r#"{"consumed": true}"#.to_string()),
-            Err(e) => err(Diagnostic::error(C, "Failed to consume write permit")
+        // GARDE 3 (RFC 8bf78218, commit-puis-consume): before consuming the
+        // permit, verify the worktree is clean on its target paths.
+        match check_worktree_clean(&self.root_path, &permit.target_paths) {
+            WorktreeCheck::Clean => { /* fall through to consume */ }
+            WorktreeCheck::Dirty(files) => {
+                return err(Diagnostic::error(C, "Permit consumption refused: uncommitted changes")
+                    .with_context(format!("consume_write_permit(permit_id={})", params.permit_id))
+                    .with_reason(format!("uncommitted changes on target paths:\n{files}"))
+                    .with_fix("Commit your code FIRST (git add && git commit), then consume the permit (write_permit_full_sequence step 4)")
+                    .to_string());
+            }
+            WorktreeCheck::GitUnavailable(cause) => {
+                return err(Diagnostic::error(C, "Permit consumption refused: cannot verify worktree")
+                    .with_context(format!("consume_write_permit(permit_id={})", params.permit_id))
+                    .with_reason(format!("git unavailable, cannot verify worktree cleanliness: {cause}"))
+                    .with_fix("git is a hard prerequisite (RFC 359f9162). Ensure git is installed and the repo is accessible, then retry")
+                    .to_string());
+            }
+        }
+
+        // (2) engine.consume_permit: DB transition active -> consumed.
+        if let Err(e) = engine.consume_permit(params.permit_id) {
+            return err(Diagnostic::error(C, "Failed to consume write permit")
                 .with_context(format!(
                     "consume_write_permit(permit_id={})",
                     params.permit_id
                 ))
                 .with_reason(format!("{e}"))
                 .with_fix("Verify the permit_id is valid and has not already been consumed")
-                .to_string()),
+                .to_string());
+        }
+
+        // (3) export the seal AFTER (2): the JSON now reflects `consumed`.
+        // (4) git add + commit --no-verify.
+        // (5) on failure: unconsume (rollback) + re-export (best effort) +
+        //     explicit error, symmetric to the grant rollback. The replay
+        //     after correction finds an active permit and re-enters at (2):
+        //     idempotence by STATE, not by memory.
+        let seal_rel = engine.write_permits_seal(&self.root_path).ok();
+        let commit_result = match &seal_rel {
+            Some(rel) => self.seal_consume_commit(rel, params.permit_id),
+            None => Err(SealError::GitFailed {
+                stderr: "seal export failed before commit".to_string(),
+            }),
+        };
+        match commit_result {
+            Ok(hash) => ok(format!(
+                r#"{{"consumed": true, "sealed_commit": "{hash}"}}"#
+            )),
+            Err(seal_err) => {
+                // (5) rollback: unconsume, then re-export best-effort.
+                let reason = seal_err.diagnostic_reason();
+                let mut rollback_note = String::new();
+                if let Err(re) = engine.unconsume_permit(params.permit_id) {
+                    eprintln!(
+                        "[orchestrator] CRITICAL: consume seal failed AND unconsume failed for \
+                         permit {}: seal={reason} unconsume={re}",
+                        params.permit_id
+                    );
+                    rollback_note = format!(
+                        " ADDITIONALLY the unconsume rollback failed: {re} — the permit may remain \
+                         consumed without a sealed commit."
+                    );
+                } else if let Err(re) = engine.write_permits_seal(&self.root_path) {
+                    // Disk seal now diverges from the (reverted) DB; warn only.
+                    eprintln!(
+                        "[orchestrator] WARN: seal re-export after unconsume failed for permit {}: {re}",
+                        params.permit_id
+                    );
+                }
+                err(Diagnostic::error(C, "Failed to seal consume on disk")
+                    .with_context(format!(
+                        "consume_write_permit(permit_id={})",
+                        params.permit_id
+                    ))
+                    .with_reason(format!("{reason}{rollback_note}"))
+                    .with_fix(
+                        "git is a hard prerequisite. Resolve the git issue then retry the consume. \
+                         The permit was reverted to active unless noted otherwise above.",
+                    )
+                    .to_string())
+            }
         }
     }
 
@@ -1895,6 +2135,92 @@ fn run_index(file_path: &str) -> anyhow::Result<()> {
     // _lock_guard drops here on the happy path too → lock released.
 }
 
+/// Read a file from HEAD via `git show`, forcing the C locale. Returns the
+/// file contents on success, `None` if the path is absent from HEAD or git
+/// fails. Used by the boot permit reseed (RFC cde13417 A1.5), which reads the
+/// seal EXCLUSIVELY from HEAD (the tamper-evident anchor), never from disk.
+fn git_show_head(root: &str, rel_path: &str) -> Option<String> {
+    use std::process::Command;
+    // Presence probe: `git cat-file -e HEAD:<path>` exits 0 iff the blob
+    // exists in HEAD.
+    let exists = Command::new("git")
+        .current_dir(root)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .args(["cat-file", "-e", &format!("HEAD:{rel_path}")])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !exists {
+        return None;
+    }
+    let out = Command::new("git")
+        .current_dir(root)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .args(["show", &format!("HEAD:{rel_path}")])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// RFC cde13417 A1.5 + A1.8-i — boot permit reseed and disk seal write.
+///
+/// (A1.5 reseed) When `store_recreated` is true (the DB file was absent
+/// before open, or the rebuild autorepair wiped it) AND the write_permits
+/// table is empty, reconstruct it from the seal in HEAD (`git show`). A
+/// NORMAL boot never reseeds, even on an empty table: an empty table on a
+/// healthy DB is a deliberate, legitimate state (post-revert, post-rollback)
+/// that a reseed would clobber. Double guard: this branch condition AND
+/// `reseed_permits_from_seal` refusing a non-empty table. All failures
+/// (absent seal, git error, invalid JSON, refusal) are logged and non-fatal.
+///
+/// (A1.8-i disk seal write) On EVERY boot, if the on-disk seal file is
+/// ABSENT, write it from the (possibly just-reseeded) live table WITHOUT
+/// committing. This is the precondition of the human migration commit (the
+/// seal must exist before `git add`). A present file is NEVER rewritten: the
+/// authority is HEAD (the reseed reads HEAD only, never this file), so a disk
+/// divergence is harmless, and grant/consume already keep the seal current.
+fn boot_reseed_and_seal(engine: &OrchestratorEngine, root: &str, store_recreated: bool) {
+    let seal_rel = format!("{}/{}", constants::DATA_DIR, constants::SEAL_FILENAME);
+
+    // (A1.5) Reseed, branch- and empty-gated.
+    if store_recreated {
+        match engine.list_all_permits() {
+            Ok(existing) if existing.is_empty() => {
+                if let Some(json) = git_show_head(root, &seal_rel) {
+                    match engine.reseed_permits_from_seal(&json) {
+                        Ok(n) => eprintln!(
+                            "[companyos:{C}] Permit reseed from HEAD seal — {n} permit(s) restored"
+                        ),
+                        Err(e) => {
+                            eprintln!("[companyos:{C}] Permit reseed skipped (non-fatal): {e}")
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "[companyos:{C}] Permit reseed skipped: no seal in HEAD (or git unavailable)"
+                    );
+                }
+            }
+            Ok(_) => { /* table not empty: never reseed */ }
+            Err(e) => eprintln!("[companyos:{C}] Permit reseed skipped (list failed): {e}"),
+        }
+    }
+
+    // (A1.8-i) Disk seal write if absent, no commit.
+    let seal_abs = format!("{root}/{seal_rel}");
+    if !std::path::Path::new(&seal_abs).exists() {
+        match engine.write_permits_seal(root) {
+            Ok(_) => eprintln!("[companyos:{C}] Permit seal written to disk (absent at boot)"),
+            Err(e) => eprintln!("[companyos:{C}] Boot seal write failed (non-fatal): {e}"),
+        }
+    }
+}
+
 async fn run_server() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -1926,6 +2252,13 @@ async fn run_server() -> anyhow::Result<()> {
     tracing::info!("Acquired exclusive DB lock on {lock_path}");
 
     let db_file = format!("{db_dir}/{}", constants::DB_FILENAME);
+    // RFC cde13417 A1.5 — capture whether the DB file existed BEFORE open()
+    // creates it. A missing DB (post make clean / clean-company) is one of
+    // the two branches (with the rebuild autorepair) where the write_permits
+    // table is empty because the store was just recreated, so the boot may
+    // reseed the permits from the HEAD seal. A NORMAL boot (DB present) never
+    // reseeds, even on an empty table (a deliberate empty state).
+    let db_existed = std::path::Path::new(&db_file).exists();
     let db = OrchestratorDb::open(&db_file)?;
     db.migrate()?;
     // RFC bdee1af4 étape 19: if migrate() dropped+recreated artifacts_fts
@@ -1967,9 +2300,15 @@ async fn run_server() -> anyhow::Result<()> {
 
     // PILIER D — autorepair at boot. If integrity_check reports
     // corruption, rebuild the DB from the YAML index source of truth.
+    // `store_recreated` (RFC cde13417 A1.5) is true when write_permits is
+    // empty because the store was just recreated: either the DB file was
+    // absent before open (!db_existed) OR the rebuild branch below wiped and
+    // recreated it. It gates the boot permit reseed.
+    let mut store_recreated = !db_existed;
     let engine = match engine.integrity_check() {
         Ok(true) => engine,
         Ok(false) => {
+            store_recreated = true;
             eprintln!(
                 "[companyos:{C}] Database corruption detected at boot — rebuilding from YAML"
             );
@@ -2023,6 +2362,11 @@ async fn run_server() -> anyhow::Result<()> {
     } else {
         engine
     };
+
+    // RFC cde13417 A1.5 + A1.8-i — permit reseed and boot seal write, run
+    // AFTER all reindexing but BEFORE serving. Non-fatal: any failure is a
+    // logged warning (the current behavior is a permit-less boot).
+    boot_reseed_and_seal(&engine, &root, store_recreated);
 
     let engine = Arc::new(Mutex::new(engine));
 
@@ -2370,8 +2714,8 @@ mod tests {
         git(root, &["config", "user.name", "Test"]);
         // A4 (RFC 324e8a33): disable commit signing in the temp repo's LOCAL
         // config. Indispensable and NOT redundant with hermetic_git_cmd: the
-        // PRODUCTION seal_db_commit path is exercised in-process by the tests
-        // and does NOT go through hermetic_git_cmd; the local config (which
+        // PRODUCTION seal_permits_commit path is exercised in-process by the
+        // tests and does NOT go through hermetic_git_cmd; the local config (which
         // takes precedence over the global) keeps the seal tests green
         // regardless of the host machine's ~/.gitconfig.
         git(root, &["config", "commit.gpgsign", "false"]);
@@ -2459,73 +2803,112 @@ mod tests {
         })
     }
 
-    // --- seal_db_commit unit tests (étape 4) ---
+    // --- seal_permits_commit unit tests (RFC cde13417 étape 12) ---
 
-    #[test]
-    fn test_seal_db_commit_ok_returns_hash() {
-        let tmp = LocalTempDir::new("seal-ok");
-        init_git_repo(tmp.path());
-        let db_dir = tmp.path().join(constants::DATA_DIR);
-        std::fs::create_dir_all(&db_dir).unwrap();
-        std::fs::write(db_dir.join(constants::DB_FILENAME), b"fakedb").unwrap();
-
-        let server = OrchestratorServer::new(
+    fn seal_server(root: &Path) -> OrchestratorServer {
+        OrchestratorServer::new(
             Arc::new(Mutex::new(OrchestratorEngine::new_without_embedder(
                 OrchestratorDb::open_in_memory().unwrap(),
                 3,
             ))),
             Arc::new(RwLock::new(ArtifactValidator::new(
-                SchemaRegistry::load(tmp.path().join("none")).unwrap(),
+                SchemaRegistry::load(root.join("none")).unwrap(),
             ))),
-            tmp.path().to_string_lossy().to_string(),
+            root.to_string_lossy().to_string(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(RwLock::new(test_review_protocol())),
-        );
+        )
+    }
 
+    // NOMINAL: a pathspec seal commit returns a 40-char sha and touches ONLY
+    // the seal JSON, never any already-present file (README).
+    #[test]
+    fn test_seal_permits_commit_ok_returns_hash_scoped() {
+        let tmp = LocalTempDir::new("seal-ok");
+        init_git_repo(tmp.path());
+        let seal_dir = tmp.path().join(constants::DATA_DIR);
+        std::fs::create_dir_all(&seal_dir).unwrap();
+        // A dirty README staged alongside must NOT be absorbed by the pathspec
+        // commit (closes lesson 595b2d8d for machine commits).
+        std::fs::write(tmp.path().join("README.md"), "changed\n").unwrap();
+        std::fs::write(
+            seal_dir.join(constants::SEAL_FILENAME),
+            "{\"version\":1,\"permits\":[]}\n",
+        )
+        .unwrap();
+
+        let server = seal_server(tmp.path());
+        let rel = format!("{}/{}", constants::DATA_DIR, constants::SEAL_FILENAME);
         let hash = server
-            .seal_db_commit(Uuid::new_v4(), Uuid::new_v4())
+            .seal_permits_commit(&rel, Uuid::new_v4(), Uuid::new_v4())
             .expect("seal should succeed");
         assert_eq!(hash.len(), 40, "expected a 40-char git sha, got '{hash}'");
 
-        // The commit must touch ONLY the .db file (VOLATILE class).
         let stat = hermetic_git_cmd(tmp.path())
             .args(["show", "--stat", "--name-only", "--format=", "HEAD"])
             .output()
             .unwrap();
         let files = String::from_utf8_lossy(&stat.stdout);
         assert!(
-            files.contains("orchestrator.db"),
-            "commit should include the db: {files}"
+            files.contains("permits-seal.json"),
+            "commit should include the seal: {files}"
         );
         assert!(
             !files.contains("README"),
-            "commit must NOT touch other files: {files}"
+            "pathspec commit must NOT absorb README: {files}"
         );
     }
 
+    // NÉGATIF: outside a git repo, the seal commit fails (GitNotFound/GitFailed).
     #[test]
-    fn test_seal_db_commit_no_git_repo_errors() {
+    fn test_seal_permits_commit_no_git_repo_errors() {
         let tmp = LocalTempDir::new("seal-nogit");
-        // No git init → not a repo.
-        let db_dir = tmp.path().join(constants::DATA_DIR);
-        std::fs::create_dir_all(&db_dir).unwrap();
-        std::fs::write(db_dir.join(constants::DB_FILENAME), b"fakedb").unwrap();
-
-        let server = OrchestratorServer::new(
-            Arc::new(Mutex::new(OrchestratorEngine::new_without_embedder(
-                OrchestratorDb::open_in_memory().unwrap(),
-                3,
-            ))),
-            Arc::new(RwLock::new(ArtifactValidator::new(
-                SchemaRegistry::load(tmp.path().join("none")).unwrap(),
-            ))),
-            tmp.path().to_string_lossy().to_string(),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(RwLock::new(test_review_protocol())),
-        );
-
-        let res = server.seal_db_commit(Uuid::new_v4(), Uuid::new_v4());
+        let seal_dir = tmp.path().join(constants::DATA_DIR);
+        std::fs::create_dir_all(&seal_dir).unwrap();
+        std::fs::write(
+            seal_dir.join(constants::SEAL_FILENAME),
+            "{\"version\":1,\"permits\":[]}\n",
+        )
+        .unwrap();
+        let server = seal_server(tmp.path());
+        let rel = format!("{}/{}", constants::DATA_DIR, constants::SEAL_FILENAME);
+        let res = server.seal_permits_commit(&rel, Uuid::new_v4(), Uuid::new_v4());
         assert!(res.is_err(), "sealing outside a git repo must fail");
+    }
+
+    // EDGE: re-committing an unchanged seal yields NothingToCommit.
+    #[test]
+    fn test_seal_permits_commit_nothing_to_commit_on_replay() {
+        let tmp = LocalTempDir::new("seal-replay");
+        init_git_repo(tmp.path());
+        let seal_dir = tmp.path().join(constants::DATA_DIR);
+        std::fs::create_dir_all(&seal_dir).unwrap();
+        std::fs::write(
+            seal_dir.join(constants::SEAL_FILENAME),
+            "{\"version\":1,\"permits\":[]}\n",
+        )
+        .unwrap();
+        let server = seal_server(tmp.path());
+        let rel = format!("{}/{}", constants::DATA_DIR, constants::SEAL_FILENAME);
+        server
+            .seal_permits_commit(&rel, Uuid::new_v4(), Uuid::new_v4())
+            .expect("first seal ok");
+        let res = server.seal_permits_commit(&rel, Uuid::new_v4(), Uuid::new_v4());
+        assert!(
+            matches!(res, Err(SealError::NothingToCommit)),
+            "unchanged re-seal must be NothingToCommit, got {res:?}"
+        );
+    }
+
+    // NOMINAL: rfc_id8_from_path extracts the 8-char id tail of an artifact
+    // filename; falls back to the stem when the convention does not hold.
+    #[test]
+    fn test_rfc_id8_from_path() {
+        assert_eq!(
+            rfc_id8_from_path("company/rfcs/v1-automation-db-untrack-cde13417.yml"),
+            "cde13417"
+        );
+        assert_eq!(rfc_id8_from_path("nostem"), "nostem");
     }
 
     #[test]
@@ -2540,7 +2923,7 @@ mod tests {
     // --- grant_write_permit orchestration tests (étapes 5 & 7) ---
 
     // T1 (nominal): new grant → permit inserted, sealed, response carries
-    // sealed_commit; commit touches only the .db.
+    // sealed_commit; commit touches only the permits seal JSON.
     #[tokio::test]
     async fn test_grant_write_permit_nominal_seals() {
         let tmp = LocalTempDir::new("grant-nominal");
@@ -2578,15 +2961,15 @@ mod tests {
         assert_eq!(fetched.unwrap().id, permit_id);
         drop(engine);
 
-        // The seal commit must touch ONLY the .db.
+        // The seal commit must touch ONLY the permits seal JSON (RFC cde13417).
         let stat = hermetic_git_cmd(tmp.path())
             .args(["show", "--stat", "--name-only", "--format=", "HEAD"])
             .output()
             .unwrap();
         let files = String::from_utf8_lossy(&stat.stdout);
         assert!(
-            files.contains("orchestrator.db"),
-            "seal must commit the db: {files}"
+            files.contains("permits-seal.json"),
+            "seal must commit the seal JSON: {files}"
         );
         assert!(
             !files.contains("README"),
@@ -3021,7 +3404,7 @@ mod tests {
         let (server, token, rfc) = setup_server(root).await;
         let permit_id = grant_permit_id(&server, &token, rfc, vec!["crates/x/src/a.rs"]).await;
 
-        // Worktree clean on the target path (the grant sealed only the .db).
+        // Worktree clean on the target path (the grant sealed only the seal JSON).
         let res = server
             .consume_write_permit(consume_params(&token, permit_id))
             .await

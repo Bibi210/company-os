@@ -313,6 +313,43 @@ function permitIdsFromHeadDb(rootDir) {
   }
 }
 
+// SOURCE B (primaire, RFC cde13417 A1.7) — ids des permits scellés dans le
+// JSON `permits-seal.json` committé en HEAD. Remplace la matérialisation
+// /tmp + sqlite3 du blob .db (permitIdsFromHeadDb) par un git show + JSON.parse.
+// Contrat identique à permitIdsFromHeadDb :
+//   - Set<string> d'ids (éventuellement VIDE = Source B EXPLOITABLE) ;
+//   - null si le seal est ABSENT de HEAD, git échoue, ou le JSON est illisible.
+// FALLBACK : quand le seal n'est pas exploitable (absent de HEAD avant le
+// commit de migration A1.8, JSON corrompu), on RETOMBE sur l'ancienne
+// permitIdsFromHeadDb (lecture du .db HEAD). Ce fallback legacy est transitoire
+// (retiré au v1-harness-refactor) ; il garantit que le nouveau hook fonctionne
+// AVANT le commit de migration. Si les deux voies échouent -> null.
+function permitIdsFromHeadSeal(rootDir) {
+  const sealPath = _zones.seal_path;
+  const fallback = () => permitIdsFromHeadDb(rootDir);
+
+  if (!sealPath) return fallback();
+
+  // (1) Le seal existe-t-il en HEAD ? run() renvoie "" si présent, null sinon.
+  if (run(`git cat-file -e "HEAD:${sealPath}"`, rootDir) === null) {
+    return fallback();
+  }
+
+  // (2) Lire le JSON committé et le parser.
+  const raw = run(`git show "HEAD:${sealPath}"`, rootDir);
+  if (raw === null) return fallback();
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.permits)) return fallback();
+    // Set des ids (éventuellement vide = exploitable, contribue 0+ ids).
+    return new Set(parsed.permits.map((p) => p && p.id).filter(Boolean));
+  } catch {
+    // JSON corrompu -> tenter le fallback legacy avant d'abandonner.
+    return fallback();
+  }
+}
+
 // SOURCE A — ids extraits du blob snapshot "before" (snapshotPermits).
 // Format du blob : "<count>|<id1>:<status1>,<id2>:<status2>,...".
 // Réutilise EXACTEMENT le même split que l'ancien beforeIds L228
@@ -350,7 +387,9 @@ function parsePermitIds(before) {
 // baseline inconnue.
 function buildBaseline(rootDir, before) {
   const sourceA = parsePermitIds(before); // Set | null
-  const sourceB = permitIdsFromHeadDb(rootDir); // Set | null
+  // Source B primaire = seal JSON en HEAD (RFC cde13417), avec fallback
+  // legacy sur le .db HEAD tant que le commit de migration n'est pas passé.
+  const sourceB = permitIdsFromHeadSeal(rootDir); // Set | null
   if (sourceA === null && sourceB === null) return null;
   return new Set([...(sourceA ?? []), ...(sourceB ?? [])]);
 }
@@ -404,6 +443,7 @@ export {
   snapshotPermits,
   parsePermitIds,
   permitIdsFromHeadDb,
+  permitIdsFromHeadSeal,
   buildBaseline,
   revertPermitTampering,
   hasActivePermit,
@@ -508,6 +548,21 @@ export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
             }),
           );
         }
+        // Block bash commands that touch the machine-owned permits seal
+        // (RFC cde13417 A1.7). The seal is written EXCLUSIVELY by the server
+        // (std::fs + git, which bypass this hook). Any agent bash referencing
+        // it — including the `git rm --cached` of the migration — is refused;
+        // the migration commit is done BY THE USER (RFC 25b6678c parade).
+        const sealFile = _zones.seal_path;
+        if (sealFile && cmd.includes(sealFile)) {
+          throw new Error(
+            diag("ERROR", "Permits seal access blocked", {
+              context: `bash command references ${sealFile}`,
+              reason: "The permits seal is machine-owned: only the orchestrator server writes it (at grant/consume/boot). Agents must never touch it directly.",
+              fix: "Use grant_write_permit / consume_write_permit; the migration untrack is performed by the user, not an agent.",
+            }),
+          );
+        }
       }
 
       // -----------------------------------------------------------------
@@ -553,6 +608,22 @@ export const createHandlers = (rootDir, sessions, onProtectedZoneWrite) => {
         typeof filePath === "string"
       ) {
         const rel = relative(rootDir, resolve(rootDir, filePath));
+
+        // [0] Permits seal guard (RFC cde13417 A1.7). The seal lives under
+        //     company/data/, which is NOT a protected prefix, so the generic
+        //     protected-zone check below would not cover it. It is machine-
+        //     owned: only the server writes it. Any agent write/edit is
+        //     refused and reverted, on all agent channels.
+        if (_zones.seal_path && rel === _zones.seal_path) {
+          revertFile(rootDir, rel);
+          throw new Error(
+            diag("ERROR", `Write blocked: permits seal is machine-owned: ${rel}`, {
+              context: `${input.tool}(file_path=${rel})`,
+              reason: `The permits seal is written EXCLUSIVELY by the orchestrator server (grant/consume/boot). Agents must never write it. Change reverted.`,
+              fix: `Use grant_write_permit / consume_write_permit; the seal is maintained by the server.`,
+            }),
+          );
+        }
 
         // [1] Naming convention: must precede protected-zone check to avoid
         //     triggering onProtectedZoneWrite for a write that will be reverted.

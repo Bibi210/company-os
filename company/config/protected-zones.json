@@ -13,5 +13,6 @@
   ],
   "personas_dir": "company/personas",
   "personas_out": "company/config/personas.yml",
-  "db_path": "company/data/orchestrator.db"
+  "db_path": "company/data/orchestrator.db",
+  "seal_path": "company/data/permits-seal.json"
 }
