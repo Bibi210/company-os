@@ -1,23 +1,23 @@
 # CompanyOS
 
-**Une organisation d'agents LLM qui se construit en s'utilisant elle-même, gouvernée par un harness mécanique.**
+**A self-improving organization of LLM agents that builds itself by using itself, governed by a mechanical harness.**
 
-CompanyOS est une "entreprise logicielle" autonome : quatre agents (PM, Architect, Implementer, CEO) collaborent selon un processus formel de revue et de gouvernance pour concevoir, implémenter et faire évoluer des projets, y compris CompanyOS lui-même. Chaque évolution du système passe par ses propres règles : task-request, RFC, revue triaxiale, approbation, permis d'écriture, implémentation, capitalisation.
+CompanyOS is an autonomous "software company": four agents (PM, Architect, Implementer, CEO) collaborate through a formal review and governance process to design, implement and evolve projects, including CompanyOS itself. Every change to the system goes through its own rules: task-request, RFC, triaxial review, approval, write permit, implementation, knowledge capture.
 
-La particularité du projet n'est pas l'orchestration multi-agents. C'est le **harness** : les règles importantes ne vivent pas dans des prompts que les modèles peuvent ignorer, elles vivent dans du code qui les rend impossibles à contourner.
+What sets this project apart is not the multi-agent orchestration. It is the **harness**: important rules do not live in prompts that models can ignore, they live in code that makes violations impossible.
 
 ---
 
-## Principes directeurs
+## Guiding principles
 
-**1. Le harness avant la prose.**
-Une règle écrite dans un prompt est un vœu. Une règle encodée dans un hook, un schema JSON, un tool MCP ou un pre-commit est un fait. Test directeur du projet : si la mémoire YAML était effacée demain (`make clean-company`), tout ce qui a été appris doit survivre, parce que l'appris vit dans le mécanisme, pas dans le texte.
+**1. Harness before prose.**
+A rule written in a prompt is a wish. A rule encoded in a hook, a JSON schema, an MCP tool or a pre-commit is a fact. The project's litmus test: if the YAML memory were wiped tomorrow (`make clean-company`), everything the organization has learned must survive, because learning lives in mechanisms, not in text.
 
-**2. Le LLM décide, l'algorithme tient les registres.**
-Les transitions de cycle de vie (RFC approuvé, permit scellé, statuts synchronisés, indexation) sont algorithmiques et automatiques. Le jugement (architecture, curation, arbitrage) reste aux agents. Aucun mécanisme ne retire un point de décision légitime ; aucun agent ne fait du bookkeeping qu'une machine sait faire.
+**2. The LLM decides, the algorithm keeps the records.**
+Lifecycle transitions (RFC approved, permit sealed, statuses synchronized, indexing) are algorithmic and automatic. Judgment (architecture, curation, arbitration) stays with the agents. No mechanism removes a legitimate decision point; no agent does bookkeeping a machine can do.
 
-**3. L'invariant mécanique.**
-On ne corrige pas un anti-pattern par une règle d'usage : on retire le paramètre, on ferme le schema, on rejette côté serveur. Même principe au niveau du code : les invariants vivent dans les types, jamais dans des conventions de contenu de String.
+**3. The mechanical invariant.**
+An anti-pattern is never fixed with a usage rule: the parameter is removed, the schema is locked, the server rejects. The same principle applies at the code level: invariants live in types, never in String content conventions.
 
 ---
 
@@ -25,83 +25,83 @@ On ne corrige pas un anti-pattern par une règle d'usage : on retire le paramèt
 
 ```
 company-os/
-├── company/               Le système lui-même
-│   ├── personas/          Contrats des 4 agents (PM, Architect, Implementer, CEO)
-│   ├── schemas/           14 JSON Schemas, verrouillés (unevaluatedProperties)
-│   ├── config/            Règles partagées, protocole de review, zones protégées
-│   ├── plugins/           Harness JS : defense-in-depth (hooks), mcp-proxy (supervision)
-│   ├── rfcs/              Request For Change (39+ RFCs, tous cycle complet)
-│   ├── lessons/           Mémoire collective (60+ lessons, graphe chaîné)
-│   ├── roadmaps/          Suivi des domaines, statuts auto-synchronisés
-│   └── scripts/           Outillage d'enforcement (zone protégée)
-├── crates/                Le serveur Rust
-│   ├── orchestrator/      Engine : index hybride, review rounds, write permits
-│   ├── mcp-servers/       Serveurs MCP (orchestrator, yaml-validator)
-│   ├── validation/        Validation schema + placement kind/chemin
-│   └── config/            Chargement de la config, watcher, zones protégées
-├── projects/              Les projets gérés (task-requests, design-docs, plans...)
-├── .githooks/             Pre-commit : validation, permits, make ci (zone protégée)
-└── tests/                 Tests d'intégration workspace
+├── company/               The system itself
+│   ├── personas/          Contracts of the 4 agents (PM, Architect, Implementer, CEO)
+│   ├── schemas/           14 JSON Schemas, locked down (unevaluatedProperties)
+│   ├── config/            Shared rules, review protocol, protected zones
+│   ├── plugins/           JS harness: defense-in-depth (hooks), mcp-proxy (supervision)
+│   ├── rfcs/              Request For Change (39+ RFCs, all full-cycle)
+│   ├── lessons/           Collective memory (60+ lessons, chained graph)
+│   ├── roadmaps/          Domain tracking, auto-synchronized statuses
+│   └── scripts/           Enforcement tooling (protected zone)
+├── crates/                The Rust server
+│   ├── orchestrator/      Engine: hybrid index, review rounds, write permits
+│   ├── mcp-servers/       MCP servers (orchestrator, yaml-validator)
+│   ├── validation/        Schema validation + kind/path placement
+│   └── config/            Config loading, watcher, protected zones
+├── projects/              Managed projects (task-requests, design-docs, plans...)
+├── .githooks/             Pre-commit: validation, permits, make ci (protected zone)
+└── tests/                 Workspace integration tests
 ```
 
-### Le harness en trois couches
+### The harness, three layers
 
-| Couche | Mécanisme | Ce qu'il rend impossible |
+| Layer | Mechanism | What it makes impossible |
 |---|---|---|
-| Hooks (plugin JS) | Interception write/edit/bash, revert automatique | Écrire en zone protégée sans permis nominatif, écrire pour le compte d'un autre agent, écritures du CEO |
-| Serveur (Rust, MCP) | Gardes dans les tools | Auto-review, vote approve avec findings, permis sans RFC approuvé, consume avec worktree sale, reviewers sous le minimum du protocole, grant sur fichier de gouvernance sans approbation utilisateur confirmée |
-| Pre-commit (git) | Validation YAML, audit des permits, `make ci` bloquant | Committer un artifact invalide ou mal placé, committer en zone protégée sans permis, merger du code rouge |
+| Hooks (JS plugin) | write/edit/bash interception, automatic revert | Writing to a protected zone without a nominative permit, writing under another agent's permit, any file write by the CEO |
+| Server (Rust, MCP) | Guards inside the tools | Self-review, approve votes carrying findings, permits without an approved RFC, consuming a permit on a dirty worktree, reviewer lists below the protocol minimum, grants on governance files without confirmed user approval |
+| Pre-commit (git) | YAML validation, permit audit, blocking `make ci` | Committing an invalid or misplaced artifact, committing to a protected zone without a permit, merging red code |
 
-### Le workflow
+### The workflow
 
 ```
-task-request ──▶ design-doc / RFC ──▶ review round ──▶ approbation CEO
+task-request ──▶ design-doc / RFC ──▶ review round ──▶ CEO approval
      ▲                                (triaxial,           │
      │                                 3 reviewers,        ▼
-  lesson-learned ◀── implémentation ◀── write permit (scellé en git,
-  (mémoire chaînée)   (plan reviewé)     nominatif, pré-check de périmètre)
+  lesson-learned ◀── implementation ◀── write permit (sealed in git,
+  (chained memory)    (reviewed plan)    nominative, scope pre-check)
 ```
 
-Chaque review analyse trois axes obligatoires (nominal, négatif, edge cases), forme vérifiée par schema. Un reviewer ne peut pas approuver avec des findings correctifs : la contradiction est rejetée par le serveur. L'auteur ne peut pas se reviewer : rejeté par le serveur. Les permis d'écriture sont émis par le CEO sur RFC approuvé uniquement (vérifié mécaniquement), couvrent des chemins précis, sont liés à leur bénéficiaire, et leur périmètre est comparé automatiquement aux fichiers annoncés par le RFC.
+Every review covers three mandatory axes (nominal, negative, edge cases), a shape enforced by schema. A reviewer cannot approve while carrying corrective findings: the contradiction is rejected server-side. An author cannot review their own artifact: rejected server-side. Write permits are granted by the CEO on approved RFCs only (mechanically verified), cover precise paths, are bound to their grantee, and their scope is automatically compared against the files announced by the RFC.
 
-### La mémoire collective
+### Collective memory
 
-Les artifacts YAML sont la source de vérité, indexés automatiquement dans SQLite (FTS5 BM25 + embeddings locaux déterministes + fusion RRF, rappel mesuré 0.895). Les lessons-learned forment un graphe chaîné (supersedes, derived-from, related) avec détection mécanique des liens pendants et des supersessions asymétriques. L'index est un cache : il se reconstruit intégralement depuis les YAML, permits inclus.
+YAML artifacts are the source of truth, automatically indexed into SQLite (FTS5 BM25 + deterministic local embeddings + RRF fusion, measured recall 0.895). Lessons-learned form a chained graph (supersedes, derived-from, related) with mechanical detection of dangling links and asymmetric supersessions. The index is a cache: it rebuilds entirely from the YAML files, permits included.
 
-### Résilience
+### Resilience
 
-Les binaires servis vivent dans `target/serve/`, jamais touchés par les builds : la mise à jour du serveur est une promotion atomique explicite (`make deploy-serve`). Le proxy MCP supervise le serveur sans état terminal : backoff avec réarmement, respawn conditionné à un binaire présent, buffer FIFO transparent pendant les indisponibilités. Un agent ne fait jamais de retry : au pire, il reçoit une erreur structurée qui prescrit l'escalade humaine.
+Served binaries live in `target/serve/`, never touched by builds: updating the server is an explicit atomic promotion (`make deploy-serve`). The MCP proxy supervises the server with no terminal state: backoff with re-arming, respawn conditioned on a present binary, transparent FIFO buffering during unavailability. Agents never retry: at worst they receive a structured error that prescribes human escalation.
 
 ---
 
-## Démarrage
+## Getting started
 
-Prérequis : Rust stable, Node.js 20+, git, [opencode](https://opencode.ai).
-
-```bash
-make setup          # build release + CI + promotion des binaires servis
-opencode            # démarre une session : le PM est l'interface unique
-```
-
-Commandes utiles :
+Prerequisites: stable Rust, Node.js 20+, git, [opencode](https://opencode.ai).
 
 ```bash
-make ci             # fmt + clippy + tests Rust + tests JS + validation YAML + naming
-make deploy-serve   # promotion atomique des binaires MCP vers target/serve/
-make validate       # validation schema de tous les artifacts
-make test-js        # tests du harness JS
+make setup          # release build + CI + promotion of served binaries
+opencode            # start a session: the PM is the single interface
 ```
 
-L'utilisateur ne parle qu'au PM. Le PM clarifie l'intention, crée les task-requests et orchestre les autres agents. Les décisions structurantes (zones protégées, personas, schemas) remontent à l'utilisateur via des déclencheurs mécaniques.
+Useful commands:
+
+```bash
+make ci             # fmt + clippy + Rust tests + JS tests + YAML validation + naming
+make deploy-serve   # atomic promotion of MCP binaries to target/serve/
+make validate       # schema validation of all artifacts
+make test-js        # JS harness tests
+```
+
+The user only talks to the PM. The PM clarifies intent, creates task-requests and orchestrates the other agents. Structural decisions (protected zones, personas, schemas) are escalated to the user through mechanical triggers.
 
 ---
 
-## État du projet
+## Project status
 
-Programme **V1** en cours : refonte complète du système par lui-même, domaine par domaine (hygiène, mémoire, durcissement des process, personas, schemas, automatisation, audits de code, refactor du harness, tag v1). L'avancement est tracé dans `company/roadmaps/`, chaque étape par un RFC au cycle complet. Sur les 62 règles de process recensées, 27 sont aujourd'hui des garanties mécaniques qui survivraient à l'effacement de la mémoire.
+**V1** program in progress: a complete overhaul of the system by the system, domain by domain (hygiene, memory, process hardening, personas, schemas, automation, code audits, harness refactor, v1 tag). Progress is tracked in `company/roadmaps/`, every step through a full-cycle RFC. Out of the 62 process rules inventoried, 27 are now mechanical guarantees that would survive a memory wipe.
 
-Ce dépôt est à la fois le produit et la démonstration : l'historique git contient l'intégralité des cycles de décision (RFCs, reviews, permits scellés, lessons) qui ont produit chaque ligne.
+This repository is both the product and the demonstration: the git history contains the complete decision cycles (RFCs, reviews, sealed permits, lessons) that produced every line.
 
-## Licence
+## License
 
-Projet personnel expérimental. Tous droits réservés.
+Personal experimental project. All rights reserved.
