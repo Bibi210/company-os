@@ -1,0 +1,502 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 5dc5b71c-f7d9-42d7-901c-409f495137f3
+  title: "Plan d'implémentation — RFC cde13417 : db-untrack + permits-seal.json, seal au grant+consume (--no-verify), Source B JSON, reseed PILIER D borné, commits lifecycle, reminders M19"
+  author: implementer
+  created_at: "2026-08-25"
+  description: >
+    Plan d'exécution du RFC cde13417 (approved). Traduit en étapes
+    ordonnées et actionnables les trois automatisations A1/A2/A3, sur
+    les 8 paths couverts par le permit bdbac2ab. A1 : orchestrator.db
+    sort du versionnement git ; le scellement des permits (RFC 359f9162)
+    committe désormais company/data/permits-seal.json (export JSON
+    canonique de write_permits) en pathspec ET --no-verify (convention
+    commits serveur, itération 2 du RFC) au grant ET au consume (séquence
+    A1.4c figée : export APRÈS la transition DB, unconsume+ré-export à
+    l'échec, idempotence par l'état) ; la Source B du hook lit ce JSON en
+    HEAD (git show + JSON.parse) avec fallback legacy transitoire ; un
+    guard dédié protège seal_path ; le reseed PILIER D est borné aux
+    branches rebuild-autorepair et DB-absente (jamais un boot normal). A2 :
+    close_review_round et rfc_set_implemented auto-committent leur
+    transition RFC en pathspec --no-verify (échec NON fatal). A3 :
+    rfc_set_implemented ajoute lifecycle_reminders (task-requests liés non
+    clos, M19, non bloquant). Tests aux 3 axes par volet (Rust + JS).
+    MISE EN SERVICE avec commit de migration exécuté PAR L'UTILISATEUR
+    (le guard anti-DB bloque légitimement les agents sur git rm --cached).
+  tags:
+    - companyos-v1
+    - automation
+    - bookkeeping
+    - write-permit
+    - defense-in-depth
+    - sealing
+    - git
+    - persistence
+    - rfc-lifecycle
+    - rust
+    - implementation
+  related:
+    - id: cde13417-5014-4bf5-9daa-edc3f6d257a6
+      kind: rfc
+      relationship: input
+    - id: 3779b2a7-483d-444c-ac57-abfecf2d6ca1
+      kind: task-request
+      relationship: input
+
+spec:
+  overview: >
+    Ordre imposé par les dépendances : (0) caller-inventory frais avant
+    toute signature touchée ; (1) constante SEAL_FILENAME ; (2) primitives
+    db.rs additives (list_all_permits, insert_permit_row, unconsume_permit) ;
+    (3) primitives engine.rs additives (write_permits_seal export canonique,
+    reseed_permits_from_seal, wrappers) ; (4) seal_permits_commit remplace
+    seal_db_commit (pathspec + --no-verify) ; (5) grant : retrait du
+    checkpoint_truncate, bascule sur seal_permits_commit ; (6) consume :
+    séquence A1.4c ; (7) reseed PILIER D borné au boot ; (8) protected-zones
+    seal_path + guard hook ; (9) Source B JSON + fallback legacy ; (10) A2
+    lifecycle commits ; (11) A3 reminders ; (12) tests 3 axes Rust ; (13)
+    tests 3 axes JS ; (14) make ci vert ; (15) commit du code + consume ;
+    (16) mise en service (deploy-serve, restart, migration humaine) ;
+    (17) clôture (rfc_set_implemented, task-request done, lesson).
+    Chaque volet A1.x est isolé pour un commit atomique compilable.
+    Le code Rust est purement ADDITIF sur les signatures pub existantes
+    (pattern lesson 50409fb0) : aucune signature pub de crates/orchestrator
+    n'est modifiée, seul seal_db_commit (méthode PRIVÉE, aucune frontière
+    de crate) est renommé/réécrit.
+
+  steps:
+    - description: >
+        ÉTAPE 0 — CALLER-INVENTORY FRAIS (avant toute écriture). Recenser à
+        nouveau, au cas où des callers auraient été ajoutés depuis la
+        rédaction du RFC, via rg + LSP get_references :
+        (a) seal_db_commit : confirmer qu'il reste une méthode PRIVÉE de
+        OrchestratorServer avec exactement 2 call-sites de PRODUCTION
+        (grant_write_permit idempotent replay ~main.rs L1047, new grant
+        ~L1122) + les tests unitaires (~L2465-2527). Aucun caller
+        cross-crate (méthode privée). VÉRIFIÉ à la rédaction : 2 prod + 4
+        tests, aucune frontière de crate.
+        (b) checkpoint_truncate() au grant : confirmer le call-site ~L1112
+        (à RETIRER) et le call-site du graceful shutdown ~L2229 (à
+        CONSERVER, PILIER C). VÉRIFIÉ : 2 call-sites main.rs + wrapper
+        engine L1393 + test db.rs L2109.
+        (c) Source B call-sites JS : permitIdsFromHeadDb est INTERNE à
+        defense-in-depth-core.mjs, appelé uniquement par buildBaseline
+        (~L353) et exporté pour les tests. VÉRIFIÉ.
+        (d) into_db_for_rebuild / OrchestratorDb::open au boot : la branche
+        rebuild construit new_db (~L1985) puis new_engine ; le boot normal
+        ouvre à ~L1929. VÉRIFIÉ : ce sont les deux points d'ancrage du
+        reseed (étape 7).
+        Si la liste diverge du périmètre du permit bdbac2ab (un caller hors
+        des 8 target_paths), STOPPER et signaler à l'Architect/PM AVANT
+        toute écriture (extension de permit). Ne pas contourner un permit
+        incomplet.
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+        - crates/orchestrator/src/engine.rs
+        - crates/orchestrator/src/db.rs
+        - company/plugins/defense-in-depth-core.mjs
+
+    - description: >
+        ÉTAPE 1 — Constante SEAL_FILENAME. Ajouter dans constants.rs, à côté
+        de DB_FILENAME (inchangé) et sous la section "Data directory" :
+        `pub const SEAL_FILENAME: &str = "permits-seal.json";`. DATA_DIR
+        réutilisé tel quel. Aucun caller existant (symbole créé). Build
+        check : cargo check du crate config.
+      files:
+        - crates/config/src/constants.rs
+
+    - description: >
+        ÉTAPE 2 — Primitives db.rs (additives, aucune signature pub
+        existante modifiée). Ajouter trois méthodes sur OrchestratorDb :
+        (a) `pub fn list_all_permits(&self) -> Result<Vec<WritePermit>, OrchestratorError>`
+        : SELECT * FROM write_permits ORDER BY id (ordre déterministe pour
+        l'export canonique) ; réutiliser le mapping de ligne existant du
+        struct WritePermit (ne pas dupliquer : factoriser si un
+        row_to_permit privé existe déjà).
+        (b) `pub fn insert_permit_row(&self, permit: &WritePermit) -> Result<(), OrchestratorError>`
+        : INSERT explicite de TOUTES les colonnes (id, rfc_id, granted_to,
+        target_paths sérialisés comme aujourd'hui, status, granted_at,
+        consumed_at) — utilisé par le reseed, doit préserver le status et
+        les timestamps d'origine (PAS de génération de nouveaux).
+        (c) `pub fn unconsume_permit(&self, id: Uuid) -> Result<(), OrchestratorError>`
+        : UPDATE write_permits SET status='active', consumed_at=NULL WHERE
+        id=?1 AND status='consumed' ; rollback du consume si le seal échoue.
+        Retourner PermitNotFound si aucune ligne consumed ne matche.
+      files:
+        - crates/orchestrator/src/db.rs
+
+    - description: >
+        ÉTAPE 3 — Primitives engine.rs (additives). Ajouter :
+        (a) `pub fn write_permits_seal(&self, root: &str) -> Result<String, OrchestratorError>`
+        : lit self.db.list_all_permits(), construit le JSON CANONIQUE au
+        format EXACT du RFC A1.1 :
+          {
+            "version": 1,
+            "permits": [
+              { "id": "<uuid>", "rfc_id": "<uuid>", "granted_to": "<persona>",
+                "target_paths": ["..."], "status": "active|consumed|revoked",
+                "granted_at": "<ts>", "consumed_at": "<ts>|null" }
+            ]
+          }
+        Tri par id croissant (déterminisme), sérialisation stable
+        (serde_json avec clés ordonnées via un struct dédié SealFile/
+        SealPermit derive Serialize dans l'ordre déclaré). Écriture
+        ATOMIQUE : fichier temporaire dans company/data/ + std::fs::rename
+        (jamais d'écriture partielle visible). Chemin cible construit via
+        constants::DATA_DIR + SEAL_FILENAME. Retourne le chemin relatif
+        "company/data/permits-seal.json".
+        (b) `pub fn reseed_permits_from_seal(&self, seal_json: &str) -> Result<usize, OrchestratorError>`
+        : parse le JSON, REFUSE (erreur) si list_all_permits() n'est pas
+        vide (garde table-vide, protège un état vivant), sinon
+        insert_permit_row pour chaque entrée, retourne le count. JSON
+        invalide -> Err remontée (le boot la traite en warning non fatal,
+        étape 7).
+        (c) wrappers engine `pub fn insert_permit_row`, `unconsume_permit`,
+        `list_all_permits` délégant à self.db (cohérence d'API : main.rs
+        appelle engine, pas db directement).
+      files:
+        - crates/orchestrator/src/engine.rs
+
+    - description: >
+        ÉTAPE 4 — seal_permits_commit remplace seal_db_commit (main.rs,
+        méthode privée). Conserver la SIGNATURE
+        (permit_id: Uuid, rfc_id: Uuid) -> Result<String, SealError> et
+        l'enum SealError + sa taxonomie à l'identique (GitNotFound,
+        GitFailed, IndexLocked, NothingToCommit). Nouveau corps :
+        (i) self.engine.lock() n'est PAS reprise ici — la méthode reçoit
+        déjà l'engine verrouillé par l'appelant (comme aujourd'hui) ;
+        appeler engine.write_permits_seal(&self.root_path) pour matérialiser
+        le JSON AVANT git.
+        (ii) `git add -- company/data/permits-seal.json` (le -f DISPARAÎT :
+        le .json ne matche pas *.db*). Chemin construit via DATA_DIR +
+        SEAL_FILENAME.
+        (iii) `git -c commit.gpgsign=false commit --no-verify -m
+        "chore: seal write permit <id> for RFC <rfc>" --
+        company/data/permits-seal.json`. Le --no-verify est la CONVENTION
+        COMMITS SERVEUR (RFC A1.4, itération 2) : le pre-commit lance make
+        ci inconditionnellement ; ce contenu est machine-généré et
+        pathspec-scopé à un fichier non-code, la CI n'a pas d'objet, et la
+        défense ne repose PAS sur le pre-commit (guard hook en amont).
+        (iv) LC_ALL=C / LANG=C conservés (lesson d5c9c933 : sortie git
+        localisée casse la détection NothingToCommit). Détection
+        is_index_locked / is_nothing_to_commit inchangée.
+        Renommer les 2 call-sites de production (grant, étape 5) et adapter
+        le doc-comment (référence RFC cde13417 en plus de 359f9162).
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+
+    - description: >
+        ÉTAPE 5 — grant_write_permit : retrait du checkpoint + bascule seal.
+        (a) SUPPRIMER l'étape (c) checkpoint_truncate (~L1109-1119) : elle
+        n'existait que pour que le .db committé contienne le permit
+        fraîchement inséré ; l'export JSON lit la connexion vivante et n'en
+        a pas besoin. NE PAS toucher le checkpoint_truncate du graceful
+        shutdown (~L2229, PILIER C intact).
+        (b) Remplacer les 2 appels self.seal_db_commit(...) (idempotent
+        replay ~L1047 + new grant ~L1122) par self.seal_permits_commit(...).
+        Sémantique inchangée : idempotence -> grant -> seal -> rollback
+        (delete_permit) si échec sur un grant neuf ; NothingToCommit sur le
+        rejeu idempotent reste un succès (état déjà scellé). Vérifier que le
+        rollback delete_permit reste appelé sur SealError (hors
+        NothingToCommit du replay).
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+
+    - description: >
+        ÉTAPE 6 — consume_write_permit : seal au consume, séquence A1.4c
+        EXACTE (les étapes 3-4 ne précèdent JAMAIS la 2, pour que le JSON
+        reflète consumed AVANT le commit). Après le token check et la
+        GARDE 3 (check_worktree_clean sur target_paths, INCHANGÉE) :
+        (1) lookup du permit (get_permit). S'il est DÉJÀ consumed (rejeu) :
+        chemin idempotent — ré-export du seal + seal_permits_commit-like
+        (add + commit pathspec --no-verify, message "chore: seal consume of
+        write permit <id>") ; NothingToCommit => succès idempotent ; commit
+        créé => succès avec hash (rattrape un rejeu après échec de seal
+        antérieur). Ne PAS re-consommer.
+        (2) engine.consume_permit : transition DB active -> consumed.
+        (3) engine.write_permits_seal : l'export lit la DB APRÈS (2), le
+        JSON reflète donc consumed.
+        (4) git add + commit pathspec --no-verify (message consume).
+        (5) Si (3) ou (4) échoue : engine.unconsume_permit (consumed ->
+        active), PUIS ré-export du seal (best effort, warning loggé si ce
+        ré-export échoue lui-même — le JSON disque redevient cohérent avec
+        la DB), PUIS erreur MCP explicite (symétrique du rollback du grant).
+        Le rejeu après correction retrouve un permit active et repasse par
+        (2) : idempotence par l'ÉTAT, pas par mémoire.
+        NON-INTERFÉRENCE : le commit de seal est émis par le serveur (pas un
+        bash d'agent), non intercepté par le hook ; l'invariant
+        consume-en-dernier (lesson 8fd49300) est intact — les commits de
+        code de l'agent précèdent le consume, le seal machine le suit.
+        Factoriser le "add + commit pathspec --no-verify" en un helper privé
+        commun avec seal_permits_commit (même LC_ALL=C, même SealError, seul
+        le message diffère) pour éviter la duplication.
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+
+    - description: >
+        ÉTAPE 7 — Reseed PILIER D borné (boot, main.rs). Le reseed est
+        branché EXCLUSIVEMENT sur les deux chemins où write_permits est
+        vide PARCE QUE le store vient d'être recréé :
+        (a) branche rebuild de l'autorepair : après into_db_for_rebuild +
+        reindex_all, sur le new_engine (~L1985-1999), AVANT de servir.
+        (b) DB absente avant open : capturer un flag `db_existed =
+        std::path::Path::new(&db_file).exists()` AVANT le premier
+        OrchestratorDb::open (~L1929, qui CRÉE le fichier) ; si !db_existed,
+        reseed après migrate.
+        Un boot NORMAL (DB existante et saine) ne reseed JAMAIS, même table
+        vide : une table vide sur DB saine est un état LÉGITIME et délibéré
+        (revert de tampering par le hook, rollback de grant) qu'un reseed
+        écraserait en ressuscitant des permits volontairement supprimés.
+        Mécanique du reseed (helper commun aux deux branches) : si
+        `git cat-file -e HEAD:company/data/permits-seal.json` réussit (Command
+        git, LC_ALL=C), lire `git show HEAD:<seal>` -> engine.reseed_permits_
+        from_seal(json). Échec git OU JSON invalide OU reseed refusé (table
+        non vide) : warning loggé sur stderr, boot NON fatal (comportement
+        actuel préservé : table vide). Le reseed lit EXCLUSIVEMENT HEAD
+        (ancre tamper-evident), JAMAIS le fichier disque. Double garde :
+        branche (a)/(b) uniquement ET reseed_permits_from_seal refuse une
+        table non vide.
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+
+    - description: >
+        ÉTAPE 8 — protected-zones.json seal_path + guard hook. (a) Ajouter
+        dans company/config/protected-zones.json la clé
+        `"seal_path": "company/data/permits-seal.json"` (même modèle que
+        db_path : consommée par les plugins JS, IGNORÉE par serde côté Rust
+        car ProtectedZones ne déclare pas deny_unknown_fields — vérifié). NE
+        PAS l'ajouter à "files" : le pre-commit exigerait alors un permit
+        couvrant ce path et bloquerait les commits de seal du serveur.
+        (b) defense-in-depth-core.mjs : charger _zones.seal_path (à côté de
+        db_path, dans le loader de zones). Nouveau guard (même famille que
+        les guards anti-DB / anti-sqlite3, dans tool.execute.before) : refus
+        de toute commande bash référençant seal_path ET de tout write/edit
+        d'agent (input.tool in write/edit/mcp_write/mcp_edit) dont le
+        file_path résout vers seal_path. Message diagnostic clair (fichier
+        machine-owned, écrit uniquement par le serveur). Les écritures
+        serveur (std::fs + git) ne passent pas par le hook (précédent
+        RFC 1c0f2570).
+      files:
+        - company/config/protected-zones.json
+        - company/plugins/defense-in-depth-core.mjs
+
+    - description: >
+        ÉTAPE 9 — Source B du hook (JSON + fallback legacy). Dans
+        defense-in-depth-core.mjs, ajouter `permitIdsFromHeadSeal(rootDir)` :
+        `git cat-file -e "HEAD:<seal_path>"` ; si présent, `git show
+        "HEAD:<seal_path>"` -> JSON.parse -> new Set(permits.map(p => p.id))
+        (Set éventuellement VIDE = EXPLOITABLE, contribue 0+ ids à l'union).
+        Absence en HEAD OU parse en échec OU structure inattendue ->
+        FALLBACK sur permitIdsFromHeadDb (legacy .db HEAD via /tmp + sqlite3,
+        CONSERVÉE transitoirement pour que le nouveau hook fonctionne AVANT
+        le commit de migration A1.8 ; retrait au v1-harness-refactor). Si
+        les DEUX voies échouent -> null (inexploitable). buildBaseline
+        appelle DÉSORMAIS permitIdsFromHeadSeal comme Source B (au lieu de
+        permitIdsFromHeadDb directement) ; le contrat null-vs-Set-vide est
+        INCHANGÉ au caractère près : baseline = union(Source A, Source B),
+        nucléaire seulement si les deux sont null. Ne PAS toucher parsePermitIds
+        (Source A) ni revertPermitTampering (invariant bde023e2 préservé).
+      files:
+        - company/plugins/defense-in-depth-core.mjs
+
+    - description: >
+        ÉTAPE 10 — A2 commits lifecycle. main.rs : helper privé
+        `lifecycle_commit(&self, rel_path: &str, msg: &str) -> Result<Option<String>, ...>`
+        : `git add -- <rel_path>` + `git -c commit.gpgsign=false commit
+        --no-verify -m <msg> -- <rel_path>` (convention commits serveur A1.4,
+        même rationale), LC_ALL=C, NothingToCommit TOLÉRÉ (idempotence,
+        renvoie Ok(None)). Brancher sur les DEUX écritures serveur de cycle
+        de vie RFC :
+        (a) close_review_round quand rfc_auto_updated=true : après la
+        transition, lifecycle_commit(<rfc_file_path>, "chore(rfc): <id8>
+        approved (close_review_round)").
+        (b) rfc_set_implemented : après set_rfc_implemented, lifecycle_commit
+        (<rfc_file_path>, "chore(rfc): <id8> implemented (rfc_set_implemented)").
+        Échec du commit NON FATAL (contrairement au seal) : la transition
+        serveur est déjà effective et légitime sans lui. La réponse MCP porte
+        `lifecycle_commit: "<hash>"|null` + un warning en cas d'échec. Le
+        chemin du fichier RFC provient de l'outcome de la transition
+        (file_path déjà exposé par SetImplementedOutcome / close_round). NE
+        PAS toucher supersede_artifact (hors scope, décision RFC).
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+
+    - description: >
+        ÉTAPE 11 — A3 lifecycle_reminders (M19). engine.rs :
+        `pub fn open_task_request_reminders(&self, root: &str, rfc_id: Uuid) -> Vec<String>`
+        (additif) : résout les related du RFC dans les DEUX sens via
+        artifact_relations (réutiliser self.related / la logique
+        bidirectionnelle existante), filtre kind=task-request, lit
+        spec.status dans le YAML source à la volée (pattern calcul-à-la-
+        lecture RFC a5f25718 : la table artifacts n'a pas de colonne
+        status). Tout status hors {done, cancelled} produit :
+        "Related task-request <id8> '<title>' is still '<status>' — if this
+        RFC completes it, set it to done (or cancelled); if other work
+        remains, leave it open." main.rs : rfc_set_implemented ajoute le
+        champ `lifecycle_reminders` (array de strings, éventuellement vide) à
+        sa réponse JSON, à côté du rappel de capitalisation M19 existant
+        (build_set_implemented_response). NON bloquant : l'algorithme
+        rappelle, le LLM décide (acceptance criterion 4 : auto-clôture
+        explicitement rejetée). Robustesse : un YAML illisible pour un
+        related donné produit un warning silencieux (pas de reminder pour
+        cette entrée), jamais une erreur qui casserait la transition.
+      files:
+        - crates/orchestrator/src/engine.rs
+        - crates/mcp-servers/orchestrator/src/main.rs
+
+    - description: >
+        ÉTAPE 12 — Tests Rust aux 3 axes (dans les modules de test EXISTANTS,
+        crate-local). Par volet :
+        write_permits_seal : NOMINAL (2 permits actif+consumed -> JSON trié
+        par id, format exact, consumed_at null vs valeur) ; NÉGATIF (dossier
+        company/data absent -> création ; rename échoue -> Err propre) ;
+        EDGE (0 permit -> {"version":1,"permits":[]} ; target_paths avec
+        caractères à échapper JSON).
+        reseed_permits_from_seal : NOMINAL (table vide + JSON 2 permits ->
+        2 insérés, status/timestamps préservés) ; NÉGATIF (table NON vide ->
+        refus Err ; JSON invalide -> Err) ; EDGE (JSON {"version":1,
+        "permits":[]} -> 0 inséré, Ok).
+        seal_permits_commit : NOMINAL (repo tmp git -> hash) ; NÉGATIF (pas
+        de repo git -> GitNotFound ; index.lock -> IndexLocked) ; EDGE
+        (rejeu sans changement -> NothingToCommit). Réutiliser le harness
+        git-tempdir existant (env git assaini, cf. pre-commit L118-135).
+        consume A1.4c : NOMINAL (active -> consumed + seal committé) ;
+        NÉGATIF (seal en échec -> unconsume, permit repasse active,
+        ré-export tenté) ; EDGE (rejeu sur permit déjà consumed -> succès
+        idempotent, NothingToCommit).
+        reseed boot borné : NOMINAL (branche rebuild : table vidée puis
+        reseed depuis HEAD) ; NÉGATIF (HEAD sans seal -> boot table vide non
+        fatal) ; EDGE (boot NORMAL table vide -> PAS de reseed, garde
+        respectée).
+        open_task_request_reminders : NOMINAL (related task-request en
+        backlog -> reminder) ; NÉGATIF (related done/cancelled -> aucun
+        reminder ; YAML illisible -> pas de crash) ; EDGE (aucun related
+        task-request -> Vec vide).
+      files:
+        - crates/orchestrator/src/db.rs
+        - crates/orchestrator/src/engine.rs
+        - crates/mcp-servers/orchestrator/src/main.rs
+
+    - description: >
+        ÉTAPE 13 — Tests JS aux 3 axes (defense-in-depth-core.test.mjs, EN
+        ZONE PROTÉGÉE, déjà dans affected_files — précédent 655fb3fb).
+        permitIdsFromHeadSeal : NOMINAL (HEAD a un seal JSON valide 2 permits
+        -> Set de 2 ids) ; NÉGATIF (git absent / show échoue -> fallback
+        legacy) ; EDGE (seal JSON {"permits":[]} -> Set VIDE exploitable ;
+        JSON corrompu -> fallback legacy puis null si legacy absent aussi).
+        buildBaseline via Source B JSON : NOMINAL (union Source A + Source B
+        JSON) ; NÉGATIF (Source A null + Source B seal null + legacy null ->
+        baseline null -> nucléaire borné) ; EDGE (Source A vide + Source B
+        seal vide -> baseline Set vide déterminable -> DELETE sur tout,
+        ferme la faille L230). Vérifier explicitement la distinction
+        null-vs-Set-vide.
+        guard seal_path : NOMINAL (write/edit d'agent sur seal_path ->
+        refusé) ; NÉGATIF (bash référençant seal_path -> refusé) ; EDGE
+        (write serveur simulé hors hook -> non concerné ; write sur un autre
+        .json de company/data -> autorisé, guard strict sur seal_path exact).
+      files:
+        - company/plugins/tests/defense-in-depth-core.test.mjs
+
+    - description: >
+        ÉTAPE 14 — make ci vert AVANT tout commit (write_permit_full_sequence
+        étape 3). Lancer `make ci` (fmt + clippy + tests Rust + validation
+        YAML) et `node --test company/plugins/tests/` (suite JS) jusqu'au
+        vert intégral. La CI est la source de vérité du critère done. Un CI
+        rouge s'arrête ici : corriger avant de committer (le pre-commit le
+        relancerait de toute façon en bloquant sur les commits d'AGENT). Ne
+        PAS utiliser --no-verify pour les commits d'agent (interdit ; le
+        --no-verify du RFC est réservé au canal serveur headless).
+      files: []
+
+    - description: >
+        ÉTAPE 15 — Commit du code + consume du permit (ordre
+        write_permit_full_sequence). git add des 7 fichiers de code/config
+        modifiés + le YAML de ce plan, git commit (le pre-commit relance
+        make ci en bloquant — doit passer). Le fichier
+        company/data/permits-seal.json (created) sera écrit par le SERVEUR au
+        prochain boot, PAS committé ici par l'agent (il n'est pas dans un
+        commit d'agent ; sa première apparition en HEAD est le commit de
+        migration humain, étape 16). PUIS consume_write_permit(permit_id=
+        bdbac2ab-ad0a-4bcc-87b4-1b9c0a5dde31) — APRÈS le commit (GARDE 3 :
+        worktree propre sur les target_paths exigé, sinon refus mécanique).
+        reload_config N'EST PAS requis (la config orchestrator Rust ne change
+        pas ; seal_path n'est lu que par le hook JS).
+      files:
+        - crates/config/src/constants.rs
+        - crates/orchestrator/src/db.rs
+        - crates/orchestrator/src/engine.rs
+        - crates/mcp-servers/orchestrator/src/main.rs
+        - company/plugins/defense-in-depth-core.mjs
+        - company/plugins/tests/defense-in-depth-core.test.mjs
+        - company/config/protected-zones.json
+
+    - description: >
+        ÉTAPE 16 — MISE EN SERVICE (ordre impératif A1.8, RFC 18011bfc +
+        25b6678c). (i) `make deploy-serve` : promotion atomique des binaires
+        servis (des crates serveur ont changé) ; au premier boot des nouveaux
+        binaires, le serveur écrit company/data/permits-seal.json s'il est
+        absent, SANS le committer, et NE reseed PAS (DB vivante intacte, table
+        non vide, garde de l'étape 7 respectée). (ii) DEMANDER À L'UTILISATEUR
+        de redémarrer opencode : le PLUGIN defense-in-depth-core.mjs a changé,
+        son rechargement passe par un restart opencode (le nouveau hook a le
+        fallback legacy, donc la fenêtre (ii)->(iii) reste couverte par la
+        lecture du .db HEAD). (iii) COMMIT DE MIGRATION exécuté PAR
+        L'UTILISATEUR (le guard anti-DB du hook bloque légitimement les agents
+        sur git rm --cached du db_path ; parade échappatoire humaine
+        RFC 25b6678c). Prescrire le script exact dans
+        /tmp/opencode/migrate-cde13417.sh (contenu ci-dessous) et demander à
+        l'utilisateur de le lire puis l'exécuter depuis la racine du repo :
+        ---
+        #!/usr/bin/env bash
+        set -euo pipefail
+        cd "$(git rev-parse --show-toplevel)"
+        # Le seal doit exister (écrit par le serveur au boot de l'étape 16-i).
+        test -f company/data/permits-seal.json || {
+          echo "ERREUR: permits-seal.json absent — le serveur ne l'a pas encore écrit. Vérifier make deploy-serve (étape 16-i)."; exit 1; }
+        git add company/data/permits-seal.json
+        git rm --cached company/data/orchestrator.db
+        # .gitignore INCHANGÉ : *.db* (ligne 3) couvre déjà orchestrator.db ;
+        # après le rm --cached, l'ignore redevient effectif automatiquement,
+        # aucune édition de .gitignore n'est nécessaire (RFC : .gitignore inchangé).
+        git commit -m "chore: untrack orchestrator.db, permits sealed in permits-seal.json (RFC cde13417)"
+        echo "OK: orchestrator.db untracké, permits-seal.json committé. git status ne doit plus montrer la DB."
+        ---
+        Après (iii), .gitignore *.db* est effectif, git status ne montre plus
+        jamais la DB, et la branche primaire JSON de la Source B est
+        exploitable. AUCUNE réécriture d'historique (les 94 blobs restent,
+        décision utilisateur hors scope).
+      files: []
+
+    - description: >
+        ÉTAPE 17 — Clôture du domaine. (a) rfc_set_implemented(id=cde13417)
+        : transition approved -> implemented (self-test : la réponse doit
+        désormais porter lifecycle_reminders ET, si git le permet,
+        lifecycle_commit — dogfooding des étapes 10/11). (b) Passer le
+        task-request 3779b2a7 en status: done (édition YAML du task-request,
+        hors zone protégée). (c) LESSON de clôture du domaine v1-automation :
+        chercher via search() une lesson proche (bd4650e2 friction B,
+        595b2d8d, d5c9c933) ; créer une lesson capitalisant : la sortie
+        d'orchestrator.db de git via seal JSON dédié, le --no-verify comme
+        convention machine bornée au canal serveur, la séquence seal-au-
+        consume anti-résurrection, le reseed PILIER D borné. Chaîner dans
+        metadata.related (derived-from d5c9c933 sur le seal ; related
+        bd4650e2/595b2d8d sur la friction M permanent résolue ; supersede si
+        une lesson est rendue obsolète). Respecter lesson_chaining.
+      files: []
+
+  dependencies:
+    - "RFC cde13417 approved (status: approved, approved_at posé au round 47a6f551)"
+    - "Write permit bdbac2ab-ad0a-4bcc-87b4-1b9c0a5dde31 actif sur les 8 target_paths (grant avec user_approval_confirmed=true, trigger M15 access-matrix)"
+    - "make deploy-serve disponible (RFC 18011bfc) pour la promotion des binaires servis (étape 16-i)"
+    - "Restart opencode par l'utilisateur pour recharger le plugin JS (étape 16-ii)"
+    - "Commit de migration exécuté par l'utilisateur (étape 16-iii) : le guard anti-DB bloque les agents"
+
+  risks:
+    - "Locale git : toute nouvelle invocation git (seal consume, lifecycle, reseed cat-file/show) DOIT forcer LC_ALL=C/LANG=C, sinon la détection NothingToCommit/index.lock casse silencieusement (lesson d5c9c933). Risque de régression si un helper oublie l'env."
+    - "Ordre A1.4c : inverser (3)/(2) ferait committer un seal reflétant encore 'active' -> NothingToCommit masquerait un seal obsolète et un permit consumed ressusciterait au reseed. L'ordre export-APRÈS-transition est non négociable (finding review itération 1)."
+    - "Reseed non borné : brancher le reseed sur le boot normal (pas seulement rebuild/db-absente) ressusciterait des permits volontairement supprimés (revert de tampering, rollback de grant). La double garde branche+table-vide est critique."
+    - "Fenêtre de migration : si le commit humain (16-iii) est fait AVANT le restart opencode (16-ii), le nouveau .db n'est plus en HEAD mais l'ancien hook (encore chargé) cherche le .db HEAD -> Source B legacy null. D'où l'ordre impératif i->ii->iii ; le fallback legacy couvre ii->iii."
+    - "Guard seal_path : un guard trop large (préfixe company/data/) bloquerait des écritures légitimes d'autres fichiers ; le guard doit matcher seal_path EXACT. Un guard trop étroit laisserait un agent forger le seal disque (mais le reseed ne lit que HEAD, atténuation)."
+    - "Test JS en zone protégée : defense-in-depth-core.test.mjs est protégé ; toute écriture exige le permit bdbac2ab actif (il couvre ce path). Consommer le permit APRÈS le commit de TOUS les fichiers protégés (étape 15)."
+    - "make ci sous engine lock : le --no-verify supprime le make ci des commits SERVEUR (gain), mais si un helper serveur oubliait --no-verify, un grant/consume relancerait make ci sous l'engine lock (gel de plusieurs minutes). Vérifier --no-verify sur les 3 canaux (seal grant, seal consume, lifecycle)."
