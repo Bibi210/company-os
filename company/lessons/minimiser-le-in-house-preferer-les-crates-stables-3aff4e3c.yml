@@ -1,0 +1,86 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 3aff4e3c-fe6b-4079-a589-0de7a05c3a9e
+  title: >
+    Minimiser le in-house : si une crate stable et reconnue couvre le besoin,
+    on l'adopte au lieu de réimplémenter ; et pas de littéraux magiques dans le code
+  author: pm
+  created_at: "2026-08-25"
+  description: >
+    Directive utilisateur érigée en principe permanent (2026-08-25, second
+    volet du jour après cc0ca5d7), ajoutée au périmètre du domaine
+    v1-rust-audit (roadmap a410bb43, task-request 0db7585b). Deux règles de
+    code. (1) Ne pas réinventer la roue : avant d'écrire un composant
+    in-house (parsing, matching, retry, sérialisation, glob, locking, etc.),
+    vérifier si une crate stable et reconnue par la communauté couvre le
+    besoin ; si oui, on l'adopte TOUJOURS au lieu de coder in-house. Le code
+    maison est limité au strict minimum : la logique métier propre à
+    CompanyOS. (2) Pas de littéraux magiques : toute valeur littérale
+    porteuse de sens (seuil, timeout, chemin, nom de table, code d'erreur,
+    format) est nommée en constante typée à un seul endroit. Un littéral
+    répété ou non nommé est un invariant que rien ne fait respecter, même
+    famille de red flag que la primitive obsession (cc0ca5d7).
+  tags:
+    - rust
+    - dependencies
+    - crates
+    - not-invented-here
+    - in-house
+    - code-reuse
+    - magic-literals
+    - constants
+    - maintainability
+    - code-review
+    - user-directive
+    - companyos-v1
+  related:
+    - id: cc0ca5d7-f6e6-452c-9864-a84971a9473e
+      kind: lesson-learned
+      relationship: related
+    - id: e8be5814-8e94-4561-ac6d-27a1785809c7
+      kind: lesson-learned
+      relationship: derived-from
+
+spec:
+  context: >
+    Au lancement du domaine v1-rust-audit (2026-08-25, ~14 000 LOC Rust sur
+    4 crates + 2 serveurs MCP, jamais de passe d'hygiène globale),
+    l'utilisateur a fixé deux critères d'audit supplémentaires, en plus du
+    dead code, de la duplication, des API sans callers et de la passe
+    primitive-obsession (cc0ca5d7). Le code de CompanyOS a grandi
+    organiquement au fil de 20+ RFCs : le risque identifié est double, des
+    valeurs littérales disséminées qui encodent des décisions sans les
+    nommer, et des composants maison qui refont ce que l'écosystème Rust
+    fournit déjà en mieux (testé, maintenu, documenté par la communauté).
+
+  insight: >
+    Le code in-house est un passif, pas un actif : chaque ligne maison doit
+    être comprise, testée, maintenue et auditée par nous seuls, alors qu'une
+    crate stable et reconnue mutualise ce coût sur toute la communauté
+    (fuzzing, revues, edge cases découverts par des milliers d'usages). Le
+    critère d'adoption est la stabilité et la reconnaissance communautaire
+    (maturité, maintenance active, usage répandu), pas la nouveauté. La
+    valeur différenciante de CompanyOS est sa logique métier (orchestration,
+    permits, artifacts), jamais ses utilitaires. Même logique pour les
+    littéraux : un littéral magique est la forme la plus locale du même mal,
+    une connaissance non institutionnalisée. La valeur existe mais rien ne la
+    nomme, rien ne la centralise, rien n'empêche sa divergence entre deux
+    occurrences. C'est l'application au code du test spirituel du programme
+    V1 : la connaissance doit vivre dans une structure qui la fait respecter
+    (le type, la constante, la crate éprouvée), pas dans la mémoire de celui
+    qui a écrit la ligne.
+
+  recommendation: >
+    En écriture de code : avant d'implémenter un utilitaire, chercher la
+    crate établie qui le fait (crates.io, blessed.rs) ; ne coder in-house
+    que si aucune crate stable et reconnue ne couvre le besoin, et justifier
+    ce choix explicitement dans le plan ou le RFC. Nommer toute valeur
+    littérale porteuse de sens en constante typée, définie à un seul
+    endroit. En review (Architect, Implementer) : un utilitaire réinventé ou
+    un littéral magique est un finding correctif au même titre qu'un champ
+    String porteur d'invariant (cc0ca5d7). Pour v1-rust-audit : le
+    diagnostic-report recense chaque composant in-house redondant avec sa
+    crate candidate (nom, version, maturité) et chaque littéral magique avec
+    sa constante cible ; le RFC d'application arbitre les remplacements en
+    pesant le coût de migration contre le passif de maintenance.

@@ -37,7 +37,20 @@ metadata:
     - id: be16dc46-0a2c-470c-a1f4-8f89a98abdbf
       kind: lesson-learned
       relationship: input
+    - id: 3aff4e3c-fe6b-4079-a589-0de7a05c3a9e
+      kind: lesson-learned
+      relationship: input
   changelog:
+    - date: "2026-08-25"
+      author: pm
+      description: >
+        Directive utilisateur : deux critères ajoutés au périmètre de
+        v1-rust-audit. (1) Éviter les littéraux dans le code (constantes
+        nommées et typées, prolonge cc0ca5d7). (2) Minimiser le in-house :
+        toute fonctionnalité couverte par une crate stable et reconnue de
+        la communauté est adoptée au lieu d'être réimplémentée. Directive
+        capitalisée en lesson 3aff4e3c, task-request 0db7585b mis à jour
+        en cohérence.
     - date: "2026-08-25"
       author: pm
       description: >
@@ -370,7 +383,7 @@ spec:
       ref:
         type: loose
         category: exploration
-        label: "~12 700 LOC sur 4 crates + 2 serveurs MCP : dead code, duplication, API sans callers"
+        label: "~12 700 LOC sur 4 crates + 2 serveurs MCP : dead code, duplication, API sans callers, littéraux magiques, in-house vs crates"
       timeframe: future
       status: planned
       target_date: "2026-Q4"
@@ -380,6 +393,14 @@ spec:
         Crate par crate : code mort (cargo +nightly udeps, clippy,
         get_references LSP), API publiques sans callers (cf. lesson
         ea6e9dd1), duplication entre crates, dépendances inutilisées.
+        Deux critères ajoutés par directive utilisateur (2026-08-25) :
+        (1) pas de littéraux magiques dans le code, toute valeur littérale
+        porteuse de sens est nommée en constante typée (prolonge la lesson
+        cc0ca5d7 : les invariants vivent dans les types) ; (2) minimiser le
+        in-house, si une crate stable et reconnue par la communauté couvre
+        un besoin, on l'adopte au lieu de réimplémenter (lesson 3aff4e3c),
+        le diagnostic recense chaque composant in-house redondant avec sa
+        crate candidate.
         Dépend des schemas (le code valide ce que les schemas définissent)
         et de v1-automation (les nouveaux mécanismes s'écrivent pendant
         cet audit, autant ne creuser le code qu'une fois).
