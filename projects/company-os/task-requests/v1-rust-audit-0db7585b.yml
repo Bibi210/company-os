@@ -1,0 +1,81 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 0db7585b-a58a-477a-ab38-a4757ed03029
+  title: "V1 rust : audit crate par crate (dead code, duplication, API sans callers, primitive obsession)"
+  author: pm
+  created_at: "2026-08-25"
+  project: company-os
+  description: >
+    Domaine v1-rust-audit du programme companyos-v1 (roadmap a410bb43).
+    Première passe globale sur les ~14000 lignes de Rust (4 crates + 2
+    serveurs MCP) depuis la création du projet : code mort, duplication
+    entre crates, API publiques sans callers, dépendances inutilisées, et
+    passe primitive-obsession exigée par la directive utilisateur du
+    2026-08-25 (lesson cc0ca5d7) : les invariants vivent dans les types,
+    String/bytes est un dernier recours. La correction de SealPermit
+    (8 champs String, RFC cde13417) est le premier cas d'application.
+    Directive utilisateur complémentaire du même jour (lesson 3aff4e3c) :
+    (1) passe littéraux magiques, toute valeur littérale porteuse de sens
+    est nommée en constante typée ; (2) passe anti-réinvention, minimiser
+    le in-house : tout composant maison redondant avec une crate stable et
+    reconnue de la communauté est recensé avec sa crate candidate, et
+    remplacé sauf justification explicite.
+  tags:
+    - companyos-v1
+    - rust
+    - audit
+    - dead-code
+    - primitive-obsession
+    - typage
+    - magic-literals
+    - crates
+    - not-invented-here
+  related:
+    - id: a410bb43-544c-44c8-b22a-6c3022df3fe3
+      kind: roadmap
+      relationship: input
+    - id: cc0ca5d7-f6e6-452c-9864-a84971a9473e
+      kind: lesson-learned
+      relationship: input
+    - id: 3aff4e3c-fe6b-4079-a589-0de7a05c3a9e
+      kind: lesson-learned
+      relationship: input
+
+spec:
+  priority: high
+  status: in_progress
+
+  context: >
+    Le code Rust a grossi organiquement au fil des 20+ RFCs sans jamais de
+    passe d'hygiène globale. Sources de vérité pour l'audit : cargo clippy
+    strict, cargo machete ou udeps (dépendances), rustc dead_code au-delà
+    des allow, get_references/grep pour les pub sans callers externes
+    (lesson ea6e9dd1), et lecture ciblée pour la duplication (le recensement
+    c981bf62 a déjà noté la triple implémentation du matching permit/path :
+    hors périmètre ici si v1-harness-refactor la couvre, à trancher).
+    Passe primitive-obsession : structs serde et signatures où des String
+    portent des invariants nommables (ids, statuts, timestamps, personas,
+    kinds, chemins). SealPermit est le cas d'école à corriger (le format
+    JSON du seal sur disque ne change PAS, seuls les types Rust portent
+    les invariants au parse).
+    Passe littéraux magiques (lesson 3aff4e3c) : seuils, timeouts, chemins,
+    noms de tables, codes d'erreur et formats disséminés en littéraux non
+    nommés ou répétés, à centraliser en constantes typées.
+    Passe anti-réinvention (lesson 3aff4e3c) : utilitaires in-house
+    (parsing, matching, retry, glob, locking, etc.) redondants avec une
+    crate stable et reconnue de la communauté ; le in-house est limité à la
+    logique métier propre à CompanyOS.
+
+  acceptance_criteria:
+    - "Un diagnostic-report recense crate par crate : code mort, pub sans callers, dépendances inutilisées, duplications, et les cas de primitive obsession avec le type cible proposé pour chacun"
+    - "Le diagnostic-report recense les littéraux magiques (avec la constante typée cible) et les composants in-house redondants avec une crate stable et reconnue (avec la crate candidate, sa maturité, et l'arbitrage remplacement vs conservation justifiée)"
+    - "Le code livré ne contient plus de littéral magique dans les zones auditées, et chaque conservation de code in-house redondant est explicitement justifiée dans le RFC"
+    - "Un RFC applique les corrections retenues (retraits pattern bd4650e2, typages), avec rétro-compatibilité des formats sérialisés vérifiée (permits-seal.json, DB, YAML)"
+    - "SealPermit est corrigé : chaque champ porte son invariant dans son type, format disque inchangé"
+    - "make ci vert, aucun changement de comportement observable hors messages d'erreur améliorés par le parse typé"
+
+  constraints:
+    - "Les retraits suivent le pattern bd4650e2 : retirer plutôt que documenter le non-usage ; un pub sans caller externe passe pub(crate) ou disparaît"
+    - "La duplication inter-couches JS/Rust (matching permit/path) reste à v1-harness-refactor si le fix exige de toucher les deux couches"
+    - "Pas de push sans validation du cycle complet"

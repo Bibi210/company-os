@@ -3,7 +3,7 @@
   "default_agent": "pm",
   "agent": {
     "pm": {
-      "model": "anthropic/claude-fable-5",
+      "model": "anthropic/claude-opus-5",
       "prompt": "{file:company/personas/pm.yml}"
     },
     "architect": {
@@ -11,11 +11,11 @@
       "prompt": "{file:company/personas/architect.yml}"
     },
     "implementer": {
-      "model": "anthropic/claude-opus-4-8",
+      "model": "anthropic/claude-opus-5",
       "prompt": "{file:company/personas/implementer.yml}"
     },
     "ceo": {
-      "model": "anthropic/claude-opus-4-8",
+      "model": "anthropic/claude-opus-5",
       "prompt": "{file:company/personas/ceo.yml}",
       "tools": {
         "write": false,
@@ -27,21 +27,34 @@
   "mcp": {
     "orchestrator": {
       "type": "local",
-      "command": ["node", "./company/plugins/mcp-proxy.mjs", "./target/serve/companyos-orchestrator-server"],
+      "command": [
+        "node",
+        "./company/plugins/mcp-proxy.mjs",
+        "./target/serve/companyos-orchestrator-server"
+      ],
       "environment": {
         "COMPANYOS_ROOT": "."
       }
     },
     "yaml-validator": {
       "type": "local",
-      "command": ["node", "./company/plugins/mcp-proxy.mjs", "./target/serve/companyos-yaml-validator"],
+      "command": [
+        "node",
+        "./company/plugins/mcp-proxy.mjs",
+        "./target/serve/companyos-yaml-validator"
+      ],
       "environment": {
         "COMPANYOS_ROOT": "."
       }
     }
   },
-  "instructions": ["company/config/personas.yml", "company/config/shared-rules.yml"],
-  "plugin": ["./company/plugins/defense-in-depth.mjs"],
+  "instructions": [
+    "company/config/personas.yml",
+    "company/config/shared-rules.yml"
+  ],
+  "plugin": [
+    "./company/plugins/defense-in-depth.mjs"
+  ],
   "permission": {
     "edit": "allow",
     "bash": "allow"
