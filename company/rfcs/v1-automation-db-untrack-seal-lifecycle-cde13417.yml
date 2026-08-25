@@ -5,7 +5,8 @@ metadata:
   title: "V1 automation : sortir orchestrator.db de git (seal dédié permits-seal.json), auto-commit des transitions lifecycle serveur, rappel task-requests non clos"
   author: architect
   created_at: "2026-08-14"
-  status: draft
+  status: approved
+  approved_at: "2026-08-25T18:50:04.776027343+00:00"
   description: >
     Solde le domaine v1-automation (task-request 3779b2a7, recensement
     672a141a, roadmap a410bb43) avec les trois automatisations retenues.
