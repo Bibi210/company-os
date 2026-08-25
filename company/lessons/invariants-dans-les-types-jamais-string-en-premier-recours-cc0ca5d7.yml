@@ -1,0 +1,84 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: cc0ca5d7-f6e6-452c-9864-a84971a9473e
+  title: "Les invariants vivent dans les types : String/bytes est un dernier recours, au même niveau de red flag qu'un littéral magique"
+  author: pm
+  created_at: "2026-08-25"
+  description: >
+    Directive utilisateur érigée en principe permanent (2026-08-25), déclenchée
+    par la struct SealPermit du RFC cde13417 : 8 champs, tous String (id, rfc_id,
+    granted_to, target_paths, status, granted_by, granted_at, consumed_at).
+    Dans un langage typé, chaque champ doit porter son invariant dans son type :
+    un id est un Uuid, un status est un enum fermé, un timestamp est un
+    DateTime, une persona est un PersonaId, un chemin est un type de chemin.
+    Passer par String/bytes est un dernier recours à justifier explicitement,
+    pas un défaut de confort. Un champ String qui encode implicitement un
+    invariant est du même niveau de red flag qu'une valeur en littéral dans le
+    code : l'invariant existe mais rien ne le fait respecter.
+  tags:
+    - rust
+    - typage
+    - invariants
+    - primitive-obsession
+    - newtype
+    - enum
+    - parse-dont-validate
+    - code-review
+    - user-directive
+    - companyos-internals
+  related:
+    - id: 00f2f2cc-472b-483a-a8e8-77d1a28e07c3
+      kind: lesson-learned
+      relationship: related
+    - id: ea6e9dd1-93dc-4b19-9854-103328203489
+      kind: lesson-learned
+      relationship: related
+    - id: bd4650e2-ab42-4b4e-9c10-cca638ded48c
+      kind: lesson-learned
+      relationship: related
+    - id: cde13417-5014-4bf5-9daa-edc3f6d257a6
+      kind: rfc
+      relationship: derived-from
+
+spec:
+  context: >
+    Implémentation du RFC cde13417 (permits-seal.json) : la struct de
+    sérialisation SealPermit a été écrite avec 8 champs String, y compris pour
+    des données à invariants forts (UUIDs, enum de statut à 3 valeurs connues,
+    timestamps ISO 8601, identifiants de persona à 4 valeurs). Le fichier
+    qu'elle sérialise est le fichier d'AUTORITÉ du système de permits : c'est
+    précisément là qu'un invariant non porté par le type coûte le plus cher
+    (un status "actif" au lieu de "active" dans le JSON serait accepté au
+    parse et créerait un permit fantôme au reseed). L'utilisateur a signalé le
+    pattern comme inacceptable en général, pas seulement sur ce cas.
+
+  insight: >
+    Dans un langage typé, le typage est le premier harness : make illegal
+    states unrepresentable. C'est l'exact analogue, au niveau du code, du
+    principe "invariant mécanique" que CompanyOS applique à ses process
+    (retirer le paramètre plutôt qu'interdire son usage, lesson bd4650e2) :
+    une règle portée par le type est infalsifiable, une règle portée par une
+    convention de contenu de String repose sur la vigilance. Le pattern
+    parse-don't-validate en découle : les frontières de sérialisation (DTOs
+    serde inclus) doivent parser vers les types forts au plus tôt, pas
+    transporter des String que chaque consommateur revalide (ou oublie de
+    revalider). Les exceptions légitimes existent (interop avec un format
+    externe non contrôlé, perf mesurée, contenu réellement libre) mais elles
+    se justifient par écrit, cas par cas : String est le last resort, jamais
+    le défaut. Symétriquement aux littéraux magiques : si une valeur mérite
+    un nom, un invariant mérite un type.
+
+  recommendation: >
+    (1) Règle de review pour tout code typé (Rust, TypeScript des plugins) :
+    un champ/paramètre String|bytes|i64-timestamp dont le contenu a un
+    invariant nommable (id, statut, date, persona, chemin, kind) est un
+    finding correctif en review de code, sauf justification écrite dans le
+    code. Uuid, enum + serde rename, DateTime<Utc>, newtype. (2) Corriger
+    SealPermit (RFC correctif ou intégration à l'audit v1-rust-audit) : le
+    format JSON sur disque ne change pas, seuls les types Rust portent les
+    invariants au parse. (3) L'audit v1-rust-audit du programme V1 doit
+    inclure une passe primitive-obsession explicite sur tout le workspace,
+    avec ce critère. (4) Candidat harness (à évaluer au rust-audit) : lint
+    clippy ou grep CI sur les structs serde à champs String nommés *_id,
+    *_at, status, kind.
