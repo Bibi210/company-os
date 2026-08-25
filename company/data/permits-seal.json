@@ -1,0 +1,268 @@
+{
+  "version": 1,
+  "permits": [
+    {
+      "id": "24e91083-d5a8-46a3-ba56-ef1f8531b10b",
+      "rfc_id": "a4ee8b6a-ebcd-4a76-96eb-7e31785c8ae6",
+      "granted_to": "implementer",
+      "target_paths": [
+        "company/schemas/review-report.schema.json",
+        "company/schemas/design-doc.schema.json",
+        "crates/validation/src/validator.rs",
+        "crates/validation/src/lib.rs",
+        "crates/mcp-servers/yaml/src/main.rs",
+        "crates/orchestrator/src/engine.rs",
+        "crates/orchestrator/src/db.rs",
+        "crates/orchestrator/src/error.rs",
+        "crates/mcp-servers/orchestrator/src/main.rs",
+        "company/plugins/defense-in-depth-core.mjs",
+        "company/plugins/tests/defense-in-depth-core.test.mjs",
+        "company/personas/ceo.yml",
+        "company/personas/architect.yml",
+        "company/personas/implementer.yml",
+        "company/config/personas.yml",
+        "company/config/shared-rules.yml",
+        "company/config/review-protocol.yml",
+        "crates/validation/src/placement.rs"
+      ],
+      "status": "consumed",
+      "granted_by": "ceo",
+      "granted_at": "2026-07-03T16:31:48.859892234+00:00",
+      "consumed_at": "2026-07-11T14:53:05.476064835+00:00"
+    },
+    {
+      "id": "286abb1a-d7d8-456e-bdfd-25188338065b",
+      "rfc_id": "8bf78218-e1f3-4bc5-864c-2abf618a990d",
+      "granted_to": "implementer",
+      "target_paths": [
+        "crates/orchestrator/src/engine.rs",
+        "crates/orchestrator/src/types.rs",
+        "crates/orchestrator/src/db.rs",
+        "crates/orchestrator/src/error.rs",
+        "crates/mcp-servers/orchestrator/src/main.rs",
+        "crates/config/src/types.rs",
+        "crates/config/src/loader.rs",
+        "crates/config/src/constants.rs",
+        "company/schemas/flow-control.schema.json",
+        "company/schemas/review-protocol.schema.json",
+        "company/schemas/review-report.schema.json",
+        "company/config/flow-control.yml",
+        "company/config/review-protocol.yml",
+        "company/config/human-review-triggers.yml",
+        "company/config/shared-rules.yml",
+        "company/personas/implementer.yml"
+      ],
+      "status": "consumed",
+      "granted_by": "ceo",
+      "granted_at": "2026-06-10T10:36:34.145517546+00:00",
+      "consumed_at": "2026-06-11T09:05:17.139462752+00:00"
+    },
+    {
+      "id": "2a1f14e9-db4a-4fe4-ab18-fa704d9e1d99",
+      "rfc_id": "272eda39-dee6-4e8c-8696-62edd0f25b35",
+      "granted_to": "implementer",
+      "target_paths": [
+        "company/config/opencode.json"
+      ],
+      "status": "consumed",
+      "granted_by": "ceo",
+      "granted_at": "2026-06-10T09:20:29.526675919+00:00",
+      "consumed_at": "2026-06-10T09:21:44.082397785+00:00"
+    },
+    {
+      "id": "324db664-7e8e-41db-ae2e-6885aba85a74",
+      "rfc_id": "324e8a33-db8a-46d8-aea9-78e2fa050d60",
+      "granted_to": "implementer",
+      "target_paths": [
+        "crates/mcp-servers/orchestrator/src/main.rs",
+        "company/plugins/tests/defense-in-depth-core.test.mjs"
+      ],
+      "status": "consumed",
+      "granted_by": "ceo",
+      "granted_at": "2026-07-11T15:34:28.056953580+00:00",
+      "consumed_at": "2026-07-11T15:38:53.990292589+00:00"
+    },
+    {
+      "id": "3c4c35d9-052e-45e4-85c4-668e2aa3af64",
+      "rfc_id": "25b6678c-5c47-4f3c-9f61-804d98fc78b2",
+      "granted_to": "implementer",
+      "target_paths": [
+        "company/plugins/defense-in-depth-core.mjs",
+        "company/plugins/defense-in-depth.mjs",
+        "company/plugins/tests/defense-in-depth-core.test.mjs",
+        "company/plugins/tests/hot-reload.test.mjs"
+      ],
+      "status": "consumed",
+      "granted_by": "ceo",
+      "granted_at": "2026-07-14T14:10:52.851898648+00:00",
+      "consumed_at": "2026-07-27T12:30:41.057506064+00:00"
+    },
+    {
+      "id": "4678e78c-8fa2-4e60-8218-13c087f43c48",
+      "rfc_id": "18011bfc-c8ae-4c31-8aca-f994755b93e7",
+      "granted_to": "implementer",
+      "target_paths": [
+        "company/plugins/mcp-proxy.mjs",
+        "company/config/opencode.json",
+        "company/config/shared-rules.yml",
+        "company/personas/implementer.yml",
+        "company/plugins/defense-in-depth-core.mjs",
+        "Makefile",
+        "company/scripts/test-mcp-proxy-restart.sh",
+        "company/scripts/deploy-serve.sh",
+        "company/plugins/mcp-proxy-core.mjs",
+        "company/plugins/tests/mcp-proxy-core.test.mjs"
+      ],
+      "status": "consumed",
+      "granted_by": "ceo",
+      "granted_at": "2026-07-02T09:24:43.677638438+00:00",
+      "consumed_at": "2026-07-02T09:47:48.286390189+00:00"
+    },
+    {
+      "id": "5ddca363-c881-4118-86a0-3c4791bbdf9b",
+      "rfc_id": "0197fbe5-949e-4917-a4d8-2eb63e028ce6",
+      "granted_to": "implementer",
+      "target_paths": [
+        "crates/orchestrator/src/engine.rs",
+        "crates/orchestrator/src/db.rs",
+        "crates/orchestrator/src/error.rs",
+        "crates/orchestrator/src/types.rs",
+        "crates/orchestrator/tests/integration_search.rs",
+        "crates/mcp-servers/orchestrator/src/main.rs",
+        "crates/validation/src/validator.rs",
+        "crates/validation/src/lib.rs",
+        "company/schemas/rfc.schema.json",
+        "company/schemas/human-review-triggers.schema.json",
+        "company/config/human-review-triggers.yml",
+        "company/config/shared-rules.yml",
+        "company/config/personas.yml",
+        "company/personas/architect.yml",
+        "company/personas/pm.yml",
+        "company/personas/implementer.yml",
+        "tests/integration/edge_cases.rs"
+      ],
+      "status": "consumed",
+      "granted_by": "ceo",
+      "granted_at": "2026-07-11T23:26:30.194997923+00:00",
+      "consumed_at": "2026-07-27T13:11:55.452324681+00:00"
+    },
+    {
+      "id": "62dddab7-c83c-4294-8e15-2dc0bca7c7ad",
+      "rfc_id": "0197fbe5-949e-4917-a4d8-2eb63e028ce6",
+      "granted_to": "implementer",
+      "target_paths": [
+        "crates/orchestrator/src/lib.rs"
+      ],
+      "status": "consumed",
+      "granted_by": "ceo",
+      "granted_at": "2026-07-27T12:42:55.973849195+00:00",
+      "consumed_at": "2026-07-27T13:12:12.536817934+00:00"
+    },
+    {
+      "id": "766e4fea-604c-46e6-bfd5-5835abc06039",
+      "rfc_id": "c129453c-3a8f-47cf-bf3e-a070e12416b0",
+      "granted_to": "implementer",
+      "target_paths": [
+        "company/config/protected-zones.json"
+      ],
+      "status": "consumed",
+      "granted_by": "ceo",
+      "granted_at": "2026-07-03T15:59:10.349396713+00:00",
+      "consumed_at": "2026-07-03T16:00:58.521793869+00:00"
+    },
+    {
+      "id": "a50d77f6-ea63-4bb0-9c36-2b01e86b57df",
+      "rfc_id": "bd416171-8e94-4c88-91af-cfee9e581faf",
+      "granted_to": "implementer",
+      "target_paths": [
+        "company/plugins/defense-in-depth.mjs",
+        "company/plugins/tests/hot-reload.test.mjs"
+      ],
+      "status": "consumed",
+      "granted_by": "ceo",
+      "granted_at": "2026-08-09T15:47:25.916118879+00:00",
+      "consumed_at": "2026-08-09T15:50:42.944188582+00:00"
+    },
+    {
+      "id": "a540d440-62a8-4def-a31e-1015eb585386",
+      "rfc_id": "272eda39-dee6-4e8c-8696-62edd0f25b35",
+      "granted_to": "implementer",
+      "target_paths": [
+        "company/config/opencode.json"
+      ],
+      "status": "consumed",
+      "granted_by": "ceo",
+      "granted_at": "2026-06-10T09:23:08.656681214+00:00",
+      "consumed_at": "2026-06-10T09:24:24.629713876+00:00"
+    },
+    {
+      "id": "b90f10e3-9915-4cbd-93c8-4ba92f5757f1",
+      "rfc_id": "098f35db-d3f8-402d-8528-bb71b2ef5dcd",
+      "granted_to": "implementer",
+      "target_paths": [
+        "company/personas/pm.yml",
+        "company/personas/architect.yml",
+        "company/personas/implementer.yml",
+        "company/personas/ceo.yml",
+        "company/config/personas.yml"
+      ],
+      "status": "consumed",
+      "granted_by": "ceo",
+      "granted_at": "2026-08-09T15:33:58.727861116+00:00",
+      "consumed_at": "2026-08-09T15:58:44.704234263+00:00"
+    },
+    {
+      "id": "bdbac2ab-ad0a-4bcc-87b4-1b9c0a5dde31",
+      "rfc_id": "cde13417-5014-4bf5-9daa-edc3f6d257a6",
+      "granted_to": "implementer",
+      "target_paths": [
+        "crates/config/src/constants.rs",
+        "crates/orchestrator/src/db.rs",
+        "crates/orchestrator/src/engine.rs",
+        "crates/mcp-servers/orchestrator/src/main.rs",
+        "company/plugins/defense-in-depth-core.mjs",
+        "company/plugins/tests/defense-in-depth-core.test.mjs",
+        "company/config/protected-zones.json",
+        "company/data/permits-seal.json"
+      ],
+      "status": "consumed",
+      "granted_by": "ceo",
+      "granted_at": "2026-08-25T18:50:45.941539780+00:00",
+      "consumed_at": "2026-08-25T19:20:42.699427291+00:00"
+    },
+    {
+      "id": "f266fa36-d481-4a9c-ade6-9fadc308b1c6",
+      "rfc_id": "2cdf620a-7071-49cf-a995-a96208625961",
+      "granted_to": "implementer",
+      "target_paths": [
+        "company/schemas/_base.schema.json",
+        "company/schemas/task-request.schema.json",
+        "company/schemas/design-doc.schema.json",
+        "company/schemas/implementation-plan.schema.json",
+        "company/schemas/rfc.schema.json",
+        "company/schemas/review-report.schema.json",
+        "company/schemas/lesson-learned.schema.json",
+        "company/schemas/diagnostic-report.schema.json",
+        "company/schemas/persona.schema.json",
+        "company/schemas/project-config.schema.json",
+        "company/schemas/flow-control.schema.json",
+        "company/schemas/review-protocol.schema.json",
+        "company/schemas/human-review-triggers.schema.json",
+        "company/schemas/roadmap.schema.json",
+        "company/rfcs/caller-inventory-discipline-eb42a8de.yml",
+        "company/rfcs/sql-schema-migration-discipline-973a5569.yml",
+        "projects/company-os/design-docs/recherche-hybride-architecture-f433fefc.yml",
+        "projects/company-os/implementation-plans/caller-inventory-personas-1c590771.yml",
+        "projects/company-os/diagnostic-reports/v1-memory-audit-162f2c8c.yml",
+        "projects/puissance4-verus/diagnostic-reports/lemma-ab-equals-pure-proof-difficulty-0838b79a.yml",
+        "projects/puissance4-verus/config/puissance-4-proof-driven-development-504e2e24.yml",
+        "crates/validation/src/validator.rs",
+        "tests/integration/user_stories.rs"
+      ],
+      "status": "consumed",
+      "granted_by": "ceo",
+      "granted_at": "2026-08-14T17:05:13.884422606+00:00",
+      "consumed_at": "2026-08-14T17:14:06.433528686+00:00"
+    }
+  ]
+}
