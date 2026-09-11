@@ -1,0 +1,717 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: 031b6703-290b-481b-927e-cad82dda204f
+  title: "Plan d'implémentation du durcissement de la récupération MCP post-crash (RFC 5bacb08a) : trois phases avec point d'arrêt utilisateur, instrumentation d'abord, puis isolation par artifact, boot readiness-first, health-check progressif, escalade 45 s et doctor coredumps"
+  author: implementer
+  created_at: "2026-09-11"
+  project: company-os
+  description: >
+    Traduction en étapes ordonnées du RFC APPROUVÉ 5bacb08a (design-doc
+    aae2af60, task-request 7d83f35d), sous le write permit ca737bdc (26
+    chemins) et sa condition CEO : ce plan est approuvé avant toute écriture
+    de code. Aucune décision du RFC n'est rediscutée ici ; le plan dit
+    COMMENT et DANS QUEL ORDRE. Structure imposée par D7 : PHASE 1
+    instrumentation (télémétrie proxy D1, crate crash-trace et panic hook
+    D3(b) dans les deux serveurs servis, .gitignore, promotion immédiate du
+    volet serveur par make deploy-serve), PHASE 2 POINT D'ARRÊT utilisateur
+    (restart de la session opencode, critère observable : apparition du
+    journal sous company/data/logs/ pour une nouvelle incarnation), PHASE 3
+    le reste (isolation par artifact D3(a), boot readiness-first avec
+    embedder late-bound et gate de warm-up D4, health-check progressif
+    10/20/40 s, escalade 45 s D5, doctor coredumps D6, harness et tests D8),
+    l'investigation gdb D2 courant en parallèle sans bloquer. Le plan intègre
+    nommément les neuf reports accumulés pendant les reviews (run_index garde
+    l'embedder synchrone, traces et baseline jamais en YAML, création eager
+    du répertoire de traces, listener error et drain inconditionnel côté
+    Node, AssertUnwindSafe avec l'argument embed-avant-transaction, gate
+    fermée sur toute la durée du warm-up, portail d'injection sous
+    cfg(debug_assertions), message error.rs pour l'état warming, corpus D2
+    porté à six cores orchestrator et deux yaml-validator). Le permit étant
+    à usage unique, la séquence retenue est : plusieurs commits atomiques
+    sous permit ACTIF, puis un consume unique après le dernier commit, puis
+    make deploy-serve. Aucun reload_config.
+  tags:
+    - mcp
+    - orchestrator
+    - proxy
+    - availability
+    - resilience
+    - sigabrt
+    - double-panic
+    - health-check
+    - logging
+    - crash-trace
+    - coredump
+    - critical-infra
+    - implementation
+    - write-permit
+  related:
+    - id: 5bacb08a-ac37-4ccc-847f-16edcf70c1ba
+      kind: rfc
+      relationship: derived-from
+    - id: aae2af60-b225-4c61-9600-8be8d6d7ebd6
+      kind: design-doc
+      relationship: related
+    - id: 7d83f35d-b6a5-46ff-b7e3-70a130ec99a8
+      kind: task-request
+      relationship: related
+    - id: ccd7c984-eb4b-4d69-90bb-c7a8980b5169
+      kind: diagnostic-report
+      relationship: related
+
+spec:
+  overview: >
+    Neuf commits atomiques répartis en trois phases, tous dans les 26 chemins
+    du permit ca737bdc et nulle part ailleurs. Contrainte d'ordre du
+    task-request respectée par construction : rien de la phase 3 n'est écrit
+    avant que l'instrumentation de la phase 1 ne soit EN SERVICE, c'est à
+    dire après la promotion des binaires (make deploy-serve) ET le restart de
+    session demandé en phase 2. Motif : le déclencheur du crash est
+    l'écriture d'un artifact YAML suivie de l'auto-reindex, or chaque commit
+    et chaque artifact de ce chantier est une occasion de le reproduire (six
+    occurrences à ce jour, la dernière pendant la review de ce RFC), et la
+    phase 1 est ce qui transforme la prochaine occurrence en matériau
+    d'investigation au lieu d'une panne aveugle.
+    GESTION DU PERMIT, point de séquencement à comprendre avant de commencer :
+    un write permit est à USAGE UNIQUE (consume_write_permit le clôt, un
+    second appel échoue en PermitAlreadyConsumed), tandis que le hook
+    defense-in-depth exige un permit ACTIF à CHAQUE commit touchant une zone
+    protégée. La séquence est donc : écrire, faire passer make ci, committer
+    (autant de fois que le plan le prévoit, le permit restant actif), et ne
+    consommer le permit qu'UNE fois, après le DERNIER commit, worktree propre
+    sur les target_paths (GARDE 3). Le point d'arrêt de la phase 2 se déroule
+    donc permit actif : c'est voulu et sans effet de bord, D7 n'exigeant
+    aucun reload_config (qui, lui, refuserait tant qu'un permit est actif).
+    Si le permit expirait pendant l'attente du restart utilisateur, ne rien
+    écrire et demander un permit de reprise au CEO sur le même périmètre.
+    VÉRIFICATION : make ci est exécuté mécaniquement et en bloquant par le
+    pre-commit à chaque commit ; le plan le lance explicitement AVANT chaque
+    commit (étape 3 de write_permit_full_sequence) pour ne pas se faire
+    rejeter, et ajoute par étape une vérification ciblée plus rapide (cargo
+    check ou test d'un seul crate, node --test d'un seul fichier, test
+    manuel) afin de ne pas découvrir une erreur triviale au bout d'un cycle
+    de CI complet.
+  steps:
+    - description: >
+        PHASE 1, ÉTAPE 1.1 (commit C1, partie 1/2). Déclarer non versionnés
+        les trois emplacements runtime créés par le chantier. Ajouter au
+        .gitignore : company/data/logs/ (journaux rotatifs du proxy),
+        company/data/crashes/ (traces de crash pré-unwind, jamais purgées) et
+        company/data/coredump-baseline.json (baseline auto-capturée du
+        doctor). Motif : le .gitignore actuel ne couvre company/data/ que par
+        entrées explicites (*.db*, orchestrator.lock, embeddings/), donc la
+        phrase du RFC « même statut git que la DB orchestrator » n'est vraie
+        qu'après cet ajout ; sans lui, les traces et journaux polluent git
+        status et risquent d'être committés.
+        REPORT (b) APPLIQUÉ ICI ET DANS TOUT LE PLAN : la baseline est en
+        .json, les traces seront en .txt, les journaux en .log, JAMAIS en
+        .yml ni .yaml. Raison mécanique : classify() (crates/config/src/
+        watcher.rs, lignes 96 à 116) renvoie None pour tout chemin qui n'est
+        ni sous company/schemas/, ni sous un préfixe protégé, ni suffixé
+        .yml/.yaml ; un YAML sous company/data/ serait au contraire classé
+        ConfigChangeKind::Artifacts et déclencherait un reindex_all complet à
+        chaque écriture (donc à chaque exécution du doctor), c'est à dire
+        exactement le chemin des six SIGABRT. De plus make validate
+        (--batch company/) ramasserait ces fichiers et échouerait.
+        VÉRIFICATION : git check-ignore -v sur un fichier témoin de chacun des
+        trois emplacements (doit répondre avec la règle correspondante), puis
+        git status --porcelain après création manuelle des trois témoins
+        (doit être vide), puis suppression des témoins.
+      files:
+        - .gitignore
+    - description: >
+        PHASE 1, ÉTAPE 1.2 (commit C1, partie 2/2). Déclarer les nouveaux
+        chemins dans le module de constantes, place canonique imposée par son
+        propre en-tête (« No magic literals should appear outside this
+        module ») et par la présence déjà établie de DATA_DIR, DB_FILENAME et
+        SEAL_FILENAME. Ajouter sous la section Data directory : CRASHES_DIR
+        (sous-répertoire crashes de DATA_DIR), LOGS_DIR (sous-répertoire logs),
+        COREDUMP_BASELINE_FILENAME (coredump-baseline.json) et l'extension des
+        traces (.txt). Documenter en commentaire de module, au dessus de ces
+        constantes, l'invariant du report (b) : ces fichiers ne doivent JAMAIS
+        porter une extension YAML sous peine de déclencher le watcher et le
+        validator, afin qu'une édition future ne régresse pas la propriété en
+        silence.
+        VÉRIFICATION : cargo check -p companyos-config (rapide), puis cargo
+        check --workspace pour s'assurer qu'aucune constante n'entre en
+        collision.
+      files:
+        - crates/config/src/constants.rs
+    - description: >
+        PHASE 1, ÉTAPE 1.3 (commit C2). Créer le crate partagé
+        companyos-crash-trace qui porte le panic hook des DEUX serveurs
+        servis, et le déclarer membre du workspace. Le RFC laisse au plan
+        l'arbitrage module partagé contre duplication : je tranche pour le
+        crate partagé, le permit couvrant déjà les deux issues, parce que
+        l'invariant d'infaillibilité doit être écrit et testé UNE fois plutôt
+        que deux.
+        API exposée : install(binary_name) qui installe le hook et prépare le
+        terrain, et un contexte de portée (set_artifact_scope / clear) que
+        seul l'orchestrator utilisera en phase 3 pour nommer l'artifact en
+        cause, via thread_local (valide parce que le chemin d'indexation est
+        synchrone, aucun await à l'intérieur, donc pas de migration de thread
+        sous le runtime multi-thread).
+        CONTENU DE LA TRACE : timestamp UTC, incarnation lue dans
+        MCP_INCARNATION avec repli PID plus horodatage de boot si absente,
+        PID, nom du binaire, message du panic, backtrace capturée par
+        Backtrace::force_capture, nom du thread, indicateur de double panic
+        (compteur de profondeur atomique, panic_count n'étant pas public), et
+        l'artifact en cause s'il est renseigné. Un fichier par crash nommé
+        <timestamp>-<pid>.txt sous CRASHES_DIR, écriture synchrone suivie de
+        fsync avant retour du hook, jamais de rotation ni de purge.
+        REPORT (c) APPLIQUÉ : la création du répertoire CRASHES_DIR est EAGER,
+        faite dans install() au boot, PAS dans le hook. La surface de
+        défaillance au moment du panic est ainsi réduite à open, write et
+        fsync.
+        REPORT (c bis), INVARIANT D'INFAILLIBILITÉ du RFC D3(b) : le corps du
+        hook ne contient aucun unwrap, aucun expect, aucun opérateur ?, aucune
+        indexation de slice ; tous les io::Result sont absorbés en let _ = ...
+        Si la trace ne peut pas être écrite, le hook rend la main et le
+        comportement de panic par défaut se poursuit : la défaillance dégrade
+        l'observabilité, jamais la disponibilité. Un hook qui paniquerait
+        produirait le panic-pendant-panic que le chantier existe pour réduire.
+        VÉRIFICATION : cargo build -p companyos-crash-trace, puis deux tests
+        unitaires dans le crate : (i) un panic déclenché sous catch_unwind
+        avec CRASHES_DIR redirigé vers un tempdir écrit bien un fichier
+        contenant le message et une backtrace non vide ; (ii) le même scénario
+        avec un répertoire cible NON inscriptible ne panique pas, n'échoue pas
+        le test, et laisse le panic suivre son cours (preuve de
+        l'infaillibilité).
+      files:
+        - crates/crash-trace/Cargo.toml
+        - crates/crash-trace/src/lib.rs
+        - Cargo.toml
+    - description: >
+        PHASE 1, ÉTAPE 1.4 (commit C3). Installer le hook dans les DEUX
+        serveurs servis, le plus tôt possible dans leur main() et pour TOUS
+        les modes d'invocation (pour l'orchestrator : le serveur, --index et
+        --prefetch-embeddings ; l'installation est donc la première
+        instruction de main(), avant le match sur les arguments). Ajouter la
+        dépendance companyos-crash-trace aux deux Cargo.toml de serveurs.
+        Motif de couvrir aussi le yaml-validator : il a lui aussi produit des
+        SIGABRT (PID 82926 le 09/09 et PID 85899 le 10/09), donc un hook
+        limité à l'orchestrator laisserait un crash reproduit sans trace.
+        VÉRIFICATION : cargo build -p companyos-orchestrator-server et cargo
+        build -p companyos-yaml-validator ; démarrage manuel de chaque binaire
+        de target/debug pour constater l'absence de régression au boot et la
+        création effective du répertoire company/data/crashes/ (preuve du
+        report (c)). La vérification de bout en bout d'une trace réellement
+        écrite par un panic du chemin d'indexation n'est possible qu'en phase
+        3, une fois le portail d'injection disponible (étape 3.2) : c'est
+        assumé et séquencé, pas oublié.
+      files:
+        - crates/mcp-servers/orchestrator/src/main.rs
+        - crates/mcp-servers/orchestrator/Cargo.toml
+        - crates/mcp-servers/yaml/src/main.rs
+        - crates/mcp-servers/yaml/Cargo.toml
+    - description: >
+        PHASE 1, ÉTAPE 1.5 (commit C4, partie 1/2). Ajouter au core pur du
+        proxy les fonctions de décision de la télémétrie, testables sans
+        système de fichiers (pattern éprouvé de mcp-proxy-core, lesson
+        8838a892, même forme que computeBackoff, dépendances injectées) :
+        shouldRotate(currentSize, incomingLength, maxBytes) qui décide la
+        rotation par taille, rotationPlan(basePath, keptArchives) qui calcule
+        le renommage borné des archives, et formatTelemetryLine({timestampIso,
+        incarnation, source, text}) qui produit le préfixe structuré imposé
+        par D1 (timestamp ISO 8601 UTC, numéro d'incarnation, source proxy ou
+        server). Étendre le fichier de tests du core avec les cas nominal
+        (sous le seuil, au dessus du seuil), négatif (taille invalide, texte
+        vide) et limites (égalité exacte au seuil, nombre d'archives à zéro,
+        ligne sans saut de ligne final).
+        VÉRIFICATION : node --test company/plugins/tests/mcp-proxy-core.test.mjs
+        (sous la seconde), puis make test-js pour vérifier que les quatre
+        suites existantes restent vertes.
+      files:
+        - company/plugins/mcp-proxy-core.mjs
+        - company/plugins/tests/mcp-proxy-core.test.mjs
+    - description: >
+        PHASE 1, ÉTAPE 1.6 (commit C4, partie 2/2). Câbler la télémétrie
+        persistée dans le proxy, unique écrivain. Quatre modifications
+        localisées : (1) le spawn passe de stdio ["pipe","pipe","inherit"] à
+        ["pipe","pipe","pipe"], sans toucher stdin ni stdout qui restent les
+        seuls canaux du framing NDJSON ; (2) un handler child.stderr.on("data")
+        découpe en lignes avec son propre StringDecoder et son accumulateur,
+        tee chaque ligne vers process.stderr (comportement live conservé) et
+        vers le fichier de journal, étiquetée source=server et numéro
+        d'incarnation ; (3) log() écrit désormais à la fois sur stderr et dans
+        le fichier, étiquetée source=proxy ; (4) l'environnement du spawn
+        reçoit MCP_INCARNATION (l'objet env est déjà reconstruit à chaque
+        spawn, c'est un ajout d'une ligne) afin que la trace de crash porte
+        l'incarnation que seul le proxy connaît.
+        REPORT (d) APPLIQUÉ, invariant de non-létalité du RFC D1 : le stream
+        d'écriture du journal porte OBLIGATOIREMENT un listener "error" (en
+        Node, un stream en erreur sans listener transforme l'erreur en
+        exception non capturée qui tue le process, ce qui violerait le volet A
+        du RFC 18011bfc, contrat de non-mort du proxy) ; toute erreur
+        d'écriture, de mkdir ou de rotation est avalée et signalée sur le
+        stderr live. Le drain du pipe stderr enfant est INCONDITIONNEL : le
+        handler consomme toujours, même journal indisponible, sinon le tube
+        (environ 64 Ko) se remplit et bloque l'enfant en écriture au moment
+        précis où un panic déverse sa backtrace, panne bien pire que la cécité
+        actuelle. L'accumulateur stderr est plafonné comme l'est déjà
+        STDOUT_ACCUM_LIMIT, avec flush forcé au dépassement : les backtraces
+        Rust produisent des lignes longues et un chunk peut ne pas finir par
+        un saut de ligne.
+        VÉRIFICATION : node --check sur le fichier, puis TEST MANUEL en
+        standalone, hors session active : lancer node company/plugins/
+        mcp-proxy.mjs target/serve/companyos-yaml-validator, envoyer une ligne
+        initialize sur stdin, constater l'apparition de company/data/logs/ avec
+        des lignes préfixées des deux sources, tuer l'enfant et constater la
+        ligne de raison de mort puis le respawn. La couverture automatisée de
+        ce chemin arrive en phase 3 avec le harness (étape 3.6), D8 plaçant le
+        harness dans cette phase.
+      files:
+        - company/plugins/mcp-proxy.mjs
+    - description: >
+        PHASE 1, ÉTAPE 1.7. Clôture de la phase 1 et MISE EN SERVICE du volet
+        serveur. Séquence exacte : make ci vert, puis les commits C1 à C4 dans
+        l'ordre des étapes ci dessus (chacun compile seul : C1 n'ajoute que des
+        constantes et une règle git, C2 crée le crate avant que C3 ne
+        l'utilise, C4 ne touche que le plugin), puis make deploy-serve pour
+        promouvoir atomiquement les deux binaires porteurs du panic hook.
+        Le permit n'est PAS consommé ici (usage unique, cf. overview) : il
+        reste actif pour la phase 3.
+        Ordre non négociable : C4 (télémétrie proxy) doit être écrit et
+        committé AVANT la phase 2, puisque le restart de session relira le
+        plugin depuis le disque ; et le deploy-serve doit précéder la phase 2
+        pour que les traces de crash soient en service au moment où la
+        nouvelle session commence à écrire des artifacts.
+        VÉRIFICATION : make deploy-serve termine en succès et les binaires de
+        target/serve/ portent bien la nouvelle date ; le restart contrôlé du
+        serveur déclenché par la promotion est absorbé par le buffer du proxy,
+        aucun retry ni sleep de ma part.
+      files:
+        - .gitignore
+        - crates/config/src/constants.rs
+        - crates/crash-trace/Cargo.toml
+        - crates/crash-trace/src/lib.rs
+        - Cargo.toml
+        - crates/mcp-servers/orchestrator/src/main.rs
+        - crates/mcp-servers/orchestrator/Cargo.toml
+        - crates/mcp-servers/yaml/src/main.rs
+        - crates/mcp-servers/yaml/Cargo.toml
+        - company/plugins/mcp-proxy-core.mjs
+        - company/plugins/tests/mcp-proxy-core.test.mjs
+        - company/plugins/mcp-proxy.mjs
+    - description: >
+        PHASE 2, ÉTAPE 2.1. POINT D'ARRÊT UTILISATEUR, aucune écriture de code.
+        Le code du proxy n'entre en service qu'au restart de la session
+        opencode (RFC 25b6678c, hot-reload de code retiré), et ce restart est
+        un acte que les agents ne peuvent ni exécuter ni simuler. Le chantier
+        s'ARRÊTE ici et demande explicitement à l'utilisateur de redémarrer la
+        session.
+        CRITÈRE DE REPRISE, OBSERVABLE : le répertoire company/data/logs/
+        existe et contient, pour le crate orchestrator, des lignes de source
+        proxy appartenant à une NOUVELLE incarnation (incarnation repartie à 1
+        avec un horodatage postérieur au restart). Tant que ce critère n'est
+        pas vérifié, la phase 3 ne commence pas : sans cela, la contrainte
+        instrumentation-d'abord du task-request serait respectée sur le papier
+        (code mergé) et violée en substance (session courante toujours
+        aveugle), alors que chaque écriture YAML de la phase 3 est une
+        occasion de reproduire le crash.
+        CONTRÔLE COMPLÉMENTAIRE pendant cette pause, sans écriture : vérifier
+        que company/data/crashes/ a bien été créé par l'install() eager des
+        binaires promus (report (c)), et que git status reste propre malgré
+        l'apparition des journaux (preuve de l'étape 1.1).
+      files: []
+    - description: >
+        PHASE 3, ÉTAPE 3.1 (commit C5, partie 1/2). Isolation par artifact du
+        reindex, décision D3(a), promesse requalifiée par le RFC : confinement
+        des panics simples et trace garantie, PAS impossibilité de l'abort.
+        Dans reindex_all (crates/orchestrator/src/engine.rs, boucle des lignes
+        2261 à 2266), envelopper l'appel self.index_artifact de chaque artifact
+        dans std::panic::catch_unwind, au périmètre le plus étroit possible, et
+        poser autour le contexte de portée du crate crash-trace (nom du chemin
+        de l'artifact en cours) afin que la trace nomme l'artifact en cause.
+        Un panic rattrapé devient un warning de ReindexOutcome plus un
+        tracing::warn, et la boucle continue sur les artifacts suivants : le
+        lot survit, le task du watcher survit, le process survit.
+        REPORT (e) APPLIQUÉ : la closure capturant &mut self, elle n'est pas
+        UnwindSafe ; AssertUnwindSafe est nécessaire et acceptable, et
+        l'argument de soundness doit être consigné en commentaire au point
+        d'usage : index_artifact calcule l'embedding AVANT d'ouvrir la
+        transaction (commentaire existant lignes 1586 à 1591), donc un panic
+        rattrapé laisse la base soit intacte, soit rollbackée par le Drop de la
+        transaction, et la fenêtre d'incohérence logique de l'engine est bornée
+        à l'artifact courant.
+        VÉRIFICATION : cargo test -p companyos-orchestrator, plus cargo clippy
+        -p companyos-orchestrator (AssertUnwindSafe est un motif que clippy
+        surveille, autant le voir tout de suite).
+      files:
+        - crates/orchestrator/src/engine.rs
+        - crates/orchestrator/Cargo.toml
+        - crates/orchestrator/src/lib.rs
+    - description: >
+        PHASE 3, ÉTAPE 3.2 (commit C5, partie 2/2). Portail d'injection de
+        faute et TEST DE RÉGRESSION exigé par le criterion 3, le déclencheur
+        étant reproduit six fois.
+        REPORT (g) APPLIQUÉ : le portail est une variable d'environnement
+        COMPANYOS_FAULT_INJECT_ARTIFACT (nom namespacé pour exclure toute
+        collision avec l'environnement ambiant, que le proxy transmet
+        intégralement au spawn), lue par le chemin d'indexation et gardée par
+        cfg(debug_assertions). Ni feature cargo (make ci lance cargo test
+        --workspace sans --all-features, la faute ne serait jamais active), ni
+        cfg(test) (invisible du binaire de test d'intégration). Le binaire
+        servi étant un build debug promu depuis target/debug, le portail y est
+        PRÉSENT mais inerte sans la variable : d'où la seconde mitigation du
+        RFC, un tracing::warn bruyant au boot du serveur quand le portail est
+        armé, visible dans la télémétrie D1, pour qu'un armement résiduel soit
+        diagnostiqué immédiatement et non pris pour un septième crash.
+        PLACEMENT DU TEST, contraint par le permit ET par l'outillage : le test
+        vit dans crates/orchestrator/tests/integration_search.rs, seul fichier
+        de test à la fois couvert par le permit ET construisant déjà un
+        embedder réel (ligne 199), ce qui est indispensable puisque
+        index_artifact passe par require_embedder. Les fichiers de
+        tests/integration/ utilisent new_without_embedder et ne peuvent donc
+        pas exercer ce chemin. Aucun nouveau fichier de test n'est créé sous
+        crates/orchestrator/tests/, ce qui serait hors permit.
+        CONTENU DU TEST : indexer un lot de plusieurs artifacts avec le portail
+        armé sur l'un d'eux, puis vérifier (i) que reindex_all retourne sans
+        paniquer, (ii) que les autres artifacts sont bien indexés et l'index
+        cohérent pour eux, (iii) qu'un warning nomme l'artifact fautif, (iv)
+        qu'une trace de crash a été écrite sous le répertoire de traces
+        redirigé vers un tempdir.
+        VÉRIFICATION : cargo test -p companyos-orchestrator --test
+        integration_search, et contrôle explicite que le test s'exécute
+        RÉELLEMENT (compter les tests passés, ne pas se satisfaire d'un succès
+        vide : c'est précisément le piège de la feature cargo écarté au round 2
+        de la review du RFC).
+      files:
+        - crates/orchestrator/src/engine.rs
+        - crates/orchestrator/tests/integration_search.rs
+        - crates/mcp-servers/orchestrator/src/main.rs
+    - description: >
+        PHASE 3, ÉTAPE 3.3 (commit C6). Boot readiness-first du serveur avec
+        embedder late-bound et gate de warm-up, décision D4, volet serveur.
+        C'est l'étape la plus structurante du chantier.
+        (1) engine.rs : l'engine se construit SANS embedder et le reçoit en fin
+        de chargement. Le champ est déjà Option<Arc<Embedder>> avec
+        require_embedder (lignes 279, 313), il manque l'injection après
+        construction : ajouter un setter, unifier new et new_without_embedder
+        en conséquence, et mettre à jour les callers. Recensement refait au
+        moment de la review du RFC, il reste valide : quinze sites, tous dans
+        des fichiers du permit (engine.rs pour la définition et un helper de
+        test, main.rs pour six sites de test et trois de production,
+        integration_search.rs, user_stories.rs, edge_cases.rs). Si une
+        dépendance doit être ajoutée au crate de tests racine, son Cargo.toml
+        est couvert.
+        (2) REPORT (h) APPLIQUÉ, error.rs : le canal actuel de la gate est
+        EmbeddingFailed avec le message « engine constructed without embedder
+        (test mode) », qui devient FAUX avec le late-binding (ce n'est plus le
+        mode test, c'est le warm-up). Introduire un état warming explicite
+        (variante dédiée, ou à défaut reformulation du message) pour que la
+        réponse structurée renvoyée aux agents nomme la bonne cause.
+        (3) main.rs : réordonner run_server. Avant serve() ne restent que
+        flock, migrate et le strict nécessaire à la construction du transport
+        (invariants de correction, quelques dizaines de ms). Passent dans un
+        task de warm-up UNIQUE : le chargement ONNX (aujourd'hui bloquant,
+        ligne 2274), le reindex de rebuild-autorepair (ligne 2330), le reindex
+        de drift fts ou model (lignes 2350 à 2364, déclenché notamment par
+        toute DB fraîche puisque model_version absent vaut drift) et le reindex
+        nominal (ligne 2393, déjà en arrière-plan). Les tools dépendant de
+        l'index ou de l'embedder attendent la fin du warm-up ou répondent
+        l'état warming ; les autres (permits, review rounds, config,
+        generate_id) servent immédiatement.
+        REPORT (f) APPLIQUÉ, deux pièges à ne pas commettre : la gate reste
+        fermée sur TOUTE la durée du warm-up, pas seulement sur la phase ONNX,
+        parce que reindex_all commence par delete_all_artifacts (ligne 2232) et
+        que l'index est donc transitoirement VIDE avant de se repeupler ;
+        ouvrir la gate plus tôt rendrait ce wipe observable et ferait tomber la
+        propriété que la supersession partielle de l'étape 19 du RFC bdee1af4
+        prétend conserver. Et les passes post-boucle de reindex_all (warnings
+        de supersession, author-produces, dangling_related_links,
+        set_model_version) restent dans la portée du warm-up, sous un verrou
+        propre.
+        VERROU PAR ARTIFACT : le warm-up ne détient pas le lock engine en
+        continu (les handlers de tools prennent tous ce mutex unique, donc un
+        warm-up le gardant stériliserait la readiness et remplacerait la boucle
+        de kill par un stall de tools finissant en -32001 opaque). reindex_all
+        étant une fonction synchrone sur &mut self, la boucle est sortie de
+        l'engine : une méthode d'énumération des chemins côté engine, et la
+        boucle prise et rendue par artifact côté main.rs, même unité que
+        l'isolation de l'étape 3.1.
+        REPORT (a) APPLIQUÉ : le mode CLI --index (run_index, ligne 2105),
+        appelé par le hook defense-in-depth, n'a PAS de warm-up et a besoin de
+        l'embedder de façon synchrone. Le late-binding ne doit pas le
+        transformer en no-op silencieux : il continue de charger ONNX en direct
+        avant d'indexer, et ce point est couvert par un commentaire explicite
+        au site d'appel.
+        VÉRIFICATION : cargo test --workspace ; puis TEST MANUEL décisif, sur
+        une copie de la base (jamais sur la base servie) : déplacer
+        company/data/orchestrator.db, lancer le binaire, mesurer le délai de
+        réponse à initialize (attendu : ordre de la seconde, contre le boot
+        complet avec reindex de DB fraîche aujourd'hui), et vérifier qu'un tool
+        sans index (par exemple generate_id) répond immédiatement pendant que
+        le warm-up tourne, tandis qu'un tool d'index répond l'état warming ou
+        attend. Mesurer aussi la latence réelle du warm-up complet sur DB
+        fraîche, chiffre demandé par l'open question 2 du design pour trancher
+        entre attente bornée et erreur structurée immédiate.
+      files:
+        - crates/orchestrator/src/engine.rs
+        - crates/orchestrator/src/error.rs
+        - crates/orchestrator/src/lib.rs
+        - crates/orchestrator/src/embedding.rs
+        - crates/mcp-servers/orchestrator/src/main.rs
+        - crates/orchestrator/tests/integration_search.rs
+        - tests/integration/user_stories.rs
+        - tests/integration/edge_cases.rs
+        - tests/integration/Cargo.toml
+    - description: >
+        PHASE 3, ÉTAPE 3.4 (commit C7, partie 1/2). Health-check progressif du
+        proxy, décision D4 volet proxy, et généralisation des overrides
+        d'environnement, décision D8. Ajouter au core une fonction pure
+        computeHealthCheckTimeout(consecutiveTimeouts, opts) qui rend 10 s au
+        premier essai, double à chaque timeout consécutif et PLAFONNE à 40 s
+        (10, 20, 40), testée dans le harness core existant comme l'est
+        computeBackoff (cas nominal, plafonnement, valeur négative ou non
+        finie). Câbler dans le proxy : compteur de timeouts consécutifs non
+        confirmés, réarmement à 10 s dès qu'une incarnation atteint ready.
+        Rendre overridables par variable d'environnement le timeout initial et
+        le plafond, sur le motif déjà en place pour UNAVAILABLE_ESCALATION_MS
+        (IIFE de validation, valeur par défaut impérative dans le code), ce qui
+        permettra au test d'intégration de l'étape 3.6 de compresser les délais
+        sous trois secondes au lieu d'ajouter trente secondes de temps mur.
+        VÉRIFICATION : node --test du fichier de tests du core, puis make
+        test-js pour la non-régression des quatre suites.
+      files:
+        - company/plugins/mcp-proxy-core.mjs
+        - company/plugins/mcp-proxy.mjs
+        - company/plugins/tests/mcp-proxy-core.test.mjs
+    - description: >
+        PHASE 3, ÉTAPE 3.5 (commit C7, partie 2/2). Abaisser le plafond
+        d'escalade, décision D5 : UNAVAILABLE_ESCALATION_MS passe de 120 000 à
+        45 000 ms par défaut, l'override d'environnement
+        MCP_PROXY_UNAVAILABLE_MS étant conservé tel quel. Changement d'une
+        seule valeur, la structure de lecture existante n'est pas touchée.
+        Cohérence à vérifier des yeux au même moment : plafond du health-check
+        40 s, strictement sous les 45 s d'escalade, elles mêmes sous les 60 s
+        du timeout client opencode. L'escalade reste un SIGNAL et non un arrêt
+        (le proxy continue de respawner, les requêtes ultérieures aboutissent
+        dès ready), et il est assumé qu'une indisponibilité cumulée supérieure
+        à 45 s escalade même pendant une récupération en cours.
+        VÉRIFICATION : contrôle de la valeur par lecture, puis test
+        d'intégration de l'étape 3.6 avec override court, qui vérifie qu'un
+        -32050 est bien émis avec escalate:true et que le proxy continue de
+        respawner après.
+      files:
+        - company/plugins/mcp-proxy.mjs
+    - description: >
+        PHASE 3, ÉTAPE 3.6 (commit C8). Harness d'intégration du proxy et
+        tests, décision D8. Créer company/plugins/tests/harness/
+        fake-mcp-server.mjs : un faux serveur NDJSON qui répond à initialize
+        après un délai paramétrable (variable d'environnement), sait mourir sur
+        commande et sait écrire sur stderr, ce qui couvre les trois besoins
+        (boot lent, mort, télémétrie). Créer company/plugins/tests/integration/
+        mcp-proxy-integration.test.mjs avec au minimum trois scénarios :
+        (i) boot lent, le faux serveur répond après un délai supérieur au
+        timeout initial, le proxy atteint ready en un nombre borné de cycles
+        sans boucle infinie, délais compressés par overrides sous trois
+        secondes ; (ii) télémétrie, le stderr du faux serveur se retrouve bien
+        dans le journal avec la source et l'incarnation, et le journal survit à
+        la mort de l'enfant ; (iii) escalade, avec un plafond d'indisponibilité
+        très court, un -32050 escalate:true est émis puis la supervision
+        continue.
+        PLACEMENT, point vérifié empiriquement pendant la review du RFC : le
+        glob de make test-js (company/plugins/tests/*.test.mjs) est NON
+        RÉCURSIF, donc un fichier placé sous tests/integration/ n'est PAS
+        ramassé par make ci ; le glob reste INCHANGÉ, ce qui évite tout effet
+        de bord sur les quatre suites existantes. Ajouter au Makefile une cible
+        dédiée (test-js-integration) pointant explicitement ce sous-répertoire,
+        hors ci et NON accrochée à deploy-serve.
+        VÉRIFICATION : make test-js-integration vert ; puis contrôle que make
+        ci ne l'exécute PAS (comparer la liste des fichiers de test exécutés
+        par make test-js avant et après, elle doit être inchangée).
+      files:
+        - company/plugins/tests/harness/fake-mcp-server.mjs
+        - company/plugins/tests/integration/mcp-proxy-integration.test.mjs
+        - Makefile
+    - description: >
+        PHASE 3, ÉTAPE 3.7 (commit C9). Surveillance des coredumps, décision
+        D6. Créer company/scripts/doctor-coredumps.sh, qui interroge
+        coredumpctl (--json=short, disponibilité vérifiée sur systemd 261,
+        sortie parsable) pour TOUS les binaires companyos (orchestrator et
+        yaml-validator), compare à la baseline persistée
+        company/data/coredump-baseline.json et signale chaque dump plus récent
+        que la baseline avec PID, binaire, date, signal et la commande gdb
+        prête à l'emploi ; liste aussi les traces présentes sous
+        company/data/crashes/ (signal de première main, indépendant de
+        systemd) ; n'efface JAMAIS rien.
+        BASELINE AUTO-CAPTURÉE AU PREMIER RUN : si le fichier de baseline est
+        absent, le script snapshotte l'état courant de coredumpctl et sort en
+        annonçant l'initialisation. Aucune valeur codée en dur : la baseline du
+        premier jet du design (« 20 dumps au soir du 09/09 ») était déjà
+        fausse au moment de la review, ce qui est la démonstration empirique du
+        principe.
+        SÉMANTIQUE À DEUX MODES, imposée par D6 : en mode hook (option --hook,
+        celui qu'appelle deploy-serve) le script est INFORMATIONNEL, il affiche
+        son rapport et sort TOUJOURS en 0, y compris quand il trouve de
+        nouveaux dumps, et dégrade gracieusement (message explicite plus exit 0)
+        si coredumpctl est absent ou sans support --json ; seul l'appel manuel
+        porte un code de sortie signifiant (non-zéro si nouveaux dumps).
+        Motif : deploy-serve.sh tourne sous set -euo pipefail et make setup
+        enchaîne release, ci et deploy-serve ; un doctor bloquant y bloquerait
+        la promotion des correctifs par le symptôme qu'ils corrigent, et
+        casserait make setup après clone.
+        ACCROCHAGE : ajouter au Makefile une cible doctor (appel manuel, code
+        de sortie signifiant) et, en TÊTE de deploy-serve.sh, l'invocation en
+        mode hook, écrite avec une ceinture de sécurité explicite du type
+        « appel || true » pour que même un plantage inattendu du script ne
+        puisse pas interrompre la promotion malgré le set -e. Aucun autre hook
+        n'est accroché à deploy-serve.
+        VÉRIFICATION : premier run manuel, la baseline est créée et le script
+        sort en 0 ; second run, aucun nouveau dump, sortie 0 ; appel avec
+        --hook, echo du code de sortie, doit valoir 0 ; simulation de l'absence
+        d'outil (PATH vidé) avec --hook, doit encore valoir 0 et afficher le
+        message de dégradation ; enfin make deploy-serve complet, qui doit
+        promouvoir malgré la présence des huit dumps connus.
+      files:
+        - company/scripts/doctor-coredumps.sh
+        - Makefile
+        - company/scripts/deploy-serve.sh
+    - description: >
+        PHASE 3, ÉTAPE 3.8, EN PARALLÈLE ET NON BLOQUANTE. Investigation gdb
+        des core dumps, décision D2. Aucun fichier du permit n'est touché : le
+        livrable est un diagnostic-report sous projects/company-os/
+        diagnostic-reports/, hors zone protégée, donc écriture directe.
+        REPORT (i) APPLIQUÉ, le corpus a grossi pendant les reviews et le RFC
+        en annonce quatre : il faut partir du décompte RÉEL, SIX cores
+        orchestrator (PIDs 33345, 54403, 80065 du 09/09 ; 20900 du 10/09 à
+        10:14 ; 85880 du 10/09 à 10:55 ; 16876 du 11/09 à 10:33, ce dernier
+        étant le plus frais et donc le plus proche du binaire servi actuel,
+        d'où l'ordre d'analyse : 16876 en premier) et DEUX cores yaml-validator
+        (82926 du 09/09, 85899 du 10/09) en matériau secondaire, à analyser si
+        l'effort est marginal.
+        MÉTHODE : coredumpctl gdb par PID ; localiser les frames de la
+        machinerie de panic (rust_panic, panic_in_cleanup) dans la pile du task
+        de reindex ; extraire le payload du panic originel ; identifier le Drop
+        fautif en isolant les frames drop_in_place traversées par l'unwind
+        (suspects hérités du diagnostic ccd7c984 : destructeurs rusqlite
+        Statement et Transaction, valeurs ort ou ONNX) ; RECOUPER les six piles.
+        LIVRABLE : soit le message du panic originel plus le Drop fautif
+        identifié, soit la démonstration documentée d'irrécupérabilité. Si un
+        Drop fautif précis sort, il donne lieu à un correctif ciblé additionnel
+        dans le même chantier, qui est le seul chemin faisant DISPARAÎTRE
+        l'abort (D3 le confine et le trace, il ne le supprime pas).
+        VÉRIFICATION : le diagnostic-report est reviewé par l'Architect pour la
+        rigueur de la root cause, conformément au review-protocol.
+      files: []
+    - description: >
+        PHASE 3, ÉTAPE 3.9. Clôture. Séquence exacte, dans cet ordre :
+        (1) make ci vert ; (2) dernier commit (C9) ; (3) consume_write_permit
+        du permit ca737bdc, UNE seule fois, après le dernier commit, avec un
+        worktree propre sur les target_paths (GARDE 3, refus mécanique sinon) ;
+        (4) make deploy-serve, obligatoire puisque des crates serveur ont
+        changé (crash-trace, orchestrator, les deux serveurs), pour promouvoir
+        atomiquement les binaires corrigés ; (5) AUCUN reload_config, la config
+        orchestrator Rust n'ayant pas changé, et de toute façon interdit tant
+        qu'un permit actif subsiste.
+        Le doctor accroché en tête de deploy-serve s'exécutera ici pour la
+        première fois en conditions réelles : il doit afficher les dumps
+        connus et laisser la promotion se faire (preuve du mode
+        informationnel).
+        Puis remonter au PM : la clôture du task-request 7d83f35d exige la
+        confirmation de la promotion. Signaler aussi les deux éléments à
+        capitaliser : la mesure de latence du warm-up sur DB fraîche (open
+        question 2 du design) et le résultat de l'investigation D2.
+      files: []
+  dependencies:
+    - >
+      RFC 5bacb08a approuvé et write permit ca737bdc accordé sur 26 chemins,
+      avec la condition CEO que ce plan soit approuvé avant toute écriture de
+      code. Aucune écriture sous permit avant l'approbation de ce plan par
+      l'Architect (review_protocol pour le kind implementation-plan).
+    - >
+      Séquencement interne strict : étape 1.2 après 1.1 (les constantes
+      nomment des chemins que .gitignore doit déjà ignorer), étape 1.4 après
+      1.3 (le crate doit exister avant d'être dépendu), étape 1.7 après 1.3 à
+      1.6, phase 2 après 1.7 (le plugin doit être sur le disque et les
+      binaires promus), toute la phase 3 après le critère observable de la
+      phase 2.
+    - >
+      À l'intérieur de la phase 3 : étape 3.2 après 3.1 (le test de régression
+      exerce l'isolation), étape 3.3 après 3.1 (le verrou par artifact réutilise
+      la décomposition de la boucle de reindex), étape 3.6 après 3.4 et 3.5
+      (les tests d'intégration consomment les overrides d'environnement et la
+      nouvelle valeur d'escalade), étape 3.9 en dernier.
+    - >
+      Outillage requis et déjà présent : coredumpctl avec support --json
+      (vérifié, systemd 261) pour l'étape 3.7 et gdb pour l'étape 3.8 ; node
+      avec --test pour les suites JS ; les six cores orchestrator et deux
+      cores yaml-validator toujours « present » dans coredumpctl (à ne pas
+      purger avant la fin de l'étape 3.8).
+    - >
+      Canaux de mise en service, non substituables : make deploy-serve pour
+      tout changement des crates serveur (promotion atomique target/serve/,
+      RFC 18011bfc), restart de la session opencode pour tout changement du
+      proxy (RFC 25b6678c), ce dernier étant un acte utilisateur et donc le
+      point d'arrêt de la phase 2.
+  risks:
+    - >
+      RISQUE PRINCIPAL, matérialisé six fois : chaque écriture d'artifact YAML
+      de ce chantier déclenche l'auto-reindex, donc peut reproduire le SIGABRT,
+      y compris l'écriture de ce plan et des reviews à venir. Mitigation par
+      construction : la phase 1 est livrée et mise en service AVANT tout le
+      reste, de sorte qu'une occurrence pendant la phase 3 laisse une trace
+      pré-unwind et un journal proxy exploitables au lieu d'une panne aveugle.
+      Si un crash survient pendant la phase 1 elle même, il reste aveugle : ne
+      pas retenter, ne pas dormir, escalader à l'utilisateur (un -32050
+      escalate:true est la réponse attendue) et reprendre le plan à l'étape
+      interrompue.
+    - >
+      Le permit est à usage unique alors que le plan prévoit neuf commits et
+      une pause utilisateur. Si le permit est consommé trop tôt (par exemple
+      par réflexe à la fin de la phase 1), tous les commits de la phase 3
+      seront refusés par le hook et il faudra un second permit, donc un
+      aller-retour CEO. Mitigation : un seul consume, à l'étape 3.9, après le
+      dernier commit. Si le permit expire pendant le point d'arrêt, ne rien
+      écrire et demander un permit de reprise sur le même périmètre.
+    - >
+      L'étape 3.3 est la plus risquée techniquement : elle change une
+      signature d'API publique de crate, réordonne le boot et déplace un
+      invariant contractuel (supersession partielle de l'étape 19 du RFC
+      bdee1af4). Deux pièges connus et déjà nommés dans le plan (gate fermée
+      sur toute la durée du warm-up à cause du delete_all_artifacts initial,
+      et --index qui doit garder un embedder synchrone) ; un troisième à
+      surveiller : le verrou par artifact rend possible l'entrelacement de
+      tools pendant le reindex, donc toute nouvelle invariante supposant un
+      reindex atomique serait fausse. En cas de blocage architectural non
+      prévu, escalader à l'Architect plutôt que redesigner.
+    - >
+      Le warm-up déplace le risque plutôt que de le supprimer sur un point :
+      si la latence réelle du warm-up sur DB fraîche dépasse le timeout client
+      de 60 s, l'attente bornée derrière la gate produirait à nouveau des
+      -32001 opaques sur les tools d'index. La mesure demandée à l'étape 3.3
+      est donc une décision, pas une curiosité : au delà du seuil, basculer
+      sur l'erreur structurée de warm-up immédiate, comme l'autorise l'open
+      question 2 du design.
+    - >
+      Risque d'auto-blocage de la mise en service si le doctor de l'étape 3.7
+      sort non-zéro en mode hook : deploy-serve.sh tourne sous set -euo
+      pipefail et c'est le SEUL canal de promotion. Double mitigation prévue :
+      exit 0 systématique par construction dans le mode hook, ET ceinture
+      « || true » au site d'appel. À vérifier explicitement avant le premier
+      deploy-serve de l'étape 3.9.
+    - >
+      Le panic hook est le chemin de code le plus large ajouté par ce
+      chantier : il court sur CHAQUE panic des deux serveurs. Un hook qui
+      paniquerait transformerait un panic simple, que l'isolation aurait
+      confiné, en panic-pendant-panic, donc en l'abort que le chantier réduit.
+      Mitigation : invariant d'infaillibilité codé sans unwrap, expect ni
+      opérateur ?, création eager du répertoire au boot, et test unitaire
+      dédié au cas du répertoire non inscriptible (étape 1.3).
+    - >
+      Risque de preuve vide sur le test de régression : un point d'injection
+      mal activé donnerait un test qui compile, passe, et n'exerce rien. Ce
+      risque est la raison du choix de la variable d'environnement sous
+      cfg(debug_assertions) plutôt qu'une feature cargo, et la raison de la
+      vérification explicite du nombre de tests réellement exécutés à l'étape
+      3.2.
+    - >
+      Risque de régression silencieuse sur les nettoyages : make clean ne
+      supprime que les fichiers de base nommément et clean-company exclut
+      company/data/, donc les traces survivent aujourd'hui par construction,
+      sans que cette propriété soit écrite nulle part (observation du CEO au
+      round du RFC). Le plan ne la verrouille pas (hors périmètre) mais je la
+      signalerai en lesson-learned à la clôture, l'exigence utilisateur étant
+      que ces traces ne puissent jamais se perdre.

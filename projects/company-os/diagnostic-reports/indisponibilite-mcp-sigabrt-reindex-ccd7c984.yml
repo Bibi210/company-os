@@ -1,0 +1,141 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: ccd7c984-eb4b-4d69-90bb-c7a8980b5169
+  title: "Indisponibilité MCP >120s le 2026-09-09 : SIGABRT double-panic du reindex, non-récupération ~4 min malgré l'architecture 18011bfc, reboot manuel requis"
+  author: pm
+  created_at: "2026-09-09"
+  project: company-os
+  description: >
+    Incident de disponibilité MCP du 2026-09-09 (~08:54-08:58 UTC) : le serveur
+    orchestrator (binaire servi target/serve/) meurt par SIGABRT (double panic
+    dans le task tokio du file watcher pendant l'auto-reindex d'un design-doc),
+    puis le proxy ne parvient pas à le ramener à l'état ready pendant ~4 minutes
+    (hypothèse dominante : boucle de kill par health-check 10s pendant une
+    fenêtre de boot lent). Le plafond de readiness -32050 du RFC 18011bfc a
+    fonctionné comme conçu (escalade propre, at-most-once respecté), mais
+    l'intention du RFC ("aucune panne de processus ne requiert plus d'humain")
+    n'a pas été tenue : reboot manuel de session nécessaire. Root cause du
+    crash établie par gdb sur core dump ; séquence de respawn irrécouvrable
+    faute de logs persistés (stderr proxy et serveur perdus dans un socket
+    opencode non persisté). 20 coredumps companyos recensés à la fin de la
+    journée, dont 2 SIGABRT du binaire servi le 25/08 absorbés silencieusement
+    et DEUX RÉCIDIVES le 09/09 même (09:24:56 et 09:39:44 UTC) qui confirment
+    le pattern déclencheur : écriture YAML → auto-reindex → crash.
+  tags:
+    - mcp
+    - orchestrator
+    - proxy
+    - availability
+    - sigabrt
+    - double-panic
+    - file-watcher
+    - reindex
+    - health-check
+    - critical-infra
+    - incident
+  related:
+    - id: 18011bfc-c8ae-4c31-8aca-f994755b93e7
+      kind: rfc
+      relationship: related
+    - id: 79f13f30-af1a-453e-9b42-962c35f93d26
+      kind: diagnostic-report
+      relationship: related
+    - id: 8838a892-434d-4af3-bd07-1c655212eb1b
+      kind: lesson-learned
+      relationship: related
+    - id: 7d83f35d-b6a5-46ff-b7e3-70a130ec99a8
+      kind: task-request
+      relationship: related
+
+spec:
+  status: resolved
+  symptom: >
+    Timeline consolidée (UTC, sources : opencode.log, journalctl, coredumpctl,
+    gdb sur core dump). 08:53:42 : écriture du design-doc sidekick 8221e203 →
+    auto-reindex par le file watcher serveur. 08:54:26 : le serveur orchestrator
+    (PID 33345, binaire target/serve/) meurt par SIGABRT ; core dump de 414 Mo
+    écrit en ~10 s (pic mémoire 1.7 Go). 08:54:54 : submit_review_vote du PM
+    bufferisé par le proxy (state != ready). 08:55:54 : timeout CLIENT opencode
+    à 60 s → le PM voit une erreur -32001 opaque. ~08:56:36 : plafond 120 s
+    atteint → -32050 structuré émis, buffer vidé (vote droppé, jamais rejoué :
+    conforme au contrat at-most-once C2). 08:58:25 : l'utilisateur tue et
+    relance la session opencode. 08:58:41 : nouveau serveur (PID 54403), boot
+    <10 s. 09:00:42 : vote PM re-soumis avec succès, aucun doublon.
+    Indisponibilité effective ~4 minutes, résolue par un reboot humain, ce que
+    l'architecture B+A+C du RFC 18011bfc devait rendre impossible pour les
+    pannes de processus. RÉCIDIVES LE JOUR MÊME (le rétablissement de 08:58
+    n'était PAS durable) : 09:24:56 UTC, SIGABRT du PID 54403 (le serveur
+    rebooté le matin) pendant la fenêtre d'écriture/indexation des artifacts
+    incident et du plan sidekick ; indisponibilité >160 s constatée à ~09:31
+    (-32050) ; second reboot utilisateur, serveur de nouveau sain à 09:37:05.
+    Puis 09:39:44 UTC : TROISIÈME SIGABRT (PID 80065), celui-ci ABSORBÉ par la
+    supervision sans intervention humaine (index sain à 09:40:27). La
+    non-récupération est donc CONDITIONNELLE à l'état de la fenêtre de boot,
+    cohérent avec l'hypothèse H1 (boucle health-check) et le boot rapide
+    post-reboot. Bilan de la journée : 3 SIGABRT du binaire servi, 2 reboots
+    humains, 1 récupération autonome.
+  root_cause: >
+    DEUX causes distinctes. (1) CAUSE DU CRASH (établie par gdb, symboles
+    complets) : double panic dans le task tokio du file watcher
+    (run_server::async_block#5, main.rs:2433, consommateur ConfigChangeKind::
+    Artifacts → engine.reindex_all). Un premier panic (message perdu avec le
+    stderr) survient pendant l'auto-reindex du design-doc écrit à 08:53:42 (le
+    fichier apparaît 23 fois dans la mémoire du core) ; pendant l'unwind, un
+    Drop panique à son tour → panic_in_cleanup → abort() → SIGABRT. Un panic de
+    task tokio est normalement contenu (JoinError) : seul le double panic tue
+    le process. WatcherGuard::drop est déjà blindé par catch_unwind ; le Drop
+    fautif est plus profond dans la pile reindex_all (suspects : destructeurs
+    rusqlite Statement/Transaction, ou session/valeurs ort/ONNX, cohérent avec
+    le diagnostic fa9bd072). Mode de panne RÉCURRENT et INVISIBLE, confirmé
+    par les récidives du jour même : 20 coredumps companyos au soir du 09/09
+    (15 SIGABRT target/debug en juin, 2 SIGABRT du binaire servi le 25/08
+    absorbés silencieusement par la supervision, et 3 SIGABRT du binaire servi
+    le 09/09 : l'incident 33345 plus les récidives 54403 et 80065, chacune
+    déclenchée pendant une phase d'auto-reindex d'artifacts YAML fraîchement
+    écrits). Le déclencheur est donc REPRODUIT : écriture YAML → auto-reindex
+    → crash. (2) CAUSE DE LA
+    NON-RÉCUPÉRATION (~3 min 50 s, hypothèse dominante H1, non prouvable
+    post-mortem faute de logs) : boucle de kill par health-check. À chaque
+    respawn le proxy arme HEALTH_CHECK_TIMEOUT_MS=10s ; le boot du serveur fait
+    tout AVANT de répondre (flock, migrate, chargement embedder ONNX, reindex
+    de boot potentiellement lourd juste après un crash mi-reindex), sous
+    saturation CPU du spin-wait ONNX (~600%, chantier 0e089d1b) et l'I/O du
+    core dump : boot systématiquement >10 s → SIGTERM → backoff → respawn →
+    même sort, boucle infinie PAR CONSTRUCTION (le backoff plafonné n'aide pas
+    si chaque incarnation est tuée à 10 s). Preuves pour : un seul coredump
+    dans la fenêtre (les incarnations suivantes meurent proprement par
+    SIGTERM), le -32050 prouve que le cycle tournait sans atteindre ready.
+    Hypothèses écartées : crash-loop SIGABRT (un seul dump), régression volet B
+    (binaires servis intacts depuis le 25/08, cargo de 08:28 n'a touché que
+    target/debug), lock zombie (flock libéré au réap par le kernel). RESTE
+    INDÉTERMINABLE : la séquence exacte des respawns et le message du panic
+    originel, car le stderr du proxy (console.error) et du serveur (tracing,
+    stdio inherit) partent dans un socket opencode jamais persisté. GAP DE
+    CONCEPTION CONNEXE : le timeout client opencode (60 s, -32001 opaque) est
+    INFÉRIEUR au plafond -32050 (120 s), donc le premier échec visible par un
+    agent n'est jamais l'erreur structurée prescrivant l'escalade.
+  resolution: >
+    Service rétabli par le reboot manuel de la session opencode (08:58:41,
+    boot serveur <10 s dans un environnement assaini). État vérifié post-
+    incident : index sain (218 artifacts, triplet cohérent, watcher vivant),
+    flock tenu par le serveur courant, DB saine, aucun doublon de vote (le
+    vote droppé a été re-soumis manuellement, conforme au contrat C2
+    at-most-once). Après les récidives : second reboot utilisateur à ~09:36
+    (indisponibilité #2 >160 s), puis récupération AUTONOME du troisième
+    SIGABRT à 09:39:44 (aucune action humaine, index sain 47 s plus tard).
+    Les TROIS core dumps du 09/09 sont conservés (PIDs 33345, 54403, 80065,
+    symboles complets) pour l'analyse approfondie des panics originels.
+    Les actions correctives (persistance des logs proxy et serveur,
+    durcissement du task reindex contre le double panic avec trace de crash
+    persistée sur disque, cassage de la boucle health-check par construction,
+    alignement du plafond -32050 sous le timeout client, surveillance des
+    coredumps) sont cadrées dans le task-request de suivi 7d83f35d (lien en
+    related). Conformité 18011bfc : volets
+    B et C conformes à la lettre (at-most-once du buffer compris), volet A
+    conforme à la lettre mais en échec sur l'intention : mode de panne non
+    couvert (SIGABRT récurrent + fenêtre de boot > health-check), pas une
+    régression. Side-note à investiguer séparément : un revert "write permit
+    tampering" du hook defense-in-depth déclenché pendant l'investigation sur
+    une commande bash en lecture seule (course possible snapshot pre/post
+    bash), consigné dans le task-request de suivi.

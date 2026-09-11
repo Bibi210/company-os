@@ -1,0 +1,786 @@
+api_version: companyos/v1
+kind: design-doc
+metadata:
+  id: aae2af60-b225-4c61-9600-8be8d6d7ebd6
+  title: "Durcissement de la récupération MCP post-crash : télémétrie persistée par le proxy, trace de crash pré-unwind, reindex isolé par artifact, boot readiness-first, health-check progressif, escalade -32050 à 45 s, surveillance des coredumps"
+  author: architect
+  created_at: "2026-09-10"
+  project: company-os
+  description: >
+    Design (révision 3, itération 2 du round deda9448 : sémantique d'échec
+    informationnelle des hooks deploy-serve, injection de faute par variable
+    d'environnement sous cfg(debug_assertions)) du
+    chantier correctif cadré par le task-request 7d83f35d (priorité critical)
+    après l'incident du 2026-09-09 (diagnostic ccd7c984) : SIGABRT récurrent
+    du serveur orchestrator par double panic dans le task reindex du file
+    watcher, déclencheur REPRODUIT à 5 reprises (écriture YAML → auto-reindex
+    → crash ; 4e occurrence le 09/09 au soir, 5e occurrence le 10/09 à 10:14
+    locale, PID 20900, core de 437 Mo, pendant la review de ce design même),
+    aggravé par une non-récupération conditionnelle (boucle de kill
+    health-check 10 s pendant une fenêtre de boot lent) et une télémétrie
+    perdue par construction. Le design se structure en deux plans :
+    (1) instrumentation inconditionnelle — le proxy devient l'unique écrivain
+    d'une télémétrie persistée en fichiers rotatifs (son propre journal + le
+    stderr capturé du serveur), et les serveurs servis (orchestrator ET
+    yaml-validator, lui-même en SIGABRT le 09/09) écrivent une trace de crash
+    persistée AVANT l'unwind via un panic hook ; (2) élimination des modes de
+    panne — isolation par artifact du reindex (catch_unwind périmétré,
+    promesse requalifiée : confinement + trace garantie + récupération
+    automatique, PAS impossibilité de l'abort), boot readiness-first du
+    serveur avec embedder late-bound et gate de warm-up (supersession
+    PARTIELLE de l'invariant « reindex avant serve » du RFC bdee1af4 étape
+    19), timeout de health-check progressif plafonné à 40 s côté proxy
+    (cohérent avec l'escalade), plafond d'escalade -32050 abaissé à 45 s
+    (supersession PARTIELLE du contrat C2 du RFC 18011bfc), et surveillance
+    des coredumps par make doctor sur baseline AUTO-CAPTURÉE au premier run
+    (≥22 dumps réels au 10/09, la baseline codée en dur du premier jet était
+    déjà fausse). L'analyse des QUATRE core dumps orchestrator (3 du 09/09 +
+    1 du 10/09) est cadrée comme étape d'investigation Implementer, livrable
+    diagnostic-report, non bloquante pour le durcissement. Le séquencement
+    comporte un POINT D'ARRÊT explicite : l'instrumentation proxy n'entre en
+    service qu'au restart de la session opencode (acte utilisateur), le
+    chantier s'arrête pour le demander avant de continuer.
+  tags:
+    - mcp
+    - orchestrator
+    - proxy
+    - availability
+    - resilience
+    - sigabrt
+    - double-panic
+    - health-check
+    - logging
+    - crash-trace
+    - coredump
+    - critical-infra
+    - design
+  related:
+    - id: 7d83f35d-b6a5-46ff-b7e3-70a130ec99a8
+      kind: task-request
+      relationship: input
+    - id: ccd7c984-eb4b-4d69-90bb-c7a8980b5169
+      kind: diagnostic-report
+      relationship: related
+    - id: 18011bfc-c8ae-4c31-8aca-f994755b93e7
+      kind: rfc
+      relationship: related
+
+spec:
+  overview: >
+    L'architecture B+A+C du RFC 18011bfc a tenu ses contrats mécaniques mais
+    pas son intention : deux reboots humains le 2026-09-09, une 4e occurrence
+    du même crash le soir même, une 5e le 10/09 pendant la review de ce
+    design. Trois défauts structurels distincts sont en cause et sont traités
+    séparément, car ils se masquent mutuellement. PREMIER DÉFAUT — cécité :
+    toute la télémétrie de récupération (stderr du proxy et du serveur, y
+    compris les messages de panic Rust) part dans un socket opencode jamais
+    persisté ; chaque incident est irrécouvrable post-mortem. Le design rend
+    la cécité impossible par deux canaux complémentaires et redondants : le
+    proxy persiste TOUT (son journal d'événements et le stderr du serveur
+    qu'il capture désormais par pipe) dans des fichiers rotatifs, et chaque
+    serveur servi écrit lui-même une trace de crash dans un fichier dédié
+    AVANT que l'unwind ne commence (panic hook), de sorte que même la mort du
+    proxy ou de la session ne peut pas perdre la trace d'un panic — exigence
+    utilisateur explicite. DEUXIÈME DÉFAUT — le crash lui-même : un panic
+    d'indexation, normalement contenu par tokio (JoinError), devient fatal
+    parce qu'un Drop panique pendant l'unwind (panic_in_cleanup → abort →
+    SIGABRT). Le design REQUALIFIE honnêtement ce qu'il peut promettre ici :
+    catch_unwind ne peut pas empêcher un abort de panic_in_cleanup
+    (process-wide), et les Drop suspects (rusqlite, ort) vivent dans la frame
+    d'indexation elle-même, donc dans la portée que le catch_unwind déroule.
+    La promesse tenue est un MÉCANISME ÉQUIVALENT (branche explicitement
+    offerte par le criterion 3 du task-request) : confinement des panics
+    simples au périmètre d'un artifact, trace persistée GARANTIE de tout
+    panic y compris l'abort résiduel, et récupération automatique en secondes
+    (respawn proxy + readiness-first) ; l'isolation par process séparé,
+    seule à rendre l'abort réellement impossible pour le parent, est évaluée
+    et rejetée pour son coût (D3), mais actée comme option de dernier recours.
+    L'analyse gdb des quatre cores orchestrator est cadrée en parallèle comme
+    investigation pour un correctif ciblé additionnel. TROISIÈME DÉFAUT — la
+    boucle de kill : le boot du serveur fait tout AVANT de répondre à
+    initialize pendant que le proxy arme un timeout fixe de 10 s ; un boot
+    lent mais vivant est tué indéfiniment PAR CONSTRUCTION. L'inventaire
+    complet du boot (corrigé au round deda9448) comprend : flock, migrate,
+    chargement ONNX BLOQUANT (Embedder::load_from_cache), et DEUX reindex_all
+    synchrones avant serve dans les branches rebuild-autorepair et drift
+    fts/model (une DB fraîche déclenche model_drift, donc le chemin post
+    make clean est un boot lent LÉGITIME) ; OrchestratorEngine::new exige
+    l'embedder par valeur. Le design casse la boucle des deux côtés : le
+    serveur répond à initialize après flock + migrate seulement, TOUT le
+    travail lourd (ONNX, reindex de rebuild, de drift et nominal) passe dans
+    un task de warm-up unique derrière une gate explicite (supersession
+    PARTIELLE de l'invariant « reindex avant serve » du RFC bdee1af4 étape
+    19 : l'invariant observable — aucun tool d'index ne voit un index
+    incohérent — est conservé, son mécanisme change), le warm-up rend le
+    lock engine PAR ARTIFACT pour que les tools s'intercalent, et le proxy
+    adopte un timeout de health-check progressif plafonné à 40 s, sous le
+    plafond d'escalade. Enfin, deux alignements de contrat : le plafond
+    d'escalade -32050 descend à 45 s pour passer SOUS le timeout client
+    opencode de 60 s (supersession partielle du C2 de 18011bfc), et les
+    coredumps des binaires servis deviennent surveillés (make doctor,
+    baseline AUTO-CAPTURÉE au premier run) au lieu de s'accumuler
+    silencieusement. MISE EN SERVICE (règle Architect) : les changements
+    serveur n'entrent en service que par make deploy-serve (promotion
+    atomique, RFC 18011bfc) ; les changements du proxy (plugin) nécessitent
+    un restart de la session opencode (hot-reload de code retiré, RFC
+    25b6678c) — ce restart est un POINT D'ARRÊT explicite du séquencement
+    (D7) ; aucun reload_config n'est requis. Zones touchées, inventaire
+    COMPLET (lesson 611fde3e) : protégées — crates/ (serveurs),
+    company/plugins/ (proxy), company/scripts/ (script doctor) ; NON
+    protégées mais modifiées — Makefile (cibles doctor et deploy-serve) et
+    .gitignore (company/data/logs/, company/data/crashes/, baseline). Ce
+    design précède un RFC qui portera le cycle approbation CEO → write
+    permit sur l'ensemble de ce périmètre.
+  components:
+    - name: "Puits de télémétrie persistée du proxy (criterion 1)"
+      description: >
+        Le proxy devient l'unique écrivain d'une télémétrie de récupération
+        persistée sous company/data/logs/ (répertoire runtime non versionné,
+        même statut git que la DB orchestrator). Deux flux dans un fichier de
+        journal par crate supervisé : (a) le journal propre du proxy — chaque
+        ligne aujourd'hui émise par log() (transitions de la machine à états,
+        raisons de mort onChildGone, résultats et timeouts de health-check,
+        planifications de respawn, entrées/sorties d'indisponibilité,
+        escalades -32050) est écrite À LA FOIS sur stderr (comportement
+        actuel conservé pour le live) et dans le fichier ; (b) le stderr du
+        serveur enfant, aujourd'hui perdu en stdio inherit, est capturé par
+        pipe et téé ligne à ligne dans le même fichier. Chaque ligne porte un
+        préfixe structuré : timestamp ISO 8601 UTC, numéro d'incarnation,
+        source (proxy | server). La rotation est par taille, gérée dans le
+        proxy, avec un nombre borné de fichiers d'archive ; la décision de
+        rotation est une fonction pure du core testable (pattern
+        mcp-proxy-core éprouvé, lesson 8838a892). Résultat : la séquence
+        complète d'un incident futur (spawn, kill, backoff, raisons) est
+        reconstituable post-mortem sans reproduction, incarnation par
+        incarnation.
+    - name: "Trace de crash pré-unwind côté serveurs (criterion 3, volet trace)"
+      description: >
+        Un panic hook Rust (std::panic::set_hook) installé au boot de CHACUN
+        des serveurs servis — orchestrator ET yaml-validator, ce dernier
+        ayant lui-même produit un SIGABRT le 09/09 à 12:21 (finding 5 du
+        round deda9448 : limiter le hook à l'orchestrator aurait laissé un
+        crash reproduit sans trace) — écrit une trace de crash dans un
+        fichier dédié sous company/data/crashes/ (un fichier par crash,
+        nommé par timestamp et PID) AVANT que l'unwind ne commence — c'est
+        la propriété clé : le hook s'exécute au point de panic, donc la
+        trace existe même si un Drop tue ensuite le process pendant
+        l'unwind. La factorisation du hook entre les deux binaires (module
+        partagé ou duplication assumée) relève du plan d'implémentation.
+        Contenu : timestamp UTC, incarnation (transmise par le proxy à
+        chaque spawn via une variable d'environnement, avec repli
+        PID+horodatage de boot si absente), PID, nom du binaire, message du
+        panic, backtrace complète capturée de force, nom du thread,
+        indicateur de double panic (hook réinvoqué pendant un unwind déjà en
+        cours : les DEUX panics sont tracés), et l'artifact en cause —
+        exposé par un contexte de portée posé par le chemin d'indexation
+        autour de chaque artifact traité (orchestrator seulement). Écriture
+        synchrone avec fsync avant retour du hook. Les traces ne sont JAMAIS
+        supprimées ni tournées automatiquement : elles survivent au process,
+        à la session et au reboot (exigence utilisateur explicite), et sont
+        remontées par la surveillance (composant make doctor).
+    - name: "Isolation par artifact du reindex (criterion 3, volet durcissement)"
+      description: >
+        Le chemin reindex (consommateur ConfigChangeKind::Artifacts du file
+        watcher, et les reindex de boot qui empruntent la même pile) est
+        restructuré pour que l'unité de panne soit L'ARTIFACT, pas le lot :
+        l'indexation de chaque artifact est enveloppée dans un catch_unwind
+        au périmètre le plus étroit possible. PORTÉE HONNÊTE du mécanisme
+        (requalifiée au round deda9448) : (i) un panic SIMPLE sur un
+        artifact est confiné — les autres artifacts du lot sont indexés
+        normalement, le task du watcher survit, le process survit ; (ii)
+        tout panic est un événement observable — log tracing warn + trace de
+        crash persistée par le panic hook (le hook court AVANT que
+        catch_unwind ne rattrape) ; (iii) en revanche, si un Drop panique
+        PENDANT l'unwind (panic_in_cleanup), l'abort reste process-wide et
+        catch_unwind ne l'empêche PAS — les Drop suspects (statements et
+        transactions rusqlite, valeurs ort) vivent dans la frame
+        d'indexation de l'artifact, donc dans la portée exacte que le
+        catch_unwind déroule ; le bénéfice dans le scénario observé est le
+        confinement du premier panic et la garantie de trace, pas la
+        suppression de l'abort. La défense contre l'abort résiduel est
+        SYSTÉMIQUE : trace pré-unwind garantie (hook), récupération
+        automatique en secondes (respawn proxy + boot readiness-first),
+        surveillance (doctor). Ce durcissement reste volontairement
+        AGNOSTIQUE de la root cause fine ; le correctif ciblé issu de
+        l'investigation gdb (composant dédié) vient en plus, pas à la place,
+        et l'isolation par process séparé est l'option de dernier recours
+        actée en D3 si l'abort se reproduit après ces deux couches. Un test
+        de régression exerce le déclencheur reproduit : écriture d'un
+        artifact YAML → événement watcher → reindex avec panic injecté sur
+        un artifact (point d'injection de faute activé par variable
+        d'environnement et gardé par cfg(debug_assertions), mécanisme
+        tranché en D8 : cfg(test) est invisible du binaire de test
+        d'intégration, et une feature cargo ne serait jamais active sous
+        make ci, qui lance cargo test --workspace sans --all-features ;
+        le binaire servi étant un build debug promu depuis target/debug,
+        le point d'injection y est présent mais inerte tant que la
+        variable d'environnement n'est pas positionnée) → le process
+        survit, l'index reste cohérent pour les autres artifacts, la trace
+        de crash est écrite.
+    - name: "Cadre d'investigation des core dumps orchestrator (criterion 2)"
+      description: >
+        Étape d'INVESTIGATION, pas de code. QUI : l'Implementer (il connaît
+        la pile réelle et l'outillage gdb ; l'Architect review le livrable
+        pour la rigueur de la root cause, conformément au review-protocol).
+        QUOI : les QUATRE cores orchestrator disponibles (PIDs 33345, 54403,
+        80065 du 09/09 et 20900 du 10/09 à 10:14, 437 Mo — 5e occurrence du
+        déclencheur, survenue pendant la review de ce design ; binaire
+        servi, symboles complets, tous « present » dans coredumpctl). Le
+        core yaml-validator du 09/09 à 12:21 (PID 82926) est un matériau
+        SECONDAIRE : l'analyser si l'effort est marginal, sans en faire un
+        critère du livrable. COMMENT : coredumpctl gdb par PID ; localiser
+        les frames de la machinerie de panic (rust_panic, panic_in_cleanup)
+        dans la pile du task run_server ; extraire le payload du panic
+        originel (objet d'exception, chaînes du message dans la mémoire du
+        core) ; identifier le Drop fautif en isolant les frames
+        drop_in_place traversées par l'unwind (suspects hérités du
+        diagnostic ccd7c984 : destructeurs rusqlite Statement/Transaction,
+        valeurs ort/ONNX) ; RECOUPER les quatre piles — quatre occurrences
+        du même déclencheur donnent quatre chances de voir le même couple
+        (panic originel, Drop fautif). LIVRABLES : un diagnostic-report
+        projet consignant soit le message du panic originel + le Drop fautif
+        identifié, soit la démonstration documentée d'irrécupérabilité (ce
+        qui a été tenté, pourquoi ça ne peut pas aboutir). NON BLOQUANT :
+        le durcissement (isolation + panic hook) n'attend pas ce résultat ;
+        si un Drop fautif précis est identifié, il donne lieu à un correctif
+        ciblé additionnel dans le même chantier.
+    - name: "Boot readiness-first du serveur (criterion 4, volet serveur)"
+      description: >
+        Le serveur répond à initialize dès que le transport MCP est
+        opérationnel, et déplace le travail lourd APRÈS la readiness.
+        INVENTAIRE COMPLET du boot actuel (corrigé au round deda9448, le
+        premier jet était incomplet) : flock writer unique → migrate →
+        chargement ONNX BLOQUANT (Embedder::load_from_cache, main.rs:2274)
+        → détection drift → construction de l'engine (OrchestratorEngine::new
+        exige l'embedder PAR VALEUR, main.rs:2299) → deux reindex_all
+        SYNCHRONES éventuels avant serve : branche rebuild-autorepair après
+        corruption (main.rs:2330) et branche drift fts/model
+        (main.rs:2350-2364), cette dernière étant déclenchée notamment par
+        toute DB FRAÎCHE (model_version absent → model_drift=true), donc le
+        boot post make clean est un boot lent légitime, pas un cas d'école.
+        Seul le reindex nominal (main.rs:2393) est déjà en arrière-plan.
+        ORDRE DE BOOT CIBLE : (1) flock + migrate (invariants de correction,
+        dizaines de ms) ; (2) transport et réponse à initialize ; (3) task
+        de warm-up unique en arrière-plan : chargement ONNX, puis
+        installation de l'embedder dans l'engine (l'embedder devient
+        LATE-BOUND : l'engine se construit sans lui et le reçoit en fin de
+        warm-up ; la forme exacte — Option, OnceCell, injection — relève du
+        plan d'implémentation), puis le reindex requis (rebuild, drift ou
+        nominal selon l'état constaté). GATE DE WARM-UP : les tools
+        dépendant de l'index ou de l'embedder (search, get, related,
+        index_*, roadmaps, supersede) attendent la fin du warm-up (attente
+        bornée) ou répondent une erreur structurée de warm-up ; les tools ne
+        touchant ni l'index ni l'embedder (permits, review rounds, config,
+        generate_id) servent immédiatement. CONSÉQUENCE CONTRACTUELLE
+        ASSUMÉE : l'invariant « reindex synchrone avant de servir » du RFC
+        bdee1af4 étape 19 est SUPERSÉDÉ PARTIELLEMENT — la propriété
+        observable (aucun tool d'index ne voit un index incohérent ou vide
+        après drift) est conservée, son mécanisme passe de « bloquer le boot
+        entier » à « bloquer les seuls tools d'index derrière la gate » ; le
+        RFC issu de ce design portera cette supersession explicitement,
+        comme celle du C2 (D5). VERROU : le warm-up ne détient PAS le lock
+        engine en continu — sans cela, les 31 sites engine.lock() des
+        handlers feraient de « les tools SQL fonctionnent immédiatement »
+        un mensonge et transformeraient la boucle de kill en stall de tools
+        se terminant en -32001 opaque (finding 3). Le lock est pris et rendu
+        PAR ARTIFACT (même unité que l'isolation D3) : les handlers
+        s'intercalent entre deux artifacts, la latence d'un tool est bornée
+        par l'indexation d'UN artifact. Conséquence architecturale : la
+        fenêtre pendant laquelle un health-check peut tuer un serveur vivant
+        passe de « durée du boot complet sous charge » (>10 s observé) à
+        « démarrage du transport » (ordre de la seconde), ce qui casse la
+        boucle à la racine, y compris pour les boots à reindex lourd
+        (rebuild, DB fraîche) qui restaient bloquants dans le premier jet.
+    - name: "Health-check à timeout progressif du proxy (criterion 4, volet proxy)"
+      description: >
+        Le timeout de health-check post-respawn cesse d'être une constante
+        fixe de 10 s : il devient progressif par incarnation consécutive non
+        confirmée — 10 s au premier essai (détection rapide d'un serveur
+        mort-né conservée), doublé à chaque timeout consécutif, PLAFONNÉ À
+        40 s (10→20→40), réarmé à 10 s dès qu'une incarnation atteint ready.
+        Le plafond passe de 60 s (premier jet) à 40 s pour rester SOUS le
+        plafond d'escalade -32050 de 45 s (finding 4, arbitrage D4×D5 en
+        D5) : chaque fenêtre de health-check prise isolément se referme
+        avant le délai d'escalade ; en cumulé, la 3e fenêtre peut
+        chevaucher l'escalade, comportement assumé car l'escalade est un
+        signal, pas un arrêt (arbitrage complet en D5). La progression est
+        calculée par une fonction pure du
+        core (testable comme computeBackoff). C'est le FILET du volet
+        serveur : même si une régression future réintroduit du travail
+        lourd avant initialize, un boot lent mais vivant finit par disposer
+        d'une fenêtre suffisante au lieu d'être tué indéfiniment ; la
+        boucle infinie devient impossible par construction des deux côtés
+        indépendamment. Avec readiness-first en place, un boot légitime
+        atteint ready en une à deux secondes : le plafond 40 s ne sert que
+        le cas de régression, où 40 s couvrent largement flock + migrate +
+        transport même sous CPU saturé. TESTS (cadrage D8) : la logique de
+        progression est testée en fonction pure dans le harness core
+        existant ; le test d'intégration « boot lent » (binaire factice
+        répondant à initialize après un délai supérieur au timeout initial)
+        utilise les overrides d'environnement des constantes temporelles
+        pour compresser les délais et vérifie que le proxy atteint ready en
+        un nombre borné de cycles, sans boucle infinie.
+    - name: "Plafond d'escalade -32050 abaissé à 45 s (criterion 5)"
+      description: >
+        UNAVAILABLE_ESCALATION_MS passe de 120 000 à 45 000 ms par défaut
+        (l'override d'environnement de test est conservé). Effet contractuel
+        : le premier échec visible par un agent pendant une indisponibilité
+        longue est TOUJOURS l'erreur structurée -32050 (escalate:true) qui
+        prescrit l'escalade humaine, plus jamais le -32001 opaque du timeout
+        client opencode à 60 s, comme observé le 09/09 (le PM a vu -32001 à
+        08:55:54, le -32050 n'est arrivé qu'à 08:56:36). SUPERSESSION
+        PARTIELLE EXPLICITE du contrat C2 du RFC 18011bfc (note du reviewer
+        Architect au round précédent) : la valeur « 120 s » inscrite dans C2
+        est remplacée par 45 s ; TOUT LE RESTE de C2 survit inchangé —
+        sémantique at-most-once du buffer (les requêtes échues sont
+        droppées, jamais rejouées), forme de l'erreur structurée, drop loggé
+        des notifications sans id. COHÉRENCE D4×D5 (finding 4) : le plafond
+        du health-check progressif est fixé à 40 s, sous les 45 s, et
+        l'escalade est un SIGNAL, pas un arrêt — voir l'arbitrage complet
+        en D5. Le RFC issu de ce design portera cette supersession partielle
+        dans sa proposal.
+    - name: "Surveillance des coredumps (criterion 6)"
+      description: >
+        Nouvelle cible make doctor, adossée à un script de surveillance
+        (créé sous company/scripts/, ZONE PROTÉGÉE — inventaire D7) qui
+        interroge coredumpctl (--json=short, vérifié disponible) pour TOUS
+        les binaires companyos (orchestrator ET yaml-validator, ce dernier
+        ayant dumpé le 09/09) et compare à une BASELINE PERSISTÉE sous
+        company/data/ (fichier runtime non versionné). La baseline est
+        AUTO-CAPTURÉE AU PREMIER RUN : le script snapshotte l'état réel de
+        coredumpctl à sa première exécution au lieu d'embarquer un état codé
+        en dur — le premier jet gravait « 20 dumps au soir du 09/09 », déjà
+        faux au moment de la review (≥22 dumps au 10/09, dont le SIGABRT
+        yaml-validator du 09/09 12:21 et le SIGABRT orchestrator du 10/09
+        10:14), preuve par l'exemple qu'une baseline codée en dur est
+        périmée avant d'être mergée (finding 5). Tout dump plus récent que
+        la baseline est signalé avec PID, binaire, date, signal, et la
+        commande gdb prête à l'emploi ; le doctor liste aussi les traces de
+        crash présentes sous company/data/crashes/ (signal de première
+        main, indépendant de systemd). Points d'accrochage : invocation
+        manuelle (routine d'inspection) ET exécution automatique en tête de
+        make deploy-serve — c'est le point de passage obligé du chantier
+        (rien n'entre en service sans lui), donc le moment naturel de
+        vérifier si les binaires sortants ont dumpé. SÉMANTIQUE D'ÉCHEC À
+        DEUX MODES : en mode hook (accroché à deploy-serve), le doctor est
+        INFORMATIONNEL — rapport affiché, exit 0 SYSTÉMATIQUE, y compris
+        quand il trouve de nouveaux dumps, et dégradation gracieuse si
+        coredumpctl est absent ou sans support --json (message explicite +
+        exit 0) ; seul l'appel manuel make doctor porte un code de sortie
+        signifiant (non-zéro si nouveaux dumps depuis la baseline). Le
+        rationale complet est en D6. VOLONTAIREMENT HORS de
+        make ci : les coredumps sont un état local de la machine, pas une
+        propriété du commit ; les mettre en gate CI bloquerait des commits
+        pour des crashs sans rapport.
+    - name: "Mise en service et séquencement du chantier (criterion 7 et contrainte d'ordre)"
+      description: >
+        Rien n'est en service sans promotion : les changements des crates
+        serveur (panic hooks, isolation reindex, readiness-first) n'entrent
+        en service que par make deploy-serve (promotion atomique
+        target/serve/, RFC 18011bfc) ; les changements du proxy (télémétrie
+        persistée, health-check progressif, plafond 45 s) sont du code
+        plugin et nécessitent un restart de la session opencode (RFC
+        25b6678c) ; aucun reload_config (la config orchestrator Rust ne
+        change pas). SÉQUENCEMENT AVEC POINT D'ARRÊT EXPLICITE (finding 8) :
+        le restart de session est un ACTE UTILISATEUR que le chantier ne
+        peut pas exécuter lui-même ; sans point d'arrêt, tout le chantier
+        s'écrirait dans une session dont le proxy est encore aveugle, en
+        contradiction avec la contrainte instrumentation-d'abord du
+        task-request. ÉTAPE 1 : livrer l'instrumentation complète —
+        télémétrie proxy (plugin) ET trace de crash serveurs (deploy-serve
+        immédiat pour ce volet). ÉTAPE 2 — POINT D'ARRÊT : demander
+        explicitement à l'utilisateur le restart de la session opencode, et
+        NE PAS poursuivre le chantier tant que la nouvelle session
+        (proxy instrumenté, vérifiable par l'apparition du journal sous
+        company/data/logs/) n'est pas confirmée. ÉTAPE 3 : le reste du
+        chantier (durcissement, readiness-first, health-check progressif,
+        45 s, doctor), chaque écriture YAML étant désormais une occasion de
+        crash DOCUMENTÉE au lieu d'une panne aveugle (déclencheur reproduit
+        5 fois). INVENTAIRE COMPLET DES ZONES pour le permit (lesson
+        611fde3e, finding 6) : zones protégées touchées — crates/
+        (serveurs orchestrator et yaml-validator), company/plugins/ (proxy
+        et son core), company/scripts/ (script doctor, protégé par
+        protected-zones.json) ; fichiers NON protégés mais modifiés, à
+        lister dans affected_files du RFC pour l'exhaustivité du périmètre —
+        Makefile (cibles doctor et accrochage deploy-serve) et .gitignore
+        (company/data/logs/, company/data/crashes/, baseline coredumps).
+        La clôture du task-request exige la confirmation de la promotion
+        (règle PM, RFC 18011bfc).
+  decisions:
+    - decision: >
+        D1 — La télémétrie persistée est écrite par le PROXY seul, qui
+        capture le stderr du serveur par pipe (fin du stdio inherit), dans
+        des fichiers rotatifs par taille sous company/data/logs/, une ligne =
+        un préfixe structuré (timestamp ISO UTC, incarnation, source
+        proxy|server).
+      rationale: >
+        Un écrivain unique élimine toute course d'écriture et garantit que
+        chaque ligne serveur est étiquetée avec l'incarnation que seul le
+        proxy connaît. Capturer le stderr côté proxy plutôt que faire écrire
+        le serveur dans son propre fichier (tracing-appender) est décisif :
+        les messages de panic Rust et l'abort « thread panicked while
+        panicking » partent sur stderr BRUT, pas dans tracing — c'est
+        précisément le message perdu le 09/09. Le canal proxy capture tout,
+        y compris ce qu'un serveur mourant n'aurait jamais pu écrire
+        proprement lui-même. Le spawn est déjà en stdio
+        ["pipe","pipe","inherit"] : seul le troisième descripteur change de
+        destination (confirmé au round deda9448). company/data/ est déjà la
+        zone de données runtime non versionnées (DB orchestrator) ; le hook
+        defense-in-depth n'intercepte que les écritures d'agents, pas
+        celles des process runtime. La rotation par taille bornée est
+        calculée par une fonction pure du core, unit-testable sans fs
+        (pattern validé par la lesson 8838a892). Alternative rejetée :
+        journald/systemd (le proxy est spawné par opencode, pas par
+        systemd ; portabilité nulle).
+    - decision: >
+        D2 — L'analyse des QUATRE core dumps orchestrator (PIDs 33345,
+        54403, 80065 du 09/09 ; 20900 du 10/09, 5e occurrence) est une étape
+        d'investigation confiée à l'Implementer, livrable diagnostic-report
+        (message du panic originel + Drop fautif, ou irrécupérabilité
+        démontrée), NON BLOQUANTE pour le durcissement du reindex. Le core
+        yaml-validator du 09/09 (PID 82926) est matériau secondaire
+        optionnel.
+      rationale: >
+        Le durcissement (D3) est conçu pour être utile sans connaître le
+        Drop fautif : conditionner la livraison du correctif à une
+        investigation gdb à l'issue incertaine inverserait les priorités
+        d'un chantier critical. Inversement, l'investigation a une vraie
+        valeur : quatre cores du même déclencheur avec symboles complets
+        sont un matériau rare (quatre piles à recouper — la 5e occurrence
+        du 10/09, survenue pendant la review de ce design, a ajouté un
+        quatrième core au corpus), et un Drop fautif identifié permet un
+        correctif ciblé qui réduit encore la surface (l'isolation confine
+        le panic, le correctif ciblé le fait disparaître). C'est d'autant
+        plus important que D3 (requalifié) ne peut PAS garantir la
+        disparition de l'abort : le correctif ciblé est le seul chemin qui
+        supprime la cause. L'Implementer est le bon exécutant : c'est lui
+        qui connaît la pile reindex_all réelle et qui traduira le résultat
+        en correctif ; l'Architect review la rigueur de la root cause
+        (review_behavior). Le livrable diagnostic-report rend le résultat
+        capitalisable même en cas d'échec (l'irrécupérabilité documentée
+        évite qu'un futur agent re-tente la même extraction).
+    - decision: >
+        D3 — Le double panic n'est PAS rendu impossible (requalification,
+        finding 1) : le criterion 3 du task-request est satisfait par sa
+        branche « mécanisme équivalent tranché au design ». Le mécanisme
+        équivalent a trois couches : (a) catch_unwind au périmètre de
+        CHAQUE artifact dans le chemin reindex — confinement des panics
+        simples, l'immense majorité ; (b) panic hook process-wide dans les
+        DEUX serveurs servis, écrivant une trace persistée, fsyncée, jamais
+        supprimée, sous company/data/crashes/, AVANT l'unwind — trace
+        GARANTIE de tout panic, y compris l'abort de double panic que (a)
+        ne peut pas empêcher ; (c) récupération automatique en secondes de
+        l'abort résiduel (respawn proxy + readiness-first D4). L'isolation
+        par process séparé du chemin d'indexation, seule option qui rendrait
+        l'abort réellement inoffensif pour le parent, est ÉVALUÉE ET
+        REJETÉE pour ce chantier, et ACTÉE comme option de dernier recours.
+      rationale: >
+        La promesse du premier jet (« rendre le double panic non fatal »)
+        était fausse dans le scénario observé, comme démontré au round
+        deda9448 : panic_in_cleanup → abort est process-wide, catch_unwind
+        ne l'intercepte pas, ET les Drop suspects (statements/transactions
+        rusqlite, valeurs ort) vivent DANS la frame d'indexation de
+        l'artifact, c'est-à-dire exactement dans la portée que le
+        catch_unwind par artifact déroule — le rétrécissement de fenêtre
+        promis pouvait être nul. La promesse requalifiée est celle que les
+        mécanismes tiennent réellement : confinement de tout panic qui ne
+        double-panique pas (bénéfice réel : le lot survit, l'index reste
+        cohérent), trace pré-unwind garantie même quand l'abort survient
+        (le hook court au point de panic, avant tout Drop, et trace AUSSI
+        le second panic avec un indicateur dédié), et transformation de
+        l'abort résiduel d'incident (perte + boucle de kill + reboot
+        humain) en événement auto-récupéré et documenté. ISOLATION PAR
+        PROCESS : un process d'indexation séparé rendrait l'abort invisible
+        du serveur, mais son coût est disproportionné ICI — second
+        chargement ONNX résident (des centaines de Mo), IPC et
+        sérialisation des lots, une machinerie de supervision de plus (qui
+        surveille le superviseur d'indexation ?), pour un bénéfice marginal
+        une fois (b) et (c) en place : l'abort résiduel coûte quelques
+        secondes de respawn et zéro perte d'information. CRITÈRE DE
+        RÉVISION EXPLICITE : si un abort de double panic se REPRODUIT après
+        livraison de ce chantier ET du correctif ciblé D2, l'isolation par
+        process devient le mécanisme prescrit d'un chantier dédié — cette
+        décision est un arbitrage coût/valeur daté, pas un rejet de
+        principe. L'écriture synchrone + fsync dans un fichier par crash
+        est le seul mécanisme qui survive à la fois au process (abort
+        immédiat), à la session (socket opencode perdu) et au reboot
+        (exigence utilisateur : pas de rotation ni purge automatique, volume
+        borné par la rareté des crashs et surveillé par make doctor).
+        L'incarnation vient du proxy (variable d'environnement au spawn,
+        one-liner) ; repli PID+timestamp hors proxy. Le test de régression
+        avec injection de faute (activation par variable d'environnement
+        gardée par cfg(debug_assertions), mécanisme et justification en D8)
+        est exigé parce que le déclencheur est reproduit : un chemin de
+        panne reproduit 5 fois sans test de non-régression serait une
+        négligence caractérisée — et un test dont le point d'injection ne
+        serait jamais compilé dans l'invocation de ci serait une preuve
+        vide, pire que l'absence de test.
+    - decision: >
+        D4 — La boucle de kill est cassée DES DEUX CÔTÉS. Côté serveur :
+        readiness-first avec EMBEDDER LATE-BOUND — initialize répond après
+        flock + migrate seulement ; chargement ONNX, reindex de
+        rebuild-autorepair, reindex de drift (y compris DB fraîche) et
+        reindex nominal passent TOUS dans un task de warm-up unique en
+        arrière-plan ; les tools dépendant de l'index ou de l'embedder sont
+        derrière une gate de warm-up (attente bornée ou erreur structurée),
+        les autres servent immédiatement ; le warm-up prend et rend le lock
+        engine PAR ARTIFACT. Ceci SUPERSÈDE PARTIELLEMENT l'invariant
+        « reindex synchrone avant de servir » du RFC bdee1af4 étape 19 (le
+        RFC aval le portera). Côté proxy : timeout de health-check
+        progressif (10 s, doublement par timeout consécutif, plafond 40 s,
+        réarmement à ready).
+      rationale: >
+        Le premier jet reposait sur un inventaire de boot FAUX (finding 2) :
+        il affirmait le reindex de boot « déjà en arrière-plan » alors que
+        deux reindex_all synchrones précèdent serve() (rebuild-autorepair,
+        main.rs:2330 ; drift fts/model, main.rs:2350-2364) et qu'une DB
+        fraîche déclenche mécaniquement model_drift — le boot post make
+        clean, cas réel et fréquent, restait donc bloquant. Différer ONNX
+        sans différer ces reindex est impossible (ils passent par
+        require_embedder), et OrchestratorEngine::new exige l'embedder par
+        valeur : le late-binding de l'embedder est donc une décision
+        architecturale, pas un détail, et elle est tranchée ICI. ARBITRAGE
+        sur l'invariant bdee1af4 étape 19 : cet invariant protège une
+        propriété OBSERVABLE (aucune requête ne voit un index incohérent ou
+        vide après drift), pas un ordonnancement de boot. La gate de
+        warm-up conserve la propriété observable en la déplaçant du boot
+        entier vers les seuls tools qui la nécessitent ; l'alternative
+        (garder les reindex de drift bloquants avant initialize) reconduit
+        la boucle de kill précisément sur les boots les plus lents, ceux
+        qui l'ont causée. La supersession est PARTIELLE et sera explicite
+        dans le RFC, comme celle de C2 : la laisser implicite rendrait
+        bdee1af4 silencieusement faux. VERROU PAR ARTIFACT (finding 3) :
+        l'engine est derrière un Mutex unique avec 31 sites lock() dans les
+        handlers ; un warm-up qui détiendrait le lock pendant tout le
+        reindex transformerait « les tools SQL fonctionnent immédiatement »
+        en mensonge et la boucle de kill en stall de tools finissant en
+        -32001 opaque. La granularité par artifact est la même unité que
+        l'isolation D3 (cohérence, pas de mécanisme nouveau) et borne la
+        latence d'un handler à l'indexation d'UN artifact ; pendant la
+        phase de warm-up antérieure à l'installation de l'embedder, la
+        gate répond l'état warming explicitement au lieu de bloquer en
+        silence. DEUX CÔTÉS car classes de panne différentes :
+        readiness-first supprime la CAUSE (fenêtre de vulnérabilité réduite
+        au démarrage du transport), le timeout progressif est le FILET
+        contre une régression future qui ré-alourdirait le pré-initialize,
+        en gardant la détection rapide des morts-nés (10 s au premier
+        essai). Le plafond du filet passe de 60 s à 40 s pour la cohérence
+        D4×D5 (voir D5). flock et migrate restent AVANT initialize : ce
+        sont des invariants de correction (writer unique, schéma cohérent,
+        design 45c04902) rapides par nature.
+    - decision: >
+        D5 — UNAVAILABLE_ESCALATION_MS passe à 45 000 ms par défaut,
+        supersession PARTIELLE du contrat C2 du RFC 18011bfc (seule la
+        valeur du plafond change ; at-most-once, forme du -32050,
+        traitement des notifications inchangés). COHÉRENCE D4×D5 (finding
+        4) : le plafond du health-check progressif est fixé à 40 s, SOUS
+        les 45 s d'escalade, et l'escalade est définie comme un SIGNAL qui
+        n'interrompt pas la supervision : après un -32050, le proxy
+        continue de respawner et les requêtes ULTÉRIEURES aboutissent dès
+        ready.
+      rationale: >
+        La contrainte dure est plafond < 60 s (timeout client opencode)
+        avec une marge de propagation : à 45 s, l'erreur structurée précède
+        le -32001 opaque de 15 s dans le pire cas, donc le premier échec
+        visible par un agent est TOUJOURS celle qui prescrit l'escalade.
+        INTERACTION AVEC LE HEALTH-CHECK PROGRESSIF (finding 4) : avec le
+        plafond initial de 60 s, une incarnation vivante mais lente pouvait
+        voir sa fenêtre de health-check chevaucher l'escalade — des
+        requêtes bufferisées qui auraient abouti étaient droppées
+        (at-most-once) pendant un boot légitime. Deux corrections
+        conjointes : (a) le plafond progressif descend à 40 s (10→20→40),
+        de sorte que CHAQUE fenêtre de health-check, prise ISOLÉMENT, est
+        plus courte que le délai d'escalade — en cumulé la garantie ne
+        tient pas : la séquence 10+20+40 fait franchir les 45 s pendant la
+        3e fenêtre (ouverte vers t≈31 s, courant jusqu'à ≈71 s), donc
+        l'escalade PEUT tirer pendant une fenêtre encore ouverte, et c'est
+        la clause (b) qui porte la décision ; (b) il est ASSUMÉ qu'une indisponibilité
+        CUMULÉE dépassant 45 s escalade même si une récupération est en
+        cours — c'est le comportement voulu, pas un défaut : l'escalade
+        protège l'AGENT (visibilité et prescription d'action avant le
+        -32001), la supervision protège la RÉCUPÉRATION, et les deux
+        continuent en parallèle ; les requêtes échues sont perdues
+        (at-most-once, clause C2 conservée) mais le serveur finit ready et
+        sert les suivantes. Avec readiness-first (D4), une récupération
+        légitime se mesure en secondes : un cumul de 45 s d'indisponibilité
+        signifie plusieurs respawns échoués ou une régression, situations
+        où informer l'agent est correct. Sur la valeur : 30 s rognerait la
+        marge de récupération sous charge (l'I/O d'un core dump de ~437 Mo
+        observée à ~10 s à elle seule), 55 s rognerait la marge client ;
+        45 s est le point d'équilibre. La supersession de C2 est PARTIELLE
+        et doit être dite explicitement : C2 est un contrat composite dont
+        l'incident a précisément montré que les autres clauses ont
+        fonctionné comme conçu ; les re-spécifier serait du churn, les
+        laisser implicites rendrait le RFC 18011bfc silencieusement faux.
+    - decision: >
+        D6 — La surveillance des coredumps est une cible make doctor
+        (script sous company/scripts/ + baseline persistée sous
+        company/data/, AUTO-CAPTURÉE au premier run par snapshot de l'état
+        réel de coredumpctl), couvrant TOUS les binaires companyos
+        (orchestrator ET yaml-validator), exécutée automatiquement en tête
+        de make deploy-serve EN MODE INFORMATIONNEL (exit 0 systématique,
+        rapport affiché, dégradation gracieuse si coredumpctl absent ou
+        sans --json) et invocable manuellement (make doctor, seul mode dont
+        le code de sortie est signifiant) ; elle liste aussi
+        les traces de company/data/crashes/. Elle n'est PAS dans make ci,
+        et AUCUN AUTRE hook n'est accroché à deploy-serve (les tests
+        d'intégration D8 sont sur demande uniquement).
+      rationale: >
+        Le task-request offre le choix (make doctor, CI, routine) : doctor +
+        accrochage au deploy-serve est retenu. Les coredumps sont un état
+        LOCAL de la machine, pas une propriété du commit : en gate CI, un
+        dump ancien ou sans rapport bloquerait des commits légitimes (et ci
+        tourne dans le pre-commit). deploy-serve est au contraire le point
+        d'accrochage naturel : c'est le seul moment où l'on remplace le
+        binaire servi, donc le dernier moment utile pour constater que le
+        binaire sortant a dumpé (2 dumps du 25/08 sont passés inaperçus
+        précisément faute de ce contrôle). SÉMANTIQUE D'ÉCHEC DU MODE HOOK
+        (itération 2 du round deda9448) : deploy-serve.sh tourne sous
+        set -euo pipefail et make setup enchaîne release ci deploy-serve —
+        un doctor qui sortirait non-zéro QUAND IL FAIT SON TRAVAIL (nouveau
+        dump trouvé, ex. PID 20900 du 10/09) bloquerait le SEUL canal de
+        mise en service, y compris la promotion des panic hooks de l'étape
+        1 du séquencement D7 (le correctif serait bloqué par le symptôme
+        qu'il corrige), et casserait make setup post-clone ; même effet si
+        coredumpctl est absent ou sans --json sur la machine. Le mode hook
+        est donc informationnel PAR CONSTRUCTION : il met l'information
+        sous les yeux de l'humain au bon moment, il ne gate pas ; le gating
+        (code de sortie signifiant) appartient exclusivement à l'invocation
+        manuelle, où un non-zéro est une réponse, pas un blocage. Pour la
+        même raison, aucun autre hook, en particulier les tests
+        d'intégration D8, intrinsèquement plus fragiles, n'est accroché à
+        deploy-serve. BASELINE AUTO-CAPTURÉE, PAS
+        CODÉE EN DUR (finding 5) : le premier jet inscrivait « 20 dumps au
+        soir du 09/09 » dans le design ; cette valeur était déjà fausse au
+        moment de la review (≥22 dumps au 10/09, dont un SIGABRT
+        yaml-validator le 09/09 à 12:21 et un SIGABRT orchestrator le 10/09
+        à 10:14) — la démonstration empirique qu'une baseline figée dans un
+        artifact est périmée avant d'entrer en service. Le snapshot au
+        premier run est structurellement juste : il capture l'état du
+        MOMENT où la surveillance commence, ce qui est exactement la
+        sémantique voulue (« tout dump POSTÉRIEUR à la mise en surveillance
+        est signalé »). Sans baseline, les dumps historiques (dont 15
+        target/debug de juin, du bruit) seraient re-signalés à chaque
+        exécution et l'outil crierait au loup jusqu'à être ignoré. Le
+        périmètre couvre yaml-validator car il a dumpé lui aussi : une
+        surveillance limitée à l'orchestrator aurait un angle mort
+        démontré. Le doctor rapporte et n'efface jamais : la décision de
+        purge appartient à l'humain (cohérent avec l'exigence de non-perte
+        des traces).
+    - decision: >
+        D7 — Mise en service en deux canaux : make deploy-serve pour tout
+        changement des crates serveur, restart de session opencode pour
+        tout changement du proxy (plugin), pas de reload_config. Livraison
+        séquencée avec POINT D'ARRÊT : (1) instrumentation complète
+        (télémétrie proxy + panic hooks serveurs, deploy-serve du volet
+        serveur) ; (2) ARRÊT — demande explicite de restart de session à
+        l'utilisateur, vérification que la nouvelle session écrit bien le
+        journal sous company/data/logs/ ; (3) reste du chantier. Aucune
+        clôture sans promotion confirmée. Inventaire complet des zones pour
+        le RFC : protégées — crates/, company/plugins/, company/scripts/ ;
+        non protégées mais modifiées — Makefile, .gitignore.
+      rationale: >
+        Règle persona Architect : un RFC ou design qui ne dit pas comment il
+        entre en service produit une mise en service improvisée. Les deux
+        canaux sont imposés par l'architecture existante : promotion
+        atomique target/serve/ pour les binaires (RFC 18011bfc, seul canal
+        qui ne subit pas cargo), restart de session pour les plugins depuis
+        le retrait du hot-reload de code (RFC 25b6678c). LE POINT D'ARRÊT
+        EST STRUCTUREL (finding 8) : le restart de session est un acte
+        UTILISATEUR que les agents ne peuvent ni exécuter ni simuler ;
+        sans arrêt explicite, l'ordre « instrumentation d'abord » du
+        task-request serait respecté sur le papier (code mergé) et violé en
+        substance (proxy de la session courante toujours aveugle), et tout
+        le reste du chantier — dont chaque écriture YAML est une occasion
+        de reproduire le crash, 5 occurrences à ce jour — s'exécuterait
+        sans télémétrie. Le critère de reprise est OBSERVABLE : l'existence
+        du journal proxy sous company/data/logs/ prouve que la session
+        courante tourne instrumentée. INVENTAIRE DES ZONES (finding 6,
+        lesson 611fde3e) : company/scripts/ est une zone PROTÉGÉE
+        (protected-zones.json) et D6 y crée le script doctor — l'omettre du
+        périmètre RFC aurait produit exactement le blocage hook documenté
+        par la lesson ; Makefile et .gitignore ne sont PAS protégés mais
+        doivent figurer dans affected_files pour l'exhaustivité du
+        périmètre (règle Architect : union callers + définitions ; ici
+        union zones protégées + fichiers de build).
+    - decision: >
+        D8 — Cadrage des tests (finding 7) : toutes les constantes
+        temporelles du proxy (HEALTH_CHECK_TIMEOUT_MS, plafond progressif,
+        UNAVAILABLE_ESCALATION_MS déjà fait) deviennent overridables par
+        variable d'environnement ; un harness d'intégration proxy est CRÉÉ
+        (binaire ou script factice répondant à initialize après un délai
+        paramétrable) ; les tests d'intégration utilisent les overrides
+        pour compresser les délais (secondes, pas dizaines de secondes) ;
+        tout test d'intégration dont le coût mur excède le budget du
+        pre-commit vit dans une cible make dédiée HORS make ci ET NON
+        ACCROCHÉE à make deploy-serve (invocation sur demande uniquement,
+        cohérence D6 : rien de fragile ou de bloquant sur le canal de mise
+        en service), la logique pure (progression du timeout, rotation)
+        restant testée dans le harness core existant qui, lui, reste dans
+        ci. MÉCANISME D'ACTIVATION de l'injection de faute du test de
+        régression reindex (D3) : variable d'environnement lue par le
+        chemin d'indexation, gardée par cfg(debug_assertions) — PAS une
+        feature cargo, PAS cfg(test).
+      rationale: >
+        Le premier jet prescrivait un test « boot lent » (binaire factice
+        répondant après plus de 10 s) sans cadrer son coût : exécuté avec
+        les constantes de production, il ajouterait ≥30 s de mur à make ci,
+        qui tourne au pre-commit — un coût inacceptable qui aurait été
+        découvert à l'implémentation et arbitré dans l'urgence. Trois
+        décisions le rendent tenable : (a) l'override env est le pattern
+        DÉJÀ en place pour UNAVAILABLE_ESCALATION_MS ; l'étendre à
+        HEALTH_CHECK_TIMEOUT_MS et au plafond progressif est une
+        généralisation, pas une invention, et elle compresse le test
+        boot-lent sous les 2-3 s ; (b) le harness d'intégration n'existe
+        pas (les tests actuels de company/plugins/tests/ ne couvrent que
+        les fonctions pures du core) — sa création est un livrable
+        explicite du chantier, pas un présupposé ; (c) la frontière
+        ci/hors-ci suit la nature du test : les fonctions pures (décision
+        de rotation, progression du timeout) sont rapides et vivent dans
+        ci ; l'intégration process réelle, même compressée, est
+        intrinsèquement plus fragile et plus lente, et ne doit jamais
+        bloquer NI un commit NI une mise en service pour une raison de
+        timing machine — cible make dédiée, sur demande uniquement,
+        explicitement PAS accrochée à deploy-serve (itération 2 du round
+        deda9448 : deploy-serve sous set -euo pipefail est le seul canal de
+        promotion, y accrocher un test fragile reproduirait le défaut que
+        D6 vient d'éviter pour le doctor). INJECTION DE FAUTE (itération 2,
+        même round) : le premier jet prescrivait une feature cargo dédiée,
+        mais make ci lance cargo test --workspace SANS --all-features (seul
+        clippy a --all-features) — le test de régression du criterion 3
+        aurait compilé mais ne serait JAMAIS exécuté avec la faute active,
+        une preuve silencieusement vide. L'activation par variable
+        d'environnement gardée par cfg(debug_assertions) (recommandation
+        initiale de l'Implementer) est compatible avec cargo test
+        --workspace tel quel : les binaires de test compilent en debug
+        (debug_assertions actif), le point d'injection y existe et s'active
+        par env ; le binaire servi est lui aussi un build debug (deploy-serve
+        promeut depuis target/debug), le point d'injection y est donc présent
+        en production mais inerte tant que la variable n'est pas positionnée.
+        Aucune modification de Makefile ni de flag d'invocation n'est
+        requise.
+  open_questions:
+    - >
+      L'investigation gdb (D2) identifiera-t-elle un Drop fautif réparable
+      localement (ordre de destruction rusqlite, valeur ort) ou un défaut
+      dans une dépendance (ort/ONNX Runtime) nécessitant un contournement ou
+      une montée de version ? Le correctif ciblé additionnel ne peut être
+      spécifié qu'après ce résultat ; le durcissement D3 (requalifié) n'en
+      dépend pas, mais c'est le correctif ciblé qui porte désormais seul
+      l'espoir de faire DISPARAÎTRE l'abort (D3 le confine et le trace).
+    - >
+      Le comportement warm-up des tools derrière la gate (attente bloquante
+      avec délai borné, ou erreur structurée immédiate invitant à
+      re-soumettre) : la préférence du design va à l'attente bloquante bornée
+      (transparente pour les agents, cohérente avec le buffer du proxy), mais
+      la latence réelle du chargement ONNX + reindex de drift sous CPU sain
+      doit être mesurée à l'implémentation pour confirmer que l'attente tient
+      sous le timeout client de 60 s ; sinon, bascule sur l'erreur structurée
+      de warm-up. La mesure doit inclure le pire cas légitime (DB fraîche,
+      reindex complet), désormais dans le périmètre du warm-up (D4 révisé).
+    - >
+      Interaction avec le chantier spin-wait ONNX 0e089d1b (hors scope ici) :
+      si ce chantier élimine la saturation CPU au repos, la fenêtre de boot
+      se raccourcit encore et le plafond 40 s du health-check progressif
+      devient très conservateur ; à re-calibrer éventuellement là-bas, pas
+      ici.

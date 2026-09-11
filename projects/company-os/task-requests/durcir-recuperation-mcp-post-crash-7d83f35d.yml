@@ -1,0 +1,137 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 7d83f35d-b6a5-46ff-b7e3-70a130ec99a8
+  title: "Durcir la récupération MCP post-crash : logs persistés, reindex sans double panic, health-check non suicidaire, plafond -32050 sous le timeout client"
+  author: pm
+  created_at: "2026-09-09"
+  project: company-os
+  description: >
+    Suite de l'incident du 2026-09-09 (diagnostic ccd7c984) : SIGABRT du
+    serveur orchestrator par double panic dans le task reindex du file
+    watcher, puis ~4 minutes de non-récupération (hypothèse dominante :
+    boucle de kill par health-check 10s pendant une fenêtre de boot lent),
+    résolues par un reboot manuel que l'architecture 18011bfc devait rendre
+    inutile. Ce task-request cadre les correctifs : instrumentation d'abord
+    (sans logs persistés, le prochain incident sera aussi aveugle), puis
+    élimination du mode de panne à la racine (double panic) et de la boucle
+    de récupération (health-check), et alignement du contrat d'escalade sur
+    le timeout client réel.
+  tags:
+    - mcp
+    - orchestrator
+    - proxy
+    - availability
+    - resilience
+    - sigabrt
+    - health-check
+    - logging
+    - critical-infra
+  related:
+    - id: ccd7c984-eb4b-4d69-90bb-c7a8980b5169
+      kind: diagnostic-report
+      relationship: input
+    - id: 18011bfc-c8ae-4c31-8aca-f994755b93e7
+      kind: rfc
+      relationship: related
+    - id: 415c73c0-eae9-46e0-8f05-e3ff38156b3c
+      kind: task-request
+      relationship: related
+
+spec:
+  priority: critical
+  status: backlog
+  context: >
+    L'architecture B+A+C du RFC 18011bfc a tenu ses contrats mécaniques
+    (binaires servis intacts, proxy sans abandon, -32050 à 120 s, at-most-once
+    du buffer) mais pas son intention : une panne de processus a de nouveau
+    requis un humain, DEUX FOIS le même jour (incident 08:54 + récidive 09:24,
+    chacune soldée par un reboot utilisateur ; un troisième SIGABRT à 09:39 a
+    été absorbé de façon autonome, prouvant que la non-récupération est
+    conditionnelle à l'état de la fenêtre de boot). Deux découvertes
+    aggravantes : (a) le SIGABRT du serveur est un mode de panne récurrent,
+    invisible et désormais REPRODUIT (20 coredumps au soir du 09/09 : 15
+    target/debug de juin, 2 target/serve du 25/08 absorbés silencieusement, 3
+    target/serve le 09/09 tous déclenchés pendant un auto-reindex
+    post-écriture YAML), (b) toute la télémétrie de récupération est perdue
+    par construction (stderr proxy et serveur dans un socket opencode non
+    persisté). Les trois core dumps du 09/09 sont conservés avec symboles
+    complets et contiennent potentiellement les messages des panics originels.
+    Facteur aggravant transversal : le spin-wait ONNX (~600% CPU au repos,
+    chantier 0e089d1b).
+  constraints:
+    - >
+      Zones protégées : crates/ et company/plugins/ sont concernés, le cycle
+      RFC + approbation CEO + write permit s'applique aux modifications.
+    - >
+      L'ordre importe : l'instrumentation (logs persistés) doit être livrable
+      indépendamment et en premier, pour que tout incident survenant pendant
+      le reste du chantier soit documenté.
+    - >
+      Le binaire servi ne doit être promu que par make deploy-serve (RFC
+      18011bfc) ; aucune correction n'est en service tant que la promotion
+      n'est pas faite.
+  acceptance_criteria:
+    - >
+      Les stderr du proxy (console.error) et du serveur (tracing) sont
+      persistés dans des fichiers rotatifs sous un emplacement dédié, avec
+      incarnations, transitions d'état du proxy, raisons de mort et résultats
+      de health-check : la séquence de récupération d'un incident futur est
+      reconstituable post-mortem sans reproduction.
+    - >
+      Le message du panic originel est extrait des core dumps conservés (ou
+      son irrécupérabilité est démontrée et documentée), et le Drop fautif de
+      la pile reindex_all est identifié. Matériau disponible : les TROIS cores
+      du 09/09 (PIDs 33345, 54403, 80065, symboles complets), trois piles à
+      recouper au lieu d'une.
+    - >
+      Le task reindex du file watcher ne peut plus tuer le process : le double
+      panic est rendu impossible sur ce chemin (isolation par artifact,
+      durcissement des Drop, ou mécanisme équivalent tranché au design). Un
+      panic d'indexation d'un artifact est un événement loggé ET une trace de
+      crash PERSISTÉE dans un fichier externe dédié sur disque (backtrace
+      complète, artifact en cause, timestamp, incarnation), qui survit au
+      process, à la session et au reboot : exigence utilisateur explicite, la
+      trace de ce genre de crash ne doit jamais pouvoir se perdre. Le
+      déclencheur étant désormais REPRODUIT (3 crashs le 09/09, tous pendant
+      un auto-reindex post-écriture YAML), un test de régression qui exerce ce
+      chemin est exigé.
+    - >
+      La boucle de kill par health-check est cassée par construction : un boot
+      lent mais vivant du serveur ne peut plus être tué indéfiniment (readiness
+      avant travail lourd, ou backoff du health-check lui-même, ou les deux :
+      tranché au design), démontré par un test qui simule un boot > timeout.
+    - >
+      Le plafond d'escalade -32050 est inférieur au timeout client opencode
+      (60 s) : le premier échec visible par un agent est toujours l'erreur
+      structurée qui prescrit l'escalade, jamais un -32001 opaque.
+    - >
+      Les coredumps companyos sont surveillés : un mécanisme (make doctor,
+      check CI, ou routine équivalente) signale tout nouveau coredump des
+      binaires servis au lieu de les laisser s'accumuler silencieusement.
+    - >
+      make deploy-serve a promu les binaires corrigés (aucune clôture sans
+      promotion, RFC 18011bfc).
+  out_of_scope:
+    - >
+      La résolution du spin-wait ONNX (~600% CPU) : chantier 0e089d1b déjà
+      tracé, facteur aggravant mais problème distinct.
+    - >
+      Le faux positif "write permit tampering" du hook defense-in-depth
+      observé pendant l'investigation (course possible snapshot pre/post
+      bash) : à investiguer dans un diagnostic séparé, noté ici pour mémoire.
+  investigation_hints: >
+    Core dumps : coredumpctl + gdb sur les TROIS dumps du 09/09 (PIDs 33345
+    à 08:54:36, 54403 à 09:24:56, 80065 à 09:39:44, tous target/serve,
+    symboles debug complets, tous "present") ; chercher l'objet d'exception
+    du panic originel dans la pile run_server::async_block#5, main.rs:2433
+    (consommateur ConfigChangeKind::Artifacts → engine.reindex_all,
+    L2480-2483) et recouper les trois piles.
+    Health-check : HEALTH_CHECK_TIMEOUT_MS = 10_000 (mcp-proxy.mjs L65),
+    plafond UNAVAILABLE_ESCALATION_MS défaut 120_000 env-overridable via
+    MCP_PROXY_UNAVAILABLE_MS (L70-77) ; le boot serveur fait flock + migrate +
+    embedder ONNX + reindex de boot avant de répondre à initialize.
+    Baseline coredumps : 20 dumps companyos recensés par coredumpctl au soir
+    du 2026-09-09 (15 SIGABRT target/debug des 10-11/06, 2 target/serve du
+    25/08 à 21:27 et 21:39 CEST, 3 target/serve du 09/09) ; tout mécanisme de
+    surveillance (criterion 6) doit partir de cette baseline réelle.
