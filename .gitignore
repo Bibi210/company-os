@@ -7,4 +7,12 @@ company/data/orchestrator.lock
 # Embedding model cache (downloaded via --prefetch-embeddings, ~500MB).
 # Reconstructible from network on demand; not part of the repo content.
 company/data/embeddings/
+# Runtime recovery telemetry (RFC 5bacb08a). Written by runtime processes
+# (the proxy and the served servers), never by agents. Same git status as
+# the orchestrator DB. NEVER rename these to a .yml/.yaml extension: the
+# file watcher would treat them as artifact changes and trigger a full
+# reindex on every write. Cf. crates/config/src/constants.rs.
+company/data/logs/
+company/data/crashes/
+company/data/coredump-baseline.json
 

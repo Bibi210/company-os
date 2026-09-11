@@ -42,6 +42,39 @@ pub const DB_FILENAME: &str = "orchestrator.db";
 /// (RFC 359f9162). Lives under [`DATA_DIR`].
 pub const SEAL_FILENAME: &str = "permits-seal.json";
 
+// --- Runtime recovery telemetry (RFC 5bacb08a) ---
+//
+// INVARIANT, do not regress: none of the paths below may ever carry a
+// `.yml` or `.yaml` extension. [`crate::watcher::classify`] maps any YAML
+// living outside the protected zones to `ConfigChangeKind::Artifacts`, so a
+// YAML file under [`DATA_DIR`] would make every write trigger a full
+// `reindex_all` (the exact code path of the SIGABRT series this telemetry
+// exists to diagnose), and `make validate` (`--batch company/`) would try
+// to validate it against an artifact schema and fail. Use `.log`, `.txt`
+// or `.json` only. These files are gitignored: they are runtime state
+// written by the proxy and the served servers, never by an agent.
+
+/// Directory of the rotating telemetry journals written by the MCP proxy,
+/// one file per supervised crate (RFC 5bacb08a D1). Lives under
+/// [`DATA_DIR`].
+pub const LOGS_DIR: &str = "company/data/logs";
+
+/// Directory of the pre-unwind crash traces written by the panic hook of
+/// every served server (RFC 5bacb08a D3b). One file per crash, never
+/// rotated and never purged: a trace must survive the process, the session
+/// and the reboot. Lives under [`DATA_DIR`].
+pub const CRASHES_DIR: &str = "company/data/crashes";
+
+/// Extension of a single crash trace file. Plain text so a trace stays
+/// readable with no tooling at all, and so the file can never be mistaken
+/// for an artifact by the watcher or the validator.
+pub const CRASH_TRACE_EXT: &str = "txt";
+
+/// Coredump baseline snapshotted on the first `make doctor` run and
+/// compared against on every later run (RFC 5bacb08a D6). Lives under
+/// [`DATA_DIR`].
+pub const COREDUMP_BASELINE_FILENAME: &str = "coredump-baseline.json";
+
 // --- File extensions ---
 pub const EXT_YML: &str = "yml";
 pub const EXT_YAML: &str = "yaml";
