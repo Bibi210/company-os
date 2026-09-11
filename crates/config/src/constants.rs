@@ -33,6 +33,14 @@ pub const PROJECTS_DIR: &str = "projects";
 // --- Environment ---
 pub const ENV_COMPANYOS_ROOT: &str = "COMPANYOS_ROOT";
 
+/// Incarnation number of the current server process, counted by the
+/// supervising MCP proxy and handed over at spawn (RFC 5bacb08a, D1/D3b).
+/// Read by the crash trace hook so a trace can be matched with the proxy
+/// journal line by line. Absent when a server is started outside the
+/// proxy. The proxy side sets the same name in
+/// `company/plugins/mcp-proxy.mjs`; keep both in sync.
+pub const ENV_MCP_INCARNATION: &str = "MCP_INCARNATION";
+
 // --- Data directory ---
 pub const DATA_DIR: &str = "company/data";
 pub const DB_FILENAME: &str = "orchestrator.db";
