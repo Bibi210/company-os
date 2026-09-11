@@ -51,6 +51,12 @@ metadata:
     - coredump
     - critical-infra
   related:
+    - id: bdee1af4-4944-4bee-b7c0-18efd6c7961f
+      kind: rfc
+      relationship: supersedes
+    - id: 18011bfc-c8ae-4c31-8aca-f994755b93e7
+      kind: rfc
+      relationship: supersedes
     - id: aae2af60-b225-4c61-9600-8be8d6d7ebd6
       kind: design-doc
       relationship: derived-from

@@ -9,6 +9,7 @@ metadata:
   implemented_at: "2026-07-02T09:48:04.044298677+00:00"
   approved_at: "2026-07-02T09:24:43.675239276+00:00"
   description: >
+    [SUPERSEDED-BY 5bacb08a le 2026-09-11] SUPERSESSION PARTIELLE (contrat C2 uniquement) : la valeur du plafond d'escalade -32050 passe de 120 s à 45 s (RFC 5bacb08a, D5). TOUT LE RESTE de ce RFC reste en vigueur : architecture B (target/serve/, promotion atomique make deploy-serve), volet A (supervision sans abandon du proxy, renforcé par l'invariant de non-létalité de la télémétrie du RFC 5bacb08a), et les autres clauses de C2 (sémantique at-most-once du buffer, forme de l'erreur structurée -32050 escalate:true, drop loggé des notifications sans id).
     Solution définitive au task-request 415c73c0 (3 coupures MCP en 24h,
     reboot manuel à chaque fois), fondée sur le diagnostic 79f13f30 :
     architecture B + A + C. B — les binaires MCP servis vivent dans
@@ -41,6 +42,9 @@ metadata:
     - harness
     - critical-infra
   related:
+    - id: 5bacb08a-ac37-4ccc-847f-16edcf70c1ba
+      kind: rfc
+      relationship: superseded-by
     - id: 79f13f30-af1a-453e-9b42-962c35f93d26
       kind: diagnostic-report
       relationship: input

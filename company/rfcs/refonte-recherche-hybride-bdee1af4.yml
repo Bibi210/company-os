@@ -193,6 +193,7 @@ metadata:
         8, 9, 10, 11 sont inchangées sur le fond. Le rollback
         plan reste valide tel quel.
   description: >
+    [SUPERSEDED-BY 5bacb08a le 2026-09-11] SUPERSESSION PARTIELLE (étape 19 uniquement) : l'invariant « reindex synchrone avant de servir » devient une gate de warm-up (RFC 5bacb08a, D4) : la propriété OBSERVABLE (aucun tool d'index ne voit un index incohérent ou vide après drift) est CONSERVÉE, son mécanisme passe de « bloquer le boot entier » à « bloquer les seuls tools d'index derrière la gate » (attente bornée ou réponse warming explicite). Tout le reste de ce RFC (hybrid search lexical + sémantique, pipeline d'indexation, embeddings) reste en vigueur.
     Refonte profonde du tool MCP search() de l'orchestrator pour
     corriger les six facteurs de faux négatifs identifiés par le
     diagnostic-report 6cfd1c62 et atteindre les acceptance criteria
@@ -231,6 +232,9 @@ metadata:
     - rag
     - critical-infra
   related:
+    - id: 5bacb08a-ac37-4ccc-847f-16edcf70c1ba
+      kind: rfc
+      relationship: superseded-by
     - id: 02c9f6eb-fb2d-48f2-82d2-5676773e0e8b
       kind: task-request
       relationship: input
