@@ -1,0 +1,356 @@
+api_version: companyos/v1
+kind: rfc
+metadata:
+  id: 5bacb08a-ac37-4ccc-847f-16edcf70c1ba
+  title: "Durcissement de la récupération MCP post-crash : télémétrie persistée par le proxy, trace de crash pré-unwind, reindex isolé par artifact, boot readiness-first avec embedder late-bound, health-check progressif 10→20→40 s, escalade -32050 à 45 s, surveillance des coredumps par make doctor"
+  author: architect
+  created_at: "2026-09-11"
+  project: company-os
+  status: approved
+  approved_at: "2026-09-11T08:47:16.916152319+00:00"
+  description: >
+    RFC du chantier correctif MCP issu du design-doc APPROUVÉ aae2af60 (round
+    deda9448 clôturé, double approve après 3 itérations), cadré par le
+    task-request 7d83f35d (priorité critical) après l'incident du 2026-09-09
+    (diagnostic ccd7c984) : 5 SIGABRT du binaire orchestrator servi en 2 jours
+    (déclencheur reproduit : écriture YAML → auto-reindex → crash), 2 reboots
+    humains, cécité télémétrique totale (stderr proxy et serveur perdus dans
+    un socket opencode non persisté). Porte les 8 décisions D1-D8 du design :
+    télémétrie persistée écrite par le proxy seul (fichiers rotatifs sous
+    company/data/logs/, stderr serveur capturé par pipe), panic hook
+    pré-unwind dans les DEUX serveurs servis (traces fsyncées jamais purgées
+    sous company/data/crashes/), investigation gdb des 4 cores orchestrator
+    (Implementer, non bloquante), isolation par artifact du reindex
+    (catch_unwind périmétré, promesse requalifiée : confinement + trace
+    garantie, pas impossibilité de l'abort), boot readiness-first avec
+    embedder late-bound et gate de warm-up, health-check progressif
+    10→20→40 s, plafond d'escalade -32050 abaissé de 120 s à 45 s,
+    surveillance des coredumps par make doctor (baseline auto-capturée,
+    informationnel en mode hook deploy-serve), cadrage des tests (overrides
+    env des constantes temporelles, harness d'intégration proxy créé,
+    injection de faute par variable d'environnement sous
+    cfg(debug_assertions)). Porte DEUX SUPERSESSIONS PARTIELLES explicites :
+    RFC 18011bfc contrat C2 (seule la valeur 120 s → 45 s change ;
+    at-most-once, forme du -32050, drop des notifications survivent) et RFC
+    bdee1af4 étape 19 (l'invariant « reindex synchrone avant de servir »
+    devient une gate de warm-up : la propriété observable est conservée,
+    l'ordonnancement de boot change). Séquencement avec POINT D'ARRÊT
+    utilisateur : restart de session opencode requis entre l'instrumentation
+    et le reste du chantier.
+  tags:
+    - mcp
+    - orchestrator
+    - proxy
+    - availability
+    - resilience
+    - sigabrt
+    - double-panic
+    - health-check
+    - logging
+    - crash-trace
+    - coredump
+    - critical-infra
+  related:
+    - id: aae2af60-b225-4c61-9600-8be8d6d7ebd6
+      kind: design-doc
+      relationship: derived-from
+    - id: 7d83f35d-b6a5-46ff-b7e3-70a130ec99a8
+      kind: task-request
+      relationship: related
+    - id: ccd7c984-eb4b-4d69-90bb-c7a8980b5169
+      kind: diagnostic-report
+      relationship: related
+    - id: 18011bfc-c8ae-4c31-8aca-f994755b93e7
+      kind: rfc
+      relationship: related
+    - id: bdee1af4-4944-4bee-b7c0-18efd6c7961f
+      kind: rfc
+      relationship: related
+
+spec:
+  motivation: >
+    L'architecture B+A+C du RFC 18011bfc a tenu ses contrats mécaniques mais
+    pas son intention (« aucune panne de processus ne requiert plus
+    d'humain »). Incident du 2026-09-09 (diagnostic ccd7c984) et suites :
+    CINQ SIGABRT du binaire orchestrator servi en DEUX JOURS, tous déclenchés
+    par le même chemin reproduit — écriture d'un artifact YAML → auto-reindex
+    du file watcher → panic d'indexation → Drop qui panique pendant l'unwind
+    → panic_in_cleanup → abort. Trois occurrences le 09/09 (PIDs 33345,
+    54403, 80065, dont deux soldées par un REBOOT HUMAIN de la session
+    opencode et une absorbée de façon autonome, prouvant que la
+    non-récupération est conditionnelle à la fenêtre de boot), une 4e le
+    09/09 au soir, une 5e le 10/09 à 10:14 (PID 20900, core de 437 Mo,
+    pendant la review du design même). Le yaml-validator a lui aussi produit
+    un SIGABRT le 09/09 à 12:21 (PID 82926). Trois défauts structurels se
+    masquent mutuellement : (1) CÉCITÉ TÉLÉMÉTRIQUE TOTALE — les stderr du
+    proxy (console.error) et du serveur (tracing + messages de panic Rust
+    bruts) partent dans un socket opencode jamais persisté ; chaque incident
+    est irrécouvrable post-mortem, la séquence de respawn du 09/09 reste une
+    hypothèse (H1 : boucle de kill health-check) faute de logs ; (2) le
+    DOUBLE PANIC du reindex tue le process alors qu'un panic de task tokio
+    est normalement contenu ; (3) la BOUCLE DE KILL par health-check : le
+    boot du serveur fait tout (flock, migrate, ONNX bloquant, jusqu'à deux
+    reindex_all synchrones) AVANT de répondre à initialize pendant que le
+    proxy arme un timeout fixe de 10 s — un boot lent mais vivant est tué
+    indéfiniment PAR CONSTRUCTION. Gap contractuel aggravant : le plafond
+    d'escalade -32050 (120 s) est SUPÉRIEUR au timeout client opencode
+    (60 s), donc le premier échec visible par un agent est toujours un
+    -32001 opaque, jamais l'erreur structurée qui prescrit l'escalade
+    (observé le 09/09 : -32001 à 08:55:54, -32050 à 08:56:36). Enfin, les
+    coredumps s'accumulent sans surveillance (≥22 dumps companyos au 10/09,
+    dont 2 SIGABRT du binaire servi le 25/08 passés inaperçus). Le
+    task-request 7d83f35d (priorité CRITICAL) cadre les correctifs avec une
+    contrainte d'ordre : instrumentation d'abord, sans quoi le prochain
+    incident sera aussi aveugle que les précédents. Le design-doc aae2af60
+    (approuvé, round deda9448, double approve après 3 itérations) a tranché
+    les 8 décisions que ce RFC porte à l'approbation.
+  proposal: >
+    Implémenter les 8 décisions du design-doc aae2af60, résumées fidèlement.
+    D1 — TÉLÉMÉTRIE PERSISTÉE PAR LE PROXY SEUL : le proxy capture le stderr
+    du serveur par pipe (fin du stdio inherit) et écrit tout (son journal
+    d'événements — transitions d'état, raisons de mort, résultats et
+    timeouts de health-check, respawns, escalades — ET le stderr serveur téé
+    ligne à ligne) dans des fichiers rotatifs par taille sous
+    company/data/logs/, une ligne = un préfixe structuré (timestamp ISO UTC,
+    numéro d'incarnation, source proxy|server) ; la décision de rotation est
+    une fonction pure du core testable ; le stderr live est conservé.
+    INVARIANT DE NON-LÉTALITÉ : la télémétrie est best-effort et ne peut
+    JAMAIS tuer ni bloquer le proxy ou l'enfant. Toute erreur d'écriture
+    fichier est avalée et loggée sur le stderr live (jamais de crash du
+    proxy par un stream en erreur), et le drain du pipe stderr enfant est
+    INCONDITIONNEL et non bloquant : le pipe est TOUJOURS consommé, même si
+    le fichier de log est indisponible, pour ne jamais bloquer l'enfant sur
+    le buffer OS au moment précis où un panic déverse sa backtrace. Le
+    volet A du RFC 18011bfc (aucun chemin de mort définitive du proxy)
+    SURVIT explicitement à D1.
+    D2 — INVESTIGATION DES CORE DUMPS : analyse gdb des QUATRE cores
+    orchestrator (PIDs 33345, 54403, 80065, 20900) confiée à l'Implementer,
+    livrable diagnostic-report (message du panic originel + Drop fautif
+    identifié, ou irrécupérabilité démontrée), NON BLOQUANTE pour le
+    durcissement ; le core yaml-validator (PID 82926) est matériau
+    secondaire optionnel.
+    D3 — ISOLATION PAR ARTIFACT DU REINDEX + TRACE PRÉ-UNWIND, promesse
+    REQUALIFIÉE (le double panic n'est PAS rendu impossible ; branche
+    « mécanisme équivalent » du criterion 3) : (a) catch_unwind au périmètre
+    de chaque artifact — confinement des panics simples, le lot et le
+    process survivent ; (b) panic hook process-wide dans les DEUX serveurs
+    servis (orchestrator ET yaml-validator), écrivant AVANT l'unwind une
+    trace fsyncée sous company/data/crashes/ (un fichier par crash :
+    timestamp, incarnation transmise par le proxy via env, PID, binaire,
+    message, backtrace forcée, thread, indicateur de double panic, artifact
+    en cause), jamais purgée ni tournée ; INVARIANT D'INFAILLIBILITÉ du
+    hook : le hook ne panique jamais et ne propage jamais d'erreur, toute
+    défaillance interne (mkdir, open, write, fsync) est silencieusement
+    dégradée (au pire la trace est perdue et le comportement de panic par
+    défaut continue) ; un hook défaillant ne doit JAMAIS transformer un
+    panic simple en panic-pendant-panic : l'instrumentation ne peut pas
+    devenir la cause du symptôme qu'elle observe ; (c) récupération automatique de
+    l'abort résiduel en secondes (respawn + D4). L'isolation par process
+    séparé est évaluée, REJETÉE pour son coût, et actée comme option de
+    dernier recours si un abort se reproduit après ce chantier et le
+    correctif ciblé D2. Test de régression exigé sur le déclencheur
+    reproduit, avec point d'injection de faute activé par VARIABLE
+    D'ENVIRONNEMENT et gardé par cfg(debug_assertions) (D8).
+    D4 — BOOT READINESS-FIRST, EMBEDDER LATE-BOUND, GATE DE WARM-UP :
+    initialize répond après flock + migrate seulement ; chargement ONNX,
+    reindex de rebuild-autorepair, de drift (y compris DB fraîche) et
+    nominal passent TOUS dans un task de warm-up unique ; l'engine se
+    construit SANS embedder et le reçoit en fin de warm-up (changement de
+    signature de l'API pub OrchestratorEngine::new — callers recensés, voir
+    impact) ; les tools dépendant de l'index ou de l'embedder attendent la
+    fin du warm-up (attente bornée) ou répondent une erreur structurée de
+    warm-up, les autres servent immédiatement ; le warm-up prend et rend le
+    lock engine PAR ARTIFACT (les 31 sites engine.lock() des handlers
+    s'intercalent, latence bornée à l'indexation d'UN artifact). Côté
+    proxy : timeout de health-check PROGRESSIF par incarnation consécutive
+    non confirmée — 10 s au premier essai, doublement par timeout
+    consécutif, PLAFONNÉ À 40 s (10→20→40), réarmé à 10 s dès qu'une
+    incarnation atteint ready ; progression calculée par une fonction pure
+    du core.
+    D5 — PLAFOND D'ESCALADE -32050 À 45 s : UNAVAILABLE_ESCALATION_MS passe
+    de 120 000 à 45 000 ms par défaut (override env de test conservé), sous
+    le timeout client opencode de 60 s avec 15 s de marge. Cohérence D4×D5 :
+    le plafond health-check (40 s) est sous les 45 s ; l'escalade est un
+    SIGNAL, pas un arrêt — après un -32050 le proxy continue de respawner et
+    les requêtes ultérieures aboutissent dès ready ; il est assumé qu'une
+    indisponibilité cumulée > 45 s escalade même pendant une récupération en
+    cours (la 3e fenêtre de health-check peut chevaucher l'escalade).
+    D6 — SURVEILLANCE DES COREDUMPS : nouvelle cible make doctor adossée à
+    un script sous company/scripts/ interrogeant coredumpctl (--json=short)
+    pour TOUS les binaires companyos, comparant à une baseline
+    AUTO-CAPTURÉE AU PREMIER RUN (persistée sous company/data/, non
+    versionnée — jamais codée en dur, le premier jet du design a prouvé
+    qu'une baseline figée est périmée avant merge), listant aussi les traces
+    de company/data/crashes/. Accrochage : invocation manuelle (code de
+    sortie SIGNIFIANT, non-zéro si nouveaux dumps) ET exécution automatique
+    en tête de make deploy-serve en mode INFORMATIONNEL (exit 0
+    SYSTÉMATIQUE, y compris avec nouveaux dumps ; dégradation gracieuse si
+    coredumpctl absent ou sans --json) — deploy-serve.sh tourne sous
+    set -euo pipefail et est le seul canal de mise en service : un doctor
+    bloquant y bloquerait la promotion des correctifs par le symptôme
+    qu'ils corrigent. Hors make ci (état local machine, pas propriété du
+    commit). Aucun autre hook accroché à deploy-serve.
+    D7 — MISE EN SERVICE ET SÉQUENCEMENT : deux canaux — make deploy-serve
+    (promotion atomique, RFC 18011bfc) pour tout changement des crates
+    serveur, RESTART DE SESSION OPENCODE (RFC 25b6678c) pour tout changement
+    du proxy (plugin) ; aucun reload_config (la config orchestrator Rust ne
+    change pas). Séquencement avec POINT D'ARRÊT UTILISATEUR explicite :
+    (1) livrer l'instrumentation complète (télémétrie proxy + panic hooks
+    serveurs, deploy-serve immédiat du volet serveur) ; (2) ARRÊT — demander
+    à l'utilisateur le restart de la session opencode et NE PAS poursuivre
+    tant que la nouvelle session n'écrit pas le journal sous
+    company/data/logs/ (critère observable) ; (3) reste du chantier
+    (durcissement, readiness-first, health-check progressif, 45 s, doctor).
+    Aucune clôture sans promotion confirmée.
+    D8 — CADRAGE DES TESTS : toutes les constantes temporelles du proxy
+    (HEALTH_CHECK_TIMEOUT_MS, plafond progressif ;
+    UNAVAILABLE_ESCALATION_MS l'est déjà) deviennent overridables par
+    variable d'environnement ; un harness d'intégration proxy est CRÉÉ
+    (serveur factice répondant à initialize après un délai paramétrable) ;
+    les tests d'intégration compressent les délais par overrides ; tout
+    test d'intégration au coût mur excessif vit dans une cible make dédiée
+    HORS make ci et NON accrochée à deploy-serve ; RÉSOLUTION DE PLACEMENT :
+    le test d'intégration proxy vit sous
+    company/plugins/tests/integration/ précisément parce que le glob NON
+    RÉCURSIF de make test-js (company/plugins/tests/*.test.mjs,
+    Makefile:31, inclus dans make ci via Makefile:46) ne descend pas dans
+    les sous-répertoires (le placer à la racine de tests/ le ferait tomber
+    dans ci, en contradiction avec cette décision) ; le glob test-js reste
+    INCHANGÉ et la cible make dédiée pointe explicitement sur ce
+    sous-répertoire ; la logique pure
+    (progression du timeout, rotation) reste testée dans le harness core
+    existant, dans ci. L'injection de faute du test de régression D3 est
+    par variable d'environnement sous cfg(debug_assertions) — PAS une
+    feature cargo (make ci lance cargo test --workspace sans
+    --all-features : la faute ne serait jamais active), PAS cfg(test)
+    (invisible du binaire de test d'intégration). Le binaire SERVI est un
+    build debug (deploy-serve promeut depuis target/debug, RFC 18011bfc) :
+    le portail d'injection y est PRÉSENT mais inerte tant que la variable
+    n'est pas positionnée — et le proxy transmet l'environnement complet au
+    spawn. Deux mitigations obligatoires en héritent : (a) le nom de la
+    variable est namespacé et non ambigu, COMPANYOS_FAULT_INJECT_ARTIFACT,
+    pour exclure toute collision avec l'environnement ambiant ; (b) le
+    serveur émet un log warn bruyant au boot quand le portail est armé,
+    visible dans la télémétrie D1.
+  impact: >
+    DEUX SUPERSESSIONS PARTIELLES EXPLICITES, portées par ce RFC (les liens
+    supersedes formels avec note PARTIAL seront posés via supersede_artifact
+    APRÈS approbation, pas avant) :
+    (1) RFC 18011bfc, contrat C2 : SEULE la valeur du plafond d'escalade
+    change — 120 s → 45 s. TOUT LE RESTE de C2 survit inchangé : sémantique
+    at-most-once du buffer (les requêtes échues sont droppées, jamais
+    rejouées), forme de l'erreur structurée -32050 (escalate:true), drop
+    loggé des notifications sans id. L'incident a précisément montré que ces
+    clauses ont fonctionné comme conçu.
+    (2) RFC bdee1af4, étape 19 : l'invariant « reindex synchrone avant de
+    servir » devient une GATE DE WARM-UP. La propriété OBSERVABLE — aucun
+    tool d'index ne voit un index incohérent ou vide après drift — est
+    CONSERVÉE ; son mécanisme passe de « bloquer le boot entier » à
+    « bloquer les seuls tools d'index derrière la gate » (attente bornée ou
+    réponse warming explicite) ; c'est l'ordonnancement de boot qui change,
+    pas la garantie.
+    IMPACT AGENTS : le premier échec visible pendant une indisponibilité
+    longue est TOUJOURS le -32050 structuré (escalate:true) qui prescrit
+    l'escalade humaine, plus jamais le -32001 opaque du timeout client ; les
+    tools d'index peuvent répondre un état warming explicite pendant le
+    warm-up post-boot ; NOUVELLE INTERRUPTION PLANIFIÉE : le séquencement D7
+    comporte un point d'arrêt où le chantier s'arrête et demande à
+    l'utilisateur un restart de la session opencode (l'instrumentation proxy
+    n'entre en service qu'à ce restart).
+    API PUBLIQUE DE CRATE (recensement callers, règle Architect) : le
+    late-binding de l'embedder change la signature de
+    OrchestratorEngine::new (et potentiellement unifie
+    new_without_embedder). Callers recensés dans le workspace :
+    crates/mcp-servers/orchestrator/src/main.rs (3 sites : boot, rebuild,
+    tests), crates/orchestrator/tests/integration_search.rs,
+    tests/integration/user_stories.rs et tests/integration/edge_cases.rs
+    (new_without_embedder) ; définition crates/orchestrator/src/engine.rs,
+    re-export crates/orchestrator/src/lib.rs. Tous figurent dans
+    affected_files. S'y ajoutent : crates/config/src/constants.rs (place
+    canonique des nouveaux chemins company/data/crashes/ et de la baseline
+    doctor sous company/data/ ; ce module interdit les magic literals
+    ailleurs et est en zone protégée : l'oublier reproduirait le blocage de
+    permit de la lesson 611fde3e), crates/orchestrator/src/error.rs (le
+    canal actuel de la gate embedder est EmbeddingFailed, dont le message
+    « test mode » devient FAUX avec le late-binding et doit être révisé),
+    et tests/integration/Cargo.toml (surensemble, même logique que le crate
+    crash-trace : le permit couvre l'issue où une dépendance ou
+    déclaration de test doit y être ajoutée).
+    PÉRIMÈTRE : zones protégées touchées — crates/ (les deux serveurs et la
+    lib orchestrator), company/plugins/ (proxy, core, tests),
+    company/scripts/ (deploy-serve.sh modifié, script doctor créé) ;
+    fichiers NON protégés mais modifiés — Makefile (cibles doctor,
+    accrochage deploy-serve, cible tests d'intégration hors ci), .gitignore
+    (company/data/logs/, company/data/crashes/, baseline coredumps),
+    Cargo.toml racine (nouveau membre workspace SI le panic hook est
+    factorisé en crate partagé). Le choix module partagé vs duplication du
+    hook relève du plan d'implémentation : affected_files liste le SURENSEMBLE
+    (crate crates/crash-trace/ en created + Cargo.toml des trois crates en
+    modified) pour que le permit couvre les deux issues ; les fichiers
+    finalement non touchés sont inertes dans le permit. Les fichiers runtime
+    (journaux, traces, baseline sous company/data/) sont écrits par les
+    process runtime, pas par les agents : hors affected_files.
+    MISE EN SERVICE (règle Architect) : make deploy-serve pour les binaires
+    servis (promotion atomique, RFC 18011bfc) ; restart de session opencode
+    pour le code des plugins (RFC 25b6678c), qui est le point d'arrêt D7 ;
+    AUCUN reload_config.
+  rollback_plan: >
+    Retour arrière par retrait des mécanismes, sans migration de données :
+    (1) constantes — UNAVAILABLE_ESCALATION_MS revient à 120 000 ms,
+    HEALTH_CHECK_TIMEOUT_MS redevient fixe à 10 s (suppression de la
+    progression) ; (2) proxy — retrait de la capture pipe du stderr serveur
+    (retour stdio inherit) et de l'écriture des fichiers de logs ;
+    (3) serveurs — retrait du panic hook, du catch_unwind par artifact et du
+    warm-up (retour au boot bloquant : ONNX + reindex avant initialize,
+    l'embedder redevient un paramètre par valeur de OrchestratorEngine::new)
+    ; (4) doctor — retrait de la cible make doctor, du script et de son
+    invocation en tête de deploy-serve.sh. Chaque retrait serveur entre en
+    service par make deploy-serve, chaque retrait proxy par restart de
+    session (mêmes canaux que l'aller). Les traces de crash et journaux déjà
+    écrits sous company/data/ RESTENT en place : ils sont inertes (aucun
+    code ne les lit après retrait du doctor), non versionnés, et leur
+    conservation est une exigence utilisateur ; la baseline coredumps peut
+    être supprimée manuellement. Les deux supersessions partielles sont
+    annulées en re-vigueur des contrats d'origine (C2 à 120 s, étape 19
+    reindex-avant-serve) : aucun artifact YAML n'a besoin d'être réécrit si
+    le rollback intervient avant la pose des liens supersedes. BRANCHE
+    POST-SUPERSESSION (la plus probable : l'impact prévoit de poser les
+    liens juste après approbation) : supersede_artifact n'a PAS d'inverse
+    (il pose la réciproque superseded-by et un marqueur daté
+    [SUPERSEDED-BY ...] en tête de description de l'ancien artifact). Le
+    rollback prévoit donc une ANNULATION MANUELLE documentée : éditer les
+    deux RFCs supersédés (18011bfc et bdee1af4) pour retirer le marqueur
+    [SUPERSEDED-BY] de leur metadata.description et le lien superseded-by
+    de leur metadata.related, et retirer les liens supersedes de ce RFC ;
+    canal approprié : company/rfcs/ est hors zones protégées, édition
+    directe des YAML par l'Architect, tracée par commit et re-validée par
+    le hook à l'écriture.
+  affected_files:
+    modified:
+      - company/plugins/mcp-proxy.mjs
+      - company/plugins/mcp-proxy-core.mjs
+      - company/plugins/tests/mcp-proxy-core.test.mjs
+      - company/scripts/deploy-serve.sh
+      - Makefile
+      - .gitignore
+      - Cargo.toml
+      - crates/config/src/constants.rs
+      - crates/orchestrator/Cargo.toml
+      - crates/orchestrator/src/engine.rs
+      - crates/orchestrator/src/lib.rs
+      - crates/orchestrator/src/embedding.rs
+      - crates/orchestrator/src/error.rs
+      - crates/orchestrator/tests/integration_search.rs
+      - crates/mcp-servers/orchestrator/Cargo.toml
+      - crates/mcp-servers/orchestrator/src/main.rs
+      - crates/mcp-servers/yaml/Cargo.toml
+      - crates/mcp-servers/yaml/src/main.rs
+      - tests/integration/Cargo.toml
+      - tests/integration/user_stories.rs
+      - tests/integration/edge_cases.rs
+    created:
+      - company/scripts/doctor-coredumps.sh
+      - company/plugins/tests/integration/mcp-proxy-integration.test.mjs
+      - company/plugins/tests/harness/fake-mcp-server.mjs
+      - crates/crash-trace/Cargo.toml
+      - crates/crash-trace/src/lib.rs
