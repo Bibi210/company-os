@@ -9,10 +9,15 @@ import {
   binaryReady,
   buildUnavailableError,
   extractPendingRequestIds,
+  shouldRotate,
+  rotationPlan,
+  formatTelemetryLine,
   BACKOFF_INITIAL_MS,
   BACKOFF_CAP_MS,
   BACKOFF_RESET_AFTER_MS,
   JITTER_RATIO,
+  LOG_MAX_BYTES,
+  LOG_MAX_ARCHIVES,
 } from "../mcp-proxy-core.mjs";
 
 // Deterministic "no jitter" random: 0.5 → (0.5*2 - 1) = 0 → factor 1.
@@ -181,4 +186,129 @@ test("extractPendingRequestIds — custom parse injected", () => {
   const lines = ["A", "B"];
   const fakeParse = (s) => ({ id: s === "A" ? 1 : 2 });
   assert.deepEqual(extractPendingRequestIds(lines, fakeParse), [1, 2]);
+});
+
+// ──────────────────── shouldRotate (RFC 5bacb08a D1) ────────────────────
+
+test("shouldRotate — NOMINAL: below the cap keeps the journal, above rotates", () => {
+  assert.equal(shouldRotate(100, 10, { maxBytes: 1000 }), false);
+  assert.equal(shouldRotate(995, 10, { maxBytes: 1000 }), true);
+  assert.equal(shouldRotate(0, 1, { maxBytes: LOG_MAX_BYTES }), false);
+});
+
+test("shouldRotate — EDGE: exact equality with the cap does NOT rotate", () => {
+  // 990 + 10 === 1000: the cap is a ceiling we may reach, not cross.
+  assert.equal(shouldRotate(990, 10, { maxBytes: 1000 }), false);
+  assert.equal(shouldRotate(991, 10, { maxBytes: 1000 }), true);
+});
+
+test("shouldRotate — NEGATIVE: junk inputs never throw and never rotate blindly", () => {
+  assert.equal(shouldRotate(NaN, NaN, { maxBytes: 1000 }), false);
+  assert.equal(shouldRotate(-5, -5, { maxBytes: 1000 }), false);
+  assert.equal(shouldRotate(undefined, undefined, { maxBytes: 1000 }), false);
+  // A meaningless cap disables rotation rather than rotating on every line.
+  assert.equal(shouldRotate(10_000, 1, { maxBytes: 0 }), false);
+  assert.equal(shouldRotate(10_000, 1, { maxBytes: -1 }), false);
+  assert.equal(shouldRotate(10_000, 1, { maxBytes: NaN }), false);
+});
+
+// ──────────────────── rotationPlan (RFC 5bacb08a D1) ────────────────────
+
+test("rotationPlan — NOMINAL: oldest archive dropped, others shifted up in order", () => {
+  const plan = rotationPlan("x.log", { keptArchives: 3 });
+  assert.equal(plan.unlink, "x.log.3");
+  assert.deepEqual(plan.renames, [
+    { from: "x.log.2", to: "x.log.3" },
+    { from: "x.log.1", to: "x.log.2" },
+    { from: "x.log", to: "x.log.1" },
+  ]);
+});
+
+test("rotationPlan — EDGE: order never overwrites an archive still needed", () => {
+  const plan = rotationPlan("x.log", { keptArchives: 4 });
+  // Every destination, except the last one, must be renamed away BEFORE it
+  // is written to. Walking the list, a `to` may only collide with a `from`
+  // that appeared earlier.
+  const alreadyMoved = new Set();
+  for (const { from, to } of plan.renames) {
+    assert.ok(
+      !plan.renames.some((r) => r.from === to) || alreadyMoved.has(to),
+      `${to} would be overwritten while still holding data`,
+    );
+    alreadyMoved.add(from);
+  }
+  assert.equal(plan.unlink, "x.log.4");
+});
+
+test("rotationPlan — EDGE: a single kept archive still shifts the live journal", () => {
+  const plan = rotationPlan("x.log", { keptArchives: 1 });
+  assert.equal(plan.unlink, "x.log.1");
+  assert.deepEqual(plan.renames, [{ from: "x.log", to: "x.log.1" }]);
+});
+
+test("rotationPlan — NEGATIVE: junk inputs yield an inert plan", () => {
+  assert.deepEqual(rotationPlan(""), { unlink: null, renames: [] });
+  assert.deepEqual(rotationPlan(null), { unlink: null, renames: [] });
+  assert.deepEqual(rotationPlan(42), { unlink: null, renames: [] });
+  // Zero archive: drop the journal, rename nothing.
+  assert.deepEqual(rotationPlan("x.log", { keptArchives: 0 }), {
+    unlink: "x.log",
+    renames: [],
+  });
+});
+
+test("rotationPlan — default keeps LOG_MAX_ARCHIVES archives", () => {
+  const plan = rotationPlan("x.log");
+  assert.equal(plan.unlink, `x.log.${LOG_MAX_ARCHIVES}`);
+  assert.equal(plan.renames.length, LOG_MAX_ARCHIVES);
+});
+
+// ───────────────── formatTelemetryLine (RFC 5bacb08a D1) ─────────────────
+
+test("formatTelemetryLine — NOMINAL: structured prefix, one trailing newline", () => {
+  const line = formatTelemetryLine({
+    timestamp: "2026-09-11T10:33:37.000Z",
+    incarnation: 3,
+    source: "server",
+    text: "thread 'tokio-runtime-worker' panicked at engine.rs:2262",
+  });
+  assert.equal(
+    line,
+    "2026-09-11T10:33:37.000Z i=3 server | thread 'tokio-runtime-worker' panicked at engine.rs:2262\n",
+  );
+  assert.equal(line.split("\n").length, 2, "exactly one record, one newline");
+});
+
+test("formatTelemetryLine — EDGE: embedded newlines collapse so a record stays one line", () => {
+  const line = formatTelemetryLine({
+    timestamp: "2026-09-11T10:33:37.000Z",
+    incarnation: 1,
+    source: "server",
+    text: "stack:\n  frame 1\r\n  frame 2",
+  });
+  assert.equal(line.split("\n").length, 2, "one record, whatever the payload");
+  assert.ok(!line.slice(0, -1).includes("\r"), "no stray CR inside the record");
+  assert.ok(line.includes("stack:") && line.includes("frame 1") && line.includes("frame 2"));
+});
+
+test("formatTelemetryLine — EDGE: incarnation 0 is a real value, not a missing one", () => {
+  const line = formatTelemetryLine({
+    timestamp: "T",
+    incarnation: 0,
+    source: "proxy",
+    text: "boot",
+  });
+  assert.equal(line, "T i=0 proxy | boot\n");
+});
+
+test("formatTelemetryLine — NEGATIVE: missing or bogus fields degrade, never throw", () => {
+  assert.equal(formatTelemetryLine(), "- i=- unknown | \n");
+  assert.equal(
+    formatTelemetryLine({ timestamp: "T", incarnation: "x", source: "hacker", text: null }),
+    "T i=- unknown | \n",
+  );
+  assert.equal(
+    formatTelemetryLine({ timestamp: "T", incarnation: 2, source: "proxy", text: 42 }),
+    "T i=2 proxy | 42\n",
+  );
 });

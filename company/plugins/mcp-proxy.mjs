@@ -36,8 +36,18 @@
 // health check (10s) as CONFIRMATION only (no periodic polling).
 
 import { spawn } from "node:child_process";
-import { existsSync, accessSync, constants as fsConstants, watch } from "node:fs";
-import { basename, dirname } from "node:path";
+import {
+  existsSync,
+  accessSync,
+  constants as fsConstants,
+  watch,
+  mkdirSync,
+  statSync,
+  renameSync,
+  unlinkSync,
+  createWriteStream,
+} from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
 import {
@@ -45,6 +55,9 @@ import {
   binaryReady,
   buildUnavailableError,
   extractPendingRequestIds,
+  shouldRotate,
+  rotationPlan,
+  formatTelemetryLine,
   BACKOFF_RESET_AFTER_MS,
 } from "./mcp-proxy-core.mjs";
 
@@ -98,6 +111,12 @@ const stdoutDecoder = new StringDecoder("utf8");
 let stdinAccum = "";
 let stdoutAccum = "";
 
+// Child stderr is NOT a JSON-RPC direction: it is captured line by line for
+// the telemetry journal (RFC 5bacb08a D1), with its own decoder so a
+// multi-byte character split across two chunks is never mangled.
+const stderrDecoder = new StringDecoder("utf8");
+let stderrAccum = "";
+
 // Stdout raw chunks buffered while state ∈ {starting, restarting}.
 let stdoutRawBuffer = [];
 
@@ -117,9 +136,106 @@ let bootstrapAttempted = false;
 
 let isFirstStartup = true;
 
+// --- Persisted telemetry (RFC 5bacb08a D1) ---
+//
+// The proxy is the SINGLE writer of the recovery telemetry: its own event
+// journal AND the child's stderr, captured through a pipe, both landing in
+// company/data/logs/<crate>.log with a structured prefix (ISO timestamp,
+// incarnation, source). Before this, every stderr of the chain went to an
+// opencode socket that is never persisted, and each incident was
+// unrecoverable post mortem: six SIGABRT of the served orchestrator left
+// nothing to read.
+//
+// INVARIANT OF NON-LETHALITY (RFC 5bacb08a D1). This channel is
+// best-effort and can NEVER kill or block the proxy, nor the child. The
+// volet A contract of RFC 18011bfc, "no code path leads to the definitive
+// death of the proxy", survives D1 untouched. Three concrete rules:
+//   1. the journal stream ALWAYS carries an 'error' listener. Without one
+//      Node promotes a stream error to an uncaught exception, which kills
+//      the proxy and takes the whole MCP channel down with it.
+//   2. every telemetry call swallows its failures and degrades to
+//      stderr-only. Losing telemetry costs observability, never
+//      availability.
+//   3. the child's stderr pipe is drained UNCONDITIONALLY, journal or no
+//      journal (cf. onChildStderrData).
+const COMPANYOS_ROOT = process.env.COMPANYOS_ROOT ?? ".";
+const LOG_DIR = join(COMPANYOS_ROOT, "company", "data", "logs");
+const LOG_PATH = join(LOG_DIR, `${crateName}.log`);
+// Mirrors companyos_config::constants::ENV_MCP_INCARNATION: the Rust panic
+// hook reads it to stamp a crash trace with the incarnation number only
+// the proxy knows how to count. Keep the two sides in sync.
+const ENV_INCARNATION = "MCP_INCARNATION";
+// Cap on the stderr line accumulator, mirroring STDOUT_ACCUM_LIMIT. Rust
+// backtraces are long and a chunk does not necessarily end on a newline.
+const STDERR_ACCUM_LIMIT = 1_048_576;
+
+let logStream = null;
+let logBytes = 0;
+
+function openTelemetry() {
+  try {
+    mkdirSync(LOG_DIR, { recursive: true });
+    logBytes = existsSync(LOG_PATH) ? statSync(LOG_PATH).size : 0;
+    const stream = createWriteStream(LOG_PATH, { flags: "a" });
+    // MANDATORY (invariant rule 1). Never remove this listener.
+    stream.on("error", (e) => {
+      if (logStream === stream) logStream = null;
+      console.error(
+        `[mcp-proxy:${crateName}] telemetry disabled after write error: ${e.message}`,
+      );
+    });
+    logStream = stream;
+  } catch (e) {
+    logStream = null;
+    console.error(
+      `[mcp-proxy:${crateName}] telemetry unavailable (${e.message}); stderr only`,
+    );
+  }
+}
+
+function rotateTelemetry() {
+  try {
+    const plan = rotationPlan(LOG_PATH);
+    if (logStream) {
+      logStream.end();
+      logStream = null;
+    }
+    if (plan.unlink && existsSync(plan.unlink)) unlinkSync(plan.unlink);
+    for (const { from, to } of plan.renames) {
+      if (existsSync(from)) renameSync(from, to);
+    }
+  } catch (e) {
+    console.error(
+      `[mcp-proxy:${crateName}] telemetry rotation failed: ${e.message}`,
+    );
+  }
+  logBytes = 0;
+  openTelemetry();
+}
+
+function writeTelemetry(source, text) {
+  if (!logStream) return;
+  try {
+    const line = formatTelemetryLine({
+      timestamp: new Date().toISOString(),
+      incarnation: childIncarnation,
+      source,
+      text,
+    });
+    const bytes = Buffer.byteLength(line, "utf8");
+    if (shouldRotate(logBytes, bytes)) rotateTelemetry();
+    if (!logStream) return; // rotation may have degraded the channel
+    logStream.write(line);
+    logBytes += bytes;
+  } catch {
+    // Observability only (invariant rule 2): swallow and keep relaying.
+  }
+}
+
 // --- Logging ---
 function log(msg) {
   console.error(`[mcp-proxy:${crateName}] ${msg}`);
+  writeTelemetry("proxy", msg);
 }
 
 // --- NDJSON helpers ---
@@ -369,6 +485,32 @@ function onChildStdoutData(chunk) {
   }
 }
 
+// --- Child stderr handler: capture + tee (RFC 5bacb08a D1) ---
+function onChildStderrData(chunk) {
+  // Live behaviour preserved: the operator keeps seeing the server stderr
+  // in real time, exactly as with the previous `inherit`.
+  try {
+    process.stderr.write(chunk);
+  } catch {
+    // EPIPE on a closed stderr must not kill the proxy.
+  }
+  // UNCONDITIONAL DRAIN (invariant rule 3). Consuming this pipe is not
+  // optional: stop reading and the OS pipe buffer (~64 KB) fills, then the
+  // child BLOCKS in write(2) at the precise moment a panic is dumping its
+  // backtrace. That would be a worse failure than the blindness being
+  // fixed here, so the parsing below runs whatever the journal's state.
+  const ref = { value: stderrAccum };
+  const lines = feedAndExtract(stderrDecoder, ref, chunk);
+  stderrAccum = ref.value;
+  if (stderrAccum.length > STDERR_ACCUM_LIMIT) {
+    // One very long line, or a stream with no newline at all: flush it
+    // instead of growing the accumulator without bound.
+    lines.push(stderrAccum);
+    stderrAccum = "";
+  }
+  for (const line of lines) writeTelemetry("server", line);
+}
+
 // --- Unified child-gone handler + per-incarnation latch (RFC A4) ---
 // Routed from 'exit', 'error' AND 'close'. Runs exactly once per child
 // incarnation, whatever the order/combination of events emitted.
@@ -450,6 +592,7 @@ function startChild() {
   enterUnavailable(); // still not ready until the health check confirms
   stdoutAccum = "";
   stdoutRawBuffer = [];
+  stderrAccum = "";
 
   childIncarnation += 1;
   const incarnation = childIncarnation;
@@ -457,8 +600,15 @@ function startChild() {
   let spawned;
   try {
     spawned = spawn(binaryPath, extraArgs, {
-      stdio: ["pipe", "pipe", "inherit"],
-      env: { ...process.env },
+      // RFC 5bacb08a D1: the third descriptor moves from `inherit` to
+      // `pipe` so the child's stderr, where raw Rust panic messages and
+      // the "panicked while panicking" abort line go, is captured and
+      // persisted. stdin and stdout are untouched: they remain the only
+      // channels of the NDJSON framing.
+      stdio: ["pipe", "pipe", "pipe"],
+      // The incarnation number travels to the child so its crash traces
+      // can be matched with this journal (read by the Rust panic hook).
+      env: { ...process.env, [ENV_INCARNATION]: String(incarnation) },
     });
   } catch (e) {
     // Synchronous spawn failure (rare) — treat as child gone immediately.
@@ -469,6 +619,7 @@ function startChild() {
   child = spawned;
 
   child.stdout.on("data", onChildStdoutData);
+  if (child.stderr) child.stderr.on("data", onChildStderrData);
   // All three lifecycle events route to the same latched handler (RFC A4).
   child.on("error", (err) => onChildGone(incarnation, `error:${err.message}`));
   child.on("exit", (code, signal) =>
@@ -642,6 +793,10 @@ function restartChild() {
 }
 
 // --- Main ---
+openTelemetry();
+log(
+  `Proxy starting (binary=${binaryPath}, telemetry=${logStream ? LOG_PATH : "stderr only"})`,
+);
 if (!binaryReady(binaryPath, fsDeps)) {
   // Served binary absent at boot: enter waiting_binary, bootstrap, and let the
   // watcher / backoff net bring us up. Never exit here (RFC B4).

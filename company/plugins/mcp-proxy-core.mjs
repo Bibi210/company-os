@@ -11,7 +11,11 @@
 //   - binaryReady(path, deps)                — binary precondition existsSync + X_OK (RFC A3)
 //   - buildUnavailableError(id, ctx)         — JSON-RPC -32050 escalation error (RFC C2)
 //   - extractPendingRequestIds(lines, parse) — ids of pending id-bearing requests (RFC C2)
-//   - constants: BACKOFF_INITIAL_MS, BACKOFF_CAP_MS, BACKOFF_RESET_AFTER_MS, JITTER_RATIO
+//   - shouldRotate(current, incoming, opts)  — size-based journal rotation (RFC 5bacb08a D1)
+//   - rotationPlan(basePath, opts)           — bounded archive shuffling (RFC 5bacb08a D1)
+//   - formatTelemetryLine(entry)             — structured journal line (RFC 5bacb08a D1)
+//   - constants: BACKOFF_INITIAL_MS, BACKOFF_CAP_MS, BACKOFF_RESET_AFTER_MS, JITTER_RATIO,
+//               LOG_MAX_BYTES, LOG_MAX_ARCHIVES
 
 // --- Backoff tunables (RFC A2, tranché) ---
 export const BACKOFF_INITIAL_MS = 200;
@@ -113,4 +117,86 @@ export function extractPendingRequestIds(lines, parse = JSON.parse) {
     }
   }
   return ids;
+}
+
+// --- Persisted telemetry (RFC 5bacb08a D1) ---
+//
+// The proxy is the single writer of the recovery telemetry: its own event
+// journal AND the child's stderr, captured through a pipe. These three
+// functions hold every DECISION of that channel so they can be unit-tested
+// without touching a filesystem; the impure wrapper only executes them.
+
+/// Size of a journal past which it is rotated. 5 MB holds a very long
+/// incident (a full backtrace is a few kB) while staying trivial to read.
+export const LOG_MAX_BYTES = 5_242_880;
+
+/// Number of rotated archives kept beside the live journal. Bounded on
+/// purpose: telemetry must never be able to fill the disk. Crash traces,
+/// which are the irreplaceable artefact, are NOT rotated (RFC 5bacb08a
+/// D3b); journals are reconstructible context, so they are.
+export const LOG_MAX_ARCHIVES = 3;
+
+// shouldRotate — would appending `incomingBytes` push the journal past the cap?
+//
+// currentBytes: size of the live journal right now.
+// incomingBytes: size of the line about to be appended.
+// opts.maxBytes: cap, defaults to LOG_MAX_BYTES.
+//
+// Non-finite or negative inputs are treated as 0: a telemetry decision must
+// never throw, and refusing to rotate is the safe default (the cap is a
+// disk-usage guard, not a correctness invariant).
+export function shouldRotate(currentBytes, incomingBytes, opts = {}) {
+  const max = opts.maxBytes ?? LOG_MAX_BYTES;
+  const current = Number.isFinite(currentBytes) && currentBytes > 0 ? currentBytes : 0;
+  const incoming = Number.isFinite(incomingBytes) && incomingBytes > 0 ? incomingBytes : 0;
+  if (!Number.isFinite(max) || max <= 0) return false;
+  return current + incoming > max;
+}
+
+// rotationPlan — the renames that free `basePath` for a fresh journal.
+//
+// Returns { unlink, renames } where `unlink` is the archive that falls off
+// the end (or null when none exists yet) and `renames` is an ORDERED list
+// of {from, to} moves. The order matters: oldest first, so no move ever
+// overwrites an archive that a later move still needs.
+//
+// With basePath "x.log" and 3 archives:
+//   unlink  = "x.log.3"
+//   renames = x.log.2 -> x.log.3, x.log.1 -> x.log.2, x.log -> x.log.1
+export function rotationPlan(basePath, opts = {}) {
+  const kept = opts.keptArchives ?? LOG_MAX_ARCHIVES;
+  if (typeof basePath !== "string" || basePath.length === 0) {
+    return { unlink: null, renames: [] };
+  }
+  if (!Number.isFinite(kept) || kept < 1) {
+    // No archive kept: the live journal is simply dropped.
+    return { unlink: basePath, renames: [] };
+  }
+  const renames = [];
+  for (let i = kept - 1; i >= 1; i -= 1) {
+    renames.push({ from: `${basePath}.${i}`, to: `${basePath}.${i + 1}` });
+  }
+  renames.push({ from: basePath, to: `${basePath}.1` });
+  return { unlink: `${basePath}.${kept}`, renames };
+}
+
+// formatTelemetryLine — one journal record, always exactly one line.
+//
+// entry = { timestamp, incarnation, source, text }
+//   timestamp:   ISO 8601 UTC string (injected, never read from a clock here)
+//   incarnation: child incarnation number the proxy is counting
+//   source:      "proxy" or "server"; anything else is recorded as "unknown"
+//   text:        the message; embedded CR/LF are collapsed so one record
+//                stays one line and the journal remains greppable
+//
+// Shape: `<timestamp> i=<incarnation> <source> | <text>\n`
+export function formatTelemetryLine(entry = {}) {
+  const { timestamp, incarnation, source, text } = entry;
+  const ts = typeof timestamp === "string" && timestamp.length > 0 ? timestamp : "-";
+  const inc = Number.isFinite(incarnation) ? incarnation : "-";
+  const src = source === "proxy" || source === "server" ? source : "unknown";
+  const body = (text === undefined || text === null ? "" : String(text))
+    .replace(/\r?\n/g, " ")
+    .replace(/\r/g, " ");
+  return `${ts} i=${inc} ${src} | ${body}\n`;
 }
