@@ -1,0 +1,89 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: 912cb9a3-2d5c-4724-ade4-9324e0a48f9e
+  title: "Face à un crash récurrent opaque, livrer l'instrumentation persistée AVANT tout correctif : elle résout en minutes ce que les post-mortems n'atteignent pas"
+  author: pm
+  created_at: "2026-09-14"
+  description: >
+    Le chantier de durcissement MCP (RFC 5bacb08a) a ordonné la livraison :
+    télémétrie persistée et trace de crash pré-unwind d'abord, correctifs
+    ensuite, avec un point d'arrêt utilisateur entre les deux. Résultat : la
+    root cause de 6 SIGABRT (panic EPIPE sur stderr mort, puis double panic),
+    que 6 core dumps analysés sur 5 jours n'avaient pas révélée et que deux
+    diagnostics successifs avaient mal attribuée (destructeurs rusqlite/ort),
+    a été identifiée en quelques minutes par la première trace pré-unwind
+    écrite. La télémétrie a aussi capturé en direct la boucle de kill du
+    health-check (hypothèse H1 prouvée) et un fait inconnu (timeout d'init
+    MCP ~30 s du client opencode). Leçon jumelle : requalifier honnêtement
+    une promesse de design (confinement + trace garantie plutôt que "double
+    panic impossible") vaut mieux qu'une garantie fausse : le criterion
+    offrait la branche "mécanisme équivalent", et c'est le CEO qui a le plus
+    fermement approuvé cette honnêteté.
+  tags:
+    - instrumentation
+    - télémétrie
+    - root-cause
+    - crash
+    - panic-hook
+    - incident-response
+    - workflow
+    - critical-infra
+  related:
+    - id: 5bacb08a-ac37-4ccc-847f-16edcf70c1ba
+      kind: rfc
+      relationship: derived-from
+    - id: 578de044-cd26-4202-ad52-33d9e0f809c0
+      kind: diagnostic-report
+      relationship: related
+    - id: ccd7c984-eb4b-4d69-90bb-c7a8980b5169
+      kind: diagnostic-report
+      relationship: related
+    - id: 8838a892-434d-4af3-bd07-1c655212eb1b
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    6 SIGABRT du serveur orchestrator servi en 5 jours, 3 reboots humains,
+    déclencheur reproduit (écriture YAML → auto-reindex → crash) mais root
+    cause inaccessible : les stderr du proxy et du serveur partaient dans un
+    socket client jamais persisté, et les analyses gdb des core dumps ne
+    remontaient que le mécanisme d'abort (panic_in_cleanup), pas le message
+    du panic originel. Deux diagnostics successifs ont hypothéqué des
+    suspects plausibles mais faux (Drop rusqlite/ort). Le task-request
+    7d83f35d a imposé une contrainte d'ordre : instrumentation livrable
+    indépendamment et en premier.
+  insight: >
+    Un crash pendant l'unwind détruit précisément l'information qui
+    l'explique : seul un hook qui écrit AVANT l'unwind (fsync, fichier dédié,
+    jamais purgé) capture le panic originel, et seul un superviseur qui
+    persiste le stderr de son enfant capture ce qu'un process mourant ne
+    peut plus écrire proprement. Les post-mortems (core dumps, hypothèses)
+    plafonnent vite : 6 cores bien analysés ont donné le mécanisme, jamais
+    la cause ; la première trace pré-unwind a donné la cause en lecture
+    directe. Corollaire de process : l'ordre de livraison est une décision
+    d'architecture (le déclencheur étant les écritures du chantier lui-même,
+    chaque étape non instrumentée était une panne aveugle potentielle), et
+    un point d'arrêt utilisateur explicite avec critère observable est le
+    seul moyen de garantir qu'une instrumentation portée par un plugin de
+    session est réellement EN SERVICE avant la suite. Corollaire d'honnêteté :
+    quand le mécanisme retenu ne tient pas la promesse littérale du criterion
+    (catch_unwind n'empêche pas un abort), requalifier la promesse dans le
+    design plutôt que la maintenir : les reviewers valident ce qui est
+    réellement tenu, et la crédibilité du design en sort renforcée.
+  recommendation: >
+    Face à un mode de panne récurrent et opaque : (1) cadrer et livrer
+    l'instrumentation persistée (journal superviseur + trace de crash
+    pré-unwind) comme PREMIER lot, indépendant, avant tout correctif ;
+    (2) si l'instrumentation dépend d'un restart utilisateur, mettre un
+    point d'arrêt explicite dans le séquencement avec un critère de reprise
+    OBSERVABLE (le journal existe et reçoit des lignes de la nouvelle
+    session) ; (3) rendre l'instrumentation incapable de nuire (best-effort,
+    jamais fatale, drain inconditionnel : les invariants de non-létalité et
+    d'infaillibilité appartiennent au RFC, pas au plan) ; (4) ne pas
+    conditionner les durcissements à l'identification de la root cause fine :
+    concevoir agnostique, et laisser l'instrumentation trancher ensuite ;
+    (5) quand un criterion promet plus que le mécanisme ne tient, requalifier
+    la promesse par la branche "mécanisme équivalent" plutôt que de laisser
+    une garantie fausse dans un document d'approbation.
