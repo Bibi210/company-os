@@ -1643,6 +1643,22 @@ impl OrchestratorEngine {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        // Fault injection gate (RFC 5bacb08a D8). Placed HERE on purpose:
+        // after the embedding, right before the transaction opens, so the
+        // injected panic unwinds the same frame as the real crash did,
+        // with the same live resources (the `ort` value that produced the
+        // embedding, the rusqlite statements about to be built). Testing
+        // a panic at function entry would prove much less.
+        #[cfg(debug_assertions)]
+        if fault_injection_target()
+            .is_some_and(|target| file_path == target || file_path.ends_with(&target))
+        {
+            panic!(
+                "{} armed: injected fault while indexing {file_path}",
+                constants::ENV_FAULT_INJECT_ARTIFACT
+            );
+        }
+
         self.db.upsert_artifact_full(
             &artifact,
             &searchable,
@@ -2257,11 +2273,52 @@ impl OrchestratorEngine {
         // Keep the successfully-indexed artifacts to run the per-artifact
         // warning families (10c supersession, 16 author-produces) AFTER the
         // whole corpus is indexed, so cross-artifact lookups see the full set.
+        // Per-artifact confinement (RFC 5bacb08a D3a). The unit of failure
+        // is the ARTIFACT, not the batch: a panic while indexing artifact
+        // (i) is caught, recorded as a warning, and the loop carries on
+        // with the next artifact. The batch survives, the watcher task
+        // survives, the process survives.
+        //
+        // HONEST SCOPE, as requalified by the RFC: this confines a SIMPLE
+        // panic. It does NOT make the double panic impossible. If a
+        // destructor panics during this unwind, the abort is process-wide
+        // and `catch_unwind` cannot intercept it; what saves the incident
+        // then is the crash trace already written by the panic hook (the
+        // hook runs at the panic site, BEFORE any destructor) and the
+        // automatic respawn. The scope guard below is what lets that trace
+        // name the culprit artifact.
+        //
+        // `AssertUnwindSafe` is required because the closure captures
+        // `&mut self`, which is not `UnwindSafe`. It is sound here:
+        // `index_artifact` computes the embedding BEFORE opening the
+        // transaction, so a caught panic leaves the database either
+        // untouched or rolled back by the transaction's own `Drop`, and
+        // the logical inconsistency window is bounded to the artifact
+        // being indexed.
         let mut indexed: Vec<IndexedArtifact> = Vec::new();
+        let mut panicked: Vec<String> = Vec::new();
         for rel in yaml_paths {
-            if let Ok(artifact) = self.index_artifact(root, &rel, validator) {
-                count += 1;
-                indexed.push(artifact);
+            let outcome = {
+                let _scope = companyos_crash_trace::ArtifactScope::enter(&rel);
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.index_artifact(root, &rel, validator)
+                }))
+            };
+            match outcome {
+                Ok(Ok(artifact)) => {
+                    count += 1;
+                    indexed.push(artifact);
+                }
+                // Pre-existing behaviour: a validation or IO error skips
+                // the artifact silently, it is not a crash.
+                Ok(Err(_)) => {}
+                Err(payload) => panicked.push(format!(
+                    "panic confiné lors de l'indexation de {rel} : {}. Les autres artifacts \
+                     du lot ont été indexés, le process a survécu ; une trace pré-unwind a été \
+                     écrite sous {} si le panic hook est installé",
+                    panic_payload_message(&payload),
+                    constants::CRASHES_DIR
+                )),
             }
         }
 
@@ -2271,7 +2328,7 @@ impl OrchestratorEngine {
         // SQL pass (order-insensitive). NOT the capitalization reminders (19c):
         // those are single-file only (moment-of-resolution), spamming history
         // in bulk.
-        let mut warnings = Vec::new();
+        let mut warnings = panicked;
         for artifact in &indexed {
             warnings.extend(self.supersession_warnings(root, artifact));
             warnings.extend(self.author_produces_warnings(root, artifact));
@@ -2284,6 +2341,43 @@ impl OrchestratorEngine {
         }
 
         Ok(ReindexOutcome { count, warnings })
+    }
+}
+
+/// Artifact the indexing path must panic on, when the fault injection
+/// gate is armed (RFC 5bacb08a, D8).
+///
+/// Always `None` in a release build: the gate is compiled out entirely.
+/// In a debug build (which the SERVED binary is, since `deploy-serve`
+/// promotes from `target/debug`) it reflects
+/// [`constants::ENV_FAULT_INJECT_ARTIFACT`], so callers can warn loudly at
+/// boot when an operator, or a stale exported variable inherited through
+/// the proxy environment, left it armed.
+///
+/// The value is matched against the artifact's repo-relative path, either
+/// exactly or as a suffix, so a test can arm it with a bare file name.
+pub fn fault_injection_target() -> Option<String> {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var(constants::ENV_FAULT_INJECT_ARTIFACT)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
+}
+
+/// Best-effort message of a caught panic payload, for the warning that
+/// reports a confined indexing panic.
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "<non string panic payload>".to_string()
     }
 }
 

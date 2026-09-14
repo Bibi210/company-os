@@ -485,3 +485,140 @@ fn filters_push_down_kind() {
         assert_eq!(r.kind, "rfc", "filter leaked: got {}", r.kind);
     }
 }
+
+// ─────────── Confinement regression test (RFC 5bacb08a D3a + D8) ───────────
+//
+// This is the non-regression test the task-request demanded for the
+// REPRODUCED trigger: write a YAML artifact, let the indexing path run,
+// have it panic, and check that the batch, the caller and the process all
+// survive while the incident leaves a persisted trace naming the culprit.
+// Six SIGABRT of the served orchestrator (2026-09-09 to 2026-09-11) went
+// through this exact code path with nothing to read afterwards.
+//
+// It lives in this file, and not in a new one, for two converging reasons:
+// this is the only test file covered by the write permit AND the only one
+// that already builds a real `Embedder`, which `index_artifact` requires.
+
+/// Minimal valid `lesson-learned` used as corpus fodder.
+fn write_lesson(dir: &std::path::Path, slug: &str, uuid: &str) {
+    let body = format!(
+        "api_version: companyos/v1\n\
+         kind: lesson-learned\n\
+         metadata:\n\
+        \x20 id: {uuid}\n\
+        \x20 title: \"Fixture {slug}\"\n\
+        \x20 author: implementer\n\
+        \x20 created_at: \"2026-09-11\"\n\
+        \x20 description: Fixture artifact for the confinement regression test.\n\
+        \x20 tags:\n\
+        \x20   - fixture\n\
+         spec:\n\
+        \x20 context: Confinement regression test corpus.\n\
+        \x20 insight: A panic while indexing must stay confined to its artifact.\n\
+        \x20 recommendation: Keep this test green.\n"
+    );
+    std::fs::write(dir.join(format!("{slug}-{}.yml", &uuid[..8])), body).expect("write fixture");
+}
+
+#[test]
+fn reindex_confines_a_panicking_artifact_and_traces_it() {
+    let workspace = workspace_root();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    let lessons = root.join("company/lessons");
+    std::fs::create_dir_all(&lessons).expect("mkdir lessons");
+    std::fs::create_dir_all(root.join("projects")).expect("mkdir projects");
+
+    write_lesson(
+        &lessons,
+        "healthy-before",
+        "11111111-1111-4111-8111-111111111111",
+    );
+    write_lesson(
+        &lessons,
+        "fault-inject-me",
+        "22222222-2222-4222-8222-222222222222",
+    );
+    write_lesson(
+        &lessons,
+        "healthy-after",
+        "33333333-3333-4333-8333-333333333333",
+    );
+
+    // Crash traces of this run land in the temp dir, never in company/data.
+    let crashes = root.join("crashes");
+    companyos_crash_trace::install_at(crashes.clone(), "companyos-test-binary");
+
+    // SAFETY (Rust 2024): mutating the process environment is unsafe
+    // because it races with concurrent readers. The target suffix below
+    // exists ONLY in this temporary corpus, so a test running in parallel
+    // in the same process cannot match it and cannot be blown up by it.
+    unsafe {
+        std::env::set_var(
+            "COMPANYOS_FAULT_INJECT_ARTIFACT",
+            "fault-inject-me-22222222.yml",
+        );
+    }
+
+    let db = OrchestratorDb::open_in_memory().expect("in-memory DB");
+    db.migrate().expect("migrate");
+    let embedder = Arc::new(
+        Embedder::load_from_cache(&workspace)
+            .expect("embedding model not found — run --prefetch-embeddings first"),
+    );
+    let mut engine = OrchestratorEngine::new(db, 3, embedder);
+    let registry = SchemaRegistry::load(format!("{workspace}/company/schemas")).expect("schemas");
+    let validator = ArtifactValidator::new(registry);
+
+    let outcome = engine
+        .reindex_all(&root.to_string_lossy(), &validator)
+        // The whole point: reindex_all RETURNS. Before the confinement it
+        // unwound through the caller and, on a bad day, aborted the process.
+        .expect("reindex_all must return normally despite the injected panic");
+
+    unsafe {
+        std::env::remove_var("COMPANYOS_FAULT_INJECT_ARTIFACT");
+    }
+
+    // (i) the panic was confined: the other artifacts are indexed.
+    assert_eq!(
+        outcome.count, 2,
+        "the two healthy artifacts must be indexed, got {} (warnings: {:?})",
+        outcome.count, outcome.warnings
+    );
+
+    // (ii) the panic is an observable event, not a silent skip.
+    let confined = outcome
+        .warnings
+        .iter()
+        .find(|w| w.contains("panic confiné"))
+        .unwrap_or_else(|| panic!("no confinement warning in {:?}", outcome.warnings));
+    assert!(
+        confined.contains("fault-inject-me"),
+        "the warning must name the culprit artifact: {confined}"
+    );
+
+    // (iii) a pre-unwind trace exists, and it names the culprit artifact
+    // through the scope guard installed by the reindex loop.
+    let traces: Vec<_> = std::fs::read_dir(&crashes)
+        .expect("crash dir must have been created eagerly at install time")
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert!(
+        !traces.is_empty(),
+        "the panic hook must have written a trace"
+    );
+    let bodies: String = traces
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .collect();
+    assert!(
+        bodies.contains("artifact: company/lessons/fault-inject-me-22222222.yml"),
+        "a trace must name the artifact under work, got:\n{bodies}"
+    );
+    assert!(
+        bodies.contains("--- backtrace ---"),
+        "a trace without a backtrace would not be worth writing"
+    );
+}

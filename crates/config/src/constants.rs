@@ -33,6 +33,16 @@ pub const PROJECTS_DIR: &str = "projects";
 // --- Environment ---
 pub const ENV_COMPANYOS_ROOT: &str = "COMPANYOS_ROOT";
 
+/// Artifact on which the indexing path must panic on purpose, for the
+/// regression test of the confinement mechanism (RFC 5bacb08a, D3/D8).
+/// Read ONLY under `cfg(debug_assertions)`, so the gate does not exist in
+/// a release build. The served binary IS a debug build (deploy-serve
+/// promotes from target/debug), so the gate is present but inert there
+/// unless this variable is set; the server logs a loud warning at boot
+/// when it finds it armed. The name is deliberately namespaced: the proxy
+/// hands its whole environment to the child.
+pub const ENV_FAULT_INJECT_ARTIFACT: &str = "COMPANYOS_FAULT_INJECT_ARTIFACT";
+
 /// Incarnation number of the current server process, counted by the
 /// supervising MCP proxy and handed over at spawn (RFC 5bacb08a, D1/D3b).
 /// Read by the crash trace hook so a trace can be matched with the proxy

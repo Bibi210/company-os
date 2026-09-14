@@ -2238,6 +2238,22 @@ async fn run_server() -> anyhow::Result<()> {
         .with_env_filter("info")
         .init();
 
+    // RFC 5bacb08a D8, second mitigation of the fault injection gate: the
+    // served binary is a debug build, so the gate EXISTS in it and is only
+    // kept inert by the absence of the variable. The proxy hands its whole
+    // environment to the child, so a variable left exported in a shell
+    // would arm a deliberate panic on the indexing path. Say it loudly, in
+    // the telemetry, rather than let a future incident look like a seventh
+    // spontaneous crash.
+    if let Some(target) = companyos_orchestrator::fault_injection_target() {
+        tracing::warn!(
+            "FAULT INJECTION ARMED: {}='{target}'. This process will panic ON PURPOSE while \
+             indexing that artifact. Unset the variable and restart unless you are running the \
+             confinement regression test.",
+            constants::ENV_FAULT_INJECT_ARTIFACT
+        );
+    }
+
     let root = std::env::var(constants::ENV_COMPANYOS_ROOT).unwrap_or_else(|_| ".".into());
 
     let config = CompanyConfig::load(&root)?;
