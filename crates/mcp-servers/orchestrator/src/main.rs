@@ -50,12 +50,83 @@ impl TokenStore {
     }
 }
 
+/// Readiness gate of the boot warm-up (RFC 5bacb08a, D4).
+///
+/// The server answers `initialize` as soon as the transport is up, then
+/// loads the ONNX embedder and rebuilds the artifact index in the
+/// background. Tools that touch neither the index nor the embedder serve
+/// immediately; the ones that do wait here, for a bounded time, and get a
+/// structured `warming` error if the warm-up is still not done.
+///
+/// The gate MUST stay closed for the WHOLE warm-up, not just the embedder
+/// loading phase: the reindex starts by wiping the index, so an early
+/// opening would expose a transiently EMPTY index, which is exactly the
+/// observable property the partial supersession of RFC bdee1af4 étape 19
+/// promises to preserve.
+#[derive(Clone)]
+struct WarmupGate {
+    open: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl WarmupGate {
+    fn new() -> Self {
+        Self {
+            open: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// An already-open gate. For tests and any caller that builds a server
+    /// on a store which needs no warm-up.
+    #[cfg(test)]
+    fn opened() -> Self {
+        let gate = Self::new();
+        gate.open();
+        gate
+    }
+
+    fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+
+    /// Open the gate and release every waiter. Idempotent.
+    fn open(&self) {
+        self.open.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    /// Wait for the gate, at most `timeout`. Returns whether it is open.
+    async fn wait(&self, timeout: Duration) -> bool {
+        if self.is_open() {
+            return true;
+        }
+        // Register BEFORE re-checking: `Notify::notified()` is edge
+        // triggered, so subscribing after a concurrent `open()` would
+        // otherwise wait for a notification that already happened.
+        let notified = self.notify.notified();
+        if self.is_open() {
+            return true;
+        }
+        tokio::time::timeout(timeout, notified).await.is_ok() || self.is_open()
+    }
+}
+
+/// How long an index-dependent tool waits for the warm-up before it
+/// answers `warming`. Sized from the real measurement (RFC 5bacb08a D4,
+/// open question 2): a cold boot loads the embedder and reindexes the
+/// corpus in about 25 s, so 45 s leaves margin while staying under the
+/// 60 s client timeout, which must never be the thing that fires first.
+const WARMUP_MAX_WAIT: Duration = Duration::from_secs(45);
+
 #[derive(Clone)]
 struct OrchestratorServer {
     engine: Arc<Mutex<OrchestratorEngine>>,
     validator: Arc<RwLock<ArtifactValidator>>,
     root_path: String,
     tokens: TokenStore,
+    /// Readiness gate of the boot warm-up (RFC 5bacb08a, D4).
+    warmup: WarmupGate,
     /// Liveness flag for the file watcher tokio task. Set to true at
     /// task entry, false on exit (drop guard). Read by `index_status`.
     /// `Arc<AtomicBool>` keeps the lock-free invariant of the
@@ -719,16 +790,49 @@ impl OrchestratorServer {
         root_path: String,
         watcher_alive: Arc<AtomicBool>,
         review_protocol: Arc<RwLock<ReviewProtocol>>,
+        warmup: WarmupGate,
     ) -> Self {
         Self {
             engine,
             validator,
             root_path,
             tokens: TokenStore::default(),
+            warmup,
             watcher_alive,
             review_protocol,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Gate of the index-dependent tools (RFC 5bacb08a, D4).
+    ///
+    /// Waits for the boot warm-up, at most [`WARMUP_MAX_WAIT`], and turns a
+    /// timeout into a structured `warming` answer rather than a silent
+    /// stall. The bounded wait is what keeps the client's own 60 s timeout
+    /// from ever being the first failure an agent sees, which is the very
+    /// contract D5 buys on the proxy side.
+    async fn await_warmup(&self, tool: &str) -> Result<(), McpError> {
+        if self.warmup.wait(WARMUP_MAX_WAIT).await {
+            return Ok(());
+        }
+        Err(McpError::internal_error(
+            Diagnostic::warning(
+                C,
+                format!(
+                    "index still warming up after {}s",
+                    WARMUP_MAX_WAIT.as_secs()
+                ),
+            )
+            .with_context(format!("{tool} (warm-up gate)"))
+            .with_reason(
+                "the server answered initialize before loading the embedder and rebuilding the \
+                 artifact index (readiness-first boot, RFC 5bacb08a D4); this tool needs the \
+                 index",
+            )
+            .with_fix("Re-submit shortly. Tools that touch neither the index nor the embedder (permits, review rounds, config) are available right now.")
+            .to_string(),
+            None,
+        ))
     }
 
     // --- Authentication ---
@@ -987,6 +1091,8 @@ impl OrchestratorServer {
         &self,
         params: Parameters<SupersedeArtifactParams>,
     ) -> Result<CallToolResult, McpError> {
+        // RFC 5bacb08a D4: index-dependent tool, gated on the warm-up.
+        self.await_warmup("supersede_artifact").await?;
         let params = params.0;
         // No token check: lifecycle transition, not a privileged operation.
         let mut engine = self.engine.lock().await;
@@ -1541,6 +1647,8 @@ impl OrchestratorServer {
         &self,
         params: Parameters<IndexNowParams>,
     ) -> Result<CallToolResult, McpError> {
+        // RFC 5bacb08a D4: index-dependent tool, gated on the warm-up.
+        self.await_warmup("index_now").await?;
         let params = params.0;
         let mut engine = self.engine.lock().await;
         let validator = self.validator.read().await;
@@ -1669,6 +1777,8 @@ impl OrchestratorServer {
         description = "Search the artifact index. Returns lightweight summaries: [{id, kind, title, description, tags}]. Use 'get' to retrieve full content."
     )]
     async fn search(&self, params: Parameters<SearchParams>) -> Result<CallToolResult, McpError> {
+        // RFC 5bacb08a D4: index-dependent tool, gated on the warm-up.
+        self.await_warmup("search").await?;
         let params = params.0;
         let limit = params
             .limit
@@ -1737,6 +1847,8 @@ impl OrchestratorServer {
         description = "Get full artifact content by its metadata.id. Returns the complete YAML content."
     )]
     async fn get(&self, params: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
+        // RFC 5bacb08a D4: index-dependent tool, gated on the warm-up.
+        self.await_warmup("get").await?;
         let params = params.0;
         let engine = self.engine.lock().await;
         match engine.get(&params.id, &self.root_path) {
@@ -1755,6 +1867,8 @@ impl OrchestratorServer {
         description = "Get all artifacts related to a given artifact ID (bidirectional). Returns [{id, kind, title, relationship, direction}]."
     )]
     async fn related(&self, params: Parameters<RelatedParams>) -> Result<CallToolResult, McpError> {
+        // RFC 5bacb08a D4: index-dependent tool, gated on the warm-up.
+        self.await_warmup("related").await?;
         let params = params.0;
         let engine = self.engine.lock().await;
         match engine.related(&params.id) {
@@ -1779,6 +1893,8 @@ impl OrchestratorServer {
         &self,
         params: Parameters<IndexArtifactParams>,
     ) -> Result<CallToolResult, McpError> {
+        // RFC 5bacb08a D4: index-dependent tool, gated on the warm-up.
+        self.await_warmup("index_artifact").await?;
         let params = params.0;
         let mut engine = self.engine.lock().await;
         let validator = self.validator.read().await;
@@ -1807,6 +1923,8 @@ impl OrchestratorServer {
         description = "Rebuild the entire artifact index from all YAML files under company/. Use after bulk file changes."
     )]
     async fn reindex_all(&self) -> Result<CallToolResult, McpError> {
+        // RFC 5bacb08a D4: index-dependent tool, gated on the warm-up.
+        self.await_warmup("reindex_all").await?;
         let mut engine = self.engine.lock().await;
         let validator = self.validator.read().await;
         match engine.reindex_all(&self.root_path, &validator) {
@@ -1835,6 +1953,8 @@ impl OrchestratorServer {
         &self,
         params: Parameters<ListRoadmapsParams>,
     ) -> Result<CallToolResult, McpError> {
+        // RFC 5bacb08a D4: index-dependent tool, gated on the warm-up.
+        self.await_warmup("list_roadmaps").await?;
         let params = params.0;
         // Tool-level validation: status must be one of the two allowed values when provided.
         if let Some(ref s) = params.status
@@ -1876,6 +1996,8 @@ impl OrchestratorServer {
         &self,
         params: Parameters<SummarizeRoadmapParams>,
     ) -> Result<CallToolResult, McpError> {
+        // RFC 5bacb08a D4: index-dependent tool, gated on the warm-up.
+        self.await_warmup("summarize_roadmap").await?;
         let params = params.0;
         // Validation: exactly ONE of id/domain must be provided.
         let selector = match (params.id, params.domain) {
@@ -2296,12 +2418,13 @@ async fn run_server() -> anyhow::Result<()> {
     let registry = SchemaRegistry::load(&schemas_dir)?;
     let validator = Arc::new(RwLock::new(ArtifactValidator::new(registry)));
 
-    // RFC bdee1af4 étape 7: load the embedder once at boot, share via Arc.
-    // Cache must be present on disk (run --prefetch-embeddings first).
-    let embedder = Arc::new(
-        companyos_orchestrator::Embedder::load_from_cache(&root)
-            .map_err(|e| anyhow::anyhow!("Failed to load embedder: {e}"))?,
-    );
+    // RFC 5bacb08a D4: the embedder is NO LONGER loaded here. Loading the
+    // ONNX runtime is the slow, blocking step that used to sit between the
+    // lock and `initialize`, and it is precisely what let a live but slow
+    // server be killed by the proxy's health check over and over. It now
+    // happens in the warm-up task below, AFTER the transport answers.
+    // Detection of the drift stays here: it only reads a row and compares
+    // a version string, no embedder instance involved.
 
     // RFC bdee1af4 étape 5+19: detect model_version drift (architecture
     // marker, model upgrade). If the stored version differs from the
@@ -2323,7 +2446,10 @@ async fn run_server() -> anyhow::Result<()> {
         }
     };
 
-    let engine = OrchestratorEngine::new(db, max_iterations, embedder.clone());
+    // RFC 5bacb08a D4: built WITHOUT an embedder. The warm-up binds one at
+    // the end of its loading phase (`set_embedder`), which is what lets the
+    // transport come up first.
+    let engine = OrchestratorEngine::new_without_embedder(db, max_iterations);
 
     // PILIER D — autorepair at boot. If integrity_check reports
     // corruption, rebuild the DB from the YAML index source of truth.
@@ -2350,7 +2476,19 @@ async fn run_server() -> anyhow::Result<()> {
 
             let new_db = OrchestratorDb::open(&db_file)?;
             new_db.migrate()?;
-            let mut new_engine = OrchestratorEngine::new(new_db, max_iterations, embedder.clone());
+            // RFC 5bacb08a D4, DELIBERATE EXCEPTION: this branch stays
+            // SYNCHRONOUS and loads the embedder eagerly. Corruption is a
+            // rare, correctness-critical path where serving a half-repaired
+            // store would be worse than a slow boot, and `into_db_for_rebuild`
+            // consumes the engine, which is incompatible with the shared
+            // `Arc<Mutex<_>>` the warm-up works through. The boot that the
+            // kill loop actually hit is the drift one below, and that one is
+            // now deferred.
+            let embedder = Arc::new(
+                companyos_orchestrator::Embedder::load_from_cache(&root)
+                    .map_err(|e| anyhow::anyhow!("Failed to load embedder for rebuild: {e}"))?,
+            );
+            let mut new_engine = OrchestratorEngine::new(new_db, max_iterations, embedder);
             // Rebuild synchronously before the server starts serving
             // requests. read() the validator under its RwLock once.
             let validator_guard = validator.read().await;
@@ -2371,24 +2509,15 @@ async fn run_server() -> anyhow::Result<()> {
         }
     };
 
-    // RFC bdee1af4 étape 19: if FTS or model drift was detected, force a
-    // synchronous reindex_all before serving any MCP request so the
-    // index is coherent and queries don't return stale or empty results.
-    let engine = if fts_drift || model_drift {
-        let mut e = engine;
-        let validator_guard = validator.read().await;
-        let count = e
-            .reindex_all(&root, &validator_guard)
-            .map_err(|e| anyhow::anyhow!("post-migrate reindex_all failed: {e}"))?
-            .count;
-        drop(validator_guard);
-        eprintln!(
-            "[companyos:{C}] Post-migration reindex completed ({count} artifacts) — drift: fts={fts_drift} model={model_drift}"
-        );
-        e
-    } else {
-        engine
-    };
+    // RFC bdee1af4 étape 19, SUPERSÉDÉ PARTIELLEMENT par le RFC 5bacb08a D4:
+    // this reindex used to run SYNCHRONOUSLY here, before serving anything.
+    // A fresh DB has no stored model_version, so `model_drift` is true and
+    // every boot after `make clean` paid a full reindex (21 s measured on
+    // 224 artifacts) BEFORE answering initialize, while the proxy killed
+    // the process at 10 s. That is the kill loop, by construction. The
+    // reindex now runs in the warm-up task below; the OBSERVABLE property
+    // (no index tool ever sees an empty or incoherent index) is preserved
+    // by the warm-up gate, only the boot ordering changes.
 
     // RFC cde13417 A1.5 + A1.8-i — permit reseed and boot seal write, run
     // AFTER all reindexing but BEFORE serving. Non-fatal: any failure is a
@@ -2406,31 +2535,140 @@ async fn run_server() -> anyhow::Result<()> {
     // from an unexpected death (error!). Cf. diagnostic 9534dd33.
     let is_shutting_down = Arc::new(AtomicBool::new(false));
 
+    let warmup = WarmupGate::new();
+
     let server = OrchestratorServer::new(
         engine.clone(),
         validator.clone(),
         root.clone(),
         watcher_alive.clone(),
         review_protocol.clone(),
+        warmup.clone(),
     );
 
     let (stdin, stdout) = rmcp::transport::io::stdio();
 
-    // Reindex in background after MCP handshake is ready
-    let reindex_handle = tokio::spawn({
+    // --- Boot warm-up (RFC 5bacb08a D4) ---
+    //
+    // Everything heavy now lives here, behind the readiness of the
+    // transport: loading the ONNX embedder, binding it to the engine, then
+    // rebuilding the artifact index. The gate stays CLOSED for the whole
+    // duration, reindex included, because `begin_reindex` wipes the index
+    // first and an early opening would expose an empty one.
+    //
+    // The engine lock is taken and released PER ARTIFACT. Holding it for
+    // the whole reindex would make "tools that need neither index nor
+    // embedder answer immediately" a lie: all 24 tool handlers go through
+    // this one mutex, so the kill loop would simply have become a tool
+    // stall ending in the client's opaque -32001, the very failure D5
+    // exists to remove.
+    let warmup_handle = tokio::spawn({
         let engine = engine.clone();
         let validator = validator.clone();
         let root = root.clone();
+        let warmup = warmup.clone();
         async move {
-            let mut engine = engine.lock().await;
-            let validator = validator.read().await;
-            let count = engine
-                .reindex_all(&root, &validator)
-                .map(|o| o.count)
-                .unwrap_or(0);
-            if count > 0 {
-                tracing::info!("Indexed {count} artifact(s) on startup");
+            let started = std::time::Instant::now();
+
+            // The gate opens when this task ENDS, whatever the reason:
+            // normal completion, early return, or panic. Discovered the
+            // hard way while measuring this very boot: an `eprintln!` that
+            // hit a broken pipe panicked the warm-up task, tokio absorbed
+            // the panic into a JoinError, and the gate stayed shut forever,
+            // so every index tool answered `warming` until the end of the
+            // session. A guard turns that permanent dead end into a
+            // degraded but recoverable state.
+            struct GateGuard(WarmupGate);
+            impl Drop for GateGuard {
+                fn drop(&mut self) {
+                    self.0.open();
+                }
             }
+            let _gate_guard = GateGuard(warmup.clone());
+
+            // (1) Load the embedder, then bind it. A failure here is NOT
+            //     fatal to the process: the server keeps serving everything
+            //     that does not need the index, and the gate reports
+            //     `warming` to the rest, which beats dying at boot.
+            match companyos_orchestrator::Embedder::load_from_cache(&root) {
+                Ok(embedder) => {
+                    engine.lock().await.set_embedder(Arc::new(embedder));
+                    tracing::info!("Warm-up: embedder bound after {:?}", started.elapsed());
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Warm-up: embedder unavailable ({e}). Index and semantic search stay \
+                         unavailable; run --prefetch-embeddings and restart. Tools that do not \
+                         need the index keep working."
+                    );
+                    return; // the guard opens the gate
+                }
+            }
+
+            // (2) Rebuild the index if the boot detected a reason to.
+            //     `fts_drift` follows a tokenizer change, `model_drift`
+            //     covers both a model upgrade and a fresh DB.
+            if fts_drift || model_drift {
+                let paths = OrchestratorEngine::collect_artifact_paths(&root);
+                let total = paths.len();
+                {
+                    let mut e = engine.lock().await;
+                    if let Err(err) = e.begin_reindex() {
+                        tracing::error!("Warm-up: begin_reindex failed: {err}");
+                        return; // the guard opens the gate
+                    }
+                }
+                let mut indexed = Vec::with_capacity(total);
+                let mut warnings = Vec::new();
+                let mut done = 0usize;
+                for rel in paths {
+                    done += 1;
+                    if done.is_multiple_of(25) {
+                        tracing::info!(
+                            "Warm-up: {done}/{total} artifact(s) in {:?}",
+                            started.elapsed()
+                        );
+                    }
+                    // Lock scope deliberately limited to ONE artifact so a
+                    // concurrent tool can slip in between two of them.
+                    let mut e = engine.lock().await;
+                    let validator_guard = validator.read().await;
+                    match e.index_artifact_confined(&root, &rel, &validator_guard) {
+                        companyos_orchestrator::ConfinedIndex::Indexed(artifact) => {
+                            indexed.push(artifact)
+                        }
+                        companyos_orchestrator::ConfinedIndex::Skipped => {}
+                        companyos_orchestrator::ConfinedIndex::Panicked(warning) => {
+                            warnings.push(warning)
+                        }
+                    }
+                    drop(validator_guard);
+                    drop(e);
+                    tokio::task::yield_now().await;
+                }
+                {
+                    let mut e = engine.lock().await;
+                    match e.finish_reindex(&root, &indexed) {
+                        Ok(more) => warnings.extend(more),
+                        Err(err) => tracing::warn!("Warm-up: finish_reindex failed: {err}"),
+                    }
+                }
+                tracing::info!(
+                    "Warm-up: indexed {} of {total} artifact(s) in {:?} (drift: fts={fts_drift} model={model_drift})",
+                    indexed.len(),
+                    started.elapsed()
+                );
+                for w in &warnings {
+                    tracing::warn!("reindex warning: {w}");
+                }
+            }
+
+            // (3) Open the gate LAST, index included (see above).
+            warmup.open();
+            tracing::info!(
+                "Warm-up complete in {:?}, index gate open",
+                started.elapsed()
+            );
         }
     });
 
@@ -2590,7 +2828,7 @@ async fn run_server() -> anyhow::Result<()> {
     // (2) Await reindex background with a bounded timeout. If it doesn't
     //     finish in time, abort and continue (data loss acceptable: a
     //     reindex is idempotent and will rerun at next boot).
-    if let Err(_e) = tokio::time::timeout(Duration::from_secs(5), reindex_handle).await {
+    if let Err(_e) = tokio::time::timeout(Duration::from_secs(5), warmup_handle).await {
         tracing::warn!("reindex_all background did not finish in 5s — aborting");
     }
     // (3) Explicit WAL checkpoint TRUNCATE on the main connection so the
@@ -2797,6 +3035,7 @@ mod tests {
             root.to_string_lossy().to_string(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(RwLock::new(test_review_protocol())),
+            WarmupGate::opened(),
         );
         let token = server.tokens.authenticate("ceo").await;
         (server, token, approved_rfc)
@@ -2844,6 +3083,7 @@ mod tests {
             root.to_string_lossy().to_string(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(RwLock::new(test_review_protocol())),
+            WarmupGate::opened(),
         )
     }
 
@@ -3106,6 +3346,7 @@ mod tests {
             root.to_string_lossy().to_string(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(RwLock::new(test_review_protocol())),
+            WarmupGate::opened(),
         );
         let token = server.tokens.authenticate("ceo").await;
 
@@ -3240,6 +3481,7 @@ mod tests {
             root.to_string_lossy().to_string(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(RwLock::new(test_review_protocol())),
+            WarmupGate::opened(),
         );
         let token = server.tokens.authenticate("ceo").await;
 
@@ -3274,6 +3516,7 @@ mod tests {
             root.to_string_lossy().to_string(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(RwLock::new(test_review_protocol())),
+            WarmupGate::opened(),
         );
         let token = server.tokens.authenticate("ceo").await;
         let res = server
@@ -3303,6 +3546,7 @@ mod tests {
             root.to_string_lossy().to_string(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(RwLock::new(test_review_protocol())),
+            WarmupGate::opened(),
         );
         let token = server.tokens.authenticate("ceo").await;
         let res = server

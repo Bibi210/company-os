@@ -310,13 +310,27 @@ impl OrchestratorEngine {
         self.embedder.as_ref()
     }
 
+    /// Bind the embedder after construction (RFC 5bacb08a, D4).
+    ///
+    /// This is what makes the readiness-first boot possible: the server
+    /// builds its engine and answers `initialize` while the ONNX runtime
+    /// is still loading, then hands the embedder over here at the end of
+    /// the warm-up. Idempotent, last call wins.
+    pub fn set_embedder(&mut self, embedder: Arc<Embedder>) {
+        self.embedder = Some(embedder);
+    }
+
+    /// Whether an embedder is bound, i.e. whether indexing and semantic
+    /// search are available right now.
+    pub fn has_embedder(&self) -> bool {
+        self.embedder.is_some()
+    }
+
     fn require_embedder(&self) -> Result<&Arc<Embedder>, OrchestratorError> {
         self.embedder
             .as_ref()
-            .ok_or_else(|| OrchestratorError::EmbeddingFailed {
-                reason: "engine constructed without embedder (test mode); \
-                         cannot index or run semantic search"
-                    .into(),
+            .ok_or_else(|| OrchestratorError::Warming {
+                detail: "no embedder bound yet".into(),
             })
     }
 
@@ -2245,17 +2259,44 @@ impl OrchestratorEngine {
         root: &str,
         validator: &ArtifactValidator,
     ) -> Result<ReindexOutcome, OrchestratorError> {
+        self.begin_reindex()?;
+        let yaml_paths = Self::collect_artifact_paths(root);
+        let mut indexed: Vec<IndexedArtifact> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        for rel in yaml_paths {
+            match self.index_artifact_confined(root, &rel, validator) {
+                ConfinedIndex::Indexed(artifact) => indexed.push(artifact),
+                ConfinedIndex::Skipped => {}
+                ConfinedIndex::Panicked(warning) => warnings.push(warning),
+            }
+        }
+        let count = indexed.len();
+        warnings.extend(self.finish_reindex(root, &indexed)?);
+        Ok(ReindexOutcome { count, warnings })
+    }
+
+    /// Wipe the index and stamp the current model version, i.e. everything
+    /// [`OrchestratorEngine::reindex_all`] does BEFORE the per-artifact
+    /// loop. Split out so the boot warm-up can drive the loop itself and
+    /// release the engine lock between two artifacts (RFC 5bacb08a, D4).
+    ///
+    /// After this call and until the loop completes, the index is EMPTY.
+    /// Any caller driving the loop manually must keep index-dependent
+    /// readers gated for the whole duration, never just for the embedder
+    /// loading phase.
+    pub fn begin_reindex(&mut self) -> Result<(), OrchestratorError> {
         self.db.delete_all_artifacts()?;
         // After delete_all, persist the current model_version so a future
         // boot can detect a mismatch and trigger a wipe + reindex.
         self.db
             .set_model_version(&crate::embedding::model_version())?;
+        Ok(())
+    }
 
-        let mut count = 0;
+    /// Repo-relative paths of every YAML artifact under `root`, in scan
+    /// order. Pure filesystem walk, no engine state touched.
+    pub fn collect_artifact_paths(root: &str) -> Vec<String> {
         let scan_roots = [constants::ARTIFACTS_DIR, constants::PROJECTS_DIR];
-
-        // Collect first to avoid holding a closure borrow while we mutate
-        // self via index_artifact.
         let mut yaml_paths: Vec<String> = Vec::new();
         for dir_name in &scan_roots {
             let scan_dir = format!("{root}/{dir_name}");
@@ -2269,67 +2310,75 @@ impl OrchestratorEngine {
                 yaml_paths.push(rel);
             });
         }
+        yaml_paths
+    }
 
-        // Keep the successfully-indexed artifacts to run the per-artifact
-        // warning families (10c supersession, 16 author-produces) AFTER the
-        // whole corpus is indexed, so cross-artifact lookups see the full set.
-        // Per-artifact confinement (RFC 5bacb08a D3a). The unit of failure
-        // is the ARTIFACT, not the batch: a panic while indexing artifact
-        // (i) is caught, recorded as a warning, and the loop carries on
-        // with the next artifact. The batch survives, the watcher task
-        // survives, the process survives.
-        //
-        // HONEST SCOPE, as requalified by the RFC: this confines a SIMPLE
-        // panic. It does NOT make the double panic impossible. If a
-        // destructor panics during this unwind, the abort is process-wide
-        // and `catch_unwind` cannot intercept it; what saves the incident
-        // then is the crash trace already written by the panic hook (the
-        // hook runs at the panic site, BEFORE any destructor) and the
-        // automatic respawn. The scope guard below is what lets that trace
-        // name the culprit artifact.
-        //
-        // `AssertUnwindSafe` is required because the closure captures
-        // `&mut self`, which is not `UnwindSafe`. It is sound here:
-        // `index_artifact` computes the embedding BEFORE opening the
-        // transaction, so a caught panic leaves the database either
-        // untouched or rolled back by the transaction's own `Drop`, and
-        // the logical inconsistency window is bounded to the artifact
-        // being indexed.
-        let mut indexed: Vec<IndexedArtifact> = Vec::new();
-        let mut panicked: Vec<String> = Vec::new();
-        for rel in yaml_paths {
-            let outcome = {
-                let _scope = companyos_crash_trace::ArtifactScope::enter(&rel);
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    self.index_artifact(root, &rel, validator)
-                }))
-            };
-            match outcome {
-                Ok(Ok(artifact)) => {
-                    count += 1;
-                    indexed.push(artifact);
-                }
-                // Pre-existing behaviour: a validation or IO error skips
-                // the artifact silently, it is not a crash.
-                Ok(Err(_)) => {}
-                Err(payload) => panicked.push(format!(
-                    "panic confiné lors de l'indexation de {rel} : {}. Les autres artifacts \
-                     du lot ont été indexés, le process a survécu ; une trace pré-unwind a été \
-                     écrite sous {} si le panic hook est installé",
-                    panic_payload_message(&payload),
-                    constants::CRASHES_DIR
-                )),
-            }
+    /// Index ONE artifact with the panic confinement of RFC 5bacb08a D3a.
+    ///
+    /// The unit of failure is the ARTIFACT, not the batch: a panic here is
+    /// caught, turned into a warning, and the caller carries on with the
+    /// next artifact. The batch survives, the watcher task survives, the
+    /// process survives.
+    ///
+    /// HONEST SCOPE, as requalified by the RFC: this confines a SIMPLE
+    /// panic. It does NOT make the double panic impossible. If a
+    /// destructor panics during this unwind, the abort is process-wide and
+    /// `catch_unwind` cannot intercept it; what saves the incident then is
+    /// the crash trace already written by the panic hook (which runs at the
+    /// panic site, BEFORE any destructor) plus the automatic respawn. The
+    /// scope guard below is what lets that trace name the culprit artifact.
+    ///
+    /// `AssertUnwindSafe` is required because the closure captures
+    /// `&mut self`, which is not `UnwindSafe`. It is sound here:
+    /// [`OrchestratorEngine::index_artifact`] computes the embedding BEFORE
+    /// opening the transaction, so a caught panic leaves the database
+    /// either untouched or rolled back by the transaction's own `Drop`, and
+    /// the logical inconsistency window is bounded to this one artifact.
+    pub fn index_artifact_confined(
+        &mut self,
+        root: &str,
+        rel: &str,
+        validator: &ArtifactValidator,
+    ) -> ConfinedIndex {
+        let outcome = {
+            let _scope = companyos_crash_trace::ArtifactScope::enter(rel);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.index_artifact(root, rel, validator)
+            }))
+        };
+        match outcome {
+            Ok(Ok(artifact)) => ConfinedIndex::Indexed(artifact),
+            // Pre-existing behaviour: a validation or IO error skips the
+            // artifact silently, it is not a crash.
+            Ok(Err(_)) => ConfinedIndex::Skipped,
+            Err(payload) => ConfinedIndex::Panicked(format!(
+                "panic confiné lors de l'indexation de {rel} : {}. Les autres artifacts du lot \
+                 ont été indexés, le process a survécu ; une trace pré-unwind a été écrite sous \
+                 {} si le panic hook est installé",
+                panic_payload_message(&payload),
+                constants::CRASHES_DIR
+            )),
         }
+    }
 
+    /// The cross-artifact warning passes that close a reindex, i.e.
+    /// everything [`OrchestratorEngine::reindex_all`] does AFTER the loop.
+    /// Split out for the same reason as [`OrchestratorEngine::begin_reindex`];
+    /// it must run inside the same gated window as the loop.
+    pub fn finish_reindex(
+        &mut self,
+        root: &str,
+        indexed: &[IndexedArtifact],
+    ) -> Result<Vec<String>, OrchestratorError> {
         // Mechanism 21 (RFC 0197fbe5): collect the non-blocking warnings.
         // Bulk families only: supersession asymmetry (10c) and author↔produces
         // (16) per artifact, plus dangling related links (17b) via one global
         // SQL pass (order-insensitive). NOT the capitalization reminders (19c):
         // those are single-file only (moment-of-resolution), spamming history
-        // in bulk.
-        let mut warnings = panicked;
-        for artifact in &indexed {
+        // in bulk. They run here, after the whole corpus is indexed, so the
+        // cross-artifact lookups see the full set.
+        let mut warnings = Vec::new();
+        for artifact in indexed {
             warnings.extend(self.supersession_warnings(root, artifact));
             warnings.extend(self.author_produces_warnings(root, artifact));
         }
@@ -2339,9 +2388,22 @@ impl OrchestratorEngine {
                  (source {source_id}) : id erroné (typo ?) ou artifact supprimé/jamais créé"
             ));
         }
-
-        Ok(ReindexOutcome { count, warnings })
+        Ok(warnings)
     }
+}
+
+/// Outcome of indexing ONE artifact under panic confinement
+/// (RFC 5bacb08a, D3a). See [`OrchestratorEngine::index_artifact_confined`].
+#[derive(Debug)]
+pub enum ConfinedIndex {
+    /// Indexed successfully.
+    Indexed(IndexedArtifact),
+    /// Skipped on a validation or IO error. Not a crash, and silent by
+    /// design: the corpus always holds a few files a given schema version
+    /// rejects.
+    Skipped,
+    /// A panic was caught and confined. Carries the warning to surface.
+    Panicked(String),
 }
 
 /// Artifact the indexing path must panic on, when the fault injection

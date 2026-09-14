@@ -118,6 +118,20 @@ pub enum OrchestratorError {
     #[error("Embedding inference failed: {reason}")]
     EmbeddingFailed { reason: String },
 
+    /// The engine has no embedder YET because the boot warm-up has not
+    /// finished binding it (RFC 5bacb08a, D4). Distinct from
+    /// [`OrchestratorError::EmbeddingFailed`]: nothing failed, the caller
+    /// simply arrived before the index was ready and should wait or
+    /// re-submit. Before the readiness-first boot this state could not
+    /// exist outside a test, which is why the previous message spoke of a
+    /// "test mode" that is no longer the only case.
+    #[error(
+        "index warming up ({detail}): the server answers immediately but the embedder and the \
+         artifact index are still loading in the background. Wait for the warm-up to finish and \
+         re-submit; tools that touch neither the index nor the embedder are already available."
+    )]
+    Warming { detail: String },
+
     #[error("Anthropic API key required for {feature} (set ANTHROPIC_API_KEY)")]
     AnthropicKeyMissing { feature: String },
 

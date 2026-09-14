@@ -12,7 +12,8 @@ pub mod types;
 pub use db::{OrchestratorDb, SearchFilters};
 pub use embedding::{EMBEDDING_DIM, Embedder, build_embedding_view, model_version};
 pub use engine::{
-    AffectedFiles, OrchestratorEngine, RfcUpdateResult, compute_consensus, fault_injection_target,
+    AffectedFiles, ConfinedIndex, OrchestratorEngine, RfcUpdateResult, compute_consensus,
+    fault_injection_target,
 };
 pub use error::OrchestratorError;
 pub use fusion::{DEFAULT_RRF_K, FusedResult, RankedResult, rrf_fuse};
