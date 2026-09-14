@@ -119,6 +119,41 @@ export function extractPendingRequestIds(lines, parse = JSON.parse) {
   return ids;
 }
 
+// --- Progressive health check (RFC 5bacb08a D4, proxy side) ---
+
+/// First health-check window, kept at the historical 10 s so a stillborn
+/// server is still detected fast.
+export const HEALTH_CHECK_INITIAL_MS = 10_000;
+
+/// Ceiling of the progression. 40 s, deliberately UNDER the 45 s
+/// escalation cap (D5): the last window granted to a live incarnation
+/// closes before the escalation fires instead of straddling it.
+export const HEALTH_CHECK_CAP_MS = 40_000;
+
+// computeHealthCheckTimeout — window granted to the next incarnation.
+//
+// consecutiveTimeouts: how many incarnations in a row failed to confirm
+// (0 for the first attempt, or right after a `ready`, which rearms).
+//
+// 10 s, 20 s, 40 s, then flat at the cap. This is the NET of the server
+// side: even if a future regression puts heavy work back before
+// `initialize`, a slow but living boot eventually gets a window wide
+// enough instead of being killed forever. Junk input degrades to the
+// initial window rather than throwing.
+export function computeHealthCheckTimeout(consecutiveTimeouts, opts = {}) {
+  const initial = opts.initialMs ?? HEALTH_CHECK_INITIAL_MS;
+  const cap = opts.capMs ?? HEALTH_CHECK_CAP_MS;
+  const safeInitial = Number.isFinite(initial) && initial > 0 ? initial : HEALTH_CHECK_INITIAL_MS;
+  const safeCap = Number.isFinite(cap) && cap > 0 ? cap : HEALTH_CHECK_CAP_MS;
+  const n =
+    Number.isFinite(consecutiveTimeouts) && consecutiveTimeouts > 0
+      ? Math.floor(consecutiveTimeouts)
+      : 0;
+  // Cap the exponent so a runaway counter cannot produce Infinity.
+  const exp = n > 30 ? 30 : n;
+  return Math.min(safeInitial * Math.pow(2, exp), safeCap);
+}
+
 // --- Persisted telemetry (RFC 5bacb08a D1) ---
 //
 // The proxy is the single writer of the recovery telemetry: its own event

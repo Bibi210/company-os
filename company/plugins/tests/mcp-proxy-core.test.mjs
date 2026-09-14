@@ -9,6 +9,7 @@ import {
   binaryReady,
   buildUnavailableError,
   extractPendingRequestIds,
+  computeHealthCheckTimeout,
   shouldRotate,
   rotationPlan,
   formatTelemetryLine,
@@ -16,6 +17,8 @@ import {
   BACKOFF_CAP_MS,
   BACKOFF_RESET_AFTER_MS,
   JITTER_RATIO,
+  HEALTH_CHECK_INITIAL_MS,
+  HEALTH_CHECK_CAP_MS,
   LOG_MAX_BYTES,
   LOG_MAX_ARCHIVES,
 } from "../mcp-proxy-core.mjs";
@@ -311,4 +314,39 @@ test("formatTelemetryLine — NEGATIVE: missing or bogus fields degrade, never t
     formatTelemetryLine({ timestamp: "T", incarnation: 2, source: "proxy", text: 42 }),
     "T i=2 proxy | 42\n",
   );
+});
+
+// ───────────── computeHealthCheckTimeout (RFC 5bacb08a D4) ─────────────
+
+test("computeHealthCheckTimeout — NOMINAL: 10s, 20s, 40s then flat at the cap", () => {
+  assert.equal(computeHealthCheckTimeout(0), 10_000);
+  assert.equal(computeHealthCheckTimeout(1), 20_000);
+  assert.equal(computeHealthCheckTimeout(2), 40_000);
+  assert.equal(computeHealthCheckTimeout(3), 40_000);
+  assert.equal(computeHealthCheckTimeout(50), 40_000);
+});
+
+test("computeHealthCheckTimeout — EDGE: the cap stays UNDER the 45s escalation", () => {
+  // The whole point of lowering the ceiling from 60s to 40s (finding 4 of
+  // the design review): a health-check window must never outlive the
+  // escalation deadline it is supposed to sit below.
+  assert.ok(HEALTH_CHECK_CAP_MS < 45_000);
+  assert.equal(HEALTH_CHECK_INITIAL_MS, 10_000);
+  for (let n = 0; n < 40; n += 1) {
+    assert.ok(computeHealthCheckTimeout(n) <= HEALTH_CHECK_CAP_MS);
+  }
+});
+
+test("computeHealthCheckTimeout — NEGATIVE: junk degrades to the initial window", () => {
+  assert.equal(computeHealthCheckTimeout(NaN), 10_000);
+  assert.equal(computeHealthCheckTimeout(-3), 10_000);
+  assert.equal(computeHealthCheckTimeout(undefined), 10_000);
+  assert.equal(computeHealthCheckTimeout(1.9), 20_000); // floored
+  assert.equal(computeHealthCheckTimeout(0, { initialMs: 0, capMs: -1 }), 10_000);
+});
+
+test("computeHealthCheckTimeout — overrides compress the delays for tests", () => {
+  assert.equal(computeHealthCheckTimeout(0, { initialMs: 100, capMs: 400 }), 100);
+  assert.equal(computeHealthCheckTimeout(1, { initialMs: 100, capMs: 400 }), 200);
+  assert.equal(computeHealthCheckTimeout(9, { initialMs: 100, capMs: 400 }), 400);
 });

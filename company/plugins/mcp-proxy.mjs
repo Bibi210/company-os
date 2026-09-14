@@ -52,6 +52,7 @@ import { StringDecoder } from "node:string_decoder";
 
 import {
   computeBackoff,
+  computeHealthCheckTimeout,
   binaryReady,
   buildUnavailableError,
   extractPendingRequestIds,
@@ -59,6 +60,8 @@ import {
   rotationPlan,
   formatTelemetryLine,
   BACKOFF_RESET_AFTER_MS,
+  HEALTH_CHECK_INITIAL_MS as CORE_HEALTH_CHECK_INITIAL_MS,
+  HEALTH_CHECK_CAP_MS as CORE_HEALTH_CHECK_CAP_MS,
 } from "./mcp-proxy-core.mjs";
 
 const [binaryPath, ...extraArgs] = process.argv.slice(2);
@@ -75,19 +78,44 @@ const binaryBase = basename(binaryPath);
 // --- Tunables ---
 const HIGH_WATER = 256; // pending chunks before pausing process.stdin
 const LOW_WATER = 64; // pending chunks remaining before resuming
-const HEALTH_CHECK_TIMEOUT_MS = 10_000;
 const WATCH_DEBOUNCE_MS = 500; // atomic rename: no intermediate state to sample
 const STDOUT_ACCUM_LIMIT = 1_048_576; // 1 MB safety cap on stdout line accumulator
-// Cap after which the proxy escalates via -32050 (RFC C2). Env-overridable for
-// tests; the DEFAULT 120000 is imperative in code.
-const UNAVAILABLE_ESCALATION_MS = (() => {
-  const raw = process.env.MCP_PROXY_UNAVAILABLE_MS;
+
+// --- Env-overridable timing (RFC 5bacb08a D8) ---
+//
+// EVERY temporal constant of the proxy is overridable, generalizing the
+// pattern that already existed for the escalation cap. Rationale: the
+// integration test of the progressive health check has to observe at
+// least one doubling, which costs 30 s of wall clock at production
+// values. With overrides the same scenario runs in under 3 s, which is
+// the difference between a test that exists and a test nobody runs. The
+// DEFAULTS below remain imperative in code.
+function envMs(name, fallback) {
+  const raw = process.env[name];
   if (raw !== undefined) {
     const n = Number(raw);
     if (Number.isFinite(n) && n > 0) return n;
   }
-  return 120_000;
-})();
+  return fallback;
+}
+
+// First health-check window (RFC 5bacb08a D4). Doubles on each consecutive
+// unconfirmed incarnation, capped, and rearmed as soon as one reaches ready.
+const HEALTH_CHECK_INITIAL_MS = envMs(
+  "MCP_PROXY_HEALTH_CHECK_MS",
+  CORE_HEALTH_CHECK_INITIAL_MS,
+);
+const HEALTH_CHECK_CAP_MS = envMs(
+  "MCP_PROXY_HEALTH_CHECK_CAP_MS",
+  CORE_HEALTH_CHECK_CAP_MS,
+);
+// Cap after which the proxy escalates via -32050 (RFC C2, value superseded
+// by RFC 5bacb08a D5: 120 s -> 45 s). 45 s sits UNDER the 60 s opencode
+// client timeout with 15 s of margin, so the first failure an agent ever
+// sees during a long outage is the structured error that prescribes human
+// escalation, never the opaque -32001. It also sits ABOVE the 40 s
+// health-check ceiling, so a single window cannot straddle it.
+const UNAVAILABLE_ESCALATION_MS = envMs("MCP_PROXY_UNAVAILABLE_MS", 45_000);
 
 // --- fs deps injected into the pure core (keeps core testable) ---
 const fsDeps = { existsSync, accessSync, constants: fsConstants };
@@ -124,6 +152,12 @@ let watchDebounce = null;
 let healthCheckTimer = null;
 let backoffTimer = null;
 let killTimer = null;
+
+// Progressive health-check bookkeeping (RFC 5bacb08a D4). Counts the
+// incarnations that failed to confirm IN A ROW; reset the moment one
+// reaches ready, so a server that comes back healthy gets the fast 10 s
+// detection again.
+let consecutiveHealthTimeouts = 0;
 
 // Backoff bookkeeping (RFC A2)
 let backoffAttempt = 0;
@@ -409,8 +443,22 @@ function bootstrapBinary() {
   }
 }
 
+// --- Health check arming with progressive timeout (RFC 5bacb08a D4) ---
+function armHealthCheck() {
+  if (healthCheckTimer) clearTimeout(healthCheckTimer);
+  const delay = computeHealthCheckTimeout(consecutiveHealthTimeouts, {
+    initialMs: HEALTH_CHECK_INITIAL_MS,
+    capMs: HEALTH_CHECK_CAP_MS,
+  });
+  log(
+    `Health check armed for ${Math.round(delay)}ms (consecutive timeouts: ${consecutiveHealthTimeouts})`,
+  );
+  healthCheckTimer = setTimeout(handleHealthCheckTimeout, delay);
+}
+
 // --- Health check timeout: confirmation only, never exit (RFC A5) ---
 function handleHealthCheckTimeout() {
+  consecutiveHealthTimeouts += 1;
   log("Health check timeout — child did not confirm initialize, cycling");
   healthCheckTimer = null;
   if (!child) return; // already gone; onChildGone path handles it
@@ -451,6 +499,9 @@ function onChildStdoutData(chunk) {
     if (isInitResponse(line, lastInitRequestId)) {
       log(`Health check OK (initialize id=${lastInitRequestId} matched)`);
       state = "ready";
+      // Rearm the progression: this incarnation is alive, the next
+      // stillborn one must be detected in 10 s again (RFC 5bacb08a D4).
+      consecutiveHealthTimeouts = 0;
       readySince = Date.now();
       clearUnavailable();
       if (healthCheckTimer) {
@@ -635,8 +686,7 @@ function startChild() {
     } catch (e) {
       log(`Failed to write initialize: ${e.message}`);
     }
-    if (healthCheckTimer) clearTimeout(healthCheckTimer);
-    healthCheckTimer = setTimeout(handleHealthCheckTimeout, HEALTH_CHECK_TIMEOUT_MS);
+    armHealthCheck();
   }
   // First startup: the health check timer is armed when we observe the first
   // initialize request from opencode (cf. onStdinData below).
@@ -658,10 +708,7 @@ function onStdinData(chunk) {
         lastInitRequest = Buffer.from(line + "\n", "utf8");
         chunkContainsInitialize = true;
         if (state === "starting" && healthCheckTimer === null) {
-          healthCheckTimer = setTimeout(
-            handleHealthCheckTimeout,
-            HEALTH_CHECK_TIMEOUT_MS,
-          );
+          armHealthCheck();
         }
       } else if (msg && msg.method === "notifications/initialized") {
         lastInitializedNotification = Buffer.from(line + "\n", "utf8");
