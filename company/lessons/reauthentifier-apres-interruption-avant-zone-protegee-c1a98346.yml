@@ -1,0 +1,59 @@
+api_version: companyos/v1
+kind: lesson-learned
+metadata:
+  id: c1a98346-4d11-4ec3-8ba4-af644e9feaec
+  title: "Après toute interruption de session, ré-authentifier AVANT le premier commit en zone protégée : l'identité d'agent ne survit pas, le permit si"
+  author: pm
+  created_at: "2026-09-14"
+  description: >
+    Pendant la phase 1 du chantier 5bacb08a, le premier commit C3 (zones
+    protégées crates/) a été rejeté par le hook defense-in-depth
+    ("Unauthorized commit touching protected zones") alors que le permit
+    ca737bdc était actif et couvrait les chemins. Cause : la session de
+    l'Implementer avait été interrompue et son authentification n'avait pas
+    survécu ; hasActivePermit exige une identité d'agent résolue avant même
+    de regarder le permit. Un authenticate() a suffi, le commit est passé à
+    l'identique, aucun travail perdu (reset soft). Le réflexe de reprise
+    documenté (reconstruire l'état) doit inclure la ré-authentification.
+  tags:
+    - authentication
+    - write-permit
+    - defense-in-depth
+    - interruption
+    - reprise
+    - workflow
+    - zone-protégée
+  related:
+    - id: 912cb9a3-2d5c-4724-ade4-9324e0a48f9e
+      kind: lesson-learned
+      relationship: related
+    - id: 611fde3e-de00-4cfd-ad7e-6c4e16085bc8
+      kind: lesson-learned
+      relationship: related
+
+spec:
+  context: >
+    Reprise d'une session Implementer après interruption, en plein milieu
+    d'une séquence de commits sous write permit actif (permit ca737bdc, RFC
+    5bacb08a). Le permit était valide en DB (status active, target_paths
+    couvrants), mais le hook defense-in-depth a rejeté le commit : la
+    résolution d'agent (resolveAgent) échouait, l'authentification de la
+    session n'ayant pas survécu à l'interruption, et hasActivePermit
+    court-circuite en refus quand l'agent est inconnu.
+  insight: >
+    Le permit et l'identité sont deux choses distinctes avec deux durées de
+    vie différentes : le permit vit en DB et survit aux interruptions,
+    l'identité d'agent vit dans la session et meurt avec elle. Un hook qui
+    refuse dans ce cas est un comportement CORRECT (fail-closed) : le
+    danger n'est pas le refus, mais le temps perdu à diagnostiquer si on ne
+    connaît pas la distinction, et la tentation de contournement
+    (--no-verify) si on la comprend mal. Le diagnostic sain : vérifier le
+    permit d'abord (status, chemins), puis l'identité ; si le permit est
+    bon, c'est l'identité.
+  recommendation: >
+    Dans toute procédure de reprise après interruption de session, ajouter
+    la ré-authentification (authenticate(persona)) AVANT la première
+    écriture ou le premier commit en zone protégée, au même titre que la
+    reconstruction d'état depuis l'index et l'orchestrator. En cas de refus
+    du hook malgré un permit actif : ne jamais contourner ; vérifier
+    l'identité d'agent, ré-authentifier, rejouer le commit à l'identique.
