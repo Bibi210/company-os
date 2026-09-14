@@ -61,6 +61,14 @@ ci: lint test test-js validate check-naming
 deploy-serve:
 	./company/scripts/deploy-serve.sh
 
+## Coredump surveillance (RFC 5bacb08a D6). Manual invocation: the exit code
+## is MEANINGFUL (non-zero when dumps appeared since the baseline). The same
+## script runs in --hook mode at the head of deploy-serve, where it is purely
+## informational. Deliberately OUT of `make ci`: a coredump is a local state
+## of the machine, not a property of the commit.
+doctor:
+	./company/scripts/doctor-coredumps.sh
+
 ## Clean build artifacts
 clean:
 	cargo clean

@@ -31,6 +31,14 @@ DEBUG_DIR="$REPO_ROOT/target/debug"
 
 # target/ is inside BASH_SAFE_PATHS of the defense-in-depth hook, so writing
 # under target/serve/ requires no write permit.
+# RFC 5bacb08a D6: coredump surveillance at the head of the promotion, the
+# last useful moment to notice that the binary being replaced has dumped.
+# INFORMATIONAL ONLY. The `|| true` is a second belt on top of the script's
+# own guarantee to exit 0 in --hook mode: this script runs under `set -e`
+# and is the ONLY channel that puts a fix in service, so nothing here may
+# ever block a promotion.
+"$REPO_ROOT/company/scripts/doctor-coredumps.sh" --hook || true
+
 mkdir -p "$SERVE_DIR"
 
 # Map of crate -> served binary basename. For this workspace the binary name
