@@ -1,0 +1,144 @@
+api_version: companyos/v1
+kind: diagnostic-report
+metadata:
+  id: 578de044-cd26-4202-ad52-33d9e0f809c0
+  title: "Root cause des SIGABRT de l'orchestrator servi : panic sur écriture stderr (EPIPE) puis double panic et panic_in_cleanup, PAS un destructeur rusqlite ou ort"
+  author: implementer
+  created_at: "2026-09-14"
+  project: company-os
+  description: >
+    Investigation D2 du RFC 5bacb08a, livrée pendant la phase 3 du chantier.
+    La root cause des SIGABRT récurrents du binaire orchestrator servi est
+    IDENTIFIÉE et confirmée par deux sources indépendantes : les traces
+    pré-unwind écrites par le panic hook livré en phase 1, qui donnent le
+    message du panic ORIGINEL, et les core dumps analysés à gdb, qui donnent
+    le mécanisme d'abort. Le panic originel est
+    « failed printing to stderr: Broken pipe (os error 32) », levé par la
+    bibliothèque standard dans std::io::stdio quand le lecteur du tube
+    stderr a disparu. Pendant l'unwind, la machinerie de panic réécrit sur
+    stderr, reprend EPIPE, repanique, et core::panicking::panic_in_cleanup
+    abort le process : SIGABRT. L'hypothèse du diagnostic ccd7c984, qui
+    soupçonnait un destructeur rusqlite (Statement, Transaction) ou une
+    valeur ort/ONNX, est RÉFUTÉE. Le chemin reindex n'est pas la cause mais
+    l'amplificateur : c'est le moment où le serveur écrit le plus sur
+    stderr, donc celui où il rencontre le tube fermé.
+  tags:
+    - mcp
+    - orchestrator
+    - sigabrt
+    - double-panic
+    - root-cause
+    - epipe
+    - stderr
+    - coredump
+    - critical-infra
+  related:
+    - id: 5bacb08a-ac37-4ccc-847f-16edcf70c1ba
+      kind: rfc
+      relationship: input
+    - id: ccd7c984-eb4b-4d69-90bb-c7a8980b5169
+      kind: diagnostic-report
+      relationship: related
+    - id: 031b6703-290b-481b-927e-cad82dda204f
+      kind: implementation-plan
+      relationship: related
+    - id: aae2af60-b225-4c61-9600-8be8d6d7ebd6
+      kind: design-doc
+      relationship: related
+
+spec:
+  status: resolved
+  symptom: >
+    SIGABRT répétés du binaire servi target/serve/companyos-orchestrator-server
+    (au moins sept occurrences entre le 2026-09-09 et le 2026-09-14, plus deux
+    du companyos-yaml-validator), systématiquement pendant un auto-reindex
+    consécutif à une écriture d'artifact YAML, chaque fois sans aucune trace
+    exploitable avant la livraison de l'instrumentation. Deux occurrences ont
+    exigé un reboot manuel de la session ; une a interrompu la soumission d'un
+    vote de review.
+  root_cause: >
+    PANIC ORIGINEL : « failed printing to stderr: Broken pipe (os error 32) »,
+    levé à library/std/src/io/stdio.rs:1165 par le panic interne que la
+    bibliothèque standard déclenche quand une écriture sur stderr échoue
+    (eprintln!, println! et l'écriture du subscriber tracing passent tous par
+    là). Rust neutralise SIGPIPE au démarrage, donc la fermeture du lecteur
+    ne tue pas le process par signal : elle remonte en erreur EPIPE, que
+    std::io::stdio transforme en panic.
+
+    ENCHAÎNEMENT VERS L'ABORT, lu directement dans les traces pré-unwind du
+    PID 129437 (2026-09-14, quatre fichiers sous company/data/crashes/) :
+    hook_entry 1, thread tokio-runtime-worker, message « failed printing to
+    stderr: Broken pipe » ; hook_entry 2, reentered_hook true, MÊME message,
+    c'est-à-dire que la machinerie d'unwind a elle-même tenté d'écrire le
+    « thread panicked at ... » sur le même stderr mort et a repaniqué ;
+    hook_entry 3, reentered_hook true, message « panic in a destructor during
+    cleanup » à core/src/panicking.rs:233, qui est le point de non-retour :
+    panic_in_cleanup est nounwind et abort le process.
+
+    CONFIRMATION INDÉPENDANTE PAR LES CORE DUMPS : la pile du core 16876
+    (2026-09-11, 433 Mo, le plus frais des six cores orchestrator) montre
+    exactement la même terminaison, de bas en haut :
+    core::panicking::panic_in_cleanup -> panic_nounwind_nobacktrace ->
+    panic_nounwind_fmt -> std::panicking::panic_handler::{{closure}} ->
+    std::panicking::panic_with_hook -> std::process::abort ->
+    std::sys::pal::unix::abort_internal -> abort -> raise. Les deux sources
+    concordent : le mécanisme d'abort est bien le double panic pendant
+    cleanup, et non un échec d'allocation, un unwrap métier ou une
+    corruption.
+
+    POURQUOI TOUJOURS PENDANT UN REINDEX : le reindex est le moment où le
+    serveur écrit le plus sur stderr (une ligne tracing par artifact indexé,
+    plus les warnings de mécanisme 21, plus les eprintln! de boot). Il n'est
+    donc pas la cause, mais le révélateur statistique : c'est la fenêtre où
+    la probabilité de rencontrer un stderr fermé est la plus forte. Cela
+    explique la corrélation parfaite avec les écritures YAML (qui déclenchent
+    l'auto-reindex par le file watcher) sans qu'aucune ressource de la pile
+    d'indexation ne soit en cause.
+
+    RÉFUTATION DE L'HYPOTHÈSE PRÉCÉDENTE : le diagnostic ccd7c984 et le design
+    aae2af60 désignaient comme suspects les destructeurs rusqlite
+    (Statement, Transaction) et les valeurs ort/ONNX vivant dans la frame
+    d'indexation. Aucune frame drop_in_place de ces types n'apparaît sur le
+    chemin d'abort, et le message du panic originel est sans ambiguïté. Le
+    « Drop fautif » recherché est le chemin d'impression de la bibliothèque
+    standard, pas une ressource applicative.
+
+    ORIGINE DE LA FERMETURE DU TUBE : avant la livraison D1, le stderr du
+    serveur était hérité (stdio inherit) et aboutissait au socket de la
+    session opencode. Tout ce qui ferme ce lecteur, à savoir la fin ou le
+    redémarrage de la session, la mort du proxy, ou une promotion
+    deploy-serve suivie d'un restart contrôlé, arme le piège pour la
+    prochaine écriture du serveur.
+  resolution: >
+    ÉTAT ACTUEL, ce qui est déjà livré et en service par ce chantier.
+    (1) Le panic hook pré-unwind (phase 1, commits C2 et C3) a rendu
+    l'incident lisible : c'est lui qui a produit le message du panic
+    originel, que six core dumps successifs n'avaient pas permis d'obtenir,
+    et qui a permis de trancher en quelques minutes une question ouverte
+    depuis cinq jours. La chaîne hook_entry 1, 2, 3 avec l'indicateur
+    reentered_hook est exactement le matériau qui manquait.
+    (2) La capture du stderr serveur par le proxy (commit C4) réduit
+    fortement l'exposition : le lecteur du tube est désormais le proxy, qui
+    est supervisé, vit plus longtemps que la session et draine le tube de
+    façon INCONDITIONNELLE. Le tube ne se ferme donc plus quand la session
+    opencode se termine, seulement si le proxy lui-même meurt.
+    (3) Le confinement par artifact (commit C5) ne protège PAS de ce
+    mode de panne précis, et le RFC l'avait honnêtement anticipé : un
+    panic_in_cleanup abort le process, catch_unwind ne l'intercepte pas.
+    Ce qui protège, c'est le respawn automatique plus le boot
+    readiness-first (commit C6), qui ramène le service en quelques secondes
+    au lieu d'exiger un reboot humain.
+
+    CORRECTIF CIBLÉ RESTANT À LIVRER, recommandé et hors du périmètre du
+    permit consommé : rendre non paniquantes les écritures du serveur sur
+    stderr, ce qui supprime la CAUSE au lieu d'en réduire l'exposition.
+    Trois points d'action, tous dans crates/mcp-servers/orchestrator/src/main.rs
+    et crates/mcp-servers/yaml/src/main.rs : remplacer les eprintln! du
+    chemin de boot par une écriture dont l'erreur est absorbée (par exemple
+    un writeln! sur std::io::stderr() dont le Result est ignoré) ; installer
+    le subscriber tracing sur un writer qui avale les erreurs d'écriture au
+    lieu de paniquer ; et vérifier qu'aucun autre println!/eprintln! ne
+    subsiste sur un chemin chaud. Ce correctif mérite son propre cycle
+    review plus write permit : il touche le chemin de crash lui-même, et
+    l'improviser en fin de session serait exactement le genre de raccourci
+    que ce chantier existe pour éviter.
