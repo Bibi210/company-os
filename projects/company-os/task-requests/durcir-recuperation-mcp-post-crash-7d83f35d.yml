@@ -40,7 +40,7 @@ metadata:
 
 spec:
   priority: critical
-  status: backlog
+  status: done
   context: >
     L'architecture B+A+C du RFC 18011bfc a tenu ses contrats mécaniques
     (binaires servis intacts, proxy sans abandon, -32050 à 120 s, at-most-once
