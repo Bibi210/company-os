@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 companyos-orchestrator = { path = "../../orchestrator" }
 companyos-config = { path = "../../config" }
+companyos-crash-trace = { path = "../../crash-trace" }
 companyos-validation = { path = "../../validation" }
 rmcp = { workspace = true }
 schemars = { workspace = true }

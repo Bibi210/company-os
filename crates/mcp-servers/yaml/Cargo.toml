@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 companyos-validation = { path = "../../validation" }
 companyos-config = { path = "../../config" }
+companyos-crash-trace = { path = "../../crash-trace" }
 rmcp = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }

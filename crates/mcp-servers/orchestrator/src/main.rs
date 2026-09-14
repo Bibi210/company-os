@@ -1985,6 +1985,17 @@ impl ServerHandler for OrchestratorServer {
 }
 
 fn main() -> anyhow::Result<()> {
+    // RFC 5bacb08a D3b: arm the pre-unwind crash trace before anything
+    // else, argument parsing included, so that NO code path of this
+    // process is left uninstrumented (server, --index called by the
+    // defense-in-depth hook, --prefetch-embeddings). The call creates the
+    // trace directory eagerly and never fails: a crash trace costs
+    // observability when it cannot be written, never availability.
+    companyos_crash_trace::install(
+        &std::env::var(constants::ENV_COMPANYOS_ROOT).unwrap_or_else(|_| ".".into()),
+        env!("CARGO_PKG_NAME"),
+    );
+
     let args: Vec<String> = std::env::args().collect();
 
     match args.get(1).map(|s| s.as_str()) {

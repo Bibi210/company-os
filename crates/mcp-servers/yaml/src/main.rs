@@ -148,6 +148,15 @@ impl ServerHandler for YamlValidatorServer {
 }
 
 fn main() -> anyhow::Result<()> {
+    // RFC 5bacb08a D3b: arm the pre-unwind crash trace before anything
+    // else. This server is in scope because it aborted twice as well
+    // (PID 82926 on 2026-09-09, PID 85899 on 2026-09-10): a hook limited
+    // to the orchestrator would leave a reproduced crash untraced.
+    companyos_crash_trace::install(
+        &std::env::var(constants::ENV_COMPANYOS_ROOT).unwrap_or_else(|_| ".".into()),
+        env!("CARGO_PKG_NAME"),
+    );
+
     let args: Vec<String> = std::env::args().collect();
 
     match args.get(1).map(|s| s.as_str()) {
