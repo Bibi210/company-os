@@ -6,7 +6,8 @@ metadata:
   author: architect
   created_at: "2026-09-11"
   project: company-os
-  status: approved
+  status: implemented
+  implemented_at: "2026-09-14T10:18:32.626192215+00:00"
   approved_at: "2026-09-11T08:47:16.916152319+00:00"
   description: >
     RFC du chantier correctif MCP issu du design-doc APPROUVÉ aae2af60 (round
