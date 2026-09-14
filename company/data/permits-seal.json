@@ -262,10 +262,10 @@
         "crates/crash-trace/Cargo.toml",
         "crates/crash-trace/src/lib.rs"
       ],
-      "status": "active",
+      "status": "consumed",
       "granted_by": "ceo",
       "granted_at": "2026-09-11T08:48:39.246202299+00:00",
-      "consumed_at": null
+      "consumed_at": "2026-09-14T10:06:04.557650956+00:00"
     },
     {
       "id": "f266fa36-d481-4a9c-ade6-9fadc308b1c6",
