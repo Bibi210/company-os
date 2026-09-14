@@ -1,0 +1,537 @@
+api_version: companyos/v1
+kind: implementation-plan
+metadata:
+  id: ec7bbc08-061f-4762-9949-2d795f86c6a2
+  title: "Implementation-plan : support VSCode pour sidekick (daemon vscode.go, extension TypeScript, plugin marketplace)"
+  author: implementer
+  created_at: "2026-09-09"
+  project: sidekick
+  description: >
+    Plan d'exécution du design-doc 8221e203 (approuvé, round 452bb2d0). Traduit
+    en étapes ordonnées et actionnables l'ajout de VSCode comme troisième éditeur
+    de sidekick : variante Vscode de l'enum app.go, branche register de rpc.go,
+    fichier vscode.go exposant les 12 tools MCP (parité Emacs) via un client HTTP
+    POST-par-op vers l'extension, extension TypeScript vscode/ (serveur HTTP local,
+    register, spawn terminal, 4 commandes palette, status bar, union
+    tabGroups+open_buffer), plugin marketplace plugins/vscode/ + entrée dans
+    .claude-plugin/marketplace.json, et section README. Cible : branche propre
+    prête pour PR upstream vers lthms/sidekick, chaque commit compilant. Aucune
+    décision d'architecture n'est prise ici : toutes sont figées par le design-doc.
+    Les 3 nuances soulevées par la review Implementer du design (round 452bb2d0)
+    sont tranchées comme détails d'implémentation dans les étapes 5, 9 et 8.
+  tags:
+    - sidekick
+    - vscode
+    - go
+    - typescript
+    - mcp
+    - editor-integration
+    - upstream-contribution
+    - implementation
+  related:
+    - id: 8221e203-561c-46dd-b60e-4fe7765615a2
+      kind: design-doc
+      relationship: input
+    - id: 0c136fac-dc9b-4acd-9c2a-ddad2e0df811
+      kind: task-request
+      relationship: related
+    - id: 8f7a512d-0793-4e90-80a0-5fed7d778f65
+      kind: project-config
+      relationship: related
+
+spec:
+  overview: >
+    CONTEXTE PROJET. sidekick est un projet CONTRIBUTED (clone local
+    /home/bibux/Compagny/sidekick, upstream lthms/sidekick, licence MPL-2.0).
+    CompanyOS gère les artifacts ; le code vit dans le dépôt sidekick. Le
+    livrable est une branche git propre, PAS un merge (le merge upstream est
+    hors de notre contrôle). La CI upstream n'est pas accessible : le substitut
+    objectif de done (règle CI de la persona, cas 2) est `go build ./...` +
+    `go vet ./...` verts côté daemon ET `npx tsc --noEmit` (compilation
+    TypeScript) vert côté extension, complétés des tests manuels décrits par
+    étape. L'impossibilité d'accès à la CI upstream est documentée ici.
+
+    ÉTAT DU CODE CIBLE (recensé au moment T). app.go : enum SupportedApp {Nvim,
+    Emacs}, map encodings, String(), UnmarshalJSON, interface AppMCPSever{Kind,
+    NewMCPServer, UnmarshalNotifyJSONParams}. rpc.go : registerRequestShared
+    {PID, App}, nvimRegisterParams{Endpoint}, emacsRegisterParams{Socket, Root},
+    et le switch registerRequest.UnmarshalJSON à deux branches (Nvim, Emacs).
+    nvim.go porte les helpers PARTAGÉS réutilisables tels quels sans
+    modification : textResult, globToRegexp, splitContentLines, et les types
+    d'input GlobInput, GrepInput, ListBuffersInput, OpenBufferInput (vscode.go
+    les réutilise par simple référence, même package main). emacs.go est le
+    gabarit le plus proche (12 tools, xref, diagnostics, ask, root épinglé,
+    format cat -n / path:line: summary, plafonds 200 xref / 500 grep).
+    main.go, registry.go, broadcaster.go, listen.go : AUCUNE modification requise
+    (confirmé par le design : l'abstraction AppMCPSever absorbe l'ajout ;
+    newRPCHandler route déjà /mcp/{pid} et /listen/{pid} de façon générique).
+    go.mod : module github.com/lthms/sidekick, go 1.25.0, SDK MCP
+    go-sdk v1.6.1. AUCUNE dépendance Go nouvelle (le canal HTTP utilise
+    net/http de la stdlib ; pas de msgpack, pas de client neovim côté vscode).
+
+    RÉUTILISATION DES HELPERS PARTAGÉS. vscode.go réutilise textResult,
+    globToRegexp, GlobInput, GrepInput, ListBuffersInput, OpenBufferInput
+    (déclarés dans nvim.go, package main). Le matching glob/grep reste côté Go :
+    l'extension fournit la liste des buffers et leurs lignes, vscode.go applique
+    globToRegexp + RE2, exactement comme emacs.go/nvim.go. Cela garantit une
+    sémantique glob identique aux trois éditeurs (le piège **/ est déjà résolu
+    dans globToRegexp).
+
+    ORDRE GLOBAL. Le daemon d'abord (compile et testable en isolation via un
+    faux serveur HTTP), l'extension ensuite (dépend du contrat de vscode.go), le
+    plugin marketplace, puis la doc README. Cet ordre est aussi celui du
+    découpage en commits (section « Découpage commits » en fin d'overview).
+
+    LES 3 NUANCES DE LA REVIEW IMPLEMENTER (round 452bb2d0), TRANCHÉES :
+
+    Nuance 1 (interrupt / sendText). Terminal.sendText("\x03", false) n'écrit
+    PAS un octet brut sur le PTY comme le chansend nvim : sendText passe par la
+    couche d'entrée du terminal VSCode. Tranché (étape 8) : l'interrupt envoie
+    la chaîne contenant l'octet ETX (String.fromCharCode(3)) via
+    terminal.sendText(text, false) avec addNewLine=false pour ne PAS ajouter de
+    retour ligne. En pratique VSCode achemine ce caractère de contrôle au PTY et
+    claude reçoit un Ctrl-C. On documente en commentaire TS que c'est le canal
+    disponible (pas d'API write PTY brute exposée par l'API extension stable) et
+    que addNewLine=false est requis pour ne pas transformer l'ETX en ETX+CR. Un
+    test manuel valide l'effet réel (claude s'interrompt).
+
+    Nuance 2 (getDiagnostics vide vs pas encore analysé). languages.getDiagnostics
+    (uri) peut renvoyer [] pour deux raisons indistinguables a priori :
+    le fichier est réellement sans problème, OU le LSP n'a pas encore analysé le
+    document (fréquent sur un document ouvert headless via openTextDocument sans
+    afficher). Tranché (étape 9) : buffer_diagnostics renvoie "no diagnostics"
+    UNIQUEMENT quand un LSP est effectivement attaché et a produit un résultat ;
+    quand aucune analyse n'est encore disponible, l'extension renvoie un
+    marqueur distinct "no diagnostics available yet (language server may still
+    be analyzing this document)" plutôt qu'un faux "clean". Heuristique
+    d'implémentation (déterministe, sans dépendance externe) : avant de conclure
+    "no diagnostics", l'extension vérifie qu'au moins un provider de diagnostics
+    a marqué le document en s'appuyant sur l'événement onDidChangeDiagnostics
+    observé pour cette uri depuis l'ouverture (drapeau par document tenu par
+    l'extension) ; si le document a été ouvert par open_buffer et qu'aucun
+    onDidChangeDiagnostics n'a encore été reçu pour son uri, renvoyer le
+    marqueur "not analyzed". Sinon (fichier déjà ouvert par l'utilisateur, LSP
+    chaud, ou événement reçu), [] signifie réellement "clean" -> "no
+    diagnostics". Ce choix respecte le contrat honnête des tools (ne pas
+    inventer une absence de problème), miroir de la rigueur du tool ask.
+
+    Nuance 3 (Location[] vs LocationLink[]). vscode.executeDefinitionProvider et
+    executeReferenceProvider peuvent retourner soit Location[] (chaque item a
+    .uri et .range), soit LocationLink[] (chaque item a .targetUri et
+    .targetRange, pas de .uri). Tranché (étape 9) : une fonction de
+    normalisation normalizeLocations(results) mappe chaque item vers {uri, range}
+    en testant la présence de .targetUri (LocationLink) sinon .uri (Location) ;
+    executeReferenceProvider retourne toujours Location[] mais on passe par la
+    même normalisation par uniformité. Le rendu final (côté extension : liste
+    {file, line, summary} envoyée au daemon ; côté daemon : format
+    path:line: summary relatif à la racine, plafond 200, identique à
+    emacs.xref) est ainsi indépendant de la forme retournée par le provider.
+
+    DÉCOUPAGE EN COMMITS (historique upstream propre, chaque commit compile ;
+    convention : messages courts préfixés par le domaine, style
+    "vscode: <sujet>" observé dans le repo — cf. "nvim: ...", "emacs: ..." dans
+    git log). Branche à créer : vscode-support (depuis main).
+      Commit 1 — "vscode: Add Vscode app variant and register params" :
+        app.go (variante Vscode, encodings, String) + rpc.go
+        (vscodeRegisterParams + branche du switch UnmarshalJSON). Compile seul
+        même sans vscode.go SI la branche construit un &VSCodeMCPServer{} déjà
+        défini ; pour garder ce commit compilable en isolation, il inclut un
+        vscode.go MINIMAL (struct + Kind + stubs NewMCPServer/UnmarshalNotify
+        renvoyant un serveur vide) — OU, préférence retenue, on fusionne
+        commits 1 et 2 pour éviter un stub jetable (peneloping). Choix retenu :
+        FUSION des étapes 1-2 dans un seul commit (voir commit 2).
+      Commit 2 — "vscode: Add the daemon-side MCP server" : app.go + rpc.go +
+        vscode.go COMPLET (les 12 tools, client HTTP, UnmarshalNotify). go build
+        + go vet verts. C'est le premier commit ; il est autonome et compile.
+      Commit 3 — "vscode: Add the TypeScript extension" : tout vscode/
+        (package.json, tsconfig.json, src/extension.ts, .gitignore,
+        .vscodeignore). tsc --noEmit vert.
+      Commit 4 — "vscode: Add the marketplace plugin" : plugins/vscode/
+        (.claude-plugin/plugin.json, commands/monitor.md) + entrée vscode dans
+        .claude-plugin/marketplace.json.
+      Commit 5 — "vscode: Document the VSCode integration" : section VSCode du
+        README.md.
+    Rationale du découpage : chaque commit est un atome cohérent (daemon /
+    extension / plugin / doc), sans do-then-undo, et chaque commit laisse HEAD
+    compilable (les commits 3-5 n'affectent pas la compilation Go du commit 2 ;
+    le commit 4 référence une extension déjà présente ; le README est purement
+    documentaire).
+
+    HORS SCOPE (task-request out_of_scope, à NE PAS faire) : publication sur le
+    VSCode Marketplace (pas de vsce publish, pas de CI de publication) ; support
+    spécifique Cursor/VSCodium au-delà de ce qui marche gratuitement (on
+    n'utilise que l'API extension stable et la CLI claude, on ne teste pas les
+    forks) ; rendu de conversation riche façon sidekick-render.el (pas de mode
+    headless, pas de rendu markdown/folds/mode-line) ; soumission effective de
+    la PR et négociation upstream (on livre la branche, on ne pousse pas la PR).
+    NE PAS ajouter d'opération unregister au daemon (limite héritée assumée par
+    le design : une session fermée laisse une entrée morte, corrigée dans une PR
+    séparée). NE PAS modifier main.go/registry.go/broadcaster.go/listen.go. NE
+    PAS redéfinir les helpers partagés de nvim.go (les réutiliser tels quels).
+
+  steps:
+    - description: >
+        [PRÉ-REQUIS BRANCHE] Dans /home/bibux/Compagny/sidekick, créer la branche
+        de travail depuis main à jour : `git switch -c vscode-support`. Vérifier
+        `git status` propre au départ (le repo est clean, HEAD = bff7442).
+        Vérification : `git branch --show-current` retourne vscode-support ;
+        `go build ./...` vert sur le point de départ.
+      files:
+        - "(git) branche vscode-support"
+    - description: >
+        [COMMIT 2 - daemon, partie A : app.go] Étendre l'enum SupportedApp avec
+        la variante Vscode. Modifications exactes dans app.go :
+        (a) ajouter `Vscode` à la liste const iota après Emacs :
+        `const ( Nvim SupportedApp = iota; Emacs; Vscode )` ;
+        (b) ajouter la branche `case Vscode: return "vscode"` dans String() ;
+        (c) ajouter l'entrée dans la map : `encodings = map[string]SupportedApp
+        {"nvim": Nvim, "emacs": Emacs, "vscode": Vscode}`. Ne PAS toucher à
+        UnmarshalJSON (générique via la map) ni à l'interface AppMCPSever.
+        Vérification : `go build ./...` (compile une fois vscode.go ajouté à
+        l'étape 4-6, cf. note commit) ; relecture que "vscode" est bien la clé
+        JSON attendue de l'app (cohérente avec le register de l'extension,
+        étape 8).
+      files:
+        - app.go
+    - description: >
+        [COMMIT 2 - daemon, partie B : rpc.go] Ajouter le type de params de
+        register et la branche du switch, sur le modèle exact des deux branches
+        existantes. Modifications dans rpc.go : (a) déclarer
+        `type vscodeRegisterParams struct { Endpoint string \`json:"endpoint"
+        validate:"required"\`; Root string \`json:"root" validate:"required"\` }`
+        (Endpoint comme nvim = URL http locale de l'extension ; Root comme emacs
+        = racine de session épinglée) ; (b) dans registerRequest.UnmarshalJSON,
+        ajouter `case Vscode:` qui unmarshale vers vscodeRegisterParams et pose
+        `req.Server = &VSCodeMCPServer{endpoint: params.Endpoint, root:
+        params.Root}`. Ne PAS modifier registerRequestShared, handleRegister,
+        notifyRequest ni le reste de rpc.go.
+        Vérification : `go build ./...` vert ; test unitaire léger optionnel :
+        unmarshaler un JSON register {"pid":1,"app":"vscode","endpoint":
+        "http://127.0.0.1:1234","root":"/tmp/x"} et vérifier le type concret
+        *VSCodeMCPServer et ses champs.
+      files:
+        - rpc.go
+    - description: >
+        [COMMIT 2 - daemon, partie C : vscode.go squelette + client HTTP]
+        Créer vscode.go (package main, en-tête licence MPL identique aux autres
+        fichiers). Définir `type VSCodeMCPServer struct { endpoint string; root
+        string }`. Implémenter le client HTTP générique
+        `call(op string, body map[string]any, out any) error` : marshale
+        `{"op": op, ...body}` en JSON, POST vers self.endpoint (http.Post,
+        Content-Type application/json), lit la réponse JSON ; si le corps
+        contient un champ {"error": "..."} non vide, retourner
+        fmt.Errorf("vscode %s: %s", op, msg) ; sinon json.Unmarshal(body, out)
+        si out != nil. Prévoir un `callCtx` avec timeout court (http.Client{
+        Timeout: ~5s}) pour toutes les ops SAUF ask (décision design : ask sans
+        timeout). Implémenter `cwd() (string, error) { return self.root, nil }`
+        (miroir emacs). Implémenter Kind() retournant Vscode.
+        Vérification : `go build ./...` vert ; `go vet ./...` vert.
+      files:
+        - vscode.go
+    - description: >
+        [COMMIT 2 - daemon, partie D : tools de base 8/12] Implémenter dans
+        vscode.go les 8 tools de base en réutilisant les helpers de nvim.go.
+        (1) read_buffer : input {buffer string (chemin relatif), start?, end?
+        1-based} ; POST op "read-lines" {buf, start, end} ; réponse {lines} ;
+        rendu cat -n via fmt.Fprintf("%6d\\t%s\\n") comme emacs.readBuffer.
+        (2) edit_buffer AVEC garde CAS (décision design : sémantique nvim, PAS
+        write_buffer emacs) : input {buffer, previous, content, start?} ; POST op
+        "edit" {buf, start, previous:[]string, content:[]string} (split via
+        splitContentLines de nvim.go) ; l'extension compare les lignes live à
+        previous et applique WorkspaceEdit, renvoie {ok, reason} ; si !ok ->
+        erreur "edit buffer rejected: <reason>". Description du tool alignée sur
+        edit_buffer nvim (clobber-guard, re-read on reject).
+        (3) glob : globToRegexp(pattern) + POST op "list-buffers-rel" pour
+        obtenir l'union des buffers relatifs à la racine, filtre RE2 côté Go,
+        rendu 1/ligne ou "no matches" (miroir emacs.glob).
+        (4) grep : compile RE2, include via globToRegexp, POST op "buffer-lines"
+        par buffer (ou op "grep-lines" renvoyant lignes de tous les buffers du
+        périmètre), matching côté Go, format path:line:text, plafond 500 +
+        "(truncated...)" (miroir emacs.grep).
+        (5) list_buffers : POST op "list-buffers" ; rendu id<TAB>chemin.
+        (6) open_buffer : input {path} ; POST op "open" {path} ; réponse {id} ;
+        rendu "buffer <id>\\t<path>" (l'extension fait openTextDocument sans
+        afficher + ajoute à l'ensemble de session).
+        (7) save_buffer : input {buffer} ; POST op "save" {buf}.
+        (8) jump : input {buffer, line, column?} ; POST op "jump" {buf, line,
+        col} ; rendu "jumped to buffer <b> at L:C (Go Back / Alt+Left returns)"
+        (décision design : mention du retour natif VSCode).
+        Réutiliser GlobInput/GrepInput/ListBuffersInput/OpenBufferInput de
+        nvim.go ; déclarer les inputs spécifiques (VSCodeReadBufferInput,
+        VSCodeEditBufferInput, VSCodeSaveBufferInput, VSCodeJumpInput) avec
+        buffer en string (chemin relatif), pas int.
+        Vérification : `go build ./...` + `go vet ./...` verts.
+      files:
+        - vscode.go
+    - description: >
+        [COMMIT 2 - daemon, partie E : tools sémantiques 4/12] Implémenter les 4
+        tools de parité Emacs dans vscode.go.
+        (9) find_definition / (10) find_references : input {buffer, line,
+        column?} ; POST op "find-definition" / "find-references" {buf, line,
+        col} ; réponse {locations:[{file, line, summary}]} (la normalisation
+        Location[]/LocationLink[] est faite CÔTÉ EXTENSION, cf. nuance 3
+        étape 9, le daemon reçoit déjà une forme normalisée) ; rendu
+        path:line: summary relatif à la racine, plafond 200 + "(truncated...)"
+        (copie de emacs.xref).
+        (11) buffer_diagnostics : input {buffer} ; POST op "diagnostics" {buf} ;
+        réponse {diagnostics:[{line, column, severity, message}]} PLUS un champ
+        {analyzed bool} pour distinguer clean vs pas-encore-analysé (nuance 2) ;
+        si diagnostics vide ET analyzed=false -> textResult("no diagnostics
+        available yet (language server may still be analyzing this document)") ;
+        si vide ET analyzed=true -> "no diagnostics" ; sinon tri par (line,
+        column) et rendu line:column: severity: message (copie de
+        emacs.diagnostics + le cas analyzed).
+        (12) ask : input {question, choices} ; POST op "ask" {prompt, choices}
+        AVEC un client SANS timeout (décision design) ; réponse {answer} ;
+        propager l'erreur "user dismissed the question" telle quelle si
+        l'extension la renvoie dans {error}. Refuser choices vide côté Go
+        (miroir emacs.ask).
+        Vérification : `go build ./...` + `go vet ./...` verts.
+      files:
+        - vscode.go
+    - description: >
+        [COMMIT 2 - daemon, partie F : NewMCPServer + notify] Implémenter
+        NewMCPServer() dans vscode.go : mcp.NewServer(&mcp.Implementation{Name:
+        "sidekick for vscode", Version: "0.1.0"}) puis mcp.AddTool pour les 12
+        tools, avec des Description adaptées à VSCode mais alignées sur le ton
+        des descriptions nvim/emacs (reprendre les formulations d'emacs.go,
+        remplacer "emacs buffer name" par "file path relative to the session
+        root", "M-," par "Go Back / Alt+Left", "flycheck/flymake" par "VSCode's
+        language servers", "minibuffer completing-read" par "quick pick").
+        Implémenter UnmarshalNotifyJSONParams : décoder VSCodeNotifyParams
+        {Buf string \`json:"buf"\`; File string \`json:"file"\`} (buf = chemin
+        relatif à la racine, cf. design ; pas de Region pour cette première
+        version, hors périmètre des acceptance criteria).
+        Vérification finale COMMIT 2 : `go build ./...` vert, `go vet ./...`
+        vert. Test manuel daemon : lancer `go run . -p 8000`, POST un register
+        vscode avec un endpoint bidon, vérifier dans les logs "registered new
+        app kind=vscode". C'est le point de commit : `git add app.go rpc.go
+        vscode.go && git commit -m "vscode: Add the daemon-side MCP server"`.
+      files:
+        - vscode.go
+    - description: >
+        [COMMIT 3 - extension, partie A : scaffolding] Créer le répertoire
+        vscode/ à la racine du repo (symétrique de lua/ et emacs/). Fichiers :
+        (a) vscode/package.json : name "sidekick-vscode", engines.vscode
+        (^1.85.0 ou compatible), main "./out/extension.js", activationEvents
+        ["onStartupFinished"] (activation sur ouverture de workspace sans vol de
+        focus), contributes.commands (4 commandes : sidekick.notify "Sidekick:
+        Notify", sidekick.interrupt "Sidekick: Interrupt", sidekick.restart
+        "Sidekick: Restart", sidekick.changeModel "Sidekick: Change Model", plus
+        sidekick.setup "Sidekick: Setup" pour retenter le register), et
+        contributes.configuration (settings miroirs de la config Lua :
+        sidekick.serverUrl défaut "http://127.0.0.1:8000",
+        sidekick.claude.defaultModel défaut "opus", sidekick.claude.autoInstall
+        défaut true, sidekick.claude.marketplace.repo "lthms/sidekick",
+        sidekick.claude.marketplace.ref "main", sidekick.claude.marketplace.path
+        null) ; scripts.compile "tsc -p ./", scripts.vscode:prepublish. Dépendances
+        devDependencies : typescript, @types/vscode, @types/node. AUCUNE dépendance
+        runtime (le serveur HTTP utilise le module http de Node intégré).
+        (b) vscode/tsconfig.json : target ES2020, module commonjs, outDir "out",
+        strict true, lib ES2020.
+        (c) vscode/.gitignore (out/, node_modules/) et vscode/.vscodeignore.
+        (d) En-tête licence MPL dans extension.ts.
+        Vérification : `cd vscode && npm install && npx tsc --noEmit` — au moins
+        la config compile (le extension.ts complet vient aux étapes suivantes).
+      files:
+        - vscode/package.json
+        - vscode/tsconfig.json
+        - vscode/.gitignore
+        - vscode/.vscodeignore
+    - description: >
+        [COMMIT 3 - extension, partie B : serveur d'opérations HTTP] Dans
+        vscode/src/extension.ts, implémenter le serveur HTTP local qui reçoit les
+        POST {op,...} du daemon. http.createServer écoutant sur 127.0.0.1 port
+        éphémère (listen(0), lire l'adresse via server.address() pour composer
+        l'endpoint). Un dispatcher par op : "read-lines", "edit", "list-buffers",
+        "list-buffers-rel", "buffer-lines"/"grep-lines", "open", "save", "jump",
+        "find-definition", "find-references", "diagnostics", "ask". Chaque
+        handler renvoie {...} ou {error}.
+        Mapping API extension (décisions design, section « Mapping des tools ») :
+        read-lines = TextDocument.getText sur la plage (1-based en entrée) ;
+        edit = comparer les lignes live [start, start+len(previous)) à previous ;
+        si divergence renvoyer {ok:false, reason:"content changed at line N"},
+        sinon WorkspaceEdit + workspace.applyEdit, {ok:true} ; list-buffers /
+        list-buffers-rel = UNION window.tabGroups (TabInputText de scheme file)
+        + documents ouverts par open_buffer (ensemble openedByClaude tenu par
+        l'extension), filtrée à la racine de session (décision design : ni
+        textDocuments seul ni tabGroups seul) ; open = workspace.openTextDocument
+        (Uri.joinPath(root, rel)), ajout à openedByClaude, {id: relPath} ; save =
+        TextDocument.save() ; jump = window.showTextDocument + selection à
+        line:column (seule op qui prend le focus, par contrat) ; NUANCE 3 :
+        find-definition/find-references passent par normalizeLocations (voir
+        étape suivante).
+        Identité de buffer : chemin relatif à la racine (fsPath absolu en
+        secours hors racine) ; résolution rel -> document via Uri.joinPath(root,
+        rel), openTextDocument idempotent (rouvre si VSCode a disposé le doc).
+        Vérification : `npx tsc --noEmit` vert.
+      files:
+        - vscode/src/extension.ts
+    - description: >
+        [COMMIT 3 - extension, partie C : sémantique LSP + diagnostics, NUANCES 2
+        et 3] Dans extension.ts : (NUANCE 3) implémenter
+        normalizeLocations(results: (vscode.Location | vscode.LocationLink)[]):
+        {uri, range}[] testant `('targetUri' in item)` -> {uri:item.targetUri,
+        range:item.targetRange} sinon {uri:item.uri, range:item.range}.
+        find-definition = commands.executeCommand("vscode.executeDefinitionProvider",
+        uri, position) -> normalizeLocations -> [{file: relPath, line: range.start.line+1,
+        summary: <texte de la ligne cible>}] ; find-references idem avec
+        "vscode.executeReferenceProvider". (NUANCE 2) diagnostics :
+        languages.getDiagnostics(uri) ; tenir un Map<uriString, boolean>
+        diagnosticsSeen alimenté par languages.onDidChangeDiagnostics (marquer
+        chaque uri touchée) ; renvoyer {diagnostics:[...], analyzed:
+        diagnosticsSeen.has(uriString)} — analyzed=false quand le document a été
+        ouvert par open_buffer et qu'aucun onDidChangeDiagnostics n'a encore été
+        reçu pour son uri, ce qui laisse le daemon rendre le marqueur "not
+        analyzed" plutôt qu'un faux "no diagnostics". Mapper severity
+        (DiagnosticSeverity -> "error"/"warning"/"information"/"hint"),
+        line/column 1-based.
+        Vérification : `npx tsc --noEmit` vert.
+      files:
+        - vscode/src/extension.ts
+    - description: >
+        [COMMIT 3 - extension, partie D : cycle de vie de session] Dans
+        extension.ts, à l'activation (onStartupFinished) : pid =
+        process.pid ; root = workspace.workspaceFolders[0].uri (premier folder,
+        décision design multi-root) ; démarrer le serveur HTTP local (étape 9)
+        et composer endpoint = "http://127.0.0.1:<port>". POST JSON-RPC register
+        {pid, app:"vscode", endpoint, root: root.fsPath} au serverUrl du daemon,
+        et LIRE la réponse (décision design : spawn conditionné au succès du
+        register, contrairement au fire-and-forget nvim). Si le daemon est
+        injoignable : afficher window.showErrorMessage("sidekick daemon
+        unreachable at <url>, start it then run Sidekick: Setup") et ne rien
+        spawner. Sur succès : écrire un mcp-config temporaire (os.tmpdir) pointant
+        {mcpServers:{sidekick:{type:"http", url:serverUrl+"/mcp/"+pid}}} ;
+        vérifier/installer le plugin (étape suivante) ; puis spawn du terminal.
+        Vérification : `npx tsc --noEmit` vert ; test manuel décrit à l'étape 14.
+      files:
+        - vscode/src/extension.ts
+    - description: >
+        [COMMIT 3 - extension, partie E : plugin marketplace + spawn terminal]
+        Dans extension.ts : reproduire l'UX nvim on_start (décision design :
+        auto-install par défaut débrayable). Via child_process, exécuter `claude
+        plugin list --json` ; si "vscode@sidekick" absent ET
+        sidekick.claude.autoInstall=true : `claude plugin marketplace add <repo#ref
+        ou path>` puis `claude plugin install vscode@sidekick`, PUIS spawn.
+        Spawn : window.createTerminal({name:"sidekick claude"}) SANS appeler
+        show() (décision design : terminal créé sans focus) ; terminal.sendText
+        la commande claude : `claude --mcp-config <cfg> --allowedTools
+        mcp__sidekick --model <defaultModel> -- /vscode:monitor <serverUrl>
+        <pid>` (miroir spawn_terminal nvim). Mémoriser {mcpConfig, pid, terminal}
+        dans l'état d'extension pour restart. Enregistrer onDidCloseTerminal :
+        si c'est le terminal claude, passer la status bar à l'état "mort".
+        Vérification : `npx tsc --noEmit` vert.
+      files:
+        - vscode/src/extension.ts
+    - description: >
+        [COMMIT 3 - extension, partie F : commandes palette + status bar,
+        NUANCE 1] Dans extension.ts, enregistrer les 4+1 commandes
+        (registerCommand) :
+        sidekick.notify -> window.activeTextEditor.document ; POST notify {pid,
+        buf: relPath, file: fsPath} au daemon (miroir on_buf_write nvim) ;
+        sidekick.interrupt (NUANCE 1) -> terminal.sendText(String.fromCharCode(3),
+        false) — addNewLine=false, commentaire expliquant que c'est le canal
+        disponible pour acheminer un Ctrl-C/ETX au PTY (pas d'API write brute) ;
+        sidekick.restart -> terminal.dispose() puis respawn avec le même pid et
+        le même mcpConfig SANS re-register (décision design : l'entrée registry
+        survit à la mort de claude) ; sidekick.changeModel -> window.showQuickPick
+        ou showInputBox pour le modèle, puis terminal.sendText("/model "+choix)
+        puis, après un délai (~300ms, miroir des délais nvim pour la modale de la
+        TUI), terminal.sendText("", true) ou un second Enter différé pour valider
+        la modale "Switch model" ; sidekick.setup -> relance la séquence register
+        (retenter sans recharger la fenêtre). Status bar : window.
+        createStatusBarItem reflétant vivante / morte / question ask en attente
+        (décision design : une question ask dismissée par accident reste
+        signalée et ré-affichable) ; sérialiser les ask concurrents via une file
+        d'attente (décision design : pas deux quick picks empilés).
+        Vérification : `npx tsc --noEmit` vert. Point de commit COMMIT 3 :
+        `cd vscode && npm install && npx tsc --noEmit` vert, puis
+        `git add vscode/ && git commit -m "vscode: Add the TypeScript extension"`
+        (ne PAS committer out/ ni node_modules/, cf. .gitignore).
+      files:
+        - vscode/src/extension.ts
+    - description: >
+        [COMMIT 4 - plugin marketplace] Créer plugins/vscode/ sur la structure
+        exacte des deux plugins existants.
+        (a) plugins/vscode/.claude-plugin/plugin.json : {"name":"vscode",
+        "version":"0.1.0","description":"sidekick - drive Claude from vscode",
+        "author":{"name":"Thomas Letan","email":"lthms@soap.coffee"}} (format
+        aligné sur plugins/nvim/.claude-plugin/plugin.json).
+        (b) plugins/vscode/commands/monitor.md : structure identique aux
+        monitor.md nvim et emacs (INPUT $1 serverUrl $2 pid ; Monitor
+        `while true; do curl -sN $1/listen/$2 || true; sleep 1; done` ; /!\
+        Monitor pas Shell ; règles d'or : remplacer REQ: par RESP: au plus tôt,
+        respecter le scope, préférer les tools sidekick, save avant build ; chat
+        non lu dans la formulation renforcée de la version nvim). Variantes
+        VSCode (décision design) : le champ buf est le chemin du fichier relatif
+        à la racine de session (identifiant attendu par tous les tools) ; retour
+        utilisateur après jump = "Go Back (Alt+Left)" ; encouragement explicite
+        à utiliser le tool ask quand une décision revient à l'utilisateur.
+        (c) .claude-plugin/marketplace.json : ajouter au tableau plugins l'entrée
+        {"name":"vscode","source":"./plugins/vscode","description":"sidekick for
+        vscode"}.
+        Vérification : JSON valide (jq . sur marketplace.json et plugin.json) ;
+        relecture croisée de monitor.md contre les deux existants (mêmes règles,
+        seules les 3 variantes diffèrent). Point de commit :
+        `git add plugins/vscode/ .claude-plugin/marketplace.json && git commit -m
+        "vscode: Add the marketplace plugin"`.
+      files:
+        - plugins/vscode/.claude-plugin/plugin.json
+        - plugins/vscode/commands/monitor.md
+        - .claude-plugin/marketplace.json
+    - description: >
+        [COMMIT 5 - README] Ajouter une section "### VSCode" au README.md après
+        la section Emacs, sur le modèle des deux existantes : mentionner
+        l'installation du plugin (`/plugin install vscode@sidekick`),
+        l'installation de l'extension VSCode (depuis vscode/, packaging vsce hors
+        scope, installation en mode dev via "Run Extension" ou vsce package
+        local), la commande "Sidekick: Setup" / activation auto, le flux
+        REQ:/RESP: avec "Sidekick: Notify" (palette), et les 4 commandes de
+        contrôle de session. Mettre à jour la ligne
+        "/plugin install emacs@sidekick    # or nvim@sidekick" pour inclure
+        vscode. Point de commit : `git add README.md && git commit -m "vscode:
+        Document the VSCode integration"`.
+      files:
+        - README.md
+    - description: >
+        [VÉRIFICATION FINALE / substitut CI] La CI upstream lthms/sidekick n'est
+        pas accessible (projet contributed, cas 2 de la règle CI de la persona) :
+        exécuter le substitut objectif complet et le documenter.
+        (a) Daemon : `go build ./...` vert, `go vet ./...` vert, `gofmt -l .`
+        vide (aucun fichier mal formaté). (b) Extension : `cd vscode && npm
+        install && npx tsc --noEmit` vert. (c) JSON : `jq .
+        .claude-plugin/marketplace.json` et les plugin.json valides.
+        (d) `git log --oneline` : 4 commits vscode: bien atomiques, chacun
+        compilant (vérifier en checkoutant chaque commit et en relançant go build
+        pour les commits touchant du Go — seul le commit 2 touche du Go, donc
+        HEAD compile à chaque commit trivialement pour 3/4/5).
+        (e) TEST MANUEL END-TO-END (acceptance criteria) : lancer le daemon
+        (`go run . -p 8000`), ouvrir un workspace de test dans une instance de
+        dev de l'extension (F5 / Run Extension), vérifier : register loggé
+        kind=vscode ; terminal claude spawné sans vol de focus ; écrire un
+        commentaire REQ: dans un fichier, "Sidekick: Notify", vérifier que claude
+        remplace REQ: par RESP: en place ; tester read_buffer, glob, grep,
+        open_buffer, save_buffer, jump (retour Alt+Left), find_definition,
+        find_references, buffer_diagnostics (dont le cas "not analyzed" sur un
+        fichier fraîchement ouvert par open_buffer), ask (quick pick + dismissal
+        = erreur explicite), et les 4 contrôles (interrupt réel, restart,
+        changement de modèle). Documenter tout écart dans un diagnostic-report
+        (règle persona : diagnostic report en cas d'échec). Le plan est done
+        quand (a)-(d) sont verts et (e) couvre les 7 acceptance criteria du
+        task-request.
+      files:
+        - "(vérification, aucun fichier modifié)"
+
+  dependencies:
+    - "Design-doc 8221e203 APPROUVÉ (round 452bb2d0 clôturé, double approve PM + Implementer) — source figée des décisions."
+    - "Clone local sidekick à jour sur main (HEAD bff7442), worktree propre."
+    - "Toolchain : Go 1.25.0 (go.mod), Node + npm pour la compilation TypeScript, CLI claude installée (pour claude plugin list/install au test manuel)."
+    - "Ordre inter-étapes strict : daemon (commit 2) avant extension (commit 3) — l'extension implémente le contrat d'ops défini par vscode.go. Plugin (commit 4) et README (commit 5) sans dépendance de compilation."
+
+  risks:
+    - "NUANCE 1 (interrupt) : sendText n'est pas un write PTY brut ; si l'acheminement de l'ETX via sendText s'avère non fiable sur une plateforme, le fallback est terminal.sendText avec une séquence explicite — à valider au test manuel (e). Escalade Architect si aucun canal ne fonctionne (ce serait un défaut de la décision spawn-terminal, pas un redesign local)."
+    - "NUANCE 2 (diagnostics) : l'heuristique onDidChangeDiagnostics distingue clean vs non-analysé de façon best-effort ; un LSP qui n'émet jamais l'événement laisserait analyzed=false en permanence. Acceptable : le marqueur 'not analyzed' est conservateur (ne prétend jamais à tort 'clean'). Le contrat honnête des tools prime sur la précision."
+    - "NUANCE 3 (Location/LocationLink) : couverte par normalizeLocations ; risque résiduel nul tant que l'API extension respecte les deux formes documentées."
+    - "Union tabGroups+open_buffer : openTextDocument peut être disposé par VSCode entre deux ops ; l'extension le rouvre à la demande (idempotent). Si un buffer ouvert par claude disparaît de l'ensemble, glob/grep perdent son périmètre — géré en réouvrant via openedByClaude."
+    - "Périmètre du permit : projet CONTRIBUTED hors zones protégées CompanyOS ; aucun write permit CompanyOS requis (le code vit dans le dépôt sidekick, pas dans company/). Si un fichier hors des étapes ci-dessus devait être touché, s'arrêter et signaler avant écriture."
+    - "Convention upstream du répertoire d'extension (vscode/ vs editors/vscode) : open_question du design, à confirmer au moment de la PR sans impact architectural. Le plan retient vscode/ par symétrie ; un renommage ultérieur serait un git mv trivial."

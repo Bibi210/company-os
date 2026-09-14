@@ -1,0 +1,460 @@
+api_version: companyos/v1
+kind: design-doc
+metadata:
+  id: 8221e203-561c-46dd-b60e-4fe7765615a2
+  title: "Support VSCode pour sidekick : extension TypeScript, vscode.go, plugin marketplace"
+  author: architect
+  created_at: "2026-09-09"
+  project: sidekick
+  description: >
+    Architecture de l'intégration VSCode dans sidekick (troisième éditeur après
+    Neovim et Emacs). Trois composants : une extension VSCode TypeScript qui
+    héberge un petit serveur HTTP local et pilote l'éditeur, un fichier
+    vscode.go côté daemon qui expose les 12 tools MCP (parité Emacs) en
+    dialoguant avec ce serveur, et un plugin marketplace plugins/vscode avec sa
+    slash command /vscode:monitor. Décision clé : canal daemon → VSCode en HTTP
+    JSON local (endpoint passé au register, pattern nvim) avec protocole de
+    dispatch par op (pattern emacs, sans base64). Parité asymétrique assumée :
+    tools = Emacs, contrôles de session = nvim. Projet contributed, livrable =
+    branche prête pour PR upstream vers lthms/sidekick.
+  tags:
+    - sidekick
+    - vscode
+    - go
+    - typescript
+    - mcp
+    - editor-integration
+    - upstream-contribution
+    - design
+  related:
+    - id: 0c136fac-dc9b-4acd-9c2a-ddad2e0df811
+      kind: task-request
+      relationship: input
+    - id: 8f7a512d-0793-4e90-80a0-5fed7d778f65
+      kind: project-config
+      relationship: related
+
+spec:
+  overview: >
+    Sidekick est un daemon Go qui fait le pont entre un éditeur et une session
+    Claude Code : l'éditeur s'enregistre (register) auprès du daemon avec une
+    clé pid, le daemon expose un serveur MCP par session sur /mcp/<pid>, et la
+    session claude tourne en arrière-plan en surveillant /listen/<pid> pour
+    réagir aux commentaires REQ: laissés dans les buffers. Ce design ajoute
+    VSCode comme troisième éditeur, avec pour cible la parité fonctionnelle
+    Emacs (l'intégration la plus complète : 8 tools de base + find_definition,
+    find_references, buffer_diagnostics, ask).
+
+    PARITÉ ASYMÉTRIQUE ASSUMÉE (note 1 de la review du task-request) : la
+    référence de parité n'est pas la même sur les deux plans. Pour les TOOLS
+    MCP, la référence est Emacs (12 tools, dont les 4 tools sémantiques que
+    nvim n'a pas). Pour les CONTRÔLES DE SESSION, la référence est nvim
+    (:SidekickNotify/:SidekickInterrupt/:SidekickRestart/:SidekickModel,
+    quatre commandes explicites), car Emacs disperse ces contrôles dans un
+    écosystème plus riche (sidekick-reset, sidekick-resume, mode-line) dont
+    une partie (rendu natif sidekick-render.el) est explicitement hors scope.
+    Cette asymétrie est un choix, pas un accident : chaque plan copie
+    l'intégration existante la plus aboutie sur ce plan.
+
+    L'architecture suit le pattern upstream : un fichier Go par éditeur à la
+    racine (vscode.go, comme nvim.go et emacs.go), un répertoire par runtime
+    éditeur (vscode/ pour l'extension, comme lua/ et emacs/), un plugin
+    marketplace par éditeur (plugins/vscode/, référencé dans
+    .claude-plugin/marketplace.json). Les points d'extension du daemon sont
+    recensés : l'enum SupportedApp d'app.go (nouvelle variante Vscode, entrée
+    dans la map encodings, branche dans String()), le switch
+    registerRequest.UnmarshalJSON de rpc.go (nouvelle branche construisant le
+    VSCodeMCPServer depuis les params de register), et la réutilisation des
+    helpers partagés de nvim.go (textResult, globToRegexp, GlobInput,
+    GrepInput, ListBuffersInput, OpenBufferInput). Aucun changement de
+    structure du daemon (registry, broadcaster, listen, main) n'est requis :
+    l'abstraction AppMCPSever est conçue pour cet ajout.
+
+    Flux nominal : l'utilisateur ouvre un workspace VSCode, l'extension
+    s'active, démarre un serveur HTTP local sur 127.0.0.1 (port éphémère),
+    s'enregistre auprès du daemon (pid, app "vscode", endpoint, root), puis
+    lance claude en terminal intégré caché avec un mcp-config pointant sur
+    /mcp/<pid> et le prompt de démarrage /vscode:monitor. Claude surveille
+    /listen/<pid> ; l'utilisateur écrit un commentaire REQ: et invoque la
+    commande Sidekick: Notify ; claude lit le buffer via les tools MCP,
+    remplace REQ: par RESP: et travaille en place dans les buffers, sans
+    jamais voler le focus (seul jump, dont c'est la fonction, déplace
+    l'utilisateur).
+
+    Cas négatifs et limites couverts par les décisions ci-dessous : daemon
+    indisponible au register (spawn conditionné au register, erreur
+    actionnable), claude qui meurt (détection de fermeture du terminal,
+    restart), quick pick dismissed (erreur MCP explicite, pas de réponse
+    inventée), édition concurrente humain/claude (garde CAS sur edit_buffer),
+    multi-fenêtre et multi-root VSCode (une session par fenêtre, root épinglé
+    au premier workspace folder). Une limite héritée de l'upstream est
+    conservée telle quelle : le daemon n'a pas d'opération unregister, une
+    session fermée laisse une entrée morte dans le registry et les appels de
+    tools échouent alors proprement au dial. La corriger relèverait d'une PR
+    séparée, pas de celle-ci.
+
+  components:
+    - name: vscode.go (daemon Go)
+      description: >
+        Fichier unique à la racine du repo, sur le modèle exact d'emacs.go.
+        Définit VSCodeMCPServer{endpoint, root} implémentant AppMCPSever :
+        Kind() retourne la nouvelle variante Vscode de SupportedApp ;
+        NewMCPServer() déclare les 12 tools (read_buffer, edit_buffer, glob,
+        grep, list_buffers, open_buffer, save_buffer, jump, find_definition,
+        find_references, buffer_diagnostics, ask) avec des descriptions
+        adaptées à VSCode mais alignées sur le ton des descriptions nvim et
+        emacs ; UnmarshalNotifyJSONParams décode {buf, file} (buf = chemin
+        relatif à la racine de session). Chaque tool se traduit en un POST
+        HTTP JSON vers l'endpoint de l'extension avec un corps {op, ...}
+        (dispatch par op, miroir du protocole emacsRequest, sans base64 : le
+        corps HTTP n'a aucun problème d'échappement shell). Le matching
+        glob/grep reste côté Go, comme pour nvim et emacs : l'extension
+        fournit la liste des buffers ouverts et leurs lignes, vscode.go
+        applique globToRegexp et le regexp RE2. Modification associée dans
+        app.go (variante Vscode, encodings["vscode"], branche String) et
+        rpc.go (vscodeRegisterParams{Endpoint, Root} et branche du switch
+        UnmarshalJSON de registerRequest, sur le modèle des deux branches
+        existantes).
+    - name: Extension VSCode (vscode/, TypeScript)
+      description: >
+        Extension VSCode vivant dans vscode/ à la racine du repo (symétrique
+        de lua/ et emacs/), avec package.json (activation sur workspace,
+        commandes palette, settings) et src/extension.ts. Trois
+        responsabilités. (1) Serveur d'opérations : un serveur HTTP Node
+        (module http, 127.0.0.1, port éphémère) qui reçoit les POST {op, ...}
+        du daemon et pilote l'éditeur via l'API extension (workspace,
+        window.tabGroups, languages.getDiagnostics, commandes
+        executeDefinitionProvider / executeReferenceProvider, showQuickPick,
+        WorkspaceEdit). (2) Cycle de vie de session : au démarrage, register
+        auprès du daemon (pid du process extension host, app "vscode",
+        endpoint du serveur local, root = premier workspace folder), écriture
+        du mcp-config temporaire pointant /mcp/<pid>, vérification ou
+        installation du plugin marketplace vscode@sidekick via la CLI claude,
+        puis spawn de claude dans un terminal intégré créé sans focus. (3)
+        Contrôles de session en commandes palette : Sidekick: Notify (POST
+        notify au daemon avec le buffer actif), Sidekick: Interrupt (envoi de
+        \x03 au terminal), Sidekick: Restart (dispose du terminal et respawn
+        avec le même pid et le même mcp-config), Sidekick: Change Model
+        (injection de /model <choix> dans le terminal, avec les mêmes délais
+        que la version nvim pour laisser la TUI accepter la modale). Un status
+        bar item reflète l'état de la session (vivante, morte, question ask en
+        attente).
+    - name: Plugin marketplace (plugins/vscode/)
+      description: >
+        Répertoire plugins/vscode/commands/monitor.md définissant la slash
+        command /vscode:monitor, plus l'entrée correspondante dans
+        .claude-plugin/marketplace.json ({name: "vscode", source:
+        "./plugins/vscode", description: "sidekick for vscode"}). Le
+        monitor.md suit la structure exacte des deux existants : INPUT
+        $RPC_SERVER $PID, création d'un Monitor (pas un Shell) bouclant sur
+        curl -sN /listen/<pid>, règles d'or identiques (remplacer REQ: par
+        RESP: au plus tôt, respecter le scope, préférer les tools sidekick aux
+        tools natifs, sauver via save_buffer avant tout build), consigne "le
+        chat n'est pas lu" dans la formulation renforcée de la version nvim.
+        Spécificités VSCode : le champ buf des événements est le chemin du
+        fichier relatif à la racine de session (c'est l'identifiant de buffer
+        attendu par tous les tools), et la mention du retour utilisateur après
+        jump est "Go Back (Alt+Left)" au lieu de <C-t> ou M-,.
+
+  decisions:
+    - decision: >
+        Canal daemon → VSCode : l'extension héberge un serveur HTTP JSON local
+        sur 127.0.0.1 (port éphémère) et passe son endpoint au register ; le
+        daemon envoie une requête POST par opération avec un corps JSON
+        {op, ...} et lit la réponse JSON ({...} ou {error}).
+      rationale: >
+        C'est la combinaison des deux patterns éprouvés du repo. Côté forme
+        d'enregistrement, c'est le précédent nvim : l'éditeur héberge un
+        serveur local et passe un endpoint au register
+        (nvimRegisterParams.Endpoint), le daemon compose une connexion par
+        opération. Côté protocole, c'est le dispatch par op d'emacs
+        (emacsRequest.Op), qui garde vscode.go mince et met la logique éditeur
+        du bon côté (TypeScript, là où l'API VSCode vit), sans le base64
+        d'emacs qui n'existait que pour contourner l'échappement shell
+        d'emacsclient --eval, problème qu'un corps HTTP n'a pas. Alternatives
+        écartées : (a) msgpack-RPC comme nvim, rejeté car VSCode n'a pas
+        d'équivalent natif de serverstart() et cela imposerait une dépendance
+        msgpack Node sans bénéfice sur du localhost ; (b) équivalent
+        emacsclient, rejeté car VSCode n'a aucun mécanisme d'eval externe
+        (la CLI code ne permet pas d'invoquer une commande d'extension
+        arbitraire de façon synchrone) ; (c) WebSocket persistant
+        extension → daemon, rejeté car il inverse le modèle (le daemon
+        deviendrait stateful par session, avec gestion de reconnexion),
+        alors que le modèle une-connexion-par-op est sans état, trivial à
+        raisonner, et déjà celui des deux intégrations existantes ; (d)
+        stdio, sans objet puisque le daemon ne spawne pas l'éditeur. Le
+        serveur écoute uniquement sur 127.0.0.1, même surface d'exposition
+        que le serverstart("127.0.0.1:0") de nvim.
+    - decision: >
+        Parité asymétrique explicite : tools MCP alignés sur Emacs (les 12
+        tools, y compris find_definition, find_references,
+        buffer_diagnostics, ask), contrôles de session alignés sur nvim (les
+        4 commandes notify, interrupt, restart, model, en commandes palette
+        préfixées "Sidekick:").
+      rationale: >
+        Sur chaque plan, on copie l'intégration existante la plus aboutie.
+        Emacs est la référence tools (nvim n'a ni tools sémantiques ni ask),
+        et VSCode rend cette parité naturelle : LSP natif (executeDefinition/
+        ReferenceProvider), diagnostics de première classe
+        (languages.getDiagnostics), quick pick natif (showQuickPick). nvim
+        est la référence contrôles : quatre commandes utilisateur nettes,
+        directement transposables en commandes palette, là où Emacs mélange
+        contrôles et fonctionnalités hors scope (resume, rendu natif,
+        mode-line scraping). Nommer l'asymétrie évite qu'un reviewer upstream
+        ou un implementer cherche une parité Emacs sur les contrôles (il n'y
+        en a pas besoin) ou une parité nvim sur les tools (elle serait
+        insuffisante).
+    - decision: >
+        Tool d'écriture : edit_buffer AVEC garde CAS, sémantique nvim
+        (previous + content + start ; l'écriture est rejetée si le buffer ne
+        correspond plus à previous), et non write_buffer sans garde comme
+        Emacs. L'application se fait par WorkspaceEdit + workspace.applyEdit
+        après comparaison des lignes live avec previous.
+      rationale: >
+        VSCode est un éditeur GUI où l'utilisateur tape activement pendant
+        que claude travaille en fond : le scénario d'édition concurrente
+        humain/claude y est plus probable que dans un Emacs daemon piloté par
+        emacsclient. La garde CAS ferme ce cas négatif : au lieu d'écraser
+        silencieusement une édition humaine, le tool rejette avec une raison
+        ("content changed at line N"), et claude re-lit puis rejoue, boucle
+        déjà documentée dans la description du edit_buffer nvim (réutilisable
+        presque telle quelle). Le coût est faible : l'extension lit la plage,
+        compare, applique. write_buffer sans garde (choix emacs) est écarté
+        précisément parce que le risque de clobber y est plus élevé ici ;
+        c'est un cas où la parité Emacs au tool près serait une régression de
+        sûreté. Nom du tool : edit_buffer, comme nvim, puisque la sémantique
+        est celle de nvim.
+    - decision: >
+        Sémantique de "buffers ouverts" pour glob/grep/list_buffers : l'union
+        des onglets texte de fichiers (window.tabGroups, entrées TabInputText
+        de scheme file) et des documents ouverts par claude via open_buffer
+        (ensemble tenu par l'extension pendant la session). Ni
+        workspace.textDocuments seul, ni tabGroups seul.
+      rationale: >
+        Les deux API candidates échouent seules. workspace.textDocuments
+        liste les documents dont le CONTENU est chargé : il inclut des
+        documents invisibles pour l'utilisateur (schemas git:, output,
+        documents fermés encore en cache) et omet les onglets en préversion
+        non encore chargés ; l'utiliser ferait diverger le périmètre de ce
+        que l'utilisateur voit. window.tabGroups liste exactement ce que
+        l'utilisateur perçoit comme "ouvert" (équivalent des buffers listés
+        nvim/emacs), mais un document chargé par open_buffer via
+        workspace.openTextDocument n'y apparaît pas (pas d'onglet créé, et
+        c'est voulu : pas de vol de focus) ; tabGroups seul rendrait
+        open_buffer inopérant pour étendre le périmètre de glob/grep, cassant
+        le contrat documenté des tools ("use open_buffer first to bring a
+        file into scope"). L'union règle les deux : perception utilisateur
+        respectée, contrat open_buffer préservé. L'extension garde une
+        référence sur les documents qu'elle a ouverts (et les rouvre à la
+        demande si VSCode les a disposés, openTextDocument étant idempotent
+        et silencieux). Le périmètre est en outre filtré à la racine de
+        session, comme le fait emacs.go pour un daemon partagé.
+    - decision: >
+        Identité de buffer : le chemin du fichier relatif à la racine de
+        session (fsPath absolu en secours pour un fichier hors racine).
+        C'est l'identifiant retourné par list_buffers/open_buffer, attendu
+        par tous les tools, et émis comme champ buf des événements notify.
+      rationale: >
+        VSCode n'a pas de numéro de buffer (nvim) ni de nom de buffer unique
+        (emacs) ; l'identifiant naturel d'un TextDocument est son URI. Le
+        chemin relatif à la racine en est la projection lisible : stable
+        pendant la session, directement compréhensible par claude et par
+        l'utilisateur, et cohérent avec les sorties de glob/grep qui sont
+        déjà relatives à la racine dans les deux intégrations existantes.
+        L'URI complet est écarté comme identité exposée (verbeux, encodage) ;
+        l'extension refait la résolution chemin → document via
+        Uri.joinPath(root, rel).
+    - decision: >
+        Spawn de claude : TUI interactive dans un terminal intégré VSCode créé
+        sans focus (createTerminal sans show(), ou show(preserveFocus) si un
+        rendu visible est demandé), pas de mode headless claude -p
+        stream-json. Restart = dispose du terminal + respawn avec le même pid
+        et le même mcp-config, comme restart_claude() côté nvim.
+      rationale: >
+        Le mode headless d'emacs n'a de valeur que couplé à son renderer
+        natif (sidekick-render.el : rendu markdown, folds de thinking,
+        mode-line), qui est explicitement hors scope du task-request. Sans
+        renderer, headless signifierait une session invisible et inauditable.
+        Le terminal intégré donne gratuitement ce que le buffer terminal nvim
+        donne : l'utilisateur peut ouvrir le panneau Terminal pour inspecter
+        la session, sans que sa création ne vole le focus (l'API createTerminal
+        n'affiche rien tant que show() n'est pas appelé). Il fournit aussi le
+        support des contrôles : interrupt = sendText("\x03") brut (précédent
+        nvim : chansend du byte ETX), model = injection de "/model X" puis
+        Enter différé (précédent nvim : délais pour la modale de la TUI).
+        Cohérent avec le choix de parité contrôles = nvim. Le mode headless
+        pourra être une évolution ultérieure upstream, ce design ne le ferme
+        pas (le canal HTTP et le register n'en dépendent pas).
+    - decision: >
+        Clé de session : le pid du process extension host (process.pid),
+        passé tel quel au register. Une session par fenêtre VSCode ; la
+        racine de session est épinglée au register (champ root, précédent
+        emacs) et vaut le premier workspace folder de la fenêtre.
+      rationale: >
+        Chaque fenêtre VSCode a son propre extension host, donc process.pid
+        est unique par fenêtre et vivant exactement aussi longtemps que la
+        session : mêmes garanties que le pid nvim, sans l'artifice du
+        id-holder emacs (nécessaire là-bas uniquement parce qu'un daemon
+        Emacs partage un seul pid entre plusieurs projets). Le root est
+        épinglé au register plutôt qu'interrogé à chaque op (précédent
+        emacs.go et son commentaire de rationale) : le daemon relativise les
+        chemins sans aller-retour, et le périmètre de session est figé et
+        prévisible. Multi-root workspace : le premier folder fait foi, les
+        buffers hors racine sont filtrés de glob/grep (même règle
+        d'exclusion que emacs.go pour un daemon multi-projet) et restent
+        adressables explicitement par les autres tools via chemin absolu.
+        C'est la limite assumée du design (une session ne couvre pas les
+        folders secondaires) ; elle est documentée plutôt que résolue, car
+        toute alternative (une session par folder) casserait l'invariant une
+        -fenêtre-une-session-un-claude.
+    - decision: >
+        Plugin marketplace : vérification puis installation automatique par
+        défaut, via la CLI claude (claude plugin list --json, puis marketplace
+        add + plugin install vscode@sidekick si absent), débrayable par un
+        setting sidekick.claude.autoInstall, avec settings miroirs de la
+        config Lua (marketplace repo/ref ou path local).
+      rationale: >
+        C'est l'UX exacte de l'intégration nvim (on_start dans init.lua :
+        list, add, install, puis spawn), que le task-request cite comme
+        référence ("même UX que les intégrations nvim/emacs"). La
+        vérification seule (sans installation) laisserait l'utilisateur
+        devant un échec de /vscode:monitor difficile à diagnostiquer. Le
+        setting débrayable préserve les utilisateurs qui gèrent leurs
+        plugins manuellement, comme auto_install=false côté nvim. Le spawn
+        n'a lieu qu'après confirmation que le plugin est présent, sinon la
+        session claude démarrerait sans sa slash command de bootstrap.
+    - decision: >
+        Tool ask : window.showQuickPick avec les choix fournis. Un dismissal
+        (Échap, perte de focus, résultat undefined) retourne une ERREUR MCP
+        explicite ("user dismissed the question") et non une réponse vide ou
+        un choix par défaut. Côté daemon, l'appel HTTP du tool ask est fait
+        SANS timeout client, alors que toutes les autres ops portent un
+        timeout court ; côté extension, les ask concurrents sont sérialisés
+        (file d'attente) et une question en attente est signalée dans la
+        status bar pour pouvoir être ré-affichée si l'utilisateur l'a
+        dismissée par accident.
+      rationale: >
+        showQuickPick retourne undefined au dismissal sans distinguer
+        "refus" et "fausse manœuvre" ; renvoyer une chaîne vide ou un défaut
+        inventerait une réponse que l'utilisateur n'a pas donnée, exactement
+        ce que le tool existe pour éviter ("let the user decide instead of
+        guessing", description emacs). L'erreur explicite laisse claude
+        choisir : reposer la question, ou continuer en signalant dans un
+        RESP: qu'il a dû trancher seul. L'asymétrie des timeouts découle de
+        la nature des ops : ask bloque légitimement le temps d'une réflexion
+        humaine (le minibuffer emacs bloque déjà ainsi, via un emacsclient
+        sans timeout), tandis qu'une op mécanique (read, edit, list) qui ne
+        répond pas en quelques secondes signale une extension morte et doit
+        échouer vite pour que claude reçoive une erreur au lieu de geler. La
+        sérialisation évite deux quick picks empilés (le second annulerait
+        silencieusement le premier dans l'UI VSCode), et le rappel status bar
+        couvre le cas du dismissal accidentel sans imposer de timeout
+        arbitraire à la réflexion de l'utilisateur.
+    - decision: >
+        Tool jump : window.showTextDocument sur le document cible (c'est la
+        seule op qui prend le focus, par contrat) avec selection posée à
+        line:column, ce qui inscrit le saut dans l'historique de navigation
+        natif de VSCode ; le retour utilisateur est Go Back
+        (workbench.action.navigateBack, Alt+Left), mentionné dans le résultat
+        du tool ("(Go Back / Alt+Left returns)") comme <C-t> et M-, le sont
+        dans les intégrations existantes.
+      rationale: >
+        VSCode maintient nativement un historique de navigation alimenté par
+        les changements de sélection inter-fichiers : il n'y a rien à
+        empiler manuellement, contrairement à nvim où le design pousse
+        explicitement le tag stack. Réutiliser ce mécanisme natif est le
+        choix minimal et idiomatique (un stack maison ferait doublon avec un
+        geste que les utilisateurs VSCode connaissent déjà). Le critère
+        d'acceptation ("jump laisse un moyen de retour") est satisfait par
+        le mécanisme le plus standard de l'éditeur, et la mention dans le
+        résultat du tool assure que claude le communique à l'utilisateur
+        dans ses RESP:, comme le font les deux autres intégrations.
+    - decision: >
+        Mapping des tools restants sur l'API extension : read_buffer =
+        TextDocument.getText sur la plage (numérotation 1-based en entrée,
+        sortie préfixée façon cat -n comme les deux autres intégrations) ;
+        list_buffers = énumération de l'union "buffers ouverts" en lignes
+        id<TAB>chemin ; open_buffer = workspace.openTextDocument (charge
+        sans afficher, donc sans vol de focus, équivalent exact de
+        bufadd/bufload) + ajout à l'ensemble de session ; save_buffer =
+        TextDocument.save() ; find_definition / find_references = commandes
+        vscode.executeDefinitionProvider / vscode.executeReferenceProvider à
+        la position donnée, résultats rendus en lignes path:line: summary
+        relatives à la racine (format xref d'emacs.go, plafonné à 200
+        résultats) ; buffer_diagnostics = languages.getDiagnostics(uri) du
+        document, rendu line:column: severity: message trié par position ;
+        glob/grep = listing et lecture de lignes fournis par l'extension,
+        matching côté Go via globToRegexp et RE2 (plafond 500 matches
+        d'emacs.go/nvim.go conservé).
+      rationale: >
+        Chaque tool a un équivalent API extension direct et de première
+        classe ; aucun ne nécessite de dépendance externe ni de contournement.
+        Garder le matching glob/grep côté Go réutilise globToRegexp et les
+        types d'input partagés (GlobInput, GrepInput déjà utilisés par les
+        deux serveurs), garantit une sémantique de glob identique dans les
+        trois éditeurs (le piège **/ y est déjà résolu et commenté), et
+        maintient l'extension comme une couche fine d'accès à l'éditeur, sans
+        logique dupliquée. Les formats de sortie (cat -n, path:line:text,
+        path:line: summary, plafonds) sont repris à l'identique des deux
+        intégrations existantes : claude reçoit la même forme quelle que soit
+        l'app, ce qui rend les monitor.md interchangeables dans leurs règles.
+    - decision: >
+        Séquencement du démarrage et cas d'échec : le spawn de claude est
+        conditionné au succès du register (la réponse JSON-RPC est lue et
+        vérifiée, contrairement au curl fire-and-forget de nvim). Si le
+        daemon est injoignable, l'extension affiche une erreur actionnable
+        ("sidekick daemon unreachable at <url>, start it then run Sidekick:
+        Setup") et n'engage rien d'autre ; la commande Sidekick: Setup permet
+        de retenter sans recharger la fenêtre. Si le terminal claude meurt
+        (onDidCloseTerminal), la status bar passe à l'état mort et Sidekick:
+        Restart respawne avec le même pid, sans nouveau register (l'entrée
+        registry du daemon est toujours valide, précédent restart_claude
+        nvim). Un échec de dial daemon → extension sur une op retourne une
+        erreur de tool à claude (précédent dial nvim), jamais un blocage.
+      rationale: >
+        Spawner claude sans register réussi produirait le pire mode de panne :
+        une session claude vivante dont le /mcp/<pid> et le /listen/<pid>
+        renvoient "no endpoint registered", indiagnosticable depuis la TUI.
+        Conditionner le spawn transforme ce mode en un message d'erreur
+        unique au bon moment. L'extension, contrairement au Lua nvim, fait
+        elle-même le POST HTTP et peut donc lire la réponse : autant s'en
+        servir. Le restart sans re-register est correct car la clé pid et
+        l'endpoint de l'extension survivent à la mort de claude (seul le
+        process claude est recréé), exactement l'invariant du restart nvim
+        qui réutilise mcp_config et pid mémorisés. Ces choix couvrent les
+        trois cas négatifs du cycle de vie (daemon absent, claude mort,
+        extension morte) avec à chaque fois un échec rapide et localisé.
+    - decision: >
+        /vscode:monitor : structure et règles identiques aux monitor.md nvim
+        et emacs (Monitor curl -sN sur /listen/<pid>, remplacement REQ: →
+        RESP: immédiat, scope strict, préférence absolue aux tools sidekick,
+        save avant build, chat non lu), avec pour seules variantes le champ
+        buf défini comme chemin relatif à la racine de session, la mention du
+        retour Go Back (Alt+Left) après jump, et l'encouragement à utiliser
+        ask quand une décision revient à l'utilisateur (comme la version
+        emacs le sous-entend via ses tools, la version vscode le dit
+        explicitement puisque ask fait partie du contrat de parité).
+      rationale: >
+        Les monitor.md sont le contrat comportemental de la session claude ;
+        leur convergence entre éditeurs est ce qui rend le système prévisible
+        (mêmes règles d'or, mêmes canaux de communication). La formulation
+        "chat non lu" de la version nvim, plus stricte que celle d'emacs, est
+        retenue car c'est la plus récente et la plus efficace contre le
+        bavardage en chat. Les variantes se limitent à ce qui diffère
+        réellement entre éditeurs : l'identité de buffer et le geste de
+        retour. Toute règle supplémentaire spécifique VSCode serait un signal
+        de design défaillant ailleurs (un tool au contrat ambigu se corrige
+        dans sa description, pas dans le monitor).
+
+  open_questions:
+    - >
+      Nom du répertoire de l'extension : vscode/ est proposé par symétrie avec
+      lua/ et emacs/, mais le mainteneur upstream peut préférer une
+      convention type editors/vscode ou un packaging vsce particulier ; à
+      confirmer au moment de la PR, sans impact sur l'architecture.
+    - >
+      Compatibilité forks (Cursor, VSCodium) : le design n'utilise que l'API
+      extension stable et la CLI claude, donc les forks devraient fonctionner
+      sans effort, mais aucune vérification n'est due (out_of_scope du
+      task-request) ; noter simplement dans la PR que rien ne les exclut
+      délibérément.

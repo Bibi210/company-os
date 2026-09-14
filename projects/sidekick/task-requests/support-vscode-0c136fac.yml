@@ -1,0 +1,98 @@
+api_version: companyos/v1
+kind: task-request
+metadata:
+  id: 0c136fac-dc9b-4acd-9c2a-ddad2e0df811
+  title: "Ajouter le support VSCode à sidekick (parité Emacs, PR upstream)"
+  author: pm
+  created_at: "2026-09-09"
+  project: sidekick
+  description: >
+    Ajouter VSCode comme troisième éditeur supporté par sidekick (daemon Go
+    de lthms qui fait le pont éditeur ↔ session Claude Code via le flux
+    REQ:/RESP:). Cible : parité fonctionnelle avec l'intégration Emacs, la
+    plus complète (tools de base + tools sémantiques LSP + ask), livrée sous
+    forme de branche prête pour une PR upstream vers lthms/sidekick.
+  tags:
+    - sidekick
+    - vscode
+    - go
+    - typescript
+    - mcp
+    - editor-integration
+    - upstream-contribution
+  related:
+    - id: 8f7a512d-0793-4e90-80a0-5fed7d778f65
+      kind: project-config
+      relationship: related
+
+spec:
+  priority: high
+  status: done
+  context: >
+    Sidekick supporte aujourd'hui Neovim (nvim.go + plugin Lua, dialogue
+    msgpack-RPC) et Emacs (emacs.go + sidekick.el, dialogue emacsclient
+    --eval avec payloads base64). L'abstraction AppMCPSever (app.go :
+    Kind, NewMCPServer, UnmarshalNotifyJSONParams) et le registry par
+    session sont conçus pour accueillir d'autres éditeurs. Chaque éditeur
+    apporte aussi un plugin Claude Code marketplace (plugins/<app>/) dont
+    la slash command /<app>:monitor bootstrape la session claude (boucle
+    curl -sN sur /listen/<pid>, règles de comportement REQ:/RESP:).
+    VSCode dispose nativement du LSP (definition/references providers),
+    des diagnostics et d'un quick pick UI, ce qui rend la parité Emacs
+    (12 tools) naturelle. Clone local : /home/bibux/Compagny/sidekick.
+  constraints:
+    - >
+      Projet contributed : suivre les conventions du repo upstream
+      (un fichier Go par éditeur au niveau racine, style et structure des
+      plugins marketplace existants, style des intégrations éditeur).
+    - >
+      Le choix du canal de communication daemon → VSCode (équivalent du
+      msgpack-RPC nvim / emacsclient emacs) est une décision d'architecture
+      à trancher au design, pas ici.
+    - >
+      Philosophie sidekick à préserver : Claude en arrière-plan sans voler
+      le focus, communication par commentaires RESP: dans les buffers (pas
+      de chat), périmètre limité aux buffers ouverts pour glob/grep.
+  acceptance_criteria:
+    - >
+      Une session VSCode s'enregistre auprès du daemon (register) et lance
+      une session claude en arrière-plan, sans voler le focus, avec
+      installation automatique ou vérification du plugin marketplace
+      vscode@sidekick (même UX que les intégrations nvim/emacs).
+    - >
+      Les 8 tools de base fonctionnent depuis claude via /mcp/<pid> :
+      read_buffer, write_buffer (ou edit_buffer), glob, grep, list_buffers,
+      open_buffer, save_buffer, jump. glob et grep opèrent sur les buffers
+      ouverts uniquement, jump laisse un moyen de retour à la position
+      précédente pour l'utilisateur.
+    - >
+      Les 4 tools de parité Emacs fonctionnent : find_definition et
+      find_references (via les providers LSP de VSCode), buffer_diagnostics
+      (diagnostics VSCode du buffer), ask (choix utilisateur via quick pick,
+      résultat retourné à claude).
+    - >
+      Le flux REQ:/RESP: fonctionne de bout en bout : commentaire REQ: dans
+      un buffer, commande notify côté VSCode, claude accuse réception en
+      remplaçant REQ: par RESP: et répond en place dans les buffers.
+    - >
+      Le plugin marketplace plugins/vscode/ existe avec sa slash command
+      /vscode:monitor, cohérente avec les monitor.md nvim et emacs
+      (Monitor en tâche background, règles REQ:/RESP:, préférence tools
+      sidekick sur les tools natifs).
+    - >
+      Contrôles de session disponibles côté VSCode : notify, interrupt,
+      restart, changement de modèle (équivalents des commandes
+      :SidekickNotify/:SidekickInterrupt/:SidekickRestart/:SidekickModel).
+    - >
+      Livrable : branche propre sur le clone local, prête pour une PR
+      upstream vers lthms/sidekick (commits cohérents avec l'historique du
+      repo, build go vert, extension VSCode compilable).
+  out_of_scope:
+    - Publication de l'extension sur le VSCode Marketplace.
+    - >
+      Support spécifique des forks (Cursor, VSCodium) au-delà de ce qui
+      fonctionne sans effort supplémentaire.
+    - >
+      Rendu de conversation riche façon sidekick-render.el (mode natif
+      headless avec rendu markdown, folds de thinking, mode-line status).
+    - Soumission effective de la PR et négociation avec le mainteneur upstream.

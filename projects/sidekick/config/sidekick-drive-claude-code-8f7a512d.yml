@@ -1,0 +1,26 @@
+api_version: companyos/v1
+kind: project-config
+metadata:
+  id: 8f7a512d-0793-4e90-80a0-5fed7d778f65
+  title: "Sidekick — Drive Claude Code from your editor"
+  author: pm
+  created_at: "2026-09-09"
+  project_name: sidekick
+  description: >
+    Daemon Go (par lthms) qui fait le pont entre un éditeur (Neovim, Emacs)
+    et une session Claude Code : l'utilisateur laisse des commentaires REQ:
+    dans son code et Claude répond en place. Expose un serveur MCP donnant
+    à Claude accès aux buffers de l'éditeur. Projet externe auquel on
+    contribue via PRs upstream. Clone local : /home/bibux/Compagny/sidekick.
+  tags:
+    - go
+    - claude-code
+    - neovim
+    - emacs
+    - mcp
+    - daemon
+    - editor-integration
+
+spec:
+  ownership: contributed
+  repo_url: https://github.com/lthms/sidekick
