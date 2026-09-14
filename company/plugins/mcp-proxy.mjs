@@ -41,7 +41,7 @@ import {
   accessSync,
   constants as fsConstants,
   watch,
-  mkdirSync,
+  mkdir,
   statSync,
   renameSync,
   unlinkSync,
@@ -206,9 +206,29 @@ const STDERR_ACCUM_LIMIT = 1_048_576;
 let logStream = null;
 let logBytes = 0;
 
+// Directory creation is ASYNCHRONOUS on purpose. A synchronous
+// `mkdirSync` on a wedged filesystem does not throw, it BLOCKS, and no
+// try/catch saves you from that: the proxy would freeze at startup before
+// wiring the relay, with the MCP channel dead and no message explaining
+// why. Observed for real while writing the integration tests, where a
+// `mkdirSync` under /proc hung forever. The non-lethality invariant
+// forbids blocking the proxy just as much as killing it, so the relay is
+// never made to wait for the journal: until the callback fires, telemetry
+// simply stays unavailable and everything degrades to stderr.
 function openTelemetry() {
+  mkdir(LOG_DIR, { recursive: true }, (err) => {
+    if (err) {
+      console.error(
+        `[mcp-proxy:${crateName}] telemetry unavailable (${err.message}); stderr only`,
+      );
+      return;
+    }
+    attachLogStream();
+  });
+}
+
+function attachLogStream() {
   try {
-    mkdirSync(LOG_DIR, { recursive: true });
     logBytes = existsSync(LOG_PATH) ? statSync(LOG_PATH).size : 0;
     const stream = createWriteStream(LOG_PATH, { flags: "a" });
     // MANDATORY (invariant rule 1). Never remove this listener.
@@ -244,7 +264,7 @@ function rotateTelemetry() {
     );
   }
   logBytes = 0;
-  openTelemetry();
+  attachLogStream();
 }
 
 function writeTelemetry(source, text) {
@@ -841,9 +861,7 @@ function restartChild() {
 
 // --- Main ---
 openTelemetry();
-log(
-  `Proxy starting (binary=${binaryPath}, telemetry=${logStream ? LOG_PATH : "stderr only"})`,
-);
+log(`Proxy starting (binary=${binaryPath}, telemetry=${LOG_PATH})`);
 if (!binaryReady(binaryPath, fsDeps)) {
   // Served binary absent at boot: enter waiting_binary, bootstrap, and let the
   // watcher / backoff net bring us up. Never exit here (RFC B4).

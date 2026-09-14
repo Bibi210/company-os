@@ -1,4 +1,4 @@
-.PHONY: build check fmt clippy lint test test-js validate check-naming release ci deploy-serve setup clean
+.PHONY: build check fmt clippy lint test test-js test-js-integration validate check-naming release ci deploy-serve doctor setup clean
 
 ## Default target
 all: setup
@@ -26,9 +26,18 @@ lint: fmt clippy
 test:
 	cargo test --workspace
 
-## Run JS tests
+## Run JS tests (pure logic only — the glob is NOT recursive, so the process
+## integration suite under tests/integration/ stays out of ci on purpose).
 test-js:
 	node --test company/plugins/tests/*.test.mjs
+
+## Proxy integration tests (RFC 5bacb08a D8). Spawns the real proxy against
+## the fake server of tests/harness/. Deliberately OUT of `make ci` and NOT
+## hooked to deploy-serve: process integration is slower and timing
+## sensitive, and must never block a commit or a promotion for a machine
+## hiccup. Delays are compressed through the proxy env overrides.
+test-js-integration:
+	node --test company/plugins/tests/integration/*.test.mjs
 
 ## Validate all YAML artifacts against schemas
 validate:
